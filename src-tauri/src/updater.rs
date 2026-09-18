@@ -273,8 +273,10 @@ fn now_stamp() -> String {
 
 /// on_before_exit 挂点本体（票 04，薄封装不进单测；核心 pre_update_snapshot /
 /// set_write_blocked 全测）：拿锁挡并发写 → 拷贝快照 → 锁内先置禁写标志 → 放锁。
-/// 标志在持锁期间置位：放锁后任何写闸门（with_conn / daily_tick /
-/// check_and_notify）都进不来，快照与实际库之间不存在漂移窗口。
+/// 标志在持锁期间置位：放锁后所有写路径都在各自锁内复查标志（with_conn /
+/// daily_tick 段 3 / check_and_notify；评审 R1 TOCTOU——置位前已过检查、阻塞在
+/// 锁上的在途写由锁内复查拦下），新发起与在途写都不再落库，快照与实际库之间
+/// 不存在漂移窗口。
 /// 任何失败只记日志、绝不阻塞安装（票面：失败不阻塞升级，状态即本函数日志）；
 /// 快照失败也不置禁写——没有快照可保护，且安装失败残留时应用需保持可用。
 fn before_exit_snapshot(app: &tauri::AppHandle) {
@@ -404,9 +406,13 @@ fn daily_tick(handle: &tauri::AppHandle) {
     };
     let result = checker.check();
 
-    // 段 3（持锁）：记账 + 折算
+    // 段 3（持锁）：记账 + 折算。锁内复查禁写标志（评审 R1 TOCTOU：段 2 网络检查
+    // 期间快照可能已置位，置位后才拿到的锁必须放弃写入，不能落"快照之后"的记账）
     let outcome = {
         let Ok(conn) = state.0.lock() else { return };
+        if is_write_blocked() {
+            return;
+        }
         finish_daily_check(&conn, result, &today)
     };
     match outcome {
@@ -876,5 +882,29 @@ mod tests {
 
         set_write_blocked(false);
         assert!(ensure_writable().is_ok(), "复位后恢复放行");
+    }
+
+    #[test]
+    fn in_flight_write_passing_prelock_check_is_rejected_by_inlock_recheck() {
+        // 评审 R1 TOCTOU 锚点：置位前已通过闸门检查、随后阻塞拿锁的在途写，
+        // 拿到锁后由"锁内复查"拒绝。生产形态：with_conn / daily_tick 段 3 /
+        // check_and_notify 均在拿到锁之后才调 ensure_writable / is_write_blocked
+        //（真锁无法进单测，这里按同一时序在纯逻辑层模拟闸门顺序）。
+        struct ResetFlag;
+        impl Drop for ResetFlag {
+            fn drop(&mut self) {
+                set_write_blocked(false);
+            }
+        }
+        let _reset = ResetFlag;
+
+        // 1. 在途写到达，通过拿锁前的检查（此刻标志未置位）
+        assert!(ensure_writable().is_ok(), "置位前在途写检查放行");
+
+        // 2. 快照持锁段内置位（模拟 before_exit_snapshot 的锁内置位）
+        set_write_blocked(true);
+
+        // 3. 在途写拿到锁 → 锁内复查必须拒绝（写落在快照之后 = 禁止）
+        assert!(ensure_writable().is_err(), "锁内复查拒绝在途写");
     }
 }

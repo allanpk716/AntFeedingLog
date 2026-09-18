@@ -320,6 +320,11 @@ pub fn check_and_notify(handle: &tauri::AppHandle) {
     let now = crate::care::now_local();
     let sent = {
         let Ok(conn) = state.0.lock() else { return };
+        // 锁内复查禁写标志（票 04 评审 R1 TOCTOU）：函数顶检查通过后阻塞在锁上、
+        // 快照置位后才拿到锁的在途写必须在此被拒，否则台账落在快照之后
+        if crate::updater::is_write_blocked() {
+            return;
+        }
         match run_check(&conn, &today, &now) {
             Ok(sent) => sent,
             Err(_) => return,
