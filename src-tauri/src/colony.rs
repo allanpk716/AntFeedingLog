@@ -30,6 +30,8 @@ pub struct Colony {
     pub actions: Vec<crate::care::ActionTile>,
     /// 最近 1-2 条记录摘要（care::RecentLog，发生时间倒序）。
     pub recent: Vec<crate::care::RecentLog>,
+    /// 进行中的冬眠段摘要（冬眠卡片横幅数据：入眠日/预计出眠）；无开放段为 None。
+    pub hibernation: Option<crate::hibernation::OpenSegment>,
 }
 
 /// 新建/编辑窝的入参。
@@ -166,6 +168,7 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
                 days_raised: 0,
                 actions: Vec::new(),
                 recent: Vec::new(),
+                hibernation: None,
             })
         },
     )
@@ -177,6 +180,7 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
         c.days_raised = days_raised(&c.start_date, today)?;
         c.actions = crate::care::tiles_for_colony(conn, c.id, today)?;
         c.recent = crate::care::recent_for_colony(conn, c.id, 2)?;
+        c.hibernation = crate::hibernation::open_segment(conn, c.id)?;
         Ok(c)
     })
 }
@@ -617,6 +621,33 @@ mod tests {
     }
 
     // ── 归档 ──
+
+    #[test]
+    fn list_colonies_embeds_open_hibernation_preview_for_banner() {
+        // 票 05：冬眠卡片横幅数据（入眠日/预计出眠）由后端随窝一起给；
+        // 只有开放段算数，闭合的历史段不算。
+        let conn = mem_conn();
+        let a = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        let b = create_colony(&conn, &input("针毛一号", Some(1)), TODAY).unwrap();
+
+        conn.execute(
+            "INSERT INTO hibernation (colony_id, start_date, expected_end_date, actual_end_date)
+             VALUES (?1, '2025-12-01', '2026-02-01', '2026-02-01')",
+            params![a.id],
+        )
+        .unwrap();
+        crate::hibernation::start_hibernation(&conn, b.id, "2026-09-01", "2026-12-01").unwrap();
+
+        let list = list_colonies(&conn, TODAY).unwrap();
+        let ha = list.iter().find(|c| c.id == a.id).unwrap();
+        assert!(ha.hibernation.is_none(), "只有闭合历史段 → None");
+        assert_eq!(ha.status, "active");
+
+        let hb = list.iter().find(|c| c.id == b.id).unwrap();
+        let seg = hb.hibernation.as_ref().expect("冬眠中的窝应带开放段");
+        assert_eq!(seg.start_date, "2026-09-01");
+        assert_eq!(seg.expected_end_date, "2026-12-01");
+    }
 
     #[test]
     fn archive_colony_sets_status_ended() {

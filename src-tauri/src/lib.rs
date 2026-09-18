@@ -2,6 +2,7 @@ mod care;
 mod colony;
 mod db;
 mod dict;
+mod hibernation;
 
 use std::sync::Mutex;
 
@@ -184,6 +185,51 @@ fn erase_location(state: tauri::State<DbState>, id: i64) -> Result<(), String> {
     with_conn(state, |conn| colony::erase_location(conn, id))
 }
 
+// ── 冬眠（票 05）──
+
+#[tauri::command]
+fn start_hibernation(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+    start_date: String,
+    expected_end_date: String,
+) -> Result<hibernation::Hibernation, String> {
+    with_conn(state, |conn| {
+        hibernation::start_hibernation(conn, colony_id, &start_date, &expected_end_date)
+    })
+}
+
+#[tauri::command]
+fn confirm_wake(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+    actual_end_date: String,
+) -> Result<hibernation::Hibernation, String> {
+    with_conn(state, |conn| {
+        hibernation::confirm_wake(conn, colony_id, &actual_end_date)
+    })
+}
+
+#[tauri::command]
+fn add_past_hibernation(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+    start_date: String,
+    end_date: String,
+) -> Result<hibernation::Hibernation, String> {
+    with_conn(state, |conn| {
+        hibernation::add_past_hibernation(conn, colony_id, &start_date, &end_date)
+    })
+}
+
+#[tauri::command]
+fn list_hibernations(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+) -> Result<Vec<hibernation::Hibernation>, String> {
+    with_conn(state, |conn| hibernation::list_hibernations(conn, colony_id))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -217,6 +263,10 @@ pub fn run() {
             save_location,
             deactivate_location,
             erase_location,
+            start_hibernation,
+            confirm_wake,
+            add_past_hibernation,
+            list_hibernations,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

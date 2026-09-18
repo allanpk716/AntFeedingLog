@@ -5,8 +5,8 @@
 //!
 //! 行为对齐 spec：
 //! - 发生时间（occurred_at）与录入时间（created_at）分开存，补录合法；
-//! - 「距上次」= 今天 − 该窝该操作最近一次发生日期（自然日，评审附录规则 5 的无冬眠基线，
-//!   出眠重算属票 05）；
+//! - 「距上次」= 今天 − max(该窝该操作最近一次发生日期, 最近出眠日期)（自然日，
+//!   评审附录规则 5：出眠当天 0 天、不全红；无出眠史即纯记录基线，票 05）；
 //! - 超期判定仅提醒类且 > 建议间隔；登记类永不红；
 //! - 喂食可一条记录挂多种食物（log_food 多选关联），与记录同事务写入。
 
@@ -37,7 +37,7 @@ pub struct ActionTile {
     /// 是否喂食类操作（决定记账时是否带食物多选；schema 标记位，与名字无关）。
     pub is_feeding: bool,
     pub suggested_interval_days: Option<i64>,
-    /// 今天 − 最近一次发生日期（自然日）；从未记录为 None。
+    /// 今天 − max(最近一次发生日期, 最近出眠日期)（自然日，规则 5）；从未记录且无出眠史为 None。
     pub days_since_last: Option<i64>,
     /// 仅提醒类且 > 建议间隔；登记类/从未记录恒 false。
     pub overdue: bool,
@@ -203,11 +203,14 @@ pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i6
 // ── 卡片展示数据 ─────────────────────────────────────────────────────────
 
 /// 某窝每个「启用中」操作一块，按 sort、id 排序（字典新增操作自动出现）。
+/// 「距上次」基线（规则 5）：有出眠史的窝取 max(最近一次记录日期, 最近出眠日期)，
+/// 出眠当天全窝 0 天、不会一睁眼全红；登记类显示同样基准（只影响文案，永不红的性质不变）。
 pub fn tiles_for_colony(
     conn: &Connection,
     colony_id: i64,
     today: &str,
 ) -> Result<Vec<ActionTile>, String> {
+    let wake = crate::hibernation::latest_wake_date(conn, colony_id);
     let mut stmt = conn
         .prepare(
             "SELECT id, name, icon, kind, is_feeding, suggested_interval_days
@@ -253,7 +256,12 @@ pub fn tiles_for_colony(
                 });
             }
         }
-        let last = latest.map(|d| d.format("%Y-%m-%d").to_string());
+        // 规则 5：出眠后基准 = max(最近一次记录, 出眠日期)
+        let base = match (latest, wake) {
+            (Some(log), Some(w)) => Some(log.max(w)),
+            (log, w) => log.or(w),
+        };
+        let last = base.map(|d| d.format("%Y-%m-%d").to_string());
         let days = days_since_last(last.as_deref(), today)?;
         let overdue = is_overdue(&kind, days, interval);
         tiles.push(ActionTile {
@@ -791,6 +799,88 @@ mod tests {
         let tiles = tiles_for_colony(&conn, c2, TODAY).unwrap();
         assert_eq!(tile(&tiles, "喂食").days_since_last, None);
         assert!(!tile(&tiles, "喂食").overdue);
+    }
+
+    #[test]
+    fn tiles_baseline_resets_to_wake_date_on_wake_day() {
+        // 验收 3：出眠当天显示"距上次 0 天"——基准 = max(最近一次记录, 出眠日期)，
+        // 不会一睁眼全红。入眠前 10 天喂过一次，冬眠期间没记账，今天（09-18）出眠。
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        log(&conn, c, "喂食", "2026-09-08 20:00:00");
+        conn.execute(
+            "INSERT INTO hibernation (colony_id, start_date, expected_end_date, actual_end_date)
+             VALUES (?1, '2026-09-10', '2026-10-01', '2026-09-18')",
+            params![c],
+        )
+        .unwrap();
+
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert_eq!(
+            tile(&tiles, "喂食").days_since_last,
+            Some(0),
+            "出眠当天基线 = 出眠日"
+        );
+        assert!(!tile(&tiles, "喂食").overdue, "出眠当天不超期");
+        assert_eq!(
+            tile(&tiles, "垃圾清理").days_since_last,
+            Some(0),
+            "从未记录的操作同样从出眠日起算（全窝同口径）"
+        );
+    }
+
+    #[test]
+    fn tiles_baseline_prefers_latest_log_when_newer_than_wake() {
+        // 出眠 17 天后昨天刚喂过：喂食用记录日（1 天），没记过的操作仍从出眠日起算
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        conn.execute(
+            "INSERT INTO hibernation (colony_id, start_date, expected_end_date, actual_end_date)
+             VALUES (?1, '2026-08-01', '2026-09-01', '2026-09-01')",
+            params![c],
+        )
+        .unwrap();
+        log(&conn, c, "喂食", "2026-09-16 20:00:00");
+
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert_eq!(
+            tile(&tiles, "喂食").days_since_last,
+            Some(2),
+            "最近记录比出眠日新 → 用记录日"
+        );
+        assert_eq!(
+            tile(&tiles, "垃圾清理").days_since_last,
+            Some(17),
+            "出眠后没记过 → 从出眠日起算"
+        );
+    }
+
+    #[test]
+    fn tiles_baseline_ignores_open_segment_and_dirty_wake_dates() {
+        // 开放段没有实际结束日期：不改基线（出眠基线只看闭合段）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        log(&conn, c, "喂食", "2026-09-14 20:00:00"); // 4 天前
+        conn.execute(
+            "INSERT INTO hibernation (colony_id, start_date, expected_end_date)
+             VALUES (?1, '2026-09-10', '2026-10-01')",
+            params![c],
+        )
+        .unwrap();
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert_eq!(tile(&tiles, "喂食").days_since_last, Some(4), "开放段不改基线");
+
+        // 脏数据：actual_end_date 非法 → 跳过，不毒死整页（票 04 停靠①口径）
+        let c2 = colony(&conn, "倒霉二号");
+        log(&conn, c2, "喂食", "2026-09-14 20:00:00");
+        conn.execute(
+            "INSERT INTO hibernation (colony_id, start_date, expected_end_date, actual_end_date)
+             VALUES (?1, '2026-08-01', '2026-09-01', '???')",
+            params![c2],
+        )
+        .unwrap();
+        let tiles = tiles_for_colony(&conn, c2, TODAY).unwrap();
+        assert_eq!(tile(&tiles, "喂食").days_since_last, Some(4), "脏出眠日被跳过");
     }
 
     #[test]
