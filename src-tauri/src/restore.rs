@@ -382,7 +382,15 @@ where
             Ok(conn) => {
                 drop(std::mem::replace(&mut *guard, conn));
             }
-            Err(e2) => eprintln!("[restore] 替换失败后重开原库也失败（原库文件完好）: {e2}"),
+            Err(e2) => {
+                // 双失败：原库文件完好但重开也失败——占位连接留在锁内，业务
+                // 命令会持续报错直到重启。错误必须带重启指引到前端（不能只留
+                // 日志），并落一条错误流水（除命令层的失败日志外这里记库级
+                // 细节，排障用）。
+                let msg = format!("{e}；此外重开原库也失败（{e2}），请重启应用后重试恢复");
+                crate::applog::log_error(&format!("[restore] 替换失败且重开原库失败: {msg}"));
+                return Err(msg);
+            }
         }
         return Err(e);
     }
@@ -873,6 +881,97 @@ mod tests {
             !list_names(&data_dir).iter().any(|n| n.starts_with(SNAPSHOT_PREFIX)),
             "校验失败不应产生快照"
         );
+    }
+
+    #[test]
+    fn apply_inlock_gate_rejection_aborts_before_any_write() {
+        // 评审 R1 TOCTOU 锚点（票 04 版）：生产 take_lock 闭包在拿到锁之后立即
+        // 复查更新禁写位（同 with_conn / daily_tick 段 3 纪律）——顶层检查与拿锁
+        // 之间的窗口里用户可确认更新安装置位，置位后拿到的锁必须放弃执行。
+        // 与 updater.rs 的时序先例同款：置位前放行 → 持锁内置位 → 锁内复查拒绝；
+        // 禁写位用注入的本地位（不触碰 updater 全局，并行安全），时序等价。
+        let (_dir, data_dir, db_path) = fixture();
+        let before = db_bytes(&db_path);
+        let source = dir_path(&_dir).join("ant-feeding-log-backup-20260910-080000.db");
+        make_db(&source, "备份窝", 1);
+        let lock = live_lock(&db_path);
+
+        // 1. 在途恢复到达时禁写位尚未置位（对应生产：顶层检查已放行）
+        let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(!gate.load(std::sync::atomic::Ordering::SeqCst), "到达时禁写位未置位");
+        // 2. 持锁段内置位（模拟 on_before_exit_snapshot 的锁内置位）
+        gate.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // 3. 恢复拿锁 → 锁内复查必须拒绝：整个协议放弃（未到校验/快照/替换）
+        let gate2 = gate.clone();
+        let err = run_apply(
+            &source,
+            &db_path,
+            &data_dir,
+            STAMP,
+            || {
+                let guard = lock.lock().map_err(|e| e.to_string())?;
+                if gate2.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("更新安装禁写窗口，暂不能恢复".to_string());
+                }
+                Ok(guard)
+            },
+            |p| crate::db::open_and_migrate(p).map_err(|e| e.to_string()),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("禁写"), "实际：{err}");
+        assert_eq!(db_bytes(&db_path), before, "当前库字节级零改动");
+        assert!(no_staging_left(&data_dir), "staging 已清理");
+        assert!(
+            !list_names(&data_dir).iter().any(|n| n.starts_with(SNAPSHOT_PREFIX)),
+            "锁内复查被拒不得产生快照"
+        );
+        // 4. 复位后（模拟安装窗口结束）同一条路放行
+        gate.store(false, std::sync::atomic::Ordering::SeqCst);
+        let outcome = run_apply(
+            &source,
+            &db_path,
+            &data_dir,
+            STAMP,
+            || {
+                let guard = lock.lock().map_err(|e| e.to_string())?;
+                if gate.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("更新安装禁写窗口，暂不能恢复".to_string());
+                }
+                Ok(guard)
+            },
+            |p| crate::db::open_and_migrate(p).map_err(|e| e.to_string()),
+        )
+        .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Done, "禁写位复位后恢复照常执行");
+    }
+
+    #[test]
+    fn apply_swap_double_failure_error_carries_restart_guidance() {
+        // 替换失败（.new 被占）且重开原库也失败（注入恒败）：应用已进入占位
+        // 连接态，业务命令会持续报错直到重启——错误信息必须带重启指引
+        let (_dir, data_dir, db_path) = fixture();
+        let before = db_bytes(&db_path);
+        let source = dir_path(&_dir).join("ant-feeding-log-backup-20260910-080000.db");
+        make_db(&source, "备份窝", 1);
+        let new_target = PathBuf::from(format!("{}.new", db_path.display()));
+        std::fs::create_dir_all(&new_target).unwrap();
+        let lock = live_lock(&db_path);
+
+        let err = run_apply(
+            &source,
+            &db_path,
+            &data_dir,
+            STAMP,
+            || lock.lock().map_err(|e| e.to_string()),
+            |_p| Err("重开失败（注入）".to_string()),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("请重启应用"), "双失败必须给重启指引，实际：{err}");
+        assert_eq!(db_bytes(&db_path), before, "原库文件未被破坏");
+        assert!(no_staging_left(&data_dir));
     }
 
     #[test]

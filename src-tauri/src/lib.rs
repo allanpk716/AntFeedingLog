@@ -695,7 +695,9 @@ fn get_backup_status() -> Result<backup_config::BackupStatus, String> {
     Ok(backup_config::status_of(&backup_config::load(&data_dir)))
 }
 
-// ── 自动备份引擎（数据安全二期票 03，D2/D3/D4；引擎本体在 auto_backup.rs）──/// 业务写入成功后的触发点（D2 ①）：先同步记 `last_data_write_date`（配置锁内
+// ── 自动备份引擎（数据安全二期票 03，D2/D3/D4；引擎本体在 auto_backup.rs）──
+
+/// 业务写入成功后的触发点（D2 ①）：先同步记 `last_data_write_date`（配置锁内
 /// 快速落账，账目不丢），再后台线程判定 + 备份——网络盘等慢速目标目录不阻塞
 /// 命令返回与 UI（spec D3 锁外拷贝）。备份失败静默（记账+日志），绝不把错误
 /// 报给业务命令：写入照常成功返回（票面铁律）。
@@ -775,9 +777,6 @@ fn restore_apply(
     app: tauri::AppHandle,
     path: String,
 ) -> Result<restore::ApplyOutcome, String> {
-    // 更新安装禁写窗口同样禁恢复（整库替换是最重的写动作；with_conn 管不到
-    // 本命令的自管锁路径，这里显式复查）
-    updater::ensure_writable()?;
     let data_dir = current_data_dir()?;
     let db_path = state.1.clone();
     let outcome = restore::run_apply(
@@ -785,7 +784,16 @@ fn restore_apply(
         &db_path,
         &data_dir,
         &restore::stamp_now(),
-        || state.0.lock().map_err(|e| format!("库锁不可用: {e}")),
+        || {
+            // 更新安装禁写复查必须在锁内（评审 R1 TOCTOU 纪律，同 with_conn /
+            // daily_tick 段 3）：整库校验要数百毫秒，顶层检查与拿锁之间的窗口里
+            // 用户可确认更新安装（on_before_exit 持锁置禁写位），复查放在拿锁
+            // 之后，置位后拿到的锁直接放弃执行——守卫随 ? 丢弃即放锁，当前库
+            // 零改动。
+            let guard = state.0.lock().map_err(|e| format!("库锁不可用: {e}"))?;
+            updater::ensure_writable()?;
+            Ok(guard)
+        },
         |p| crate::db::open_and_migrate(p).map_err(|e| e.to_string()),
     );
     match &outcome {
