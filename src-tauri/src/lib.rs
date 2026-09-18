@@ -1,4 +1,5 @@
 mod applog;
+mod backup_config;
 mod care;
 mod colony;
 mod db;
@@ -555,12 +556,60 @@ fn log_frontend_error(message: String) -> Result<(), String> {
     Ok(())
 }
 
-/// 当前数据目录（日志命令共用；全局未初始化时回退解析一次）。
+/// 当前数据目录（日志与备份配置命令共用；全局未初始化时回退解析一次）。
 fn current_data_dir() -> Result<std::path::PathBuf, String> {
     if let Some(dir) = applog::data_dir() {
         return Ok(dir.to_path_buf());
     }
-    Err("日志底座未初始化（数据目录未知）".into())
+    Err("数据目录未初始化（应用底座未就绪）".into())
+}
+
+// ── 备份配置（数据安全二期票 02，D1/D10 配置部分）──
+
+/// 读备份配置（数据目录 backup-config.json；缺失/损坏按默认值，不报错）。
+/// 配置在库外独立文件（D1）：恢复整库不影响它。
+#[tauri::command]
+fn get_backup_config() -> Result<backup_config::BackupConfig, String> {
+    let data_dir = current_data_dir()?;
+    Ok(backup_config::load(&data_dir))
+}
+
+/// 保存备份配置（只收用户可改的三项：开关/目录/保留份数；账目字段 Rust 侧
+/// 维护，前端不可覆写）。保留份数 1–365 之外拒绝（前端已先行校验，这里兜底
+/// 拦下绕过前端的直调）。成功记一条动作流水（D7）。
+#[tauri::command]
+fn set_backup_config(
+    input: backup_config::BackupConfigInput,
+) -> Result<backup_config::BackupConfig, String> {
+    let data_dir = current_data_dir()?;
+    let saved = backup_config::update_and_save(&data_dir, &input)?;
+    applog::log_action(&format!(
+        "备份配置已保存：开关{}，保留 {} 份，目录 {}",
+        if saved.enabled { "开" } else { "关" },
+        saved.keep_count,
+        saved.backup_dir.as_deref().unwrap_or("未设"),
+    ));
+    Ok(saved)
+}
+
+/// rfd 系统文件夹选择框选备份目录（取消返回 None）。async command：对话框
+/// 不能占主线程（与 backup_to 同理，评审 R1-2）。路径字符串回给前端保存。
+#[tauri::command]
+async fn pick_backup_dir() -> Result<Option<String>, String> {
+    let picked = rfd::AsyncFileDialog::new()
+        .set_title("选择自动备份目录")
+        .pick_folder()
+        .await
+        .map(|handle| handle.path().to_string_lossy().to_string());
+    Ok(picked)
+}
+
+/// 备份状态（D10：上次结果/时间 + last_backup_date/last_data_write_date；
+/// 本票从配置文件投影，票 03 接真数据后同一出口）。
+#[tauri::command]
+fn get_backup_status() -> Result<backup_config::BackupStatus, String> {
+    let data_dir = current_data_dir()?;
+    Ok(backup_config::status_of(&backup_config::load(&data_dir)))
 }
 
 // ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──
@@ -756,6 +805,10 @@ pub fn run() {
             get_recent_errors,
             get_last_abnormal_exit,
             log_frontend_error,
+            get_backup_config,
+            set_backup_config,
+            pick_backup_dir,
+            get_backup_status,
             backup_to,
             export_data,
             get_stats,
