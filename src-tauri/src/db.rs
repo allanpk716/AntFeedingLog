@@ -83,9 +83,16 @@ pub fn schema_version_of(conn: &Connection) -> Result<i64, rusqlite::Error> {
     conn.query_row("PRAGMA user_version", [], |row| row.get(0))
 }
 
-/// 把库迁移到 [`SCHEMA_VERSION`]。幂等：已是最新则什么都不做；高于最新则不动（只升不降）。
+/// 把库迁移到 [`SCHEMA_VERSION`]。幂等：已是最新则什么都不做；
+/// 库版本高于应用支持时 fail-fast（报"请升级应用"，绝不静默放行，更不降级）。
 pub fn migrate(conn: &Connection) -> DbResult<()> {
     let mut version = schema_version_of(conn)?;
+    if version > SCHEMA_VERSION {
+        return Err(rusqlite::Error::InvalidParameterName(format!(
+            "库版本过新（schema v{version}，应用最高支持 v{SCHEMA_VERSION}），请升级应用后再打开"
+        ))
+        .into());
+    }
     while version < SCHEMA_VERSION {
         match version {
             0 => migrate_v0_to_v1(conn)?,
@@ -494,6 +501,25 @@ mod tests {
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM location"), 2);
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM settings"), 5);
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn db_newer_than_app_is_rejected_with_friendly_error() {
+        // 停靠：库版本高于应用支持的 schema 版本时 fail-fast（报"请升级应用"），
+        // 不再静默放行——旧应用读新库可能漏列/漏约束，写坏数据。
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .expect("置未来版本失败");
+
+        let err = migrate(&conn).unwrap_err().to_string();
+        assert!(err.contains("过新"), "实际错误：{err}");
+        assert!(err.contains("升级"), "实际错误：{err}");
+        // 版本必须原样保留，绝不能被降级
+        assert_eq!(
+            scalar_i64(&conn, "PRAGMA user_version"),
+            SCHEMA_VERSION + 1,
+            "拒绝打开时不得改动库版本"
+        );
     }
 
     #[test]
