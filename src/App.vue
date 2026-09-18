@@ -1,48 +1,306 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-
 /**
- * 健康检查拿到的 schema 版本。
- * null = IPC 未返回（前端单测环境或启动早期），首页照常渲染空状态。
+ * 首页：按地点分组渲染窝卡片（分组顺序 = 地点清单顺序，空地点「未分组」最后），
+ * 已结束的窝收底部折叠区（默认折叠）。「+ 新建窝」与地点管理入口在本页。
+ * 卡片上的操作块（喂食/换水/保湿/清理）属票 03。
  */
-const schemaVersion = ref<number | null>(null);
+import { computed, onMounted, ref } from "vue";
+import { invoke } from "@tauri-apps/api/core";
+import type { Colony, LocationItem } from "./types";
+import { groupColonies, splitColonies } from "./lib/home";
+import ColonyCard from "./components/ColonyCard.vue";
+import ColonyFormDialog from "./components/ColonyFormDialog.vue";
+import LocationManagerDialog from "./components/LocationManagerDialog.vue";
 
-onMounted(async () => {
+const colonies = ref<Colony[]>([]);
+const locations = ref<LocationItem[]>([]);
+const pageError = ref("");
+
+const showForm = ref(false);
+const editing = ref<Colony | null>(null);
+const showLocations = ref(false);
+const endedOpen = ref(false);
+
+const activeColonies = computed(() => splitColonies(colonies.value).active);
+const endedColonies = computed(() => splitColonies(colonies.value).ended);
+const groups = computed(() => groupColonies(activeColonies.value, locations.value));
+
+async function refresh() {
   try {
-    const info = await invoke<{ schema_version: number }>("health_check");
-    schemaVersion.value = info.schema_version;
-  } catch (err) {
-    console.error("健康检查失败", err);
+    const [cols, locs] = await Promise.all([
+      invoke<Colony[]>("list_colonies"),
+      invoke<LocationItem[]>("list_locations"),
+    ]);
+    colonies.value = cols;
+    locations.value = locs;
+    pageError.value = "";
+  } catch (e) {
+    pageError.value = String(e);
   }
+}
+
+function openCreate() {
+  editing.value = null;
+  showForm.value = true;
+}
+
+function openEdit(colony: Colony) {
+  editing.value = colony;
+  showForm.value = true;
+}
+
+function onSaved() {
+  showForm.value = false;
+  void refresh();
+}
+
+function onLocationsSaved() {
+  showLocations.value = false;
+  void refresh();
+}
+
+onMounted(() => {
+  void refresh();
 });
 </script>
 
 <template>
-  <main class="container">
-    <!-- 真正的首页卡片墙在票 02 实现；本票只放空状态占位 -->
-    <p class="empty">暂无窝</p>
-    <p v-if="schemaVersion !== null" class="schema">数据 schema v{{ schemaVersion }}</p>
-  </main>
+  <div class="page">
+    <header class="topbar">
+      <div class="brand">🐜 蚂蚁饲养日志</div>
+      <div class="tools">
+        <button class="ghost-btn location-mgr-btn" type="button" @click="showLocations = true">
+          地点管理
+        </button>
+      </div>
+    </header>
+
+    <main class="container">
+      <p v-if="pageError" class="page-error">{{ pageError }}</p>
+      <p v-if="colonies.length === 0" class="empty">暂无窝</p>
+
+      <section v-for="g in groups" :key="g.key" class="group">
+        <div class="group-head">
+          <h2 class="group-title">{{ g.title }}</h2>
+          <span class="cnt">{{ g.colonies.length }} 窝</span>
+          <div class="rule"></div>
+        </div>
+        <div class="cards">
+          <ColonyCard
+            v-for="c in g.colonies"
+            :key="c.id"
+            :colony="c"
+            @edit="openEdit(c)"
+          />
+        </div>
+      </section>
+
+      <section v-if="endedColonies.length > 0" class="ended-area">
+        <button class="ended-toggle" type="button" @click="endedOpen = !endedOpen">
+          已结束（{{ endedColonies.length }}）{{ endedOpen ? "▲ 收起" : "▼ 展开" }}
+        </button>
+        <div v-show="endedOpen" class="ended-section">
+          <div class="cards">
+            <ColonyCard
+              v-for="c in endedColonies"
+              :key="c.id"
+              :colony="c"
+              @edit="openEdit(c)"
+            />
+          </div>
+        </div>
+      </section>
+
+      <button class="new-colony" type="button" @click="openCreate">
+        ＋ 新建窝（名字 / 物种 / 地点 / 开始饲养日期 / 状态）
+      </button>
+    </main>
+
+    <ColonyFormDialog
+      v-if="showForm"
+      :editing="editing"
+      :colonies="colonies"
+      :locations="locations"
+      @close="showForm = false"
+      @saved="onSaved"
+    />
+    <LocationManagerDialog
+      v-if="showLocations"
+      :locations="locations"
+      @close="showLocations = false"
+      @saved="onLocationsSaved"
+    />
+  </div>
 </template>
 
 <style scoped>
-.container {
+.page {
+  /* 视觉基线 mocks/mock-a-light.html */
+  --bg: #f6f4f1;
+  --card: #ffffff;
+  --tile: #faf8f5;
+  --text: #2c2822;
+  --muted: #8f887d;
+  --border: #e8e2d8;
+  --border-strong: #d8d1c4;
+  --accent: #d97706;
+  --accent-deep: #b45309;
+  --accent-soft: #fdf1de;
+  --ok: #188a4b;
+  --ok-soft: #e7f5ec;
+  --bad: #d13d3d;
+  --bad-soft: #fcebeb;
+  --hib: #5b6472;
+  --hib-soft: #eef0f3;
+  --shadow: 0 1px 2px rgba(60, 50, 30, 0.05), 0 4px 14px rgba(60, 50, 30, 0.06);
+  --overlay: rgba(40, 35, 25, 0.35);
+
   min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.topbar {
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+
+.hbar,
+.topbar {
+  padding: 10px 20px;
   display: flex;
-  flex-direction: column;
   align-items: center;
-  justify-content: center;
+  gap: 18px;
+}
+
+.brand {
+  font-size: 17px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.tools {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.ghost-btn {
+  padding: 5px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 13px;
+  background: var(--card);
+  font-family: inherit;
+}
+
+.ghost-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-deep);
+}
+
+.container {
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 0 20px 80px;
 }
 
 .empty {
+  margin-top: 60px;
+  text-align: center;
   font-size: 18px;
-  color: #999;
+  color: var(--muted);
 }
 
-.schema {
+.page-error {
+  margin-top: 16px;
+  padding: 8px 12px;
+  border-radius: 10px;
+  background: var(--bad-soft);
+  color: var(--bad);
+  font-size: 13px;
+}
+
+.group {
+  margin-top: 26px;
+}
+
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.group-head h2 {
+  font-size: 16px;
+}
+
+.group-head .cnt {
   font-size: 12px;
-  color: #bbb;
-  margin-top: 8px;
+  color: var(--muted);
+  background: var(--tile);
+  border: 1px solid var(--border);
+  padding: 1px 9px;
+  border-radius: 999px;
+}
+
+.group-head .rule {
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+  gap: 14px;
+}
+
+.ended-area {
+  margin-top: 30px;
+}
+
+.ended-toggle {
+  border: 1px solid var(--border-strong);
+  background: var(--tile);
+  color: var(--muted);
+  border-radius: 10px;
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 14px;
+  cursor: pointer;
+}
+
+.ended-toggle:hover {
+  border-color: var(--accent);
+  color: var(--accent-deep);
+}
+
+.ended-section {
+  margin-top: 12px;
+}
+
+.new-colony {
+  margin-top: 14px;
+  width: 100%;
+  border: 1.5px dashed var(--border-strong);
+  border-radius: 14px;
+  background: transparent;
+  padding: 14px;
+  cursor: pointer;
+  color: var(--muted);
+  font: inherit;
+  font-size: 14px;
+  text-align: center;
+}
+
+.new-colony:hover {
+  border-color: var(--accent);
+  color: var(--accent-deep);
 }
 </style>
