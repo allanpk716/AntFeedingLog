@@ -493,6 +493,11 @@ pub fn check_and_notify(handle: &tauri::AppHandle) {
         }
         if !settled.is_empty() {
             if let Ok(conn) = state.0.lock() {
+                // 合并专项评审：锁内复查禁写标志（Pushover HTTP 最长 10s 的锁外窗口里
+                // 可能恰逢升级快照锁内置位——此时台账回写会落在快照之后造成漂移）。
+                if crate::updater::is_write_blocked() {
+                    return;
+                }
                 let _ = settle_pushover(&conn, &settled);
             }
         }
