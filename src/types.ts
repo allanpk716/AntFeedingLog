@@ -140,6 +140,62 @@ export interface CareLogInput {
   food_ids: number[];
 }
 
+/** 统计页 payload（Rust stats::StatsPayload；spec API 契约 getStats） */
+export interface StatsDailyCount {
+  date: string;
+  count: number;
+}
+
+/** 热力图悬停明细里的一天内单条记录（喂食带食物名，其他为空数组） */
+export interface StatsDayEntry {
+  action_name: string;
+  food_names: string[];
+}
+
+/** 悬停明细按天分组（只含有记录的天） */
+export interface StatsDayDetail {
+  date: string;
+  entries: StatsDayEntry[];
+}
+
+/** 食物出现次数（分母 = 各项合计，前端归一化 100%，规则 8） */
+export interface StatsFoodShare {
+  food_name: string;
+  occurrences: number;
+}
+
+/** 每周操作数（周一为周首） */
+export interface StatsWeeklyCount {
+  week_start: string;
+  count: number;
+}
+
+/** 单个操作间隔统计（间隔已扣冬眠重叠天数，规则 6） */
+export interface StatsInterval {
+  action_id: number;
+  name: string;
+  kind: ActionKind;
+  /** 仅提醒类有值（前端画建议刻度竖线）；登记类恒 null（界面标「仅登记」） */
+  suggested_interval_days: number | null;
+  sample_count: number;
+  avg_days: number | null;
+  min_days: number | null;
+  max_days: number | null;
+}
+
+/** get_stats 返回体 */
+export interface StatsPayload {
+  range_start: string;
+  range_end: string;
+  /** 规则 7：频率分母 = 范围自然日天数（含首尾，不扣冬眠） */
+  range_days: number;
+  daily: StatsDailyCount[];
+  daily_detail: StatsDayDetail[];
+  food_share: StatsFoodShare[];
+  weekly: StatsWeeklyCount[];
+  intervals: StatsInterval[];
+}
+
 export const COLONY_STATUS_LABELS: Record<ColonyStatus, string> = {
   active: "活跃",
   hibernating: "冬眠",

@@ -8,6 +8,12 @@ import { addDays, todayIso } from "./lib/dates";
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
+// 票 07：统计页图表在 happy-dom 无 canvas，mock 掉 echarts（导航测试只验接线）
+const { echartsSetOption } = vi.hoisted(() => ({ echartsSetOption: vi.fn() }));
+vi.mock("echarts", () => ({
+  init: vi.fn(() => ({ setOption: echartsSetOption, dispose: vi.fn(), resize: vi.fn() })),
+}));
+
 /** 票 06：get_settings 的回放数据（测试里可整体替换） */
 const defaultSettings: AppSettings = {
   notify_master_enabled: true,
@@ -529,6 +535,29 @@ describe("设置 · 字典管理（票 04）", () => {
     await dlg.findAll(".dict-row")[1].find(".row-btn").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("set_food_enabled", { id: 2, enabled: false });
+  });
+});
+
+describe("顶栏导航（票 07）", () => {
+  it("三页 nav 骨架：首页/统计可切换，记录占位禁用（票 08）", async () => {
+    const wrapper = await mountApp();
+
+    const tabs = wrapper.findAll(".topbar .tab");
+    expect(tabs.map((t) => t.text())).toEqual(["首页", "统计", "记录"]);
+    expect(tabs[0].classes()).toContain("active");
+    expect(tabs[2].attributes("disabled")).toBeDefined();
+
+    // 切到统计：统计页渲染并拉数据
+    invokeMock.mockClear();
+    await tabs[1].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".stats-page").exists()).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "get_stats")).toBe(true);
+
+    // 切回首页：卡片墙回来
+    await wrapper.findAll(".topbar .tab")[0].trigger("click");
+    expect(wrapper.find(".group-title").exists()).toBe(true);
+    expect(wrapper.find(".stats-page").exists()).toBe(false);
   });
 });
 

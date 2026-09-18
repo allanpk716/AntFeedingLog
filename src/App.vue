@@ -12,6 +12,11 @@ import { groupColonies, splitColonies } from "./lib/home";
 import ColonyCard from "./components/ColonyCard.vue";
 import ColonyFormDialog from "./components/ColonyFormDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
+import StatsPage from "./components/StatsPage.vue";
+
+/** 顶栏三页 nav（票 07 加「统计」，「记录」占位给票 08） */
+type Page = "home" | "stats";
+const page = ref<Page>("home");
 
 const colonies = ref<Colony[]>([]);
 const locations = ref<LocationItem[]>([]);
@@ -73,6 +78,25 @@ onMounted(() => {
   <div class="page">
     <header class="topbar">
       <div class="brand">🐜 蚂蚁饲养日志</div>
+      <nav class="nav">
+        <button
+          class="tab"
+          :class="{ active: page === 'home' }"
+          type="button"
+          @click="page = 'home'"
+        >
+          首页
+        </button>
+        <button
+          class="tab"
+          :class="{ active: page === 'stats' }"
+          type="button"
+          @click="page = 'stats'"
+        >
+          统计
+        </button>
+        <button class="tab" type="button" disabled title="记录流水页（票 08 交付）">记录</button>
+      </nav>
       <div class="tools">
         <button class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
           ⚙ 设置
@@ -80,7 +104,7 @@ onMounted(() => {
       </div>
     </header>
 
-    <main class="container">
+    <main v-if="page === 'home'" class="container">
       <p v-if="pageError" class="page-error">{{ pageError }}</p>
       <p v-if="colonies.length === 0" class="empty">暂无窝</p>
 
@@ -122,6 +146,8 @@ onMounted(() => {
         ＋ 新建窝（名字 / 物种 / 地点 / 开始饲养日期 / 状态）
       </button>
     </main>
+
+    <StatsPage v-if="page === 'stats'" />
 
     <ColonyFormDialog
       v-if="showForm"
@@ -185,6 +211,34 @@ onMounted(() => {
   font-size: 17px;
   font-weight: 700;
   white-space: nowrap;
+}
+
+/* 三页 nav（视觉基线 mocks/mock-b-stats.html 的 .nav/.tab） */
+.nav {
+  display: flex;
+  gap: 4px;
+}
+
+.tab {
+  padding: 5px 14px;
+  border: none;
+  border-radius: 999px;
+  cursor: pointer;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  font-size: 14px;
+}
+
+.tab.active {
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+  font-weight: 600;
+}
+
+.tab:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .tools {
