@@ -14,6 +14,16 @@
 //! "上次检查日"复用 settings 表存储（settings.rs 同款 key-value，键
 //! [`K_LAST_CHECK_DAY`]），跨启动持久化；手动检查不写这个键（互不干扰）。
 //!
+//! 配置面（tauri.conf.json，严格 JSON 不带注释，决策记这里）：
+//! - `bundle.createUpdaterArtifacts: true`：发布产物带 minisign 签名；main CI
+//!   无私钥，构建步用 `--config` 覆盖关闭（见 .github/workflows/ci.yml）；
+//! - `plugins.updater.endpoints`：GitHub latest.json 直连，数组留镜像扩展位；
+//! - `plugins.updater.pubkey` 当前是占位串（base64 的 "untrusted comment:"），
+//!   **票 07** 由用户生成 minisign 密钥对后填真实公钥。公钥只在插件下载/验签
+//!   阶段解析（插件源码 v2.11.0：verify_signature），check 阶段不受影响；占位
+//!   期间尚无 release 时检查 404 → 每日按无更新静默、手动返回 Err，应用启动
+//!   不受影响——票 07 会在首发前填真实公钥。
+//!
 //! 生产检查器、每日定时线程与通知发送是薄封装（lib.rs 调
 //! `spawn_daily_checker`，系统行为不进单测）。
 
@@ -149,6 +159,93 @@ pub fn run_daily_check<C: UpdateChecker>(
         // fold_daily 之后失败态已折为 UpToDate，这里兜底同口径
         _ => DailyOutcome::NoUpdate,
     })
+}
+
+// ── 薄封装：生产检查器 / 手动入口 / 每日定时（Tauri 侧，系统行为不进单测）──
+
+use tauri::Manager;
+
+/// 生产检查器：走 tauri-plugin-updater（endpoints / pubkey 来自 tauri.conf.json）。
+struct PluginChecker {
+    app: tauri::AppHandle,
+}
+
+impl UpdateChecker for PluginChecker {
+    fn check(&self) -> Result<Option<UpdateInfo>, String> {
+        use tauri_plugin_updater::UpdaterExt;
+        let updater = self
+            .app
+            .updater()
+            .map_err(|e| format!("初始化更新器失败: {e}"))?;
+        let update = tauri::async_runtime::block_on(updater.check())
+            .map_err(|e| format!("检查更新失败: {e}"))?;
+        // 版本比较由插件内部完成：远端不比当前新时返回 None
+        Ok(update.map(|u| UpdateInfo {
+            version: u.version.clone(),
+            notes: u.body.clone(),
+        }))
+    }
+}
+
+/// 手动检查入口（设置页 `check_update_now`）：失败折为 Err 一次性展示。
+/// 刻意不写每日记账（last_check_day）：两条路径互不干扰，当天每日检查照常执行。
+pub fn manual_check(app: &tauri::AppHandle) -> Result<CheckOutcome, String> {
+    manual_result(to_outcome(PluginChecker { app: app.clone() }.check()))
+}
+
+/// 发现新版的系统通知（每日路径唯一的对外打扰；复用 tauri-plugin-notification，
+/// 与提醒同款；发送失败静默——通知是副产物）。
+fn notify_update(handle: &tauri::AppHandle, version: &str, notes: Option<&str>) {
+    use tauri_plugin_notification::NotificationExt;
+    let mut body = format!("发现新版本 v{version}，可到设置页查看并安装。");
+    if let Some(n) = notes.map(str::trim).filter(|n| !n.is_empty()) {
+        let mut brief: String = n.chars().take(80).collect();
+        if brief.chars().count() < n.chars().count() {
+            brief.push('…');
+        }
+        body = format!("发现新版本 v{version}：{brief}");
+    }
+    let _ = handle
+        .notification()
+        .builder()
+        .title("蚂蚁饲养记录有更新")
+        .body(body)
+        .show();
+}
+
+/// 一轮每日 tick：该查则查 → 查到新版发系统通知（窗口关着也跑，托盘常驻线程）。
+/// 任何一步失败都止于日志，绝不弹错误通知（spec 错误路径约定）。
+fn daily_tick(handle: &tauri::AppHandle) {
+    let Some(state) = handle.try_state::<crate::DbState>() else {
+        return;
+    };
+    let today = crate::colony::today_iso();
+    let checker = PluginChecker {
+        app: handle.clone(),
+    };
+    let outcome = {
+        let Ok(conn) = state.0.lock() else { return };
+        run_daily_check(&conn, &checker, &today)
+    };
+    if let Ok(DailyOutcome::UpdateAvailable { version, notes }) = outcome {
+        notify_update(handle, &version, notes.as_deref());
+    }
+}
+
+/// 每日检查定时器：启动即跑一轮（内部按"上次检查日"决定真查还是跳过，重启
+/// 不重查），此后每 30 分钟醒一次，跨天后的第一轮负责真查。独立 std 线程 +
+/// catch_unwind，与提醒调度同款（票 09 停靠 A）。
+pub fn spawn_daily_checker(handle: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        let h = handle.clone();
+        let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            daily_tick(&h);
+        }));
+        if let Err(panic) = round {
+            eprintln!("[updater] 本轮每日更新检查 panic（已跳过，下个 30 分钟周期重试）: {panic:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30 * 60));
+    });
 }
 
 // ── 测试：只测外部行为（spec「Testing Decisions」）────────────────────────

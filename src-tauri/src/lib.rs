@@ -394,6 +394,15 @@ fn send_test_notification(app: tauri::AppHandle) -> Result<(), String> {
     reminder::send_test_notification(&app)
 }
 
+// ── 更新检查（票 02）──
+
+/// 手动检查更新（设置页按钮，票 06 接 UI）：三态中"检查失败"折为 Err 一次性
+/// 展示；成功返回 `{"status":"up_to_date"}` 或 `{"status":"update_available",..}`。
+#[tauri::command]
+fn check_update_now(app: tauri::AppHandle) -> Result<updater::CheckOutcome, String> {
+    updater::manual_check(&app)
+}
+
 // ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──
 
 /// 打开数据文件夹（opener 打开 app data 目录；目录不存在先创建）。
@@ -482,6 +491,9 @@ pub fn run() {
             None,
         ))
         .plugin(tauri_plugin_opener::init())
+        // 应用内更新（票 02）：检查全在 Rust 侧（每日定时 + check_update_now），
+        // 前端不直接调 updater JS API，capabilities 不加 updater:default
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // 库文件放系统应用数据目录（Windows: %APPDATA%\<identifier>\），非项目目录。
             let data_dir = app.path().app_data_dir()?;
@@ -494,6 +506,9 @@ pub fn run() {
             // 托盘常驻 + 提醒调度（启动即查一次，此后每 30 分钟；评审附录规则 1）。
             reminder::setup_tray(app)?;
             reminder::spawn_scheduler(app.handle().clone());
+            // 每日更新检查（票 02）：托盘常驻进程内跑，窗口关闭也查；
+            // 内部按"上次检查日"决定真查还是跳过（重启不重查）。
+            updater::spawn_daily_checker(app.handle().clone());
             // 关窗 = 最小化到托盘（票 09 验收 1）：拦截关闭请求只隐藏，托盘「退出」才真退。
             if let Some(window) = app.get_webview_window("main") {
                 let win = window.clone();
@@ -542,6 +557,7 @@ pub fn run() {
             get_settings,
             set_settings,
             send_test_notification,
+            check_update_now,
             reveal_data_folder,
             backup_to,
             export_data,

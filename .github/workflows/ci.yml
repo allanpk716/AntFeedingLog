@@ -47,4 +47,8 @@ jobs:
         working-directory: src-tauri
 
       - name: Build Tauri app (build only, no release)
-        run: pnpm tauri build
+        # 票 02：tauri.conf.json 已开 bundle.createUpdaterArtifacts（发版签名用），
+        # 但本流水线只读、没有签名私钥（TAURI_SIGNING_PRIVATE_KEY 只在 tag 发布
+        # job 的 Secrets 注入）——不覆盖关闭的话 updater 产物在签名步直接失败。
+        # 这里用 --config 覆盖只关本次构建的 updater 产物，conf 文件本身不动。
+        run: pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
