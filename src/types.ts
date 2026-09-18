@@ -98,7 +98,7 @@ export interface LocationInput {
   sort: number;
 }
 
-/** 食物（含停用的：新建入口前端过滤 enabled；referenced=被历史引用，只能停用不能删） */
+/** 食物（含停用的：新建入口前端过滤 enabled；referenced=被历史记录或提醒台账引用，只能停用不能删） */
 export interface FoodItem {
   id: number;
   name: string;

@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 // ── DTO ──────────────────────────────────────────────────────────────────
 
-/// 食物（含停用的：前端新建入口过滤 enabled；referenced=被历史记录引用，只能停用不能删）。
+/// 食物（含停用的：前端新建入口过滤 enabled；referenced=被历史记录或提醒台账
+/// （food 维度，F3）引用，只能停用不能删）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Food {
     pub id: i64,
@@ -713,7 +714,8 @@ pub fn recent_for_colony(
 
 const FOOD_SQL: &str = concat!(
     "SELECT f.id, f.name, f.enabled, f.sort, f.suggested_interval_days, f.is_preset, ",
-    "EXISTS(SELECT 1 FROM log_food lf WHERE lf.food_id = f.id) ",
+    "(EXISTS(SELECT 1 FROM log_food lf WHERE lf.food_id = f.id) ",
+    "OR EXISTS(SELECT 1 FROM reminder_ledger g WHERE g.food_id = f.id)) ",
     "FROM food f ",
 );
 
@@ -743,7 +745,8 @@ pub fn get_food(conn: &Connection, id: i64) -> Result<Food, String> {
 }
 
 /// 全部食物（含停用的，与 list_locations 同口径；新建入口由前端过滤 enabled）。
-/// `referenced` = 被 log_food 引用：删除会被拒，只能停用（规则 10）。
+/// `referenced` = 被 log_food 或 reminder_ledger（food 维度，F3）引用：
+/// 删除会被拒，只能停用（规则 10）。
 pub fn list_foods(conn: &Connection) -> Result<Vec<Food>, String> {
     let mut stmt = conn
         .prepare(&format!("{FOOD_SQL} ORDER BY f.sort, f.id"))
@@ -1332,6 +1335,24 @@ mod tests {
 
         let foods = list_foods(&conn).unwrap();
         assert!(foods.iter().find(|f| f.name == "种子").unwrap().referenced);
+        assert!(!foods.iter().find(|f| f.name == "干虾仁").unwrap().referenced);
+    }
+
+    #[test]
+    fn list_foods_flags_referenced_by_reminder_ledger_food_dimension() {
+        // F3：food_overdue 台账行也是引用——否则从未喂过的食物（被补发过提醒）
+        // 会显示可删，DELETE 撞 reminder_ledger.food_id 外键报原始错误
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, food_id, base_date, sent_at)
+             VALUES (?1, 'food_overdue', ?2, ?3, '2026-09-11', '2026-09-18 08:00:00')",
+            params![c, action_id(&conn, "喂食"), food_id(&conn, "面包虫")],
+        )
+        .unwrap();
+
+        let foods = list_foods(&conn).unwrap();
+        assert!(foods.iter().find(|f| f.name == "面包虫").unwrap().referenced);
         assert!(!foods.iter().find(|f| f.name == "干虾仁").unwrap().referenced);
     }
 

@@ -338,7 +338,8 @@ pub fn set_food_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(),
     Ok(())
 }
 
-/// 物理删；预置项禁删（反馈第二轮 F2）；被 log_food 引用则拒绝（规则 10）。
+/// 物理删；预置项禁删（反馈第二轮 F2）；被 log_food 或 reminder_ledger（food 维度，
+/// F3）引用则拒绝（友好文案，规则 10）。
 pub fn erase_food(conn: &Connection, id: i64) -> Result<(), String> {
     let preset: i64 = conn
         .query_row("SELECT is_preset FROM food WHERE id = ?1", params![id], |r| r.get(0))
@@ -358,6 +359,16 @@ pub fn erase_food(conn: &Connection, id: i64) -> Result<(), String> {
         .map_err(db_err)?;
     if used_by > 0 {
         return Err(format!("该食物已被 {used_by} 条记录使用，不能删除；可改为停用"));
+    }
+    let ledger: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reminder_ledger WHERE food_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if ledger > 0 {
+        return Err(format!("该食物仍被 {ledger} 条提醒台账引用，不能删除；可改为停用"));
     }
     let changed = conn
         .execute("DELETE FROM food WHERE id = ?1", params![id])
@@ -939,6 +950,29 @@ mod tests {
 
         let recent = crate::care::recent_for_colony(&conn, c, 5).unwrap();
         assert_eq!(recent[0].food_names, vec!["种子"], "历史记录名称保留");
+    }
+
+    #[test]
+    fn erase_food_referenced_only_by_reminder_ledger_rejected() {
+        // F3：food_overdue 台账行也是引用——守护不拦的话 DELETE 撞
+        // reminder_ledger.food_id 外键，只会报原始"数据库操作失败"
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let custom = save_food(&conn, &FoodInput { id: None, name: "糖水".into(), sort: 9, suggested_interval_days: None }).unwrap();
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, food_id, base_date, sent_at)
+             VALUES (?1, 'food_overdue', ?2, ?3, '2026-09-11', '2026-09-18 08:00:00')",
+            params![c, action_id(&conn, "喂食"), custom.id],
+        )
+        .unwrap();
+
+        let err = erase_food(&conn, custom.id).unwrap_err();
+        assert!(err.contains("台账"), "实际错误：{err}");
+        assert_eq!(count_where_id(&conn, "food", custom.id), 1, "行保留");
+
+        // referenced 位同步点亮：前端据此禁用删除按钮（规则 10）
+        let foods = crate::care::list_foods(&conn).unwrap();
+        assert!(foods.iter().find(|f| f.id == custom.id).unwrap().referenced);
     }
 
     #[test]

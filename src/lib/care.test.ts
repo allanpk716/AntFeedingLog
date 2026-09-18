@@ -58,6 +58,61 @@ describe("操作块展示态", () => {
     ).toEqual({ tone: "reg", text: "今天 · 已记录" });
   });
 
+  it("食物层顶的红：报「该喂X了」，不拿统一层数字硬算（F3 评审：统一层新鲜时会出现负数）", () => {
+    const food = (id: number, name: string, overdue: boolean): FoodTileInfo => ({
+      food_id: id,
+      name,
+      suggested_interval_days: 7,
+      days_since_last: overdue ? 8 : 1,
+      overdue,
+    });
+
+    // 面包虫 8 > 7 食物超期、统一层 2 ≤ 3 新鲜 → 整块红但报「该喂面包虫了」
+    expect(
+      actionTile(
+        action({
+          action_id: 1,
+          is_feeding: true,
+          days_since_last: 2,
+          suggested_interval_days: 3,
+          overdue: true,
+          foods: [food(3, "面包虫", true)],
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 该喂面包虫了" });
+
+    // 两种食物都超期：顿号连接
+    expect(
+      actionTile(
+        action({
+          action_id: 1,
+          is_feeding: true,
+          days_since_last: 2,
+          suggested_interval_days: 3,
+          overdue: true,
+          foods: [food(1, "种子", true), food(3, "面包虫", true)],
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 该喂种子、面包虫了" });
+
+    // 统一层自己也超（8 > 3）：维持「超期 N 天」原句式，操作层措辞优先
+    expect(
+      actionTile(
+        action({
+          action_id: 1,
+          is_feeding: true,
+          days_since_last: 8,
+          suggested_interval_days: 3,
+          overdue: true,
+          foods: [food(3, "面包虫", true)],
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 超期 5 天" });
+  });
+
   it("冬眠静音：永不红、文案加（静音）", () => {
     expect(
       actionTile(action({ action_id: 1, days_since_last: 4, overdue: true }), true),

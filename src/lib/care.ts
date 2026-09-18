@@ -26,8 +26,17 @@ export function actionTile(a: ColonyAction, hibernating: boolean): TileView {
     return { tone: "reg", text: baseText };
   }
   if (a.overdue && days !== null) {
-    const overDays = days - (a.suggested_interval_days ?? 0);
-    return { tone: "bad", text: `⚠ 超期 ${overDays} 天` };
+    const interval = a.suggested_interval_days;
+    if (interval !== null && days > interval) {
+      // 操作层自己超期：维持「超期 N 天」原句式（措辞优先于食物层）
+      return { tone: "bad", text: `⚠ 超期 ${days - interval} 天` };
+    }
+    // 红是食物层顶的（统一层还新鲜，拿它算超期天数会出负数）：报该喂哪些食物
+    const names = a.foods
+      .filter((f) => f.overdue)
+      .map((f) => f.name)
+      .join("、");
+    return { tone: "bad", text: `⚠ 该喂${names}了` };
   }
   if (days === null) {
     return { tone: "none", text: baseText };
