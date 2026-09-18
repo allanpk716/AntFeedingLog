@@ -16,7 +16,7 @@ pub const STATUSES: [&str; 3] = ["active", "hibernating", "ended"];
 
 // ── DTO ──────────────────────────────────────────────────────────────────
 
-/// 窝（含给首页展示的饲养天数，Rust 算好直接给前端）。
+/// 窝（含首页展示数据：饲养天数、每个启用操作的距上次/超期态、最近记录摘要，Rust 算好）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Colony {
     pub id: i64,
@@ -26,6 +26,10 @@ pub struct Colony {
     pub start_date: String,
     pub status: String,
     pub days_raised: i64,
+    /// 每个启用中操作一块（care::ActionTile，按字典顺序）。
+    pub actions: Vec<crate::care::ActionTile>,
+    /// 最近 1-2 条记录摘要（care::RecentLog，发生时间倒序）。
+    pub recent: Vec<crate::care::RecentLog>,
 }
 
 /// 新建/编辑窝的入参。
@@ -160,6 +164,8 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
                 start_date: row.get(4)?,
                 status: row.get(5)?,
                 days_raised: 0,
+                actions: Vec::new(),
+                recent: Vec::new(),
             })
         },
     )
@@ -169,6 +175,8 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
     })
     .and_then(|mut c| {
         c.days_raised = days_raised(&c.start_date, today)?;
+        c.actions = crate::care::tiles_for_colony(conn, c.id, today)?;
+        c.recent = crate::care::recent_for_colony(conn, c.id, 2)?;
         Ok(c)
     })
 }
@@ -556,6 +564,42 @@ mod tests {
         let ids: Vec<i64> = list.iter().map(|c| c.id).collect();
         assert_eq!(ids, vec![b.id, a.id, c.id]);
         assert!(list.iter().all(|c| c.days_raised == 241));
+    }
+
+    #[test]
+    fn list_colonies_embeds_action_tiles_and_recent_summary() {
+        let conn = mem_conn();
+        let c = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        // 喂食昨天（今天补录，距上次按发生时间 = 1）；保湿 3 天前
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (?1, 1, '2026-09-17 20:00:00', '', '2026-09-18 08:00:00')",
+            params![c.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (?1, 3, '2026-09-15 09:00:00', '', '2026-09-15 09:00:00')",
+            params![c.id],
+        )
+        .unwrap();
+
+        let list = list_colonies(&conn, TODAY).unwrap();
+        let colony = &list[0];
+
+        // 每个启用操作一块，带距上次/超期态
+        assert_eq!(colony.actions.len(), 4);
+        let feed = colony.actions.iter().find(|t| t.name == "喂食").unwrap();
+        assert_eq!(feed.days_since_last, Some(1));
+        assert!(!feed.overdue);
+        let hydrate = colony.actions.iter().find(|t| t.name == "巢穴保湿").unwrap();
+        assert_eq!(hydrate.days_since_last, Some(3));
+        assert!(!hydrate.overdue, "登记类永不红");
+
+        // 最近摘要按发生时间倒序，至多 2 条
+        assert_eq!(colony.recent.len(), 2);
+        assert_eq!(colony.recent[0].action_name, "喂食");
+        assert_eq!(colony.recent[1].action_name, "巢穴保湿");
     }
 
     // ── 归档 ──

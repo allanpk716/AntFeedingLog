@@ -1,3 +1,4 @@
+mod care;
 mod colony;
 mod db;
 
@@ -33,6 +34,21 @@ fn health_check(state: tauri::State<DbState>) -> Result<SchemaInfo, String> {
             .map(|schema_version| SchemaInfo { schema_version })
             .map_err(|e| e.to_string())
     })
+}
+
+// ── 记账与字典查询（票 03）──
+
+#[tauri::command]
+fn log_care(
+    state: tauri::State<'_, DbState>,
+    input: care::CareLogInput,
+) -> Result<i64, String> {
+    with_conn(state, |conn| care::log_care(conn, &input, &care::now_local()))
+}
+
+#[tauri::command]
+fn list_foods(state: tauri::State<'_, DbState>) -> Result<Vec<care::Food>, String> {
+    with_conn(state, care::list_foods)
 }
 
 // ── 窝（票 02）──
@@ -111,6 +127,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             health_check,
+            log_care,
+            list_foods,
             list_colonies,
             create_colony,
             update_colony,
