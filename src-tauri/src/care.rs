@@ -203,6 +203,7 @@ pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i6
 // ── 记录列表 / 编辑 / 删除（票 08）──────────────────────────────────────
 
 /// 记录流水一行（食物按字典顺序；停用操作/食物照常返回显示名，规则 10）。
+/// created_at=录入时间（与发生时间分开存，补录合法；导出 CSV 的「录入时间」列）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LogRow {
     pub id: i64,
@@ -211,6 +212,7 @@ pub struct LogRow {
     pub action_id: i64,
     pub action_name: String,
     pub occurred_at: String,
+    pub created_at: String,
     pub note: String,
     pub food_ids: Vec<i64>,
     pub food_names: Vec<String>,
@@ -308,7 +310,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
 
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT l.id, l.colony_id, c.name, l.action_id, a.name, l.occurred_at, l.note
+            "SELECT l.id, l.colony_id, c.name, l.action_id, a.name, l.occurred_at, l.note, l.created_at
              FROM care_log l
              JOIN colony c ON c.id = l.colony_id
              JOIN care_action a ON a.id = l.action_id
@@ -327,6 +329,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })
         .map_err(db_err)?
@@ -334,7 +337,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
         .map_err(db_err)?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (id, colony_id, colony_name, action_id, action_name, occurred_at, note) in rows {
+    for (id, colony_id, colony_name, action_id, action_name, occurred_at, note, created_at) in rows {
         let mut stmt_food = conn
             .prepare(
                 "SELECT lf.food_id, f.name FROM log_food lf JOIN food f ON f.id = lf.food_id
@@ -355,6 +358,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
             action_id,
             action_name,
             occurred_at,
+            created_at,
             note,
             food_ids: pairs.iter().map(|(fid, _)| *fid).collect(),
             food_names: pairs.into_iter().map(|(_, name)| name).collect(),

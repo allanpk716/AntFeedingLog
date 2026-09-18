@@ -6,6 +6,7 @@ mod hibernation;
 mod reminder;
 mod settings;
 mod stats;
+mod system;
 
 use std::sync::Mutex;
 
@@ -20,7 +21,8 @@ pub struct SchemaInfo {
 }
 
 /// 数据库连接托管在应用状态里：Rust 是数据层唯一属主，前端只经 command 读写。
-pub struct DbState(Mutex<Connection>);
+/// `.1` 是库文件路径（安全备份直接拷这个文件，journal_mode=DELETE 拷贝即完整）。
+pub struct DbState(Mutex<Connection>, std::path::PathBuf);
 
 /// 借出连接的统一入口（锁被毒化时转成前端可见的错误串）。
 fn with_conn<T>(
@@ -314,10 +316,23 @@ fn set_settings(
     app: tauri::AppHandle,
     input: settings::AppSettings,
 ) -> Result<settings::AppSettings, String> {
-    let result = with_conn(state, |conn| settings::set_settings(conn, &input));
-    // 通知设置影响托盘超期摘要之外的展示口径有限，但提前天数等变化后顺手刷新一次
+    let effective = with_conn(state, |conn| settings::set_settings(conn, &input))?;
+    // 开机自启：设置是权威，插件状态跟随同步（票 09；用户主动改，失败要报给用户）
+    apply_autostart(&app, effective.autostart_enabled)?;
+    // 通知设置变化后顺手刷新托盘概要（停靠 C；锁已释放）
     reminder::refresh_tray_tooltip(&app);
-    result
+    Ok(effective)
+}
+
+/// 把开机自启插件状态对齐设置值（票 09：读改插件状态 + settings 同步）。
+fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let result = if enabled {
+        app.autolaunch().enable()
+    } else {
+        app.autolaunch().disable()
+    };
+    result.map_err(|e| format!("同步开机自启状态失败（目标：{enabled}）: {e}"))
 }
 
 /// 发送测试通知（设置弹窗按钮；不经开关与台账，排障用）。
@@ -326,19 +341,120 @@ fn send_test_notification(app: tauri::AppHandle) -> Result<(), String> {
     reminder::send_test_notification(&app)
 }
 
+// ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──
+
+/// 打开数据文件夹（opener 打开 app data 目录；目录不存在先创建）。
+#[tauri::command]
+fn reveal_data_folder(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("解析数据目录失败: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
+    app.opener()
+        .open_path(dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| format!("打开数据文件夹失败: {e}"))?;
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// rfd 保存对话框选目标路径（取消返回 None）。同名文件覆盖确认由对话框承担。
+async fn pick_save_path(
+    default_name: &str,
+    filter_name: &str,
+    extensions: &[&str],
+) -> Option<std::path::PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .set_file_name(default_name)
+        .add_filter(filter_name, extensions)
+        .save_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
+}
+
+/// 今日日期戳（备份/导出默认文件名用）。
+fn date_stamp() -> String {
+    chrono::Local::now().format("%Y%m%d").to_string()
+}
+
+/// 安全备份：rfd 选目标 → 短暂拿锁挡住并发写 → 拷贝库文件
+/// （journal_mode=DELETE，拷贝即完整，评审附录规则 11）。用户取消返回 None。
+#[tauri::command]
+async fn backup_to(state: tauri::State<'_, DbState>) -> Result<Option<String>, String> {
+    let db_path = state.1.clone();
+    let default_name = format!("ant-feeding-log-backup-{}.db", date_stamp());
+    let Some(target) = pick_save_path(&default_name, "SQLite 数据库", &["db"]).await else {
+        return Ok(None);
+    };
+    // 拷贝期间短暂持锁：保证没有并发写（对话框阶段不持锁，不卡其他命令）
+    let _guard = state.0.lock().map_err(|e| e.to_string())?;
+    system::backup_db_file(&db_path, &target)?;
+    Ok(Some(target.to_string_lossy().to_string()))
+}
+
+/// 导出归档（评审附录规则 11：归档带走，不是恢复通道）：csv=记录流水一行一条
+/// （BOM，Excel 直开不乱码）；json=全库数据结构化。用户取消返回 None。
+#[tauri::command]
+async fn export_data(
+    state: tauri::State<'_, DbState>,
+    format: String,
+) -> Result<Option<String>, String> {
+    let stamp = date_stamp();
+    let (default_name, filter_name, ext): (String, &str, &str) = match format.as_str() {
+        "csv" => (
+            format!("ant-feeding-log-export-{stamp}.csv"),
+            "CSV（逗号分隔）",
+            "csv",
+        ),
+        "json" => (format!("ant-feeding-log-export-{stamp}.json"), "JSON 文件", "json"),
+        other => return Err(format!("未知导出格式：{other}（支持 csv / json）")),
+    };
+    let Some(target) = pick_save_path(&default_name, filter_name, &[ext]).await else {
+        return Ok(None);
+    };
+    with_conn(state, |conn| match format.as_str() {
+        "csv" => system::export_csv_to(conn, &target),
+        _ => system::export_json_to(conn, &target),
+    })?;
+    Ok(Some(target.to_string_lossy().to_string()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        // 开机自启（票 09）：状态权威在 settings，启动/改设置时对齐插件
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // 库文件放系统应用数据目录（Windows: %APPDATA%\<identifier>\），非项目目录。
             let data_dir = app.path().app_data_dir()?;
-            let conn = db::open_and_migrate(&data_dir.join(db::DB_FILE_NAME))
-                .map_err(|e| e.to_string())?;
-            app.manage(DbState(Mutex::new(conn)));
+            let db_path = data_dir.join(db::DB_FILE_NAME);
+            let conn = db::open_and_migrate(&db_path).map_err(|e| e.to_string())?;
+            let autostart_on = settings::get_settings(&conn)
+                .map(|s| s.autostart_enabled)
+                .unwrap_or(true);
+            app.manage(DbState(Mutex::new(conn), db_path));
             // 托盘常驻 + 提醒调度（启动即查一次，此后每 30 分钟；评审附录规则 1）。
             reminder::setup_tray(app)?;
             reminder::spawn_scheduler(app.handle().clone());
+            // 关窗 = 最小化到托盘（票 09 验收 1）：拦截关闭请求只隐藏，托盘「退出」才真退。
+            if let Some(window) = app.get_webview_window("main") {
+                let win = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win.hide();
+                    }
+                });
+            }
+            // 开机自启默认开（settings 预置行=1 即「首次启动写入」）；失败只打日志不拦启动。
+            if let Err(e) = apply_autostart(app.handle(), autostart_on) {
+                eprintln!("[autostart] 启动时同步开机自启失败: {e}");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -373,6 +489,9 @@ pub fn run() {
             get_settings,
             set_settings,
             send_test_notification,
+            reveal_data_folder,
+            backup_to,
+            export_data,
             get_stats,
             earliest_log_date,
         ])

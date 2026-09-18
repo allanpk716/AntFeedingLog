@@ -39,7 +39,7 @@ export function parseDaysAhead(text: string | number): number | null {
 
 /**
  * 表单态 → 设置态（保存入参）。提前天数非法返回 null（调用方报错不落库）；
- * autostart 本票不接 UI，原样透传当前值。
+ * autostart 由通知 tab 的「开机自启」开关提供（票 09），随保存一起落库。
  */
 export function toSettings(f: NotifySettingsForm, autostart: boolean): AppSettings | null {
   const days = parseDaysAhead(f.daysAheadText);

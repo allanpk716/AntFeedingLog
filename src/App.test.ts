@@ -603,10 +603,13 @@ describe("设置 · 通知（票 06）", () => {
     const dlg = await openNotifyTab(wrapper);
 
     const boxes = dlg.findAll(".notify-row input[type=checkbox]");
-    expect(boxes.length).toBe(3);
+    // 通知三开关 + 开机自启（票 09）
+    expect(boxes.length).toBe(4);
     expect((boxes[0].element as HTMLInputElement).checked).toBe(true);
     expect((boxes[1].element as HTMLInputElement).checked).toBe(true);
     expect((boxes[2].element as HTMLInputElement).checked).toBe(true);
+    // 开机自启默认开
+    expect((boxes[3].element as HTMLInputElement).checked).toBe(true);
     expect((dlg.find(".days-input").element as HTMLInputElement).value).toBe("7");
 
     await boxes[1].setValue(false); // 关超期分类
@@ -632,6 +635,28 @@ describe("设置 · 通知（票 06）", () => {
     // 刷新重渲染后重查弹窗（旧 wrapper 可能已脱离文档）
     const dlgAfter = wrapper.find(".settings-dialog");
     expect(dlgAfter.find(".saved-hint").text()).toContain("已保存");
+  });
+
+  it("通知 tab：开机自启开关随保存一起落库（票 09）", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openNotifyTab(wrapper);
+
+    const boxes = dlg.findAll(".notify-row input[type=checkbox]");
+    await boxes[3].setValue(false);
+
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce({ ...currentSettings, autostart_enabled: false });
+    await dlg.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("set_settings", {
+      input: expect.objectContaining({ autostart_enabled: false }),
+    });
+    // 回显保存后的生效值
+    const boxesAfter = wrapper
+      .find(".settings-dialog")
+      .findAll(".notify-row input[type=checkbox]");
+    expect((boxesAfter[3].element as HTMLInputElement).checked).toBe(false);
   });
 
   it("通知 tab：总开关关闭禁用子开关；提前天数非法时报错且不落库", async () => {
@@ -661,6 +686,87 @@ describe("设置 · 通知（票 06）", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("send_test_notification");
     expect(dlg.find(".saved-hint").text()).toContain("测试通知已发出");
+  });
+});
+
+describe("设置 · 数据与备份（票 09）", () => {
+  async function openDataTab(wrapper: Awaited<ReturnType<typeof mountApp>>) {
+    await wrapper.find(".settings-btn").trigger("click");
+    await flushPromises();
+    const dlg = wrapper.find(".settings-dialog");
+    await dlg.find(".tab-data").trigger("click");
+    await flushPromises();
+    return dlg;
+  }
+
+  it("数据 tab：帮助文案写明手动拷贝备份需先从托盘真实退出、应用内备份无需退出", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openDataTab(wrapper);
+
+    const body = dlg.find(".tab-body");
+    expect(body.text()).toContain("手动拷贝备份需先从托盘真实退出");
+    expect(body.text()).toContain("应用内一键安全备份无需退出");
+    expect(dlg.find(".reveal-btn").exists()).toBe(true);
+    expect(dlg.find(".backup-btn").exists()).toBe(true);
+    expect(dlg.find(".export-csv-btn").exists()).toBe(true);
+    expect(dlg.find(".export-json-btn").exists()).toBe(true);
+  });
+
+  it("「打开数据文件夹」发 reveal_data_folder；「安全备份」发 backup_to 并展示备份路径", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openDataTab(wrapper);
+
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce("C:\\Users\\x\\AppData\\Roaming\\com.antfeedinglog.app");
+    await dlg.find(".reveal-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("reveal_data_folder");
+
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce("D:\\backup\\ant-feeding-log-backup-20260918.db");
+    await dlg.find(".backup-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("backup_to");
+    expect(dlg.find(".data-result").text()).toContain("ant-feeding-log-backup-20260918.db");
+
+    // 用户在对话框取消（Rust 返回 null）：不报错也不留旧结果
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce(null);
+    await dlg.find(".backup-btn").trigger("click");
+    await flushPromises();
+    expect(dlg.find(".data-error").exists()).toBe(false);
+    expect(dlg.find(".data-result").exists()).toBe(false);
+  });
+
+  it("「导出 CSV」「导出 JSON」发 export_data 带格式并展示产物路径", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openDataTab(wrapper);
+
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce("D:\\arch\\ant-feeding-log-export-20260918.csv");
+    await dlg.find(".export-csv-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("export_data", { format: "csv" });
+
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce("D:\\arch\\ant-feeding-log-export-20260918.json");
+    await dlg.find(".export-json-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("export_data", { format: "json" });
+    expect(dlg.find(".data-result").text()).toContain("export-20260918.json");
+  });
+
+  it("备份/导出失败时展示原因，不误报成功", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openDataTab(wrapper);
+
+    invokeMock.mockClear();
+    invokeMock.mockRejectedValueOnce("备份拷贝失败: 磁盘已满");
+    await dlg.find(".backup-btn").trigger("click");
+    await flushPromises();
+
+    expect(dlg.find(".data-error").text()).toContain("磁盘已满");
+    expect(dlg.find(".data-result").exists()).toBe(false);
   });
 });
 

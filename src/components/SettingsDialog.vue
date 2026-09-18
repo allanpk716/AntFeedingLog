@@ -1,13 +1,16 @@
 <script setup lang="ts">
 /**
- * 设置弹窗（票 04 字典管理 + 票 06 通知）：操作 / 食物 / 地点 / 通知 四个 tab。
+ * 设置弹窗（票 04 字典管理 + 票 06 通知 + 票 09 数据收口）：操作 / 食物 / 地点 / 通知 / 数据 五个 tab。
  * - 操作行可编辑：名字、性质（提醒/仅登记）、建议间隔（提醒类显示）、
  *   「喂食」标记（带提示，允许编辑不强制唯一）、停用/启用、删除
  *   （被历史记录/提醒台账引用时删除禁用，只能停用——规则 10）。
  * - 食物行：名字、停用/启用、删除（被引用禁用）。
  * - 地点 tab 复用 LocationManagerPanel。
  * - 通知 tab（票 06）：总开关/超期/冬眠三开关 + 临近出眠提前天数 +
- *   「发送测试通知」按钮（排障用）；保存整体落库，autostart 本票透传不动。
+ *   「发送测试通知」按钮（排障用）；开机自启开关（票 09）随保存一起落库，
+ *   Rust 侧 set_settings 同步自启插件状态。
+ * - 数据 tab（票 09）：打开数据文件夹 / 安全备份（Rust 拷贝库文件，无需退出）/
+ *   导出 CSV / JSON（归档带走）；帮助文案写明手动拷贝需先从托盘真实退出。
  *
  * 行级 停用/启用/删除 即时落库并抛 changed（外层刷新首页，卡片红/灰随之变化）；
  * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
@@ -30,7 +33,7 @@ import {
 import { DAYS_AHEAD_ERROR, toForm, toSettings, type NotifySettingsForm } from "../lib/notifySettings";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 
-type Tab = "actions" | "foods" | "locations" | "notify";
+type Tab = "actions" | "foods" | "locations" | "notify" | "data";
 
 const emit = defineEmits<{ close: []; changed: [] }>();
 
@@ -257,6 +260,48 @@ function onPanelSaved() {
   emit("changed");
 }
 
+// ── 数据 tab（票 09）：备份 / 导出 / 数据文件夹 ──
+const dataResult = ref("");
+const dataError = ref("");
+const dataBusy = ref(false);
+
+async function revealFolder() {
+  dataError.value = "";
+  try {
+    await invoke<string>("reveal_data_folder");
+  } catch (e) {
+    dataError.value = String(e);
+  }
+}
+
+async function runBackup() {
+  dataBusy.value = true;
+  dataError.value = "";
+  dataResult.value = "";
+  try {
+    const path = await invoke<string | null>("backup_to");
+    dataResult.value = path ? `已备份到：${path}` : "";
+  } catch (e) {
+    dataError.value = String(e);
+  } finally {
+    dataBusy.value = false;
+  }
+}
+
+async function exportData(format: "csv" | "json") {
+  dataBusy.value = true;
+  dataError.value = "";
+  dataResult.value = "";
+  try {
+    const path = await invoke<string | null>("export_data", { format });
+    dataResult.value = path ? `已导出到：${path}` : "";
+  } catch (e) {
+    dataError.value = String(e);
+  } finally {
+    dataBusy.value = false;
+  }
+}
+
 function eraseTitle(referenced: boolean): string {
   return referenced ? "被历史记录引用，只能停用，不能删除" : "";
 }
@@ -279,6 +324,9 @@ function eraseTitle(referenced: boolean): string {
         </button>
         <button class="tab tab-notify" :class="{ active: activeTab === 'notify' }" type="button" @click="activeTab = 'notify'">
           通知
+        </button>
+        <button class="tab tab-data" :class="{ active: activeTab === 'data' }" type="button" @click="activeTab = 'data'">
+          数据
         </button>
       </div>
 
@@ -358,8 +406,8 @@ function eraseTitle(referenced: boolean): string {
         <LocationManagerPanel :locations="locations" @saved="onPanelSaved" @changed="onPanelChanged" />
       </div>
 
-      <!-- 通知（票 06） -->
-      <div v-else class="tab-body">
+      <!-- 通知（票 06）+ 开机自启（票 09） -->
+      <div v-else-if="activeTab === 'notify'" class="tab-body">
         <div class="notify-row">
           <label class="switch-label">
             <input v-model="notifyForm.master" type="checkbox" />
@@ -383,6 +431,12 @@ function eraseTitle(referenced: boolean): string {
             天通知
           </label>
         </div>
+        <div class="notify-row">
+          <label title="Windows 登录后自动启动；随「保存」落库并同步系统启动项">
+            <input v-model="autostart" type="checkbox" />
+            开机自启
+          </label>
+        </div>
         <p class="hint">
           超期每天最多提醒一条；冬眠中的窝静音；改预计出眠日后，没发过的提醒按新日期重算。
           总开关关闭时完全静默（不写提醒台账），重开后照常提醒。
@@ -394,6 +448,31 @@ function eraseTitle(referenced: boolean): string {
           <span class="spacer"></span>
           <button class="btn primary" type="button" :disabled="notifyBusy" @click="saveNotify">保存</button>
         </div>
+      </div>
+
+      <!-- 数据（票 09）：打开数据文件夹 / 安全备份 / 导出归档 -->
+      <div v-else class="tab-body">
+        <div class="data-actions">
+          <button class="btn data-btn reveal-btn" type="button" title="在资源管理器中打开库文件所在目录" @click="revealFolder">
+            打开数据文件夹
+          </button>
+          <button class="btn data-btn backup-btn" type="button" :disabled="dataBusy" title="把库文件完整拷贝到你选的位置（无需退出）" @click="runBackup">
+            安全备份
+          </button>
+          <button class="btn data-btn export-csv-btn" type="button" :disabled="dataBusy" title="记录流水一行一条，Excel 可直开" @click="exportData('csv')">
+            导出 CSV
+          </button>
+          <button class="btn data-btn export-json-btn" type="button" :disabled="dataBusy" title="全库数据结构化归档" @click="exportData('json')">
+            导出 JSON
+          </button>
+        </div>
+        <p v-if="dataResult" class="data-result">{{ dataResult }}</p>
+        <p v-if="dataError" class="form-error data-error">{{ dataError }}</p>
+        <p class="hint">
+          数据都在一个本地 SQLite 库文件里。「安全备份」由应用把库文件完整拷贝到你选的位置，
+          应用内一键安全备份无需退出；手动拷贝备份需先从托盘真实退出后再拷。
+          导出 CSV / JSON 用于归档带走，不是恢复通道（恢复 = 把备份的 .db 拷回数据文件夹）。
+        </p>
       </div>
 
       <p v-if="error && activeTab !== 'locations'" class="form-error">{{ error }}</p>
@@ -499,6 +578,25 @@ function eraseTitle(referenced: boolean): string {
   margin-top: 10px;
   font-size: 13px;
   color: var(--ok, #2e7d32);
+}
+
+/* 数据 tab（票 09） */
+.data-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.data-btn {
+  font-size: 13px;
+}
+
+.data-result {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--ok, #2e7d32);
+  word-break: break-all;
 }
 
 .dict-row {

@@ -159,6 +159,8 @@ export interface LogRow {
   action_id: number;
   action_name: string;
   occurred_at: string;
+  /** 录入时间（与发生时间分开存，补录合法） */
+  created_at: string;
   note: string;
   food_ids: number[];
   food_names: string[];
@@ -250,6 +252,6 @@ export interface AppSettings {
   notify_hibernation_enabled: boolean;
   /** 临近出眠提前天数（0–365；0=出眠日当天才提醒） */
   wake_remind_days_ahead: number;
-  /** 开机自启（本票只透传，不接 UI） */
+  /** 开机自启（票 09：通知 tab 开关随保存落库，Rust 同步自启插件状态） */
   autostart_enabled: boolean;
 }
