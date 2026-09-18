@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# 只读权限：本流水线只跑测试与构建，不发布、不上传任何产物
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: Test & Build (windows)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Frontend tests (Vitest)
+        run: pnpm test
+
+      - name: Rust tests
+        run: cargo test
+        working-directory: src-tauri
+
+      - name: Build Tauri app (build only, no release)
+        run: pnpm tauri build
