@@ -1,0 +1,90 @@
+name: Release
+
+# 票 03：push 语义化版本 tag（vX.Y.Z）时自动构建并发布 GitHub Release（直接 publish 非草稿）。
+# 与 main CI（ci.yml，只读）分离：仅本流水线的 job 持有 contents: write。
+#
+# 重跑纪律：本流水线对 Release 只做 upsert（tauri-action 对已存在 release 覆盖上传同名资产、
+# gh release edit 只刷新 notes），绝不删除已发布的 release。重跑失败 job 是安全的。
+
+on:
+  push:
+    tags:
+      # 匹配 v<数字>.<数字>.<数字>（GitHub filter 语法里 [0-9]+ = 一到多位数字）
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build & Publish Release (windows)
+    runs-on: windows-latest
+    # 仅本发布 job 有写权限：创建 Release、上传资产、补 notes
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Verify version matches tag
+        # 版本校验第一步，失败即中止：tag == tauri.conf.json version，且
+        # package.json / tauri.conf.json / Cargo.toml 三处一致（单测见 scripts/check-versions.test.mjs）
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: node scripts/check-versions.mjs . "$TAG_NAME"
+
+      - name: Check signing secrets present
+        # 友好预检（白天配置项）：Secrets 缺失不在这里拦截，让 job 在签名步自然失败，
+        # 但提前给出可操作的中文提示，省得从构建日志里猜原因。
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::warning::未配置 Secret TAURI_SIGNING_PRIVATE_KEY：稍后 updater 产物签名会失败。请在仓库 Settings → Secrets and variables → Actions 添加 TAURI_SIGNING_PRIVATE_KEY 与 TAURI_SIGNING_PRIVATE_KEY_PASSWORD。"
+          else
+            echo "签名密钥已配置。"
+          fi
+
+      - name: Build & publish release
+        # 官方 tauri-action：构建 Windows x64 安装包 + updater 产物，创建/更新 Release 并上传（upsert 语义）
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: true
+
+      - name: Generate release notes
+        # tauri-action 自身无 auto-notes 选项，发布完成后补自动生成的 notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release edit "$TAG_NAME" --generate-notes
