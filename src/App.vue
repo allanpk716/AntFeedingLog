@@ -129,6 +129,7 @@ onMounted(() => {
       :locations="locations"
       @close="showLocations = false"
       @saved="onLocationsSaved"
+      @changed="void refresh()"
     />
   </div>
 </template>

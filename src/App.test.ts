@@ -304,9 +304,12 @@ describe("地点管理", () => {
     });
   });
 
-  it("删除被引用的地点展示后端原因，停用则调用 deactivate_location", async () => {
+  it("行级操作不关弹窗：删除被引用展示原因；停用成功后弹窗保持、未保存改名不丢、外层静默刷新", async () => {
     const wrapper = await mountApp();
     const dlg = await openManager(wrapper);
+
+    // 未保存的改名（行内编辑）
+    await dlg.find(".loc-row .loc-name-input").setValue("老家");
 
     invokeMock.mockImplementation(async (cmd: string) => {
       switch (cmd) {
@@ -327,11 +330,21 @@ describe("地点管理", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("erase_location", { id: 1 });
     expect(dlg.find(".loc-error").text()).toContain("停用");
+    expect(wrapper.find(".loc-dialog").exists()).toBe(true);
     expect(dlg.findAll(".loc-row").length).toBe(2);
 
     await rows[0].find(".loc-deactivate-btn").trigger("click");
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("deactivate_location", { id: 1 });
+    // 弹窗仍开着；行内未保存的改名保留；停用态行内可见
+    expect(wrapper.find(".loc-dialog").exists()).toBe(true);
+    expect(
+      (wrapper.find(".loc-row .loc-name-input").element as HTMLInputElement).value,
+    ).toBe("老家");
+    expect(wrapper.find(".loc-row .loc-disabled-chip").exists()).toBe(true);
+    // 行级操作触发外层静默刷新（changed → list_locations），但弹窗不关
+    const refreshCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_locations");
+    expect(refreshCalls.length).toBeGreaterThanOrEqual(1);
   });
 });

@@ -3,8 +3,12 @@
  * 地点清单管理：改名、上下移调排序、新增、停用、删除。
  * 删除校验在 Rust：被窝引用的地点只能停用、不能物理删（评审附录规则 10）。
  * 保存 = 按当前行序逐行 save_location（sort = 行下标）。
+ *
+ * 关弹窗的只有两条路：整体「保存」成功、点取消。
+ * 停用/删除这类行级操作只抛 changed 让外层静默刷新数据，弹窗保持打开，
+ * 行内未保存的改名/排序也不受影响（行状态在本地维护，不因外层刷新重建）。
  */
-import { ref, watch } from "vue";
+import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { LocationItem } from "../types";
 
@@ -15,19 +19,18 @@ interface Row {
 }
 
 const props = defineProps<{ locations: LocationItem[] }>();
-const emit = defineEmits<{ close: []; saved: [] }>();
+const emit = defineEmits<{ close: []; saved: []; changed: [] }>();
 
-const rows = ref<Row[]>([]);
-const addName = ref("");
-const error = ref("");
-const busy = ref(false);
-
-function rebuild() {
-  rows.value = [...props.locations]
+function buildRows(locations: LocationItem[]): Row[] {
+  return [...locations]
     .sort((a, b) => a.sort - b.sort || a.id - b.id)
     .map((l) => ({ id: l.id, name: l.name, enabled: l.enabled }));
 }
-watch(() => props.locations, rebuild, { immediate: true });
+
+const rows = ref<Row[]>(buildRows(props.locations));
+const addName = ref("");
+const error = ref("");
+const busy = ref(false);
 
 function move(index: number, direction: -1 | 1) {
   const target = index + direction;
@@ -87,7 +90,7 @@ async function deactivate(row: Row) {
   try {
     await invoke("deactivate_location", { id: row.id });
     row.enabled = false;
-    emit("saved");
+    emit("changed");
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -102,7 +105,7 @@ async function erase(row: Row) {
   try {
     await invoke("erase_location", { id: row.id });
     rows.value = rows.value.filter((r) => r !== row);
-    emit("saved");
+    emit("changed");
   } catch (e) {
     error.value = String(e);
   } finally {

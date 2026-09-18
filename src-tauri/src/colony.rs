@@ -134,13 +134,17 @@ fn db_err(e: rusqlite::Error) -> String {
 }
 
 /// 唯一约束兜底报错转友好文案（应用层已预检，这里防并发/边界）。
+/// 用扩展错误码 2067（SQLITE_CONSTRAINT_UNIQUE）识别唯一约束；
+/// 文案匹配只用于区分撞的是哪条唯一索引，不再是识别手段。
 fn friendly_unique_err(e: rusqlite::Error, what: &str, name: &str) -> String {
-    let text = e.to_string();
-    if text.contains("UNIQUE constraint failed") && text.contains(what) {
-        format!("「{name}」已存在")
-    } else {
-        db_err(e)
+    if let rusqlite::Error::SqliteFailure(ffi, message) = &e {
+        if ffi.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+            && message.as_deref().is_some_and(|m| m.contains(what))
+        {
+            return format!("「{name}」已存在");
+        }
     }
+    db_err(e)
 }
 
 fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String> {
@@ -245,6 +249,7 @@ pub fn archive_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony,
 }
 
 /// 仅无记录窝可删；有 care_log 行则拒绝。顺带清掉该窝的提醒台账与冬眠段（它们不是记录）。
+/// 三条 DELETE 包在同一事务里，任一失败整体回滚，不留中间态。
 pub fn delete_colony(conn: &Connection, id: i64) -> Result<(), String> {
     let logs: i64 = conn
         .query_row(
@@ -258,17 +263,19 @@ pub fn delete_colony(conn: &Connection, id: i64) -> Result<(), String> {
             "该窝已有 {logs} 条记录，不能删除；可改为置为「已结束」"
         ));
     }
-    conn.execute("DELETE FROM reminder_ledger WHERE colony_id = ?1", params![id])
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    tx.execute("DELETE FROM reminder_ledger WHERE colony_id = ?1", params![id])
         .map_err(db_err)?;
-    conn.execute("DELETE FROM hibernation WHERE colony_id = ?1", params![id])
+    tx.execute("DELETE FROM hibernation WHERE colony_id = ?1", params![id])
         .map_err(db_err)?;
-    let changed = conn
+    let changed = tx
         .execute("DELETE FROM colony WHERE id = ?1", params![id])
         .map_err(db_err)?;
     if changed == 0 {
+        // tx 在此 drop，自动回滚前两条 DELETE
         return Err("窝不存在".into());
     }
-    Ok(())
+    tx.commit().map_err(db_err)
 }
 
 // ── 地点 ─────────────────────────────────────────────────────────────────
@@ -609,6 +616,37 @@ mod tests {
     fn delete_colony_missing_id_rejected() {
         let conn = mem_conn();
         assert!(delete_colony(&conn, 42).is_err());
+    }
+
+    #[test]
+    fn delete_colony_failure_rolls_back_side_table_deletes() {
+        let conn = mem_conn();
+        let c = create_colony(&conn, &input("倒楣窝", None), TODAY).unwrap();
+        conn.execute(
+            "INSERT INTO hibernation (colony_id, start_date, expected_end_date)
+             VALUES (?1, '2026-12-01', '2027-03-01')",
+            params![c.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
+             VALUES (?1, 'overdue', 1, '2026-09-10', '2026-09-10 08:00:00')",
+            params![c.id],
+        )
+        .unwrap();
+        // 让最后的 colony DELETE 失败，模拟中途崩溃
+        conn.execute(
+            "CREATE TRIGGER block_colony_delete BEFORE DELETE ON colony
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+            [],
+        )
+        .unwrap();
+
+        assert!(delete_colony(&conn, c.id).is_err());
+        // 三张表必须原样都在：台账/冬眠段不能被删掉一半
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM reminder_ledger WHERE colony_id = ?1", c.id), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM hibernation WHERE colony_id = ?1", c.id), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM colony WHERE id = ?1", c.id), 1);
     }
 
     // ── 地点 ──
