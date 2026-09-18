@@ -5,7 +5,7 @@
  * 冬眠整卡静音（票 05 接管横幅）。
  */
 
-import type { ColonyAction, RecentLog } from "../types";
+import type { ColonyAction, FoodTileInfo, RecentLog } from "../types";
 
 /** 操作块展示态：ok=绿 / bad=红（超期）/ reg=中性灰（登记类）/ none=尚未记录 / mute=冬眠静音 */
 export type TileTone = "ok" | "bad" | "reg" | "none" | "mute";
@@ -38,6 +38,17 @@ export function actionTile(a: ColonyAction, hibernating: boolean): TileView {
 /** 是否喂食类操作（点它弹食物多选，其余一点即记）。按 schema 的 is_feeding 标记位，与名字无关。 */
 export function isFeeding(a: ColonyAction): boolean {
   return a.is_feeding;
+}
+
+/** 喂食 tile 悬停提示：逐食物"距上次"，超期的标出来。 */
+export function feedingTooltip(foods: FoodTileInfo[]): string {
+  return foods
+    .map((f) => {
+      const days = f.days_since_last === null ? "尚未记录" : `距上次 ${f.days_since_last} 天`;
+      const mark = f.overdue ? " · 超期" : "";
+      return `${f.name}：${days}${mark}`;
+    })
+    .join("\n");
 }
 
 /**

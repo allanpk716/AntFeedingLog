@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ColonyAction, RecentLog } from "../types";
-import { actionTile, formatRecent, isFeeding, nowLocalDateTime } from "./care";
+import type { ColonyAction, FoodTileInfo, RecentLog } from "../types";
+import { actionTile, feedingTooltip, formatRecent, isFeeding, nowLocalDateTime } from "./care";
 
 function action(partial: Partial<ColonyAction> & { action_id: number }): ColonyAction {
   return {
@@ -11,6 +11,7 @@ function action(partial: Partial<ColonyAction> & { action_id: number }): ColonyA
     suggested_interval_days: 3,
     days_since_last: null,
     overdue: false,
+    foods: [],
     ...partial,
   };
 }
@@ -83,6 +84,20 @@ describe("喂食判定", () => {
     // 名字叫「喂食」但标记位为假 → 不弹
     expect(isFeeding(action({ action_id: 2, name: "喂食", is_feeding: false }))).toBe(false);
     expect(isFeeding(action({ action_id: 3, name: "垃圾清理", is_feeding: false }))).toBe(false);
+  });
+});
+
+describe("喂食块悬停提示（反馈第二轮 F3）", () => {
+  it("feedingTooltip 逐食物三态：距上次 / 超期标注 / 尚未记录；空明细为空串", () => {
+    const foods: FoodTileInfo[] = [
+      { food_id: 1, name: "种子", suggested_interval_days: 3, days_since_last: 2, overdue: false },
+      { food_id: 3, name: "面包虫", suggested_interval_days: 7, days_since_last: 8, overdue: true },
+      { food_id: 2, name: "干虾仁", suggested_interval_days: 7, days_since_last: null, overdue: false },
+    ];
+    expect(feedingTooltip(foods)).toBe(
+      "种子：距上次 2 天\n面包虫：距上次 8 天 · 超期\n干虾仁：尚未记录",
+    );
+    expect(feedingTooltip([])).toBe("");
   });
 });
 

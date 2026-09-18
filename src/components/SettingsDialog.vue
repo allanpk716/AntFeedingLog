@@ -4,7 +4,7 @@
  * - 操作行可编辑：名字、性质（提醒/仅登记）、建议间隔（提醒类显示）、
  *   「喂食」标记（带提示，允许编辑不强制唯一）、停用/启用、删除
  *   （预置项或被历史记录/提醒台账引用时删除禁用，只能停用——规则 10 + 反馈第二轮 F2）。
- * - 食物行：名字、停用/启用、删除（预置或被引用禁用）。
+ * - 食物行：名字、建议间隔（F3：留空=只按喂食统一周期）、停用/启用、删除（预置或被引用禁用）。
  * - 地点 tab 复用 LocationManagerPanel。
  * - 通知 tab（票 06 + 反馈第二轮 F4）：推送通知总开关（桌面 + 手机，分类子开关作废）+
  *   临近出眠提前天数 + Pushover 配置状态 + 「发送测试通知」按钮（双通道分别回显结果，
@@ -106,7 +106,7 @@ async function addActionRow(kind: "actions" | "foods") {
     });
     addActionName.value = "";
   } else {
-    foodRows.value.push({ id: null, name: raw, enabled: true, isPreset: false, referenced: false });
+    foodRows.value.push({ id: null, name: raw, enabled: true, intervalText: "", isPreset: false, referenced: false });
     addFoodName.value = "";
   }
   error.value = "";
@@ -392,6 +392,13 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
             <button type="button" :disabled="index === foodRows.length - 1" @click="moveRow(foodRows, index, 1)">↓</button>
           </span>
           <input v-model="row.name" class="name-input" type="text" />
+          <input
+            v-model="row.intervalText"
+            class="interval-input"
+            type="number"
+            min="1"
+            title="食物建议间隔：距上次喂该食物超过它就单独提醒；留空 = 只按喂食统一周期"
+          />
           <span v-if="!row.enabled" class="disabled-chip">已停用</span>
           <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setFoodEnabled(row, false)">停用</button>
           <button v-else class="row-btn" type="button" @click="setFoodEnabled(row, true)">启用</button>
@@ -404,6 +411,8 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
           <input v-model="addFoodName" class="add-input" type="text" placeholder="新食物，如：糖水" @keyup.enter="addActionRow('foods')" />
           <button class="add-btn" type="button" @click="addActionRow('foods')">＋ 添加</button>
         </div>
+
+        <p class="hint">设了间隔的食物各自算「距上次」，任一超期喂食块就变红并单独提醒。</p>
 
         <div class="dlg-btns">
           <span class="spacer"></span>

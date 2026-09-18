@@ -8,6 +8,18 @@ export type ColonyStatus = "active" | "hibernating" | "ended";
 /** 维护操作性质：reminding=提醒（超期标红可通知）/ log_only=仅登记（永不催促） */
 export type ActionKind = "reminding" | "log_only";
 
+/** 喂食块里单个食物的「距上次」明细（Rust care::FoodTileStatus，反馈第二轮 F3） */
+export interface FoodTileInfo {
+  food_id: number;
+  name: string;
+  /** 该食物自己的建议间隔；null = 未设，只受喂食统一周期管 */
+  suggested_interval_days: number | null;
+  /** 今天 − 最近一次喂「该食物」日期（含出眠重置基线）；从未喂过且无出眠史为 null */
+  days_since_last: number | null;
+  /** 仅操作 kind=reminding 且已设周期且 > 周期 */
+  overdue: boolean;
+}
+
 /** 窝卡片上单个操作块（Rust 已算好距上次/超期态） */
 export interface ColonyAction {
   action_id: number;
@@ -19,8 +31,10 @@ export interface ColonyAction {
   suggested_interval_days: number | null;
   /** 今天 − 最近一次发生日期（自然日）；从未记录为 null */
   days_since_last: number | null;
-  /** 仅提醒类且 > 建议间隔 */
+  /** 仅提醒类且 > 建议间隔；喂食类任一设周期食物超期也算（F3，Q2） */
   overdue: boolean;
+  /** 逐食物「距上次」明细（F3）；仅喂食类非空，其余操作恒空数组 */
+  foods: FoodTileInfo[];
 }
 
 /** 最近记录摘要的一行（前端拼展示文案） */
@@ -90,6 +104,8 @@ export interface FoodItem {
   name: string;
   enabled: boolean;
   sort: number;
+  /** 食物建议间隔（天，F3）：距上次喂该食物超过它就单独提醒；null = 未设 */
+  suggested_interval_days: number | null;
   /** 预置项禁删可停用（反馈第二轮 F2） */
   is_preset: boolean;
   referenced: boolean;
@@ -133,6 +149,8 @@ export interface FoodInput {
   id: number | null;
   name: string;
   sort: number;
+  /** 食物建议间隔（天，F3）；null = 不设 */
+  suggested_interval_days: number | null;
 }
 
 /** 记账入参：喂食才带 food_ids（其余操作传空数组）；happened_at 可补录过去 */

@@ -17,7 +17,10 @@ use rusqlite::Connection;
 /// v4：字典预置项保护位（反馈第二轮 F2，Q5）——care_action/food 各加 is_preset。
 /// v5：提醒台账推送列（反馈第二轮 F4，Q3/Q4/Q8）——push_title/push_body = 发送当时
 ///     的通知文案快照（补发直接用、不重算），pushover_done = 手机侧已了结。
-pub const SCHEMA_VERSION: i64 = 5;
+/// v6：双层喂食周期（反馈第二轮 F3）——food 加 suggested_interval_days（预置按名
+///     回填）；reminder_ledger 整表重建加 food_id 维度（v1 的 kind CHECK 不含
+///     'food_overdue'，重建时顺带去掉该 CHECK、改由应用层保证）。
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -105,6 +108,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             2 => migrate_v2_to_v3(conn)?,
             3 => migrate_v3_to_v4(conn)?,
             4 => migrate_v4_to_v5(conn)?,
+            5 => migrate_v5_to_v6(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -196,6 +200,54 @@ fn migrate_v4_to_v5(conn: &Connection) -> Result<(), rusqlite::Error> {
         "#,
     )?;
     tx.pragma_update(None, "user_version", 5)?;
+    tx.commit()
+}
+
+/// v6（F3）：① food 加 suggested_interval_days（按名回填 种子3/干虾仁7/面包虫7）；
+/// ② reminder_ledger 整表重建——v1 的 kind CHECK 不含 'food_overdue' 且 SQLite 不能
+/// 改列约束，顺带加 food_id 维度；kind 合法性改由应用层（compute 只产四种）保证。
+/// 数据、推送列（v5）、既有唯一键语义全部原样保留。
+fn migrate_v5_to_v6(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        ALTER TABLE food ADD COLUMN suggested_interval_days INTEGER;
+        UPDATE food SET suggested_interval_days = CASE name
+            WHEN '种子' THEN 3
+            WHEN '干虾仁' THEN 7
+            WHEN '面包虫' THEN 7
+        END
+        WHERE name IN ('种子', '干虾仁', '面包虫');
+
+        CREATE TABLE reminder_ledger_v6 (
+            id             INTEGER PRIMARY KEY,
+            colony_id      INTEGER NOT NULL REFERENCES colony(id),
+            kind           TEXT    NOT NULL,
+            action_id      INTEGER REFERENCES care_action(id),
+            food_id        INTEGER REFERENCES food(id),
+            base_date      TEXT    NOT NULL,
+            sent_at        TEXT    NOT NULL,
+            push_title     TEXT,
+            push_body      TEXT,
+            pushover_done  INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO reminder_ledger_v6
+            (id, colony_id, kind, action_id, base_date, sent_at, push_title, push_body, pushover_done)
+            SELECT id, colony_id, kind, action_id, base_date, sent_at, push_title, push_body, pushover_done
+            FROM reminder_ledger;
+        DROP TABLE reminder_ledger;
+        ALTER TABLE reminder_ledger_v6 RENAME TO reminder_ledger;
+
+        CREATE UNIQUE INDEX uq_ledger_overdue
+            ON reminder_ledger(colony_id, action_id, base_date) WHERE kind = 'overdue';
+        CREATE UNIQUE INDEX uq_ledger_food
+            ON reminder_ledger(colony_id, action_id, food_id, base_date) WHERE kind = 'food_overdue';
+        CREATE UNIQUE INDEX uq_ledger_wake
+            ON reminder_ledger(colony_id, kind, base_date)
+            WHERE kind IN ('approaching_wake', 'wake_day');
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 6)?;
     tx.commit()
 }
 
@@ -390,7 +442,7 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 5);
+        assert_eq!(SCHEMA_VERSION, 6);
     }
 
     #[test]
@@ -418,6 +470,64 @@ mod tests {
             .query_row("SELECT push_title, push_body FROM reminder_ledger", [], |r| Ok((r.get(0)?, r.get(1)?)))
             .unwrap();
         assert_eq!((title, body), (None, None));
+    }
+
+    #[test]
+    fn v6_adds_food_interval_and_rebuilds_ledger_with_food_dimension() {
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).unwrap();
+        seed_v1_presets(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        // v5 列（F4 之后真实库至少 v5；这里手工补齐等价结构再升 v6）
+        conn.execute_batch(
+            "ALTER TABLE reminder_ledger ADD COLUMN push_title TEXT;
+             ALTER TABLE reminder_ledger ADD COLUMN push_body TEXT;
+             ALTER TABLE reminder_ledger ADD COLUMN pushover_done INTEGER NOT NULL DEFAULT 0;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at, push_title, push_body, pushover_done)
+             VALUES (1, 'overdue', 1, '2026-09-15', '2026-09-15 08:00:00', '喂食超期', '正文', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // 食物周期：预置三样按名回填，自建为 NULL
+        let intervals: Vec<(String, Option<i64>)> = {
+            let mut stmt = conn.prepare("SELECT name, suggested_interval_days FROM food ORDER BY sort").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(intervals, vec![
+            ("种子".into(), Some(3)), ("干虾仁".into(), Some(7)), ("面包虫".into(), Some(7)),
+        ]);
+
+        // 台账重建后：旧行与推送列原样保留 + 新 food_id 列（NULL）
+        let row: (Option<i64>, Option<String>, i64) = conn
+            .query_row("SELECT food_id, push_title, pushover_done FROM reminder_ledger", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!(row, (None, Some("喂食超期".into()), 1));
+
+        // food_overdue 维度的唯一键生效：同窝同操作同日、不同食物共存；同食物重复被拒
+        let insert = |food: Option<i64>| {
+            conn.execute(
+                "INSERT INTO reminder_ledger (colony_id, kind, action_id, food_id, base_date, sent_at)
+                 VALUES (1, 'food_overdue', 1, ?1, '2026-09-15', '2026-09-15 08:00:00')",
+                params![food],
+            )
+        };
+        assert_eq!(insert(Some(1)).unwrap(), 1);
+        assert_eq!(insert(Some(2)).unwrap(), 1);
+        assert!(insert(Some(1)).is_err());
     }
 
     #[test]

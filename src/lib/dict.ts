@@ -93,11 +93,13 @@ export function moveRow<T>(rows: T[], index: number, direction: -1 | 1): void {
 
 // ── 食物 ─────────────────────────────────────────────────────────────────
 
-/** 食物行本地编辑态 */
+/** 食物行本地编辑态：间隔用输入框原文承载（空串=未设，F3），保存时才解析。 */
 export interface FoodRow {
   id: number | null;
   name: string;
   enabled: boolean;
+  /** 建议间隔输入框原文（空串=未设）；type=number 可能给回数字，同 ActionRow 口径 */
+  intervalText: string | number;
   /** 预置项禁删可停用（反馈第二轮 F2） */
   isPreset: boolean;
   referenced: boolean;
@@ -111,14 +113,20 @@ export function buildFoodRows(foods: FoodItem[]): FoodRow[] {
       id: f.id,
       name: f.name,
       enabled: f.enabled,
+      intervalText: f.suggested_interval_days === null ? "" : String(f.suggested_interval_days),
       isPreset: f.is_preset,
       referenced: f.referenced,
     }));
 }
 
-/** 行列表 → save_food 入参：sort = 行下标，名字 trim。 */
+/** 行列表 → save_food 入参：sort = 行下标，名字 trim，间隔文本转数字或 null（F3）。 */
 export function toFoodInputs(rows: FoodRow[]): FoodInput[] {
-  return rows.map((r, index) => ({ id: r.id, name: r.name.trim(), sort: index }));
+  return rows.map((r, index) => ({
+    id: r.id,
+    name: r.name.trim(),
+    sort: index,
+    suggested_interval_days: parseInterval(r.intervalText),
+  }));
 }
 
 /** 保存前本地预检，返回首个错误文案；通过返回空串。 */
@@ -130,6 +138,12 @@ export function validateFoodRows(rows: FoodRow[]): string {
   const duplicated = names.find((n, i) => names.indexOf(n) !== i);
   if (duplicated) {
     return `食物名字「${duplicated}」已存在`;
+  }
+  for (const r of rows) {
+    const interval = parseInterval(r.intervalText);
+    if (interval !== null && (!Number.isInteger(interval) || interval < 1)) {
+      return `食物「${r.name.trim()}」的建议间隔应是不小于 1 的整数天数`;
+    }
   }
   return "";
 }

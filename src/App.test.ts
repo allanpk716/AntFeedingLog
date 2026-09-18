@@ -30,10 +30,10 @@ const locations: LocationItem[] = [
 ];
 
 const foods: FoodItem[] = [
-  { id: 1, name: "种子", enabled: true, sort: 1, referenced: false, is_preset: true },
-  { id: 2, name: "干虾仁", enabled: true, sort: 2, referenced: false, is_preset: true },
-  { id: 3, name: "面包虫", enabled: true, sort: 3, referenced: false, is_preset: true },
-  { id: 4, name: "蚕蛹", enabled: false, sort: 4, referenced: false, is_preset: false },
+  { id: 1, name: "种子", enabled: true, sort: 1, suggested_interval_days: 3, referenced: false, is_preset: true },
+  { id: 2, name: "干虾仁", enabled: true, sort: 2, suggested_interval_days: 7, referenced: false, is_preset: true },
+  { id: 3, name: "面包虫", enabled: true, sort: 3, suggested_interval_days: 7, referenced: false, is_preset: true },
+  { id: 4, name: "蚕蛹", enabled: false, sort: 4, suggested_interval_days: null, referenced: false, is_preset: false },
 ];
 
 const actions: CareActionItem[] = [
@@ -571,11 +571,16 @@ describe("设置 · 字典管理（票 04）", () => {
     expect(rows[3].find(".erase-btn").attributes("disabled")).toBeUndefined();
 
     await rows[0].find(".name-input").setValue("瓜子");
+    // F3：食物行带建议间隔输入框，回显预置值；保存一并落库
+    expect((rows[0].find(".interval-input").element as HTMLInputElement).value).toBe("3");
+    expect((rows[3].find(".interval-input").element as HTMLInputElement).value).toBe("");
+    expect(dlg.text()).toContain("任一超期喂食块就变红并单独提醒");
+    await rows[0].find(".interval-input").setValue("5");
     invokeMock.mockClear();
     await dlg.find(".tab-body .btn.primary").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("save_food", {
-      input: { id: 1, name: "瓜子", sort: 0 },
+      input: { id: 1, name: "瓜子", sort: 0, suggested_interval_days: 5 },
     });
 
     invokeMock.mockClear();
@@ -819,6 +824,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: 3,
     days_since_last: 4,
     overdue: true,
+    foods: [],
   };
   const waterReg: ColonyAction = {
     action_id: 2,
@@ -829,6 +835,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: null,
     days_since_last: 2,
     overdue: false,
+    foods: [],
   };
   const hydrateNever: ColonyAction = {
     action_id: 3,
@@ -839,6 +846,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: null,
     days_since_last: null,
     overdue: false,
+    foods: [],
   };
   const trashToday: ColonyAction = {
     action_id: 4,
@@ -849,6 +857,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: 7,
     days_since_last: 0,
     overdue: false,
+    foods: [],
   };
   // 名字不含「喂食」的喂食类操作：弹窗触发与标题只认 is_feeding 位（R1 解耦）
   const feedCustom: ColonyAction = {
@@ -860,6 +869,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: 3,
     days_since_last: 9,
     overdue: true,
+    foods: [],
   };
 
   const recent: RecentLog[] = [
@@ -902,6 +912,31 @@ describe("卡片操作块与一键记账（票 03）", () => {
 
     // 最近记录摘要
     expect(card.find(".recent").text()).toBe("最近：09-17 喂食（种子）");
+  });
+
+  it("喂食块带食物明细：食物层超期整块红，悬停 title 逐食物列「距上次」并标注超期（反馈第二轮 F3）", async () => {
+    const feedWithFoods: ColonyAction = {
+      ...feedOverdue,
+      days_since_last: 8,
+      foods: [
+        { food_id: 1, name: "种子", suggested_interval_days: 3, days_since_last: 8, overdue: true },
+        { food_id: 2, name: "干虾仁", suggested_interval_days: 7, days_since_last: 1, overdue: false },
+        { food_id: 3, name: "面包虫", suggested_interval_days: 7, days_since_last: null, overdue: false },
+      ],
+    };
+    colony1With([feedWithFoods, waterReg]);
+    const wrapper = await mountApp();
+
+    const feed = wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="1"]');
+    expect(feed.classes()).toContain("bad");
+    expect(feed.find(".pill").text()).toBe("⚠ 超期 5 天");
+    expect(feed.attributes("title")).toBe(
+      "种子：距上次 8 天 · 超期\n干虾仁：距上次 1 天\n面包虫：尚未记录",
+    );
+
+    // 非喂食块无食物明细 → 不带 title
+    const water = wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]');
+    expect(water.attributes("title")).toBeUndefined();
   });
 
   it("非喂食弹打卡面板：默认今天可补录，点「记录」才落库并刷新", async () => {
@@ -1222,6 +1257,7 @@ describe("冬眠管理（票 05）", () => {
       suggested_interval_days: 3,
       days_since_last: 4,
       overdue: true,
+      foods: [],
     };
     colony3With({ id: 9, start_date: "2026-08-20", expected_end_date: "2099-01-01" });
     currentColonies = currentColonies.map((c) => (c.id === 3 ? { ...c, actions: [feedOverdue] } : c));

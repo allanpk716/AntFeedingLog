@@ -36,6 +36,7 @@ function food(overrides: Partial<FoodItem>): FoodItem {
     name: "种子",
     enabled: true,
     sort: 1,
+    suggested_interval_days: null,
     referenced: false,
     is_preset: true,
     ...overrides,

@@ -9,7 +9,7 @@
  */
 import { computed, ref } from "vue";
 import type { Colony, ColonyAction } from "../types";
-import { actionTile, formatRecent, isFeeding, type TileView } from "../lib/care";
+import { actionTile, feedingTooltip, formatRecent, isFeeding, type TileView } from "../lib/care";
 import { hibernationBanner } from "../lib/hibernation";
 import { todayIso } from "../lib/dates";
 import FeedDialog from "./FeedDialog.vue";
@@ -122,6 +122,7 @@ function onFeedSaved() {
         :class="view.tone"
         :data-action-id="a.action_id"
         type="button"
+        :title="a.is_feeding && a.foods.length > 0 ? feedingTooltip(a.foods) : undefined"
         @click="onTile(a)"
       >
         <span class="t-head">

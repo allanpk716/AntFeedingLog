@@ -12,7 +12,7 @@ const colony: Colony = {
 };
 const action: ColonyAction = {
   action_id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false,
-  suggested_interval_days: null, days_since_last: 2, overdue: false,
+  suggested_interval_days: null, days_since_last: 2, overdue: false, foods: [],
 };
 
 function mountDlg() {
