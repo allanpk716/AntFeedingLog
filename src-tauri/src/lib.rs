@@ -251,6 +251,12 @@ fn get_stats(
     with_conn(state, |conn| stats::get_stats(conn, colony_id, &start_date, &end_date))
 }
 
+/// 全部记录里最早的 occurred_at 日期（前端「全部」范围下界用；无记录为 null）。
+#[tauri::command]
+fn earliest_log_date(state: tauri::State<'_, DbState>) -> Result<Option<String>, String> {
+    with_conn(state, stats::earliest_log_date)
+}
+
 // ── 设置与通知（票 06）──
 
 #[tauri::command]
@@ -317,6 +323,7 @@ pub fn run() {
             set_settings,
             send_test_notification,
             get_stats,
+            earliest_log_date,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

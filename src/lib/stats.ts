@@ -50,13 +50,19 @@ export function normalizeFoodShare(items: { food_name: string; occurrences: numb
 
 /**
  * 筛选范围 → 开始日期（YYYY-MM-DD，含首尾）。
- * 近 3/6 个月按自然日窗（90/180 天，含今天）；「全部」= 各窝最早开始饲养日期，
- * 且不晚于今天——无窝或最早开始日在未来时回退今天（单天范围，不崩不变形）。
+ * 近 3/6 个月按自然日窗（90/180 天，含今天）；「全部」= min(各窝最早开始饲养日,
+ * 最早记录日 earliestLogDate)——早于饲养日的补录不从统计消失（票 07 停靠①），
+ * 且不晚于今天：无窝无记录、或最小值在未来时回退今天（单天范围，不崩不变形）。
  */
-export function rangeStartFor(range: StatsRange, today: string, colonies: { start_date: string }[]): string {
+export function rangeStartFor(
+  range: StatsRange,
+  today: string,
+  colonies: { start_date: string }[],
+  earliestLogDate: string | null = null,
+): string {
   if (range === "3m") return addDays(today, -89);
   if (range === "6m") return addDays(today, -179);
-  let min: string | null = null;
+  let min: string | null = earliestLogDate;
   for (const c of colonies) {
     if (min === null || c.start_date < min) min = c.start_date;
   }
@@ -99,7 +105,7 @@ export interface IntervalRow extends StatsInterval {
   avgLabel: string | null;
   /** 建议刻度竖线位置（%）；仅提醒类有（登记类恒 null，界面标「仅登记」） */
   markPct: number | null;
-  /** 右侧文案尾巴："建议 N 天" / "仅登记" */
+  /** 右侧文案尾巴："建议 N 天" / "未设建议间隔"（提醒类没设值）/ "仅登记"（按 kind 判定） */
   tail: string;
 }
 
@@ -117,7 +123,13 @@ export function intervalRows(intervals: StatsInterval[]): IntervalRow[] {
       avgPct,
       avgLabel: it.avg_days === null ? null : it.avg_days.toFixed(1),
       markPct,
-      tail: suggested === null ? "仅登记" : `建议 ${suggested} 天`,
+      // 按 kind 判定（票 07 停靠②）：提醒类但没设建议间隔时不误标「仅登记」
+      tail:
+        it.kind === "log_only"
+          ? "仅登记"
+          : suggested === null
+            ? "未设建议间隔"
+            : `建议 ${suggested} 天`,
     };
   });
 }

@@ -146,6 +146,30 @@ fn parse_date_part(s: &str) -> Option<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(s.get(0..10)?, "%Y-%m-%d").ok()
 }
 
+/// 全部记录里最早的 occurred_at 日期（`YYYY-MM-DD`）；无记录（或全是脏行）为 None。
+/// 前端用它把「全部」范围下界压到 min(最早开始饲养日, 最早记录日期)：
+/// 早于开始饲养日的补录不再从统计里消失（票 07 停靠①）。
+pub fn earliest_log_date(conn: &Connection) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare("SELECT substr(occurred_at, 1, 10) FROM care_log")
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    let mut min: Option<chrono::NaiveDate> = None;
+    for date_part in rows {
+        if let Some(day) = parse_date_part(&date_part) {
+            min = Some(match min {
+                Some(prev) if prev <= day => prev,
+                _ => day,
+            });
+        }
+    }
+    Ok(min.map(fmt_d))
+}
+
 /// 统计页聚合：按日操作数（含无记录天 = 0）、悬停明细（含食物）、食物出现
 /// 次数、每周操作数（周一为周首）、各操作间隔（扣冬眠，规则 6）。
 /// `colony_id` 为 None = 全部窝合并。
@@ -708,6 +732,30 @@ mod tests {
             .daily_detail
             .iter()
             .all(|x| x.entries.iter().all(|e| e.action_name != "garbage-time")));
+    }
+
+    #[test]
+    fn earliest_log_date_takes_min_across_logs_and_skips_dirty_rows() {
+        // 票 07 停靠①：「全部」范围下界 = min(最早开始饲养日, 最早记录日期)。
+        // 2025-12-01 的补录早于饲养日 2026-01-20，统计不该把它弄丢。
+        let conn = mem_conn();
+        assert_eq!(earliest_log_date(&conn).unwrap(), None, "空库无下界");
+
+        let c = colony(&conn, "大头一号");
+        log(&conn, c, "喂食", "2026-09-10 09:00:00");
+        log(&conn, c, "喂食", "2025-12-01 09:00:00");
+        // 脏行（occurred_at 解析失败）整行跳过，不当天花板也不当下界（票 04 停靠①口径）
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (?1, ?2, 'garbage-time', '', '2027-06-01 08:00:00')",
+            params![c, action_id(&conn, "喂食")],
+        )
+        .unwrap();
+
+        assert_eq!(
+            earliest_log_date(&conn).unwrap(),
+            Some("2025-12-01".to_string())
+        );
     }
 
     #[test]

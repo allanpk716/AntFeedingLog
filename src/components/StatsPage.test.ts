@@ -152,6 +152,31 @@ describe("统计页（票 07）", () => {
     });
   });
 
+  it("「全部」下界 = min(最早开始饲养日, 最早记录日)：早于饲养日的补录不消失（票 07 停靠①）", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return colonies; // start_date 最早 2026-01-20
+        case "get_stats":
+          return currentStats;
+        case "earliest_log_date":
+          return "2025-12-01";
+        default:
+          return null;
+      }
+    });
+    const wrapper = await mountPage();
+    await wrapper.find(".range-select").setValue("all");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("earliest_log_date");
+    expect(invokeMock).toHaveBeenCalledWith("get_stats", {
+      colonyId: null,
+      startDate: "2025-12-01",
+      endDate: todayIso(),
+    });
+  });
+
   it("频率口径标注可见：平均每天 = 总数 ÷ 自然日天数（不扣冬眠）（验收 6）", async () => {
     const wrapper = await mountPage();
     // 样例：总数 3、range_days 180 → 0.0；标注含天数与「不扣冬眠」

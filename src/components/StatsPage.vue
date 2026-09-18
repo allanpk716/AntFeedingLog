@@ -53,10 +53,12 @@ async function refresh() {
     if (colonies.value.length === 0) {
       colonies.value = await invoke<Colony[]>("list_colonies");
     }
-    // 分母口径（规则 7）由 range_days 随 payload 带回；起始日按当前窝清单起算
+    // 「全部」下界 = min(最早开始饲养日, 最早记录日)（票 07 停靠①）；分母口径
+    // （规则 7）由 range_days 随 payload 带回
+    const earliest = await invoke<string | null>("earliest_log_date");
     payload.value = await invoke<StatsPayload>("get_stats", {
       colonyId: colonyId.value,
-      startDate: rangeStartFor(range.value, today, colonies.value),
+      startDate: rangeStartFor(range.value, today, colonies.value, earliest),
       endDate: today,
     });
     pageError.value = "";

@@ -87,9 +87,21 @@ describe("时间范围起算（规则 7 频率分母的窗口）", () => {
     expect(rangeStartFor("6m", today, [])).toBe(addDays(today, -179));
   });
 
-  it("全部 = 各窝最早开始饲养日期", () => {
+  it("全部 = 各窝最早开始饲养日期（无更早记录时）", () => {
     const colonies = [{ start_date: "2026-03-01" }, { start_date: "2025-12-20" }];
     expect(rangeStartFor("all", today, colonies)).toBe("2025-12-20");
+    // 记录晚于饲养日时不改变下界
+    expect(rangeStartFor("all", today, colonies, "2026-01-05")).toBe("2025-12-20");
+  });
+
+  it("全部：早于饲养日的补录把下界压到最早记录日（票 07 停靠①）", () => {
+    const colonies = [{ start_date: "2026-03-01" }];
+    expect(rangeStartFor("all", today, colonies, "2025-12-01")).toBe("2025-12-01");
+  });
+
+  it("全部：最早记录日参与比较，min 落在未来才回退今天（不变形）", () => {
+    expect(rangeStartFor("all", today, [{ start_date: "2027-01-01" }], "2027-02-01")).toBe(today);
+    expect(rangeStartFor("all", today, [{ start_date: "2026-03-01" }], "2027-01-01")).toBe("2026-03-01");
   });
 
   it("全部但无窝 / 最早开始日在未来 → 今天兜底（单天范围，不崩）", () => {
@@ -162,6 +174,24 @@ describe("间隔条布局（照 mock-b .itrack/.ibar/.imark）", () => {
     expect(row.suggested).toBeNull();
     expect(row.markPct).toBeNull();
     expect(row.tail).toBe("仅登记");
+  });
+
+  it("提醒类但未设建议间隔：文案不误标「仅登记」（票 07 停靠②，按 kind 判定）", () => {
+    const noSuggestion: StatsInterval = {
+      action_id: 3,
+      name: "糖水",
+      kind: "reminding",
+      suggested_interval_days: null,
+      sample_count: 2,
+      avg_days: 6,
+      min_days: 5,
+      max_days: 7,
+    };
+    const [row] = intervalRows([noSuggestion]);
+    expect(row.suggested).toBeNull();
+    expect(row.markPct).toBeNull();
+    expect(row.tail).toBe("未设建议间隔");
+    expect(row.tail).not.toContain("仅登记");
   });
 
   it("无样本（记录不足）：avgPct 为 null，不产生 NaN", () => {
