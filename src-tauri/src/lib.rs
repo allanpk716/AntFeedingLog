@@ -8,11 +8,13 @@ mod dict;
 mod hibernation;
 mod pushover;
 mod reminder;
+mod restore;
 mod settings;
 mod stats;
 mod system;
 mod updater;
 
+use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -693,9 +695,7 @@ fn get_backup_status() -> Result<backup_config::BackupStatus, String> {
     Ok(backup_config::status_of(&backup_config::load(&data_dir)))
 }
 
-// ── 自动备份引擎（数据安全二期票 03，D2/D3/D4；引擎本体在 auto_backup.rs）──
-
-/// 业务写入成功后的触发点（D2 ①）：先同步记 `last_data_write_date`（配置锁内
+// ── 自动备份引擎（数据安全二期票 03，D2/D3/D4；引擎本体在 auto_backup.rs）──/// 业务写入成功后的触发点（D2 ①）：先同步记 `last_data_write_date`（配置锁内
 /// 快速落账，账目不丢），再后台线程判定 + 备份——网络盘等慢速目标目录不阻塞
 /// 命令返回与 UI（spec D3 锁外拷贝）。备份失败静默（记账+日志），绝不把错误
 /// 报给业务命令：写入照常成功返回（票面铁律）。
@@ -728,6 +728,87 @@ fn spawn_auto_backup(app: &tauri::AppHandle) {
         };
         auto_backup::run_triggered(state.inner(), &data_dir);
     });
+}
+
+// ── 应用内恢复（数据安全二期票 04，D5/D6/D10；协议本体在 restore.rs）──
+
+/// rfd 系统文件选择框选备份文件（取消返回 None）。async command：对话框不能占
+/// 主线程（与 pick_backup_dir 同理，评审 R1-2）。`default_dir` = 备份目录已设置
+/// 时作为对话框初始位置（目录真实存在才生效）。
+#[tauri::command]
+async fn pick_restore_file(default_dir: Option<String>) -> Result<Option<String>, String> {
+    let mut dialog = rfd::AsyncFileDialog::new()
+        .set_title("选择要恢复的备份文件")
+        .add_filter("SQLite 数据库", &["db"]);
+    if let Some(dir) = default_dir {
+        let p = std::path::PathBuf::from(&dir);
+        if p.is_dir() {
+            dialog = dialog.set_directory(&p);
+        }
+    }
+    let picked = dialog
+        .pick_file()
+        .await
+        .map(|handle| handle.path().to_string_lossy().to_string());
+    Ok(picked)
+}
+
+/// 恢复预览（D10 契约）：校验链通过返回摘要（备份日期/窝数/记录数/备份内目录
+/// 设置值），否则返回可展示的中文拒绝原因。只读校验，当前库零改动（spec D5
+/// 步骤 1–2 在 staging 临时库上进行）。
+#[tauri::command]
+fn restore_preview(
+    state: tauri::State<'_, DbState>,
+    path: String,
+) -> Result<restore::RestoreSummary, String> {
+    let data_dir = current_data_dir()?;
+    restore::run_preview(Path::new(&path), &state.1, &data_dir, &restore::stamp_now())
+}
+
+/// 恢复执行（D10 契约）：重走完整校验（TOCTOU 安全——preview 与 apply 之间
+/// 源文件可能被换）→ pre-restore 快照 → 锁内原子替换 → 重开连接 → 广播前端
+/// 刷新。返回 `done`（界面当场刷新）或 `done_needs_restart`（新库文件已就位
+/// 但重开连接失败，前端提示「请重启应用」）。恢复执行写动作流水（D7，含来源）。
+#[tauri::command]
+fn restore_apply(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<restore::ApplyOutcome, String> {
+    // 更新安装禁写窗口同样禁恢复（整库替换是最重的写动作；with_conn 管不到
+    // 本命令的自管锁路径，这里显式复查）
+    updater::ensure_writable()?;
+    let data_dir = current_data_dir()?;
+    let db_path = state.1.clone();
+    let outcome = restore::run_apply(
+        Path::new(&path),
+        &db_path,
+        &data_dir,
+        &restore::stamp_now(),
+        || state.0.lock().map_err(|e| format!("库锁不可用: {e}")),
+        |p| crate::db::open_and_migrate(p).map_err(|e| e.to_string()),
+    );
+    match &outcome {
+        Ok(outcome) => {
+            applog::log_action(&format!(
+                "恢复执行完成（来源 {path}）：整库已替换{}",
+                match outcome {
+                    restore::ApplyOutcome::Done => "，界面即将刷新",
+                    restore::ApplyOutcome::DoneNeedsRestart => "，重开连接失败待重启生效",
+                }
+            ));
+            // 广播各页刷新（spec D5 步骤 4；done_needs_restart 也广播——库文件
+            // 确实换了，前端此时应展示重启提示而不是旧数据）
+            use tauri::Emitter;
+            let _ = app.emit("db-restored", ());
+            // 托盘 tooltip 是库内超期摘要的投影，恢复后立即重算
+            reminder::refresh_tray_tooltip(&app);
+        }
+        Err(e) => {
+            applog::log_error(&format!("恢复执行失败（来源 {path}）: {e}"));
+        }
+    }
+    outcome
 }
 
 // ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──
@@ -932,6 +1013,9 @@ pub fn run() {
             pick_backup_dir,
             get_backup_status,
             backup_to,
+            restore_preview,
+            restore_apply,
+            pick_restore_file,
             export_data,
             get_stats,
             earliest_log_date,

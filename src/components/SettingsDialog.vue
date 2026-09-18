@@ -17,6 +17,10 @@
  *   保留份数（1–365 校验）/ 上次备份状态（尚未备份/成功/失败+原因）；
  *   开关开着 ∧ 目录未设时显示「未生效」提示。配置存数据目录 backup-config.json
  *   （D1：库外文件，恢复整库不回滚备份设置）。
+ *   恢复区（数据安全二期票 04）：「从备份恢复」按钮在自动备份区与手动按钮之间
+ *   （D11）；流程 = 选文件（默认定位备份目录）→ 摘要预览（窝数/记录数/备份日期/
+ *   备份内目录设置值 + 固定文案）→ 二段确认（与删除记录同待遇）→ 执行 →
+ *   刷新或重启提示。整库替换语义（ADR-0002）。
  * - 更新 tab（release-update 票 06）：当前版本 / 立即检查更新 / 确认下载安装，
  *   全部走 Tauri command；升级未完成残留的引导也挂在本节顶（UpdatePanel）。
  *
@@ -34,6 +38,8 @@ import type {
   FoodItem,
   LocationItem,
   PushoverStatus,
+  RestoreApplyOutcome,
+  RestoreSummary,
   TestNotifyOutcome,
   AbnormalExitInfo,
 } from "../types";
@@ -56,6 +62,12 @@ import {
   formatLastBackup,
   validateKeepCount,
 } from "../lib/backupUi";
+import {
+  RESTORE_CONFIRM_TEXT,
+  formatRestoreOutcome,
+  summaryLooksSuspicious,
+  summaryRows,
+} from "../lib/restoreUi";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
 
@@ -435,6 +447,75 @@ async function saveBackupConfig() {
   }
 }
 
+// ── 数据 tab：恢复区（数据安全二期票 04，spec D5/D11）──
+// 流程：选文件（对话框默认定位备份目录，已设置时）→ restore_preview 校验链
+// 产摘要 → 摘要预览（含备份内目录设置值与固定文案）→ 二段确认（与删除记录
+// 同待遇）→ restore_apply → 刷新或重启提示。校验与替换全在 Rust 侧，当前库
+// 在校验阶段零改动；执行成功后本弹窗数据重拉自新库，首页经 db-restored 事件刷新。
+
+const restoreSummary = ref<RestoreSummary | null>(null);
+const restorePath = ref("");
+const restoreConfirming = ref(false);
+const restoreBusy = ref(false);
+const restoreError = ref("");
+const restoreResult = ref("");
+
+async function startRestore() {
+  restoreError.value = "";
+  restoreResult.value = "";
+  // 对话框默认定位备份目录（已设置时；读取失败不挡选文件）
+  let defaultDir: string | null = null;
+  try {
+    defaultDir = (await invoke<BackupConfigInfo>("get_backup_config")).backup_dir;
+  } catch {
+    // 静默：默认定位是锦上添花
+  }
+  try {
+    const picked = await invoke<string | null>("pick_restore_file", { defaultDir });
+    if (!picked) return; // 用户取消选文件
+    restorePath.value = picked;
+    restoreBusy.value = true;
+    // 校验链 + 摘要（Rust staging 临时库，当前库零改动）；拒绝原因直接展示
+    restoreSummary.value = await invoke<RestoreSummary>("restore_preview", { path: picked });
+    restoreConfirming.value = false; // 每份新摘要都重新走二段确认
+  } catch (e) {
+    restoreError.value = String(e);
+    restoreSummary.value = null;
+  } finally {
+    restoreBusy.value = false;
+  }
+}
+
+async function confirmRestoreApply() {
+  if (!restoreSummary.value) return;
+  // 二段确认（与删除记录同待遇）：第一次进入确认态，第二次才真执行
+  if (!restoreConfirming.value) {
+    restoreConfirming.value = true;
+    return;
+  }
+  restoreBusy.value = true;
+  restoreError.value = "";
+  try {
+    const outcome = await invoke<RestoreApplyOutcome>("restore_apply", { path: restorePath.value });
+    restoreResult.value = formatRestoreOutcome(outcome);
+    restoreSummary.value = null;
+    restoreConfirming.value = false;
+    // 库已整体替换：弹窗内字典/通知设置重拉自新库；备份配置在库外不受影响
+    await load();
+    emit("changed");
+  } catch (e) {
+    restoreError.value = String(e);
+  } finally {
+    restoreBusy.value = false;
+  }
+}
+
+function cancelRestore() {
+  restoreSummary.value = null;
+  restoreConfirming.value = false;
+  restoreError.value = "";
+}
+
 function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   if (row.isPreset) return "预置项不能删除；可改为停用";
   return row.referenced ? "被历史记录引用，只能停用，不能删除" : "";
@@ -651,6 +732,50 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
           </div>
         </div>
 
+        <!-- 恢复区（数据安全二期票 04）：位置在自动备份区与手动按钮之间（D11） -->
+        <div class="backup-section restore-section">
+          <div class="notify-row">
+            <button
+              class="btn data-btn restore-btn"
+              type="button"
+              :disabled="restoreBusy"
+              title="选一份备份整体替换当前全部数据（恢复前自动快照当前库，可反悔）"
+              @click="startRestore"
+            >
+              从备份恢复…
+            </button>
+            <span class="restore-hint">整库替换，不是合并——旧数据全部消失，恢复前会自动快照当前库</span>
+          </div>
+          <p v-if="restoreError" class="form-error restore-error">{{ restoreError }}</p>
+          <div v-if="restoreSummary" class="restore-panel">
+            <p class="restore-panel-title">备份摘要（请确认没选错文件）</p>
+            <div v-for="([label, value], i) in summaryRows(restoreSummary)" :key="i" class="restore-summary-row">
+              <span class="restore-summary-label">{{ label }}：</span>
+              <span class="restore-summary-value">{{ value }}</span>
+            </div>
+            <p v-if="summaryLooksSuspicious(restoreSummary)" class="form-error restore-suspicious">
+              这份备份里 0 窝 0 条记录——如果与预期不符，可能选错了文件，请勿继续。
+            </p>
+            <p class="restore-confirm-text">{{ RESTORE_CONFIRM_TEXT }}</p>
+            <div class="dlg-btns">
+              <button class="btn restore-cancel-btn" type="button" :disabled="restoreBusy" @click="cancelRestore">
+                取消
+              </button>
+              <span class="spacer"></span>
+              <button
+                class="btn restore-confirm-btn"
+                :class="{ confirming: restoreConfirming }"
+                type="button"
+                :disabled="restoreBusy"
+                @click="confirmRestoreApply"
+              >
+                {{ restoreConfirming ? "再次点击确认恢复" : "确认恢复" }}
+              </button>
+            </div>
+          </div>
+          <p v-if="restoreResult" class="data-result restore-result">{{ restoreResult }}</p>
+        </div>
+
         <div class="data-actions">
           <button class="btn data-btn reveal-btn" type="button" title="在资源管理器中打开库文件所在目录" @click="revealFolder">
             打开数据文件夹
@@ -838,6 +963,56 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   font-size: 13px;
   color: var(--muted);
   word-break: break-all;
+}
+
+/* 数据 tab 恢复区（数据安全二期票 04） */
+.restore-hint {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.restore-panel {
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-top: 8px;
+  background: var(--tile);
+}
+
+.restore-panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.restore-summary-row {
+  font-size: 13px;
+  padding: 1px 0;
+}
+
+.restore-summary-label {
+  color: var(--muted);
+}
+
+.restore-summary-value {
+  word-break: break-all;
+}
+
+.restore-suspicious {
+  margin-top: 8px;
+}
+
+.restore-confirm-text {
+  margin-top: 8px;
+  font-size: 13px;
+  color: var(--bad);
+}
+
+.restore-confirm-btn.confirming {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #fff;
+  font-weight: 600;
 }
 
 .data-btn {

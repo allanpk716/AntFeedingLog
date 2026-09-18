@@ -7,6 +7,7 @@
  */
 import { computed, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { Colony, LocationItem } from "./types";
 import { groupColonies, splitColonies } from "./lib/home";
 import { todayLabel } from "./lib/dates";
@@ -73,6 +74,11 @@ function onSettingsClosed() {
 
 onMounted(() => {
   void refresh();
+  // 恢复完成广播（数据安全二期票 04）：整库被替换，各页数据全部重拉——
+  // 首页在此刷新；统计/记录页离开再进时按 v-if 重挂载自然重拉
+  void listen("db-restored", () => {
+    void refresh();
+  });
 });
 </script>
 

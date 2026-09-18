@@ -333,3 +333,21 @@ export interface BackupConfigInput {
   backup_dir: string | null;
   keep_count: number;
 }
+
+/** restore_preview 返回体（数据安全二期票 04，Rust restore::RestoreSummary）：
+ * 摘要预览是选错文件的最后防线（spec D6） */
+export interface RestoreSummary {
+  /** 备份日期（YYYY-MM-DD）：优先文件名时间戳，否则库内最新记录日期；null = 空库 */
+  backup_date: string | null;
+  /** 备份内窝数（0 窝 0 条 = 可能选错文件的信号，界面如实展示） */
+  colony_count: number;
+  /** 备份内记录数 */
+  log_count: number;
+  /** 备份内的备份目录设置值（settings 表旧布局才有；null = 备份内无此设置，
+   * 备份设置存库外不随恢复回滚——D1） */
+  backup_dir_in_backup: string | null;
+}
+
+/** restore_apply 返回体：done = 界面当场刷新；done_needs_restart = 新库文件已
+ * 就位但重开连接失败，提示「请重启应用」 */
+export type RestoreApplyOutcome = "done" | "done_needs_restart";

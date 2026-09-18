@@ -252,7 +252,8 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<(), rusqlite::Error> {
 }
 
 /// v1 预置数据：四操作（喂食/活动区换水/巢穴保湿/垃圾清理）、三食物、两地点、五项设置默认值。
-fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
+/// pub(crate)：restore.rs 的旧 schema 备份测试要搭真实 v1 库（票 04 验收 3）。
+pub(crate) fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         r#"
         INSERT INTO care_action (name, icon, kind, suggested_interval_days, enabled, sort) VALUES
@@ -281,8 +282,8 @@ fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
-/// v1 全部建表 DDL。
-const V1_SCHEMA_SQL: &str = r#"
+/// v1 全部建表 DDL。pub(crate)：restore.rs 的旧 schema 备份测试要搭真实 v1 库（票 04 验收 3）。
+pub(crate) const V1_SCHEMA_SQL: &str = r#"
 -- 地点（预置：家、公司）
 CREATE TABLE location (
     id      INTEGER PRIMARY KEY,

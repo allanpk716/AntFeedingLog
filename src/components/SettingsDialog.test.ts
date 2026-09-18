@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import SettingsDialog from "./SettingsDialog.vue";
-import type { BackupConfigInfo } from "../types";
+import type { BackupConfigInfo, RestoreSummary } from "../types";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC 与事件监听（沿 LogListPage.test.ts 先例）
 const { invokeMock, listenStub } = vi.hoisted(() => ({
@@ -358,5 +358,228 @@ describe("设置弹窗「数据」页签自动备份区（数据安全二期票 
     expect(status.text()).toContain("失败");
     expect(status.text()).toContain("2026-09-18 09:00:00");
     expect(status.text()).toContain("网盘掉线");
+  });
+});
+
+// ── 数据页签恢复区（数据安全二期票 04）──
+
+function restoreSummaryFixture(overrides: Partial<RestoreSummary> = {}): RestoreSummary {
+  return {
+    backup_date: "2026-09-10",
+    colony_count: 2,
+    log_count: 5,
+    backup_dir_in_backup: null,
+    ...overrides,
+  };
+}
+
+async function openDataTabForRestore(
+  extra: {
+    pickResult?: string | null;
+    preview?: RestoreSummary;
+    previewError?: string;
+    apply?: string;
+    applyError?: string;
+    withBackupDir?: boolean;
+  } = {},
+) {
+  baseMock();
+  invokeMock.mockImplementation(async (cmd: string) => {
+    switch (cmd) {
+      case "list_actions":
+      case "list_foods":
+      case "list_locations":
+        return [];
+      case "get_settings":
+        return {
+          notify_master_enabled: true,
+          notify_overdue_enabled: true,
+          notify_hibernation_enabled: true,
+          wake_remind_days_ahead: 7,
+          autostart_enabled: true,
+        };
+      case "get_recent_errors":
+        return [];
+      case "get_last_abnormal_exit":
+        return null;
+      case "get_backup_config":
+        return backupConfigFixture({ backup_dir: extra.withBackupDir ? "D:\\ant-bk" : null });
+      case "pick_restore_file":
+        return extra.pickResult ?? null;
+      case "restore_preview":
+        if (extra.previewError) throw extra.previewError;
+        return extra.preview ?? restoreSummaryFixture();
+      case "restore_apply":
+        if (extra.applyError) throw extra.applyError;
+        return extra.apply ?? "done";
+      default:
+        return null;
+    }
+  });
+  const wrapper = mount(SettingsDialog);
+  await flushPromises();
+  await wrapper.find(".tab-data").trigger("click");
+  await flushPromises();
+  return wrapper;
+}
+
+async function pickAndPreview(wrapper: ReturnType<typeof mount>) {
+  await wrapper.find(".restore-btn").trigger("click");
+  await flushPromises();
+}
+
+describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）", () => {
+  it("恢复按钮存在，且位于自动备份区之后、手动按钮区之前（D11 位置）", async () => {
+    const wrapper = await openDataTabForRestore();
+
+    const section = wrapper.find(".restore-section");
+    expect(section.exists()).toBe(true);
+    expect(wrapper.find(".restore-btn").exists()).toBe(true);
+    // DOM 顺序：自动备份区 → 恢复区 → 手动按钮区
+    const html = wrapper.find(".tab-body").element.innerHTML;
+    const autoPos = html.indexOf("save-backup-btn");
+    const restorePos = html.indexOf("restore-btn");
+    const manualPos = html.indexOf("reveal-btn");
+    expect(autoPos).toBeGreaterThan(-1);
+    expect(restorePos).toBeGreaterThan(autoPos);
+    expect(manualPos).toBeGreaterThan(restorePos);
+  });
+
+  it("选完文件调 restore_preview，摘要展示备份日期/窝数/记录数/备份内目录值 + 固定文案（验收 1）", async () => {
+    const wrapper = await openDataTabForRestore({
+      pickResult: "D:\\ant-bk\\ant-feeding-log-backup-20260910-080000.db",
+      preview: restoreSummaryFixture({ backup_dir_in_backup: "D:\\old-bk" }),
+      withBackupDir: true,
+    });
+
+    invokeMock.mockClear();
+    await pickAndPreview(wrapper);
+
+    // 默认定位备份目录：pick 入参带配置里的目录
+    expect(invokeMock).toHaveBeenCalledWith("pick_restore_file", { defaultDir: "D:\\ant-bk" });
+    expect(invokeMock).toHaveBeenCalledWith("restore_preview", {
+      path: "D:\\ant-bk\\ant-feeding-log-backup-20260910-080000.db",
+    });
+    const panel = wrapper.find(".restore-panel");
+    expect(panel.exists()).toBe(true);
+    const text = panel.text();
+    expect(text).toContain("2026-09-10");
+    expect(text).toContain("2");
+    expect(text).toContain("5");
+    expect(text).toContain("D:\\old-bk");
+    expect(text).toContain("恢复将整体替换当前全部数据");
+    expect(text).toContain("备份设置保持当前值，不随恢复回滚");
+  });
+
+  it("用户取消选文件 → 不调 restore_preview、不出摘要面板", async () => {
+    const wrapper = await openDataTabForRestore({ pickResult: null });
+
+    invokeMock.mockClear();
+    await pickAndPreview(wrapper);
+
+    expect(invokeMock).toHaveBeenCalledWith("pick_restore_file", expect.anything());
+    expect(invokeMock).not.toHaveBeenCalledWith("restore_preview", expect.anything());
+    expect(wrapper.find(".restore-panel").exists()).toBe(false);
+  });
+
+  it("preview 拒绝（损坏/未来版本等）→ 展示拒绝原因、无摘要面板（验收 2 的展示面）", async () => {
+    const wrapper = await openDataTabForRestore({
+      pickResult: "D:\\bk\\bad.db",
+      previewError: "备份文件已损坏",
+    });
+
+    await pickAndPreview(wrapper);
+
+    expect(wrapper.find(".restore-error").text()).toContain("备份文件已损坏");
+    expect(wrapper.find(".restore-panel").exists()).toBe(false);
+  });
+
+  it("0 窝 0 条摘要 → 出选错文件疑点提示（D6 最后防线的界面面）", async () => {
+    const wrapper = await openDataTabForRestore({
+      pickResult: "D:\\bk\\wrong.db",
+      preview: restoreSummaryFixture({ colony_count: 0, log_count: 0, backup_date: null }),
+    });
+
+    await pickAndPreview(wrapper);
+
+    expect(wrapper.find(".restore-suspicious").text()).toContain("0 窝 0 条");
+    expect(wrapper.find(".restore-suspicious").text()).toContain("选错了文件");
+  });
+
+  it("二段确认：第一次点只进入确认态，第二次才调 restore_apply（与删除记录同待遇）", async () => {
+    const wrapper = await openDataTabForRestore({ pickResult: "D:\\bk\\good.db", apply: "done" });
+
+    await pickAndPreview(wrapper);
+    invokeMock.mockClear();
+    await wrapper.find(".restore-confirm-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).not.toHaveBeenCalledWith("restore_apply", expect.anything());
+    expect(wrapper.find(".restore-confirm-btn").text()).toContain("再次点击确认恢复");
+
+    await wrapper.find(".restore-confirm-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("restore_apply", { path: "D:\\bk\\good.db" });
+    expect(wrapper.find(".restore-result").text()).toContain("恢复完成，界面已刷新");
+    expect(wrapper.find(".restore-panel").exists()).toBe(false);
+  });
+
+  it("恢复成功 done → 弹窗内数据重拉自新库（list_actions 再次调用）并向外抛 changed", async () => {
+    const wrapper = await openDataTabForRestore({ pickResult: "D:\\bk\\good.db", apply: "done" });
+
+    await pickAndPreview(wrapper);
+    invokeMock.mockClear();
+    await wrapper.find(".restore-confirm-btn").trigger("click");
+    await flushPromises();
+    await wrapper.find(".restore-confirm-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("list_actions");
+    expect(wrapper.emitted("changed")).toBeTruthy();
+  });
+
+  it("恢复成功但需重启（done_needs_restart）→ 提示「请重启应用」（spec D5 附录 #10）", async () => {
+    const wrapper = await openDataTabForRestore({
+      pickResult: "D:\\bk\\good.db",
+      apply: "done_needs_restart",
+    });
+
+    await pickAndPreview(wrapper);
+    await wrapper.find(".restore-confirm-btn").trigger("click");
+    await flushPromises();
+    await wrapper.find(".restore-confirm-btn").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".restore-result").text()).toContain("重启");
+  });
+
+  it("restore_apply 失败 → 展示错误、不误报成功", async () => {
+    const wrapper = await openDataTabForRestore({
+      pickResult: "D:\\bk\\good.db",
+      applyError: "恢复执行失败：库锁不可用",
+    });
+
+    await pickAndPreview(wrapper);
+    await wrapper.find(".restore-confirm-btn").trigger("click");
+    await flushPromises();
+    await wrapper.find(".restore-confirm-btn").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".restore-error").text()).toContain("库锁不可用");
+    // 结果与错误区分展示，失败绝不误报成功文案
+    expect(wrapper.find(".restore-result").exists()).toBe(false);
+  });
+
+  it("取消按钮收起摘要面板且不产生任何写命令", async () => {
+    const wrapper = await openDataTabForRestore({ pickResult: "D:\\bk\\good.db" });
+
+    await pickAndPreview(wrapper);
+    invokeMock.mockClear();
+    await wrapper.find(".restore-cancel-btn").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".restore-panel").exists()).toBe(false);
+    expect(invokeMock).not.toHaveBeenCalledWith("restore_apply", expect.anything());
   });
 });

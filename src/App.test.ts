@@ -5,8 +5,13 @@ import type { AppSettings, CareActionItem, Colony, ColonyAction, FoodItem, Locat
 import { addDays, todayIso, todayLabel } from "./lib/dates";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
-const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+const { invokeMock, listenStub } = vi.hoisted(() => ({
+  invokeMock: vi.fn(),
+  listenStub: vi.fn(async () => () => {}),
+}));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+// 票 04：App.vue 监听 db-restored 事件（恢复后各页刷新），测试里同样 mock 掉
+vi.mock("@tauri-apps/api/event", () => ({ listen: listenStub }));
 
 // 票 07：统计页图表在 happy-dom 无 canvas，mock 掉 echarts（导航测试只验接线）
 const { echartsSetOption } = vi.hoisted(() => ({ echartsSetOption: vi.fn() }));
