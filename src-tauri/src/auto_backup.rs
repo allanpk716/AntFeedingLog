@@ -686,6 +686,9 @@ mod tests {
         // 验收 7：拷贝期间库锁只覆盖本地临时文件拷贝段——慢速目录（网络盘）
         // 模拟：守卫的 Drop 阻塞到主线程放行。若实现把「临时 → 备份目录」
         // 也放进了锁窗口，放行前目标文件就会出现，断言当场抓住。
+        // Further Notes 落账：真实网络盘未实测（round 0 实验 #14 仅本地盘）；
+        // 本测试以慢速模拟守住锁外语义，常态超时的实际体验（Q8 静默 +
+        // 失败记账补跑）留开发期观察。
         let (_dir, data_dir, backup_dir, db_path) = io_fixture();
         let stamp = "20260918-120000";
         let temp = data_dir.join(format!("{STAGING_PREFIX}{stamp}.db"));

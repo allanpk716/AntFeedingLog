@@ -828,6 +828,7 @@ mod tests {
         let ledger: i64 = conn
             .query_row("SELECT COUNT(*) FROM reminder_ledger", [], |r| r.get(0))
             .unwrap();
+        // Further Notes 落账：台账回滚后的重发窗口是 Q14 已接受的取舍，留意实际体验
         assert_eq!(ledger, 0, "提醒台账随库回滚");
         drop(conn);
         // 锁内连接也已指向新库
@@ -1008,6 +1009,9 @@ mod tests {
         let source = dir_path(&_dir).join("ant-feeding-log-backup-20260910-080000.db");
         make_db(&source, "备份窝", 1);
         // 注入步骤 4 拷贝失败：<库>.new 侧车路径被目录占住
+        // Further Notes 落账：Windows「先写新文件+原子改名」的占用/权限边界由
+        // 本测试与 apply_swap_double_failure_* 注入覆盖；杀毒/索引器的瞬态占用
+        // 由重开连接的短退避重试兜底。
         let new_target = PathBuf::from(format!("{}.new", db_path.display()));
         std::fs::create_dir_all(&new_target).unwrap();
         let lock = live_lock(&db_path);

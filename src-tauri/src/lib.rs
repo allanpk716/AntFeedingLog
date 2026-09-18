@@ -14,6 +14,11 @@ mod stats;
 mod system;
 mod updater;
 
+/// 全链冒烟（数据安全二期票 05）：造数据 → 自动备份 → 改数据 → 恢复 的端到端
+/// 断言。只在测试构建编译。
+#[cfg(test)]
+mod full_chain;
+
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -807,6 +812,9 @@ fn restore_apply(
             ));
             // 广播各页刷新（spec D5 步骤 4；done_needs_restart 也广播——库文件
             // 确实换了，前端此时应展示重启提示而不是旧数据）
+            // Further Notes 落账：Q13 授权的「提示重启」降级未触发——db-restored
+            // 事件刷新链路已工作（组件测试覆盖前端侧），降级预案仅在未来链路
+            // 失灵时启用。
             use tauri::Emitter;
             let _ = app.emit("db-restored", ());
             // 托盘 tooltip 是库内超期摘要的投影，恢复后立即重算
@@ -870,7 +878,7 @@ async fn backup_to(state: tauri::State<'_, DbState>) -> Result<Option<String>, S
     Ok(Some(target.to_string_lossy().to_string()))
 }
 
-/// 导出归档（评审附录规则 11：归档带走，不是恢复通道）：csv=记录流水一行一条
+/// 导出归档（评审附录规则 11：定位为归档带走；恢复走应用内恢复通道 restore.rs）：csv=记录流水一行一条
 /// （BOM，Excel 直开不乱码）；json=全库数据结构化。用户取消返回 None。
 #[tauri::command]
 async fn export_data(
