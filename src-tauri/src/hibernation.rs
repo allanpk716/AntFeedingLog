@@ -38,9 +38,7 @@ pub struct OpenSegment {
 }
 
 /// 纯函数入参的一段冬眠期。`end` 为 None = 开放段（尚未出眠，视为延伸到 +∞）。
-// 本纯函数 API 随票 05 交付、票 06（提醒调度静音窗口）/票 07（间隔统计）接线，
-// 接线后可去掉 allow。
-#[allow(dead_code)]
+/// 票 06（提醒静音窗口）与票 07（间隔统计/重叠扣减）共用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Segment {
     pub start: chrono::NaiveDate,
@@ -49,13 +47,11 @@ pub struct Segment {
 
 impl Segment {
     /// 闭合段（入眠日与出眠日都算冬眠日）。
-    #[allow(dead_code)]
     pub fn closed(start: chrono::NaiveDate, end: chrono::NaiveDate) -> Self {
         Segment { start, end: Some(end) }
     }
 
     /// 开放段（尚未出眠）。
-    #[allow(dead_code)]
     pub fn open(start: chrono::NaiveDate) -> Self {
         Segment { start, end: None }
     }
@@ -77,8 +73,7 @@ fn db_err(e: rusqlite::Error) -> String {
 /// 区间 [range_start, range_end)（半开，按自然日）与冬眠段并集的重叠天数。
 /// 开放段（end=None）视为延伸到区间右端之外；段先裁剪进区间再并集去重，
 /// 即便输入段彼此重叠（应用层约束本不允许）也不重复计数；空区间返回 0。
-// 统计页间隔扣减（规则 6）的共用入口：`cargo test hibernation_overlap` 有用例。
-#[allow(dead_code)]
+/// 统计页间隔扣减（规则 6）的共用入口：`cargo test hibernation_overlap` 有用例。
 pub fn hibernation_overlap_days(
     range_start: chrono::NaiveDate,
     range_end: chrono::NaiveDate,

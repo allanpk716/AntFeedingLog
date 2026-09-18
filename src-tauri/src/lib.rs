@@ -5,6 +5,7 @@ mod dict;
 mod hibernation;
 mod reminder;
 mod settings;
+mod stats;
 
 use std::sync::Mutex;
 
@@ -238,6 +239,18 @@ fn list_hibernations(
     with_conn(state, |conn| hibernation::list_hibernations(conn, colony_id))
 }
 
+// ── 统计页（票 07）──
+
+#[tauri::command]
+fn get_stats(
+    state: tauri::State<'_, DbState>,
+    colony_id: Option<i64>,
+    start_date: String,
+    end_date: String,
+) -> Result<stats::StatsPayload, String> {
+    with_conn(state, |conn| stats::get_stats(conn, colony_id, &start_date, &end_date))
+}
+
 // ── 设置与通知（票 06）──
 
 #[tauri::command]
@@ -303,6 +316,7 @@ pub fn run() {
             get_settings,
             set_settings,
             send_test_notification,
+            get_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
