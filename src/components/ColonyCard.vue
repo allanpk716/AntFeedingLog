@@ -2,19 +2,19 @@
 /**
  * 窝卡片：名字、物种徽章、状态徽章、饲养天数大数字（Rust 算好），
  * + 冬眠横幅（票 05：入眠日/预计出眠/剩余天数，预计出眠前 7 天内加「临近出眠」角标）
- * + 动态操作块（每个启用操作一块，2 列自适应；非喂食一点即记，喂食弹 FeedDialog）
+ * + 动态操作块（每个启用操作一块，2 列自适应；非喂食弹 QuickLogDialog 打卡面板，喂食弹 FeedDialog）
  * + 最近记录摘要行。展示态口径见 lib/care.ts（视觉基线 mock-a-light）。
  * 冬眠卡：整卡灰化、操作块静音但仍可记账；「开始冬眠 / 确认出眠 / 补录冬眠」入口在卡片底部。
  * 记账/冬眠操作成功后抛 saved 让外层 refresh（数据驱动重算）。
  */
 import { computed, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
 import type { Colony, ColonyAction } from "../types";
-import { actionTile, formatRecent, isFeeding, nowLocalDateTime, type TileView } from "../lib/care";
+import { actionTile, formatRecent, isFeeding, type TileView } from "../lib/care";
 import { hibernationBanner } from "../lib/hibernation";
 import { todayIso } from "../lib/dates";
 import FeedDialog from "./FeedDialog.vue";
 import HibernationDialog from "./HibernationDialog.vue";
+import QuickLogDialog from "./QuickLogDialog.vue";
 
 const props = defineProps<{ colony: Colony }>();
 const emit = defineEmits<{ edit: []; saved: [] }>();
@@ -42,8 +42,9 @@ const recentLine = computed(() => formatRecent(props.colony.recent));
 
 const showFeed = ref(false);
 const feedAction = ref<ColonyAction | null>(null);
-const busyActionId = ref<number | null>(null);
-const tileError = ref("");
+
+const showQuick = ref(false);
+const quickAction = ref<ColonyAction | null>(null);
 
 const showHibernation = ref(false);
 const hibernationMode = ref<"start" | "wake" | "past" | "edit">("start");
@@ -59,34 +60,19 @@ function onHibernationSaved() {
 }
 
 function onTile(a: ColonyAction) {
-  tileError.value = "";
   if (isFeeding(a)) {
     feedAction.value = a;
     showFeed.value = true;
     return;
   }
-  void quickLog(a);
+  quickAction.value = a;
+  showQuick.value = true;
 }
 
-/** 非喂食一点即记：发生时间=现在（可后补，补录走记录页属票 04/05 范围）。 */
-async function quickLog(a: ColonyAction) {
-  busyActionId.value = a.action_id;
-  try {
-    await invoke("log_care", {
-      input: {
-        colony_id: props.colony.id,
-        action_id: a.action_id,
-        happened_at: nowLocalDateTime(),
-        note: null,
-        food_ids: [],
-      },
-    });
-    emit("saved");
-  } catch (e) {
-    tileError.value = String(e);
-  } finally {
-    busyActionId.value = null;
-  }
+function onQuickSaved() {
+  showQuick.value = false;
+  quickAction.value = null;
+  emit("saved");
 }
 
 function onFeedSaved() {
@@ -136,7 +122,6 @@ function onFeedSaved() {
         :class="view.tone"
         :data-action-id="a.action_id"
         type="button"
-        :disabled="busyActionId === a.action_id"
         @click="onTile(a)"
       >
         <span class="t-head">
@@ -146,7 +131,6 @@ function onFeedSaved() {
         <span class="pill">{{ view.text }}</span>
       </button>
     </div>
-    <p v-if="tileError" class="tile-error">{{ tileError }}</p>
 
     <div v-if="recentLine" class="recent">{{ recentLine }}</div>
 
@@ -186,6 +170,13 @@ function onFeedSaved() {
       :action="feedAction"
       @close="showFeed = false"
       @saved="onFeedSaved"
+    />
+    <QuickLogDialog
+      v-if="showQuick && quickAction !== null"
+      :colony="colony"
+      :action="quickAction"
+      @close="showQuick = false"
+      @saved="onQuickSaved"
     />
     <HibernationDialog
       v-if="showHibernation"
@@ -414,12 +405,6 @@ function onFeedSaved() {
   opacity: 0.6;
   cursor: default;
   transform: none;
-}
-
-.tile-error {
-  margin-top: 8px;
-  font-size: 12px;
-  color: var(--bad);
 }
 
 .recent {

@@ -899,32 +899,40 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(card.find(".recent").text()).toBe("最近：09-17 喂食（种子）");
   });
 
-  it("非喂食一点即记：log_care 带默认现在时间、无食物，成功后数据驱动刷新且块变「今天 · 已记录」", async () => {
+  it("非喂食弹打卡面板：默认今天可补录，点「记录」才落库并刷新", async () => {
     colony1With([waterReg]);
     const wrapper = await mountApp();
 
-    invokeMock.mockClear();
-    const click = wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
-    // 记账成功后外层 refresh，后端算出距上次 0
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
+    const dialog = wrapper.find(".quick-dialog");
+    expect(dialog.exists()).toBe(true);
+    expect(dialog.find("h3").text()).toBe("记录活动区换水 · 大头一号");
+
+    await dialog.find(".time-input").setValue("2026-09-17T21:00");
     colony1With([{ ...waterReg, days_since_last: 0 }]);
-    await click;
+    invokeMock.mockClear();
+    await dialog.find(".record-btn").trigger("click");
     await flushPromises();
 
     const logCall = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
     expect(logCall).toBeDefined();
-    expect(logCall![0]).toBe("log_care");
-    const input = logCall![1] as { input: { colony_id: number; action_id: number; happened_at: string; note: string | null; food_ids: number[] } };
+    const input = logCall![1] as { input: { colony_id: number; action_id: number; happened_at: string } };
     expect(input.input.colony_id).toBe(1);
     expect(input.input.action_id).toBe(2);
-    expect(input.input.happened_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
-    expect(input.input.note).toBeNull();
-    expect(input.input.food_ids).toEqual([]);
+    expect(input.input.happened_at).toBe("2026-09-17T21:00");
+    expect(wrapper.find(".quick-dialog").exists()).toBe(false);
+    expect(wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"] .pill').text()).toBe("今天 · 已记录");
+  });
 
-    const refreshCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_colonies");
-    expect(refreshCalls.length).toBeGreaterThanOrEqual(1);
-    expect(
-      wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"] .pill').text(),
-    ).toBe("今天 · 已记录");
+  it("打卡面板点「取消」不记账", async () => {
+    colony1With([waterReg]);
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
+    invokeMock.mockClear();
+    await wrapper.find(".quick-dialog .cancel-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".quick-dialog").exists()).toBe(false);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "log_care")).toBe(false);
   });
 
   it("点喂食类操作弹食物多选弹窗（只认 is_feeding 位）：只列启用食物，勾两种 + 补录时间 + 备注，确认生成一条带两食物的记录", async () => {
@@ -1011,29 +1019,22 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(tile.find(".pill").text()).toBe("距上次 4 天（静音）");
   });
 
-  it("一键记账失败：卡片上展示原因，不误刷数据", async () => {
+  it("打卡面板提交失败：原因展示在面板内、面板不关", async () => {
     colony1With([waterReg]);
     const wrapper = await mountApp();
-    invokeMock.mockClear();
-
     invokeMock.mockImplementation(async (cmd: string) => {
       switch (cmd) {
-        case "log_care":
-          throw "操作「活动区换水」已停用，不能新记";
-        case "list_colonies":
-          return currentColonies;
-        case "list_locations":
-          return locations;
-        default:
-          return null;
+        case "log_care": throw "操作「活动区换水」已停用，不能新记";
+        case "list_colonies": return currentColonies;
+        case "list_locations": return locations;
+        default: return null;
       }
     });
-
     await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
+    await wrapper.find(".quick-dialog .record-btn").trigger("click");
     await flushPromises();
-
-    expect(wrapper.find('.card[data-colony-id="1"] .tile-error').text()).toContain("不能新记");
-    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(false);
+    expect(wrapper.find(".quick-dialog .form-error").text()).toContain("停用");
+    expect(wrapper.find(".quick-dialog").exists()).toBe(true);
   });
 });
 
@@ -1222,7 +1223,9 @@ describe("冬眠管理（票 05）", () => {
     const wrapper = await mountApp();
 
     invokeMock.mockClear();
+    // F1 起：点击先弹打卡面板，点「记录」才落库（灰化静音仍可记账的验收不变）
     await wrapper.find('.card[data-colony-id="3"] .tile[data-action-id="1"]').trigger("click");
+    await wrapper.find(".quick-dialog .record-btn").trigger("click");
     await flushPromises();
 
     const logCall = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
