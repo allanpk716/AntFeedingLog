@@ -367,6 +367,20 @@ pub fn deactivate_location(conn: &Connection, id: i64) -> Result<(), String> {
     Ok(())
 }
 
+/// 启用/停用双向开关（票 04：补上停用后的恢复通道）。
+pub fn set_location_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE location SET enabled = ?1 WHERE id = ?2",
+            params![enabled, id],
+        )
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err("地点不存在".into());
+    }
+    Ok(())
+}
+
 /// 物理删；仍被窝引用则拒绝。
 pub fn erase_location(conn: &Connection, id: i64) -> Result<(), String> {
     let used_by: i64 = conn
@@ -765,5 +779,20 @@ mod tests {
     fn erase_missing_location_rejected() {
         let conn = mem_conn();
         assert!(erase_location(&conn, 999).is_err());
+    }
+
+    #[test]
+    fn set_location_enabled_round_trip() {
+        // 票 04：停用的地点可再启用（此前只有 deactivate 一条单行道）
+        let conn = mem_conn();
+        let home = list_locations(&conn).unwrap()[0].id;
+
+        set_location_enabled(&conn, home, false).unwrap();
+        assert!(!list_locations(&conn).unwrap().iter().find(|l| l.id == home).unwrap().enabled);
+
+        set_location_enabled(&conn, home, true).unwrap();
+        assert!(list_locations(&conn).unwrap().iter().find(|l| l.id == home).unwrap().enabled);
+
+        assert!(set_location_enabled(&conn, 999, true).unwrap_err().contains("地点不存在"));
     }
 }

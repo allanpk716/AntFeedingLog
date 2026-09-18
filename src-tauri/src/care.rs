@@ -17,13 +17,14 @@ use serde::{Deserialize, Serialize};
 
 // ── DTO ──────────────────────────────────────────────────────────────────
 
-/// 食物（含停用的：前端新建入口过滤 enabled）。
+/// 食物（含停用的：前端新建入口过滤 enabled；referenced=被历史记录引用，只能停用不能删）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Food {
     pub id: i64,
     pub name: String,
     pub enabled: bool,
     pub sort: i64,
+    pub referenced: bool,
 }
 
 /// 窝卡片上单个操作块的后端算好的展示数据。
@@ -82,6 +83,15 @@ pub fn normalize_happened_at(s: &str) -> Result<String, String> {
         return Ok(d.format("%Y-%m-%d 00:00:00").to_string());
     }
     Err("发生时间格式应为 YYYY-MM-DD 或 YYYY-MM-DD HH:MM".into())
+}
+
+/// 发生时间不得晚于当前时间（补录合法、预记未来不合法；同刻允许）。
+/// 两串均为库内统一 `YYYY-MM-DD HH:MM:SS`，字典序 = 时间序（票 04 停靠②）。
+pub fn ensure_not_future(happened_at: &str, now: &str) -> Result<(), String> {
+    if happened_at > now {
+        return Err(format!("发生时间不能晚于当前时间（{happened_at} 在未来）"));
+    }
+    Ok(())
 }
 
 /// ISO 日期解析（`YYYY-MM-DD`）。与 colony.rs 的 parse_iso 同口径，本模块自持不外依赖。
@@ -145,6 +155,7 @@ pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i6
     }
 
     let happened_at = normalize_happened_at(&input.happened_at)?;
+    ensure_not_future(&happened_at, now)?;
     let note = input.note.as_deref().map(str::trim).unwrap_or("").to_string();
 
     // 食物关联仅喂食类操作可带（is_feeding 标记位，与名字无关）
@@ -220,13 +231,29 @@ pub fn tiles_for_colony(
 
     let mut tiles = Vec::with_capacity(rows.len());
     for (action_id, name, icon, kind, is_feeding, interval) in rows {
-        let last: Option<String> = conn
-            .query_row(
-                "SELECT MAX(occurred_at) FROM care_log WHERE colony_id = ?1 AND action_id = ?2",
-                params![colony_id, action_id],
-                |row| row.get(0),
-            )
-            .map_err(db_err)?;
+        // 逐行取 occurred_at、跳过解析失败的单条（票 04 停靠①：一条脏行不得毒死整页），
+        // 取剩余行里的最近日期；无可用行视同从未记录。
+        let occurred_rows: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT occurred_at FROM care_log WHERE colony_id = ?1 AND action_id = ?2")
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![colony_id, action_id], |row| row.get(0))
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows
+        };
+        let mut latest: Option<chrono::NaiveDate> = None;
+        for occurred in &occurred_rows {
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(occurred.get(0..10).unwrap_or(""), "%Y-%m-%d") {
+                latest = Some(match latest {
+                    Some(prev) if prev >= d => prev,
+                    _ => d,
+                });
+            }
+        }
+        let last = latest.map(|d| d.format("%Y-%m-%d").to_string());
         let days = days_since_last(last.as_deref(), today)?;
         let overdue = is_overdue(&kind, days, interval);
         tiles.push(ActionTile {
@@ -289,20 +316,43 @@ pub fn recent_for_colony(
 
 // ── 字典查询 ─────────────────────────────────────────────────────────────
 
+const FOOD_SQL: &str = concat!(
+    "SELECT f.id, f.name, f.enabled, f.sort, ",
+    "EXISTS(SELECT 1 FROM log_food lf WHERE lf.food_id = f.id) ",
+    "FROM food f ",
+);
+
+fn row_to_food(row: &rusqlite::Row<'_>) -> rusqlite::Result<Food> {
+    Ok(Food {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        enabled: row.get::<_, i64>(2)? != 0,
+        sort: row.get(3)?,
+        referenced: row.get::<_, i64>(4)? != 0,
+    })
+}
+
+/// 单个食物（dict::save_food 保存后回读用）。
+pub fn get_food(conn: &Connection, id: i64) -> Result<Food, String> {
+    conn.query_row(
+        &format!("{FOOD_SQL} WHERE f.id = ?1"),
+        params![id],
+        row_to_food,
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => "食物不存在".to_string(),
+        other => db_err(other),
+    })
+}
+
 /// 全部食物（含停用的，与 list_locations 同口径；新建入口由前端过滤 enabled）。
+/// `referenced` = 被 log_food 引用：删除会被拒，只能停用（规则 10）。
 pub fn list_foods(conn: &Connection) -> Result<Vec<Food>, String> {
     let mut stmt = conn
-        .prepare("SELECT id, name, enabled, sort FROM food ORDER BY sort, id")
+        .prepare(&format!("{FOOD_SQL} ORDER BY f.sort, f.id"))
         .map_err(db_err)?;
     let rows = stmt
-        .query_map([], |row| {
-            Ok(Food {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                enabled: row.get::<_, i64>(2)? != 0,
-                sort: row.get(3)?,
-            })
-        })
+        .query_map([], row_to_food)
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
@@ -376,6 +426,63 @@ mod tests {
         assert_eq!(normalize_happened_at("2026-09-18").unwrap(), "2026-09-18 00:00:00");
         assert!(normalize_happened_at("2026/09/18").is_err());
         assert!(normalize_happened_at("昨天晚上").is_err());
+    }
+
+    #[test]
+    fn ensure_not_future_rejects_later_than_now_and_allows_same_or_earlier() {
+        // 库内统一 `YYYY-MM-DD HH:MM:SS`，字典序 = 时间序（票 04 停靠②：拒绝未来时间）
+        assert!(ensure_not_future("2026-09-18 08:00:01", "2026-09-18 08:00:00").is_err());
+        assert!(ensure_not_future("2026-09-19 00:00:00", "2026-09-18 08:00:00").is_err());
+        assert!(ensure_not_future("2026-09-18 08:00:00", "2026-09-18 08:00:00").is_ok(), "同刻允许");
+        assert!(ensure_not_future("2026-09-17 23:59:59", "2026-09-18 08:00:00").is_ok());
+    }
+
+    #[test]
+    fn log_care_rejects_future_happened_at_with_friendly_error() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let feed = action_id(&conn, "喂食");
+
+        let err = log_care(
+            &conn,
+            &CareLogInput {
+                colony_id: c,
+                action_id: feed,
+                happened_at: "2026-09-19T09:00".into(),
+                note: None,
+                food_ids: vec![],
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap_err();
+        assert!(err.contains("未来"), "实际错误：{err}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 0, "被拒的记账不落库");
+
+        // 同刻与过去照常可记
+        assert!(log_care(
+            &conn,
+            &CareLogInput {
+                colony_id: c,
+                action_id: feed,
+                happened_at: "2026-09-18 08:00:00".into(),
+                note: None,
+                food_ids: vec![],
+            },
+            "2026-09-18 08:00:00",
+        )
+        .is_ok());
+        assert!(log_care(
+            &conn,
+            &CareLogInput {
+                colony_id: c,
+                action_id: feed,
+                happened_at: "2026-09-18T07:00".into(),
+                note: None,
+                food_ids: vec![],
+            },
+            "2026-09-18 08:00:00",
+        )
+        .is_ok());
     }
 
     // ── 距上次 / 超期判定（纯函数） ──
@@ -477,7 +584,8 @@ mod tests {
         let input = |colony_id: i64, act: i64, foods: Vec<i64>| CareLogInput {
             colony_id,
             action_id: act,
-            happened_at: "2026-09-18T20:00".into(),
+            // 早于 now（08:00）：未来发生时间会被另行拒绝，这里只测字典引用校验
+            happened_at: "2026-09-18T07:00".into(),
             note: None,
             food_ids: foods,
         };
@@ -514,7 +622,7 @@ mod tests {
             &CareLogInput {
                 colony_id: c,
                 action_id: action_id(&conn, "喂食"),
-                happened_at: "2026-09-18T20:00".into(),
+                happened_at: "2026-09-18T07:00".into(),
                 note: None,
                 food_ids: vec![seed, seed],
             },
@@ -538,7 +646,7 @@ mod tests {
             &CareLogInput {
                 colony_id: c,
                 action_id: water,
-                happened_at: "2026-09-18T20:00".into(),
+                happened_at: "2026-09-18T07:00".into(),
                 note: None,
                 food_ids: vec![seed],
             },
@@ -554,7 +662,7 @@ mod tests {
             &CareLogInput {
                 colony_id: c,
                 action_id: water,
-                happened_at: "2026-09-18T20:00".into(),
+                happened_at: "2026-09-18T07:00".into(),
                 note: None,
                 food_ids: vec![],
             },
@@ -580,7 +688,7 @@ mod tests {
             &CareLogInput {
                 colony_id: c,
                 action_id: action_id(&conn, "喂食"),
-                happened_at: "2026-09-18T20:00".into(),
+                happened_at: "2026-09-18T07:00".into(),
                 note: None,
                 food_ids: vec![food_id(&conn, "种子")],
             },
@@ -653,6 +761,39 @@ mod tests {
     }
 
     #[test]
+    fn tiles_skip_single_anomalous_occurred_at_instead_of_poisoning_the_page() {
+        // 票 04 停靠①：单条异常 occurred_at 跳过该行，不让 ? 传播毒死整页
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        log(&conn, c, "喂食", "2026-09-15 20:00:00"); // 3 天前
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (?1, ?2, 'garbage-time', '', '2026-09-18 08:00:00')",
+            params![c, action_id(&conn, "喂食")],
+        )
+        .unwrap();
+
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert_eq!(
+            tile(&tiles, "喂食").days_since_last,
+            Some(3),
+            "异常行被跳过，距上次取其余行里的最近一条"
+        );
+
+        // 全部异常 → 视同从未记录，也不 Err
+        let c2 = colony(&conn, "倒霉二号");
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (?1, ?2, '???', '', '2026-09-18 08:00:00')",
+            params![c2, action_id(&conn, "喂食")],
+        )
+        .unwrap();
+        let tiles = tiles_for_colony(&conn, c2, TODAY).unwrap();
+        assert_eq!(tile(&tiles, "喂食").days_since_last, None);
+        assert!(!tile(&tiles, "喂食").overdue);
+    }
+
+    #[test]
     fn recent_lists_latest_two_with_food_names() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
@@ -690,5 +831,28 @@ mod tests {
         let names: Vec<&str> = foods.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["种子", "干虾仁", "面包虫"]);
         assert_eq!(foods.iter().find(|f| f.name == "面包虫").unwrap().enabled, false);
+    }
+
+    #[test]
+    fn list_foods_flags_referenced_by_log_food() {
+        // 票 04：referenced 供设置页禁用「删除」按钮（被引用只能停用，规则 10）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        log_care(
+            &conn,
+            &CareLogInput {
+                colony_id: c,
+                action_id: action_id(&conn, "喂食"),
+                happened_at: "2026-09-17 20:00:00".into(),
+                note: None,
+                food_ids: vec![food_id(&conn, "种子")],
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap();
+
+        let foods = list_foods(&conn).unwrap();
+        assert!(foods.iter().find(|f| f.name == "种子").unwrap().referenced);
+        assert!(!foods.iter().find(|f| f.name == "干虾仁").unwrap().referenced);
     }
 }

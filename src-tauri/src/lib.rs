@@ -1,6 +1,7 @@
 mod care;
 mod colony;
 mod db;
+mod dict;
 
 use std::sync::Mutex;
 
@@ -49,6 +50,75 @@ fn log_care(
 #[tauri::command]
 fn list_foods(state: tauri::State<'_, DbState>) -> Result<Vec<care::Food>, String> {
     with_conn(state, care::list_foods)
+}
+
+// ── 字典管理与操作性质设置（票 04）──
+
+#[tauri::command]
+fn list_actions(state: tauri::State<'_, DbState>) -> Result<Vec<dict::CareAction>, String> {
+    with_conn(state, dict::list_actions)
+}
+
+#[tauri::command]
+fn save_action(
+    state: tauri::State<'_, DbState>,
+    input: dict::ActionInput,
+) -> Result<dict::CareAction, String> {
+    with_conn(state, |conn| dict::save_action(conn, &input))
+}
+
+#[tauri::command]
+fn set_action_enabled(
+    state: tauri::State<'_, DbState>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    with_conn(state, |conn| dict::set_action_enabled(conn, id, enabled))
+}
+
+#[tauri::command]
+fn erase_action(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
+    with_conn(state, |conn| dict::erase_action(conn, id))
+}
+
+#[tauri::command]
+fn set_action_policy(
+    state: tauri::State<'_, DbState>,
+    id: i64,
+    input: dict::ActionPolicyInput,
+) -> Result<dict::CareAction, String> {
+    with_conn(state, |conn| dict::set_action_policy(conn, id, &input))
+}
+
+#[tauri::command]
+fn save_food(
+    state: tauri::State<'_, DbState>,
+    input: dict::FoodInput,
+) -> Result<care::Food, String> {
+    with_conn(state, |conn| dict::save_food(conn, &input))
+}
+
+#[tauri::command]
+fn set_food_enabled(
+    state: tauri::State<'_, DbState>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    with_conn(state, |conn| dict::set_food_enabled(conn, id, enabled))
+}
+
+#[tauri::command]
+fn erase_food(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
+    with_conn(state, |conn| dict::erase_food(conn, id))
+}
+
+#[tauri::command]
+fn set_location_enabled(
+    state: tauri::State<'_, DbState>,
+    id: i64,
+    enabled: bool,
+) -> Result<(), String> {
+    with_conn(state, |conn| colony::set_location_enabled(conn, id, enabled))
 }
 
 // ── 窝（票 02）──
@@ -129,6 +199,15 @@ pub fn run() {
             health_check,
             log_care,
             list_foods,
+            list_actions,
+            save_action,
+            set_action_enabled,
+            erase_action,
+            set_action_policy,
+            save_food,
+            set_food_enabled,
+            erase_food,
+            set_location_enabled,
             list_colonies,
             create_colony,
             update_colony,
