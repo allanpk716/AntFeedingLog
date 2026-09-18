@@ -22,7 +22,7 @@
  */
 import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings, CareActionItem, FoodItem, LocationItem, PushoverStatus, TestNotifyOutcome } from "../types";
+import type { AppSettings, CareActionItem, FoodItem, LocationItem, PushoverStatus, TestNotifyOutcome, AbnormalExitInfo } from "../types";
 import {
   buildActionRows,
   buildFoodRows,
@@ -35,6 +35,7 @@ import {
   type FoodRow,
 } from "../lib/dict";
 import { DAYS_AHEAD_ERROR, toForm, toSettings, type NotifySettingsForm } from "../lib/notifySettings";
+import { formatAbnormalExit } from "../lib/applog";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
 
@@ -81,6 +82,8 @@ onMounted(async () => {
   } catch (e) {
     error.value = String(e);
   }
+  // 日志区（票 01）加载失败静默：日志区是辅助信息，不值得为它报错打扰
+  await loadLogSection();
 });
 
 // ── 行级即时操作 ──
@@ -315,6 +318,32 @@ async function exportData(format: "csv" | "json") {
   }
 }
 
+// ── 数据 tab：日志区（数据安全二期票 01）──
+const recentErrors = ref<string[]>([]);
+const abnormalExitText = ref<string | null>(null);
+
+async function loadLogSection() {
+  try {
+    const [errs, abnormal] = await Promise.all([
+      invoke<string[]>("get_recent_errors"),
+      invoke<AbnormalExitInfo | null>("get_last_abnormal_exit"),
+    ]);
+    recentErrors.value = errs ?? [];
+    abnormalExitText.value = formatAbnormalExit(abnormal);
+  } catch {
+    // 静默：日志展示失败不影响其他功能区
+  }
+}
+
+async function openLogs() {
+  dataError.value = "";
+  try {
+    await invoke<string>("open_logs_folder");
+  } catch (e) {
+    dataError.value = String(e);
+  }
+}
+
 function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   if (row.isPreset) return "预置项不能删除；可改为停用";
   return row.referenced ? "被历史记录引用，只能停用，不能删除" : "";
@@ -503,6 +532,30 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
           应用内一键安全备份无需退出；手动拷贝备份需先从托盘真实退出后再拷。
           导出 CSV / JSON 用于归档带走，不是恢复通道（恢复 = 把备份的 .db 拷回数据文件夹）。
         </p>
+
+        <!-- 日志区（数据安全二期票 01）：打开日志文件夹 / 上次异常退出 / 最近错误摘要 -->
+        <div class="log-section">
+          <div class="data-actions log-actions">
+            <button
+              class="btn data-btn open-logs-btn"
+              type="button"
+              title="在资源管理器中打开日志目录（纯文本按天滚动，自动清理 14 天前的旧日志）"
+              @click="openLogs"
+            >
+              打开日志文件夹
+            </button>
+          </div>
+          <p v-if="abnormalExitText" class="abnormal-exit" title="时间为异常会话的启动时间（异常发生的时刻无从得知）">
+            {{ abnormalExitText }}
+          </p>
+          <div v-if="recentErrors.length" class="recent-errors">
+            <p class="recent-errors-title">最近错误（新在上，共 {{ recentErrors.length }} 条）</p>
+            <ul class="recent-errors-list">
+              <li v-for="(line, i) in recentErrors" :key="i" class="recent-error-line">{{ line }}</li>
+            </ul>
+          </div>
+          <p v-else class="hint recent-errors-empty">最近没有错误记录。</p>
+        </div>
       </div>
 
       <p v-if="error && activeTab !== 'locations'" class="form-error">{{ error }}</p>
@@ -627,6 +680,46 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   font-size: 13px;
   color: var(--ok, #2e7d32);
   word-break: break-all;
+}
+
+/* 数据 tab 日志区（数据安全二期票 01） */
+.log-section {
+  margin-top: 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.log-actions {
+  margin-bottom: 8px;
+}
+
+.abnormal-exit {
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: var(--bad);
+  word-break: break-all;
+}
+
+.recent-errors-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.recent-errors-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.recent-error-line {
+  font-size: 12px;
+  color: var(--bad);
+  word-break: break-all;
+  padding: 2px 0;
+  border-bottom: 1px dashed var(--border);
 }
 
 .dict-row {

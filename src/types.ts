@@ -291,3 +291,11 @@ export interface TestNotifyOutcome {
   desktop_error: string | null;
   pushover: PushoverTestResult | null;
 }
+
+/** get_last_abnormal_exit 返回体（数据安全二期票 01）；null = 上次正常退出 */
+export interface AbnormalExitInfo {
+  /** 异常会话的启动时间（运行标记写入时间）；标记损坏时 null（时间未知） */
+  session_started_at: string | null;
+  /** 原因行（上次会话的 panic 日志）；null = 无崩溃日志，疑强杀/断电 */
+  reason: string | null;
+}
