@@ -11,6 +11,8 @@ const existing: Colony[] = [
     start_date: "2026-01-20",
     status: "active",
     days_raised: 241,
+    actions: [],
+    recent: [],
   },
 ];
 

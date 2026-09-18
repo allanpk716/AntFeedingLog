@@ -2,7 +2,7 @@
 /**
  * 首页：按地点分组渲染窝卡片（分组顺序 = 地点清单顺序，空地点「未分组」最后），
  * 已结束的窝收底部折叠区（默认折叠）。「+ 新建窝」与地点管理入口在本页。
- * 卡片上的操作块（喂食/换水/保湿/清理）属票 03。
+ * 卡片操作块/喂食弹窗在 ColonyCard 内（票 03）：记账成功抛 saved → refresh 数据驱动重算。
  */
 import { computed, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
@@ -91,6 +91,7 @@ onMounted(() => {
             :key="c.id"
             :colony="c"
             @edit="openEdit(c)"
+            @saved="void refresh()"
           />
         </div>
       </section>
@@ -106,6 +107,7 @@ onMounted(() => {
               :key="c.id"
               :colony="c"
               @edit="openEdit(c)"
+              @saved="void refresh()"
             />
           </div>
         </div>

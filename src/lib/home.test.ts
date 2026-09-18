@@ -10,6 +10,8 @@ function colony(partial: Partial<Colony> & { id: number }): Colony {
     start_date: "2026-01-20",
     status: "active",
     days_raised: 100,
+    actions: [],
+    recent: [],
     ...partial,
   };
 }

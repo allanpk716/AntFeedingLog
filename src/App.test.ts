@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "./App.vue";
-import type { Colony, LocationItem } from "./types";
+import type { Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -10,6 +10,13 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 const locations: LocationItem[] = [
   { id: 1, name: "家", enabled: true, sort: 1 },
   { id: 2, name: "公司", enabled: true, sort: 2 },
+];
+
+const foods: FoodItem[] = [
+  { id: 1, name: "种子", enabled: true, sort: 1 },
+  { id: 2, name: "干虾仁", enabled: true, sort: 2 },
+  { id: 3, name: "面包虫", enabled: true, sort: 3 },
+  { id: 4, name: "蚕蛹", enabled: false, sort: 4 },
 ];
 
 const colonies: Colony[] = [
@@ -21,6 +28,8 @@ const colonies: Colony[] = [
     start_date: "2026-01-20",
     status: "active",
     days_raised: 241,
+    actions: [],
+    recent: [],
   },
   {
     id: 2,
@@ -30,6 +39,8 @@ const colonies: Colony[] = [
     start_date: "2026-06-14",
     status: "active",
     days_raised: 96,
+    actions: [],
+    recent: [],
   },
   {
     id: 3,
@@ -39,6 +50,8 @@ const colonies: Colony[] = [
     start_date: "2026-02-10",
     status: "hibernating",
     days_raised: 220,
+    actions: [],
+    recent: [],
   },
   {
     id: 4,
@@ -48,16 +61,23 @@ const colonies: Colony[] = [
     start_date: "2025-01-01",
     status: "ended",
     days_raised: 626,
+    actions: [],
+    recent: [],
   },
 ];
+
+/** list_colonies 返回的数据源，测试里可整体替换（模拟后端重算后的新数据）。 */
+let currentColonies: Colony[] = colonies;
 
 function baseMock() {
   invokeMock.mockImplementation(async (cmd: string) => {
     switch (cmd) {
       case "list_colonies":
-        return colonies;
+        return currentColonies;
       case "list_locations":
         return locations;
+      case "list_foods":
+        return foods;
       default:
         return null;
     }
@@ -72,6 +92,7 @@ async function mountApp() {
 
 beforeEach(() => {
   invokeMock.mockReset();
+  currentColonies = colonies;
   baseMock();
 });
 
@@ -346,5 +367,222 @@ describe("地点管理", () => {
     // 行级操作触发外层静默刷新（changed → list_locations），但弹窗不关
     const refreshCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_locations");
     expect(refreshCalls.length).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("卡片操作块与一键记账（票 03）", () => {
+  const feedOverdue: ColonyAction = {
+    action_id: 1,
+    name: "喂食",
+    icon: null,
+    kind: "reminding",
+    suggested_interval_days: 3,
+    days_since_last: 4,
+    overdue: true,
+  };
+  const waterReg: ColonyAction = {
+    action_id: 2,
+    name: "活动区换水",
+    icon: null,
+    kind: "log_only",
+    suggested_interval_days: null,
+    days_since_last: 2,
+    overdue: false,
+  };
+  const hydrateNever: ColonyAction = {
+    action_id: 3,
+    name: "巢穴保湿",
+    icon: null,
+    kind: "log_only",
+    suggested_interval_days: null,
+    days_since_last: null,
+    overdue: false,
+  };
+  const trashToday: ColonyAction = {
+    action_id: 4,
+    name: "垃圾清理",
+    icon: null,
+    kind: "reminding",
+    suggested_interval_days: 7,
+    days_since_last: 0,
+    overdue: false,
+  };
+
+  const recent: RecentLog[] = [
+    { happened_at: "2026-09-17 20:00:00", action_name: "喂食", food_names: ["种子"] },
+  ];
+
+  function colony1With(actions: ColonyAction[], withRecent: RecentLog[] = []): void {
+    currentColonies = colonies.map((c) =>
+      c.id === 1 ? { ...c, actions, recent: withRecent } : c,
+    );
+  }
+
+  it("每个启用操作动态渲染一块：超期红/登记灰带角标/今天绿/未记录中性，底部显示最近摘要", async () => {
+    colony1With([feedOverdue, waterReg, hydrateNever, trashToday], recent);
+    const wrapper = await mountApp();
+
+    const card = wrapper.find('.card[data-colony-id="1"]');
+    const tiles = card.findAll(".tile");
+    expect(tiles.length).toBe(4); // 操作块随字典启用项渲染
+
+    // 超期：喂食 4 天 > 建议 3 → 红（验收 4）
+    const feed = card.find('.tile[data-action-id="1"]');
+    expect(feed.classes()).toContain("bad");
+    expect(feed.find(".pill").text()).toBe("⚠ 超期 1 天");
+
+    // 登记类：中性灰 +「仅登记」角标，永不红（验收 5）
+    const water = card.find('.tile[data-action-id="2"]');
+    expect(water.classes()).toContain("reg");
+    expect(water.classes()).not.toContain("bad");
+    expect(water.find(".t-tag").text()).toBe("仅登记");
+    expect(water.find(".pill").text()).toBe("距上次 2 天");
+
+    // 从未记录：中性
+    expect(card.find('.tile[data-action-id="3"]').find(".pill").text()).toBe("尚未记录");
+
+    // 今天已记录：绿（验收 1 的展示态）
+    const trash = card.find('.tile[data-action-id="4"]');
+    expect(trash.classes()).toContain("ok");
+    expect(trash.find(".pill").text()).toBe("今天 · 已记录");
+
+    // 最近记录摘要
+    expect(card.find(".recent").text()).toBe("最近：09-17 喂食（种子）");
+  });
+
+  it("非喂食一点即记：log_care 带默认现在时间、无食物，成功后数据驱动刷新且块变「今天 · 已记录」", async () => {
+    colony1With([waterReg]);
+    const wrapper = await mountApp();
+
+    invokeMock.mockClear();
+    const click = wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
+    // 记账成功后外层 refresh，后端算出距上次 0
+    colony1With([{ ...waterReg, days_since_last: 0 }]);
+    await click;
+    await flushPromises();
+
+    const logCall = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
+    expect(logCall).toBeDefined();
+    expect(logCall![0]).toBe("log_care");
+    const input = logCall![1] as { input: { colony_id: number; action_id: number; happened_at: string; note: string | null; food_ids: number[] } };
+    expect(input.input.colony_id).toBe(1);
+    expect(input.input.action_id).toBe(2);
+    expect(input.input.happened_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
+    expect(input.input.note).toBeNull();
+    expect(input.input.food_ids).toEqual([]);
+
+    const refreshCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_colonies");
+    expect(refreshCalls.length).toBeGreaterThanOrEqual(1);
+    expect(
+      wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"] .pill').text(),
+    ).toBe("今天 · 已记录");
+  });
+
+  it("点喂食弹食物多选弹窗：只列启用食物，勾两种 + 补录时间 + 备注，确认生成一条带两食物的记录", async () => {
+    colony1With([feedOverdue]);
+    const wrapper = await mountApp();
+
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="1"]').trigger("click");
+
+    const dialog = wrapper.find(".feed-dialog");
+    expect(dialog.exists()).toBe(true);
+    expect(dialog.find("h3").text()).toBe("记录喂食 · 大头一号");
+    expect(invokeMock).toHaveBeenCalledWith("list_foods");
+
+    // 停用食物不出现在新建记录入口（规则 10）
+    const chips = dialog.findAll(".food");
+    expect(chips.map((c) => c.text())).toEqual(["种子", "干虾仁", "面包虫"]);
+
+    await chips[1].trigger("click"); // 干虾仁
+    await chips[2].trigger("click"); // 面包虫
+    expect(chips[1].classes()).toContain("selected");
+    expect(chips[0].classes()).not.toContain("selected");
+
+    // 补录昨天时间（验收 3：距上次按发生时间算，Rust 侧覆盖计算）
+    await dialog.find(".time-input").setValue("2026-09-17T21:00");
+    await dialog.find(".note-input").setValue("  加餐  ");
+
+    invokeMock.mockClear();
+    await dialog.find(".record-btn").trigger("click");
+    await flushPromises();
+
+    const logCall = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
+    expect(logCall).toBeDefined();
+    expect(logCall![1]).toEqual({
+      input: {
+        colony_id: 1,
+        action_id: 1,
+        happened_at: "2026-09-17T21:00",
+        note: "加餐",
+        food_ids: [2, 3],
+      },
+    });
+    // saved → 关窗 + 外层刷新
+    expect(wrapper.find(".feed-dialog").exists()).toBe(false);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(true);
+  });
+
+  it("喂食弹窗未选食物不允许提交，弹窗保持", async () => {
+    colony1With([feedOverdue]);
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="1"]').trigger("click");
+
+    invokeMock.mockClear();
+    await wrapper.find(".feed-dialog .record-btn").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".feed-dialog .form-error").text()).toContain("先选至少一种食物");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "log_care")).toBe(false);
+    expect(wrapper.find(".feed-dialog").exists()).toBe(true);
+  });
+
+  it("取消关闭喂食弹窗且不记账", async () => {
+    colony1With([feedOverdue]);
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="1"]').trigger("click");
+
+    invokeMock.mockClear();
+    await wrapper.find(".feed-dialog .cancel-btn").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".feed-dialog").exists()).toBe(false);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "log_care")).toBe(false);
+  });
+
+  it("冬眠窝的操作块全部静音态：不红、文案带（静音）", async () => {
+    currentColonies = colonies.map((c) =>
+      c.id === 3 ? { ...c, actions: [feedOverdue] } : c,
+    );
+    const wrapper = await mountApp();
+
+    const tile = wrapper.find('.card[data-colony-id="3"] .tile[data-action-id="1"]');
+    expect(tile.classes()).toContain("mute");
+    expect(tile.classes()).not.toContain("bad");
+    expect(tile.find(".pill").text()).toBe("距上次 4 天（静音）");
+  });
+
+  it("一键记账失败：卡片上展示原因，不误刷数据", async () => {
+    colony1With([waterReg]);
+    const wrapper = await mountApp();
+    invokeMock.mockClear();
+
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "log_care":
+          throw "操作「活动区换水」已停用，不能新记";
+        case "list_colonies":
+          return currentColonies;
+        case "list_locations":
+          return locations;
+        default:
+          return null;
+      }
+    });
+
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find('.card[data-colony-id="1"] .tile-error').text()).toContain("不能新记");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(false);
   });
 });
