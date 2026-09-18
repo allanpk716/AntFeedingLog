@@ -1,0 +1,5 @@
+.xcheck/
+.claude/worktrees/
+node_modules/
+dist/
+target/

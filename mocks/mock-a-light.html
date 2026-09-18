@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>蚂蚁饲养日志 · mock A（卡片仪表盘 · 浅色）</title>
+<style>
+:root{
+  --bg:#f6f4f1; --card:#ffffff; --tile:#faf8f5; --text:#2c2822; --muted:#8f887d;
+  --border:#e8e2d8; --border-strong:#d8d1c4;
+  --accent:#d97706; --accent-deep:#b45309; --accent-soft:#fdf1de;
+  --ok:#188a4b; --ok-soft:#e7f5ec; --bad:#d13d3d; --bad-soft:#fcebeb;
+  --hib:#5b6472; --hib-soft:#eef0f3;
+  --shadow:0 1px 2px rgba(60,50,30,.05),0 4px 14px rgba(60,50,30,.06);
+  --overlay:rgba(40,35,25,.35); --toast-bg:#2c2822; --toast-fg:#fff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.55}
+main{max-width:1080px;margin:0 auto;padding:0 20px 80px}
+
+/* ── 顶栏 ── */
+header{position:sticky;top:0;z-index:10;background:var(--card);border-bottom:1px solid var(--border)}
+.hbar{max-width:1080px;margin:0 auto;padding:10px 20px;display:flex;align-items:center;gap:18px}
+.brand{font-size:17px;font-weight:700;white-space:nowrap}
+.today{font-size:12px;color:var(--muted);white-space:nowrap}
+nav{display:flex;gap:4px;margin-left:8px}
+.tab{padding:5px 14px;border-radius:999px;cursor:pointer;color:var(--muted)}
+.tab.active{background:var(--accent-soft);color:var(--accent-deep);font-weight:600}
+.tools{margin-left:auto;display:flex;gap:8px}
+.ghost-btn{padding:5px 12px;border:1px solid var(--border-strong);border-radius:8px;cursor:pointer;color:var(--text);font-size:13px;background:var(--card)}
+.ghost-btn:hover{border-color:var(--accent);color:var(--accent-deep)}
+
+/* ── 地点分组 ── */
+.group{margin-top:26px}
+.group-head{display:flex;align-items:center;gap:10px;margin-bottom:12px}
+.group-head h2{font-size:16px}
+.group-head .cnt{font-size:12px;color:var(--muted);background:var(--tile);border:1px solid var(--border);padding:1px 9px;border-radius:999px}
+.group-head .rule{flex:1;height:1px;background:var(--border)}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:14px}
+
+/* ── 窝卡片 ── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;box-shadow:var(--shadow)}
+.card.hib{background:linear-gradient(180deg,var(--hib-soft),var(--card) 55%)}
+.chead{display:flex;align-items:flex-start;gap:10px}
+.cname{font-size:17px;font-weight:700}
+.chips{margin-top:3px;display:flex;gap:6px;flex-wrap:wrap}
+.chip{font-size:12px;padding:1px 9px;border-radius:999px;border:1px solid transparent}
+.chip.sp{background:var(--accent-soft);color:var(--accent-deep)}
+.chip.st{background:var(--ok-soft);color:var(--ok)}
+.chip.st.hib{background:var(--hib-soft);color:var(--hib)}
+.chip.wake{background:var(--accent-soft);color:var(--accent-deep);font-weight:600}
+.daysbox{margin-left:auto;text-align:right}
+.daysbox .n{font-size:24px;font-weight:800;line-height:1.1}
+.daysbox .l{font-size:11px;color:var(--muted)}
+.start{margin-top:6px;font-size:12px;color:var(--muted)}
+
+/* 冬眠横幅 */
+.banner{margin:12px 0 4px;padding:8px 12px;border-radius:10px;background:var(--hib-soft);color:var(--hib);font-size:13px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+
+/* ── 操作块 ── */
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}
+.tile{border:1px solid var(--border);background:var(--tile);border-radius:11px;padding:10px 12px;cursor:pointer;text-align:left;font:inherit;color:var(--text);display:flex;flex-direction:column;gap:6px;transition:.12s}
+.tile:hover{border-color:var(--accent);transform:translateY(-1px)}
+.tile.ok:hover{box-shadow:0 3px 10px rgba(180,83,9,.12)}
+.tile .t-head{display:flex;align-items:center;gap:7px;font-weight:600;font-size:14px}
+.tile .t-ico{font-size:16px}
+.t-tag{margin-left:auto;font-size:10px;font-weight:400;color:var(--muted);border:1px solid var(--border);padding:0 6px;border-radius:999px;white-space:nowrap}
+.pill{align-self:flex-start;font-size:12px;padding:1px 9px;border-radius:999px}
+.tile.reg .pill{background:var(--tile);color:var(--muted)}
+.tile.ok .pill{background:var(--ok-soft);color:var(--ok)}
+.tile.bad{border-color:var(--bad);background:var(--bad-soft)}
+.tile.bad:hover{box-shadow:0 3px 10px rgba(209,61,61,.15)}
+.tile.bad .pill{background:#fff;color:var(--bad);font-weight:600}
+.tile.mute{opacity:.55;cursor:pointer}
+.tile.mute .pill{background:var(--hib-soft);color:var(--hib)}
+.recent{margin-top:12px;font-size:12px;color:var(--muted);border-top:1px dashed var(--border);padding-top:9px}
+
+/* 新建窝 */
+.new-colony{border:1.5px dashed var(--border-strong);border-radius:14px;background:transparent;padding:14px;cursor:pointer;color:var(--muted);font:inherit;font-size:14px;grid-column:1/-1;text-align:center}
+.new-colony:hover{border-color:var(--accent);color:var(--accent-deep)}
+
+/* ── 喂食弹窗 ── */
+.overlay{position:fixed;inset:0;background:var(--overlay);display:flex;align-items:center;justify-content:center;z-index:50}
+.overlay.hidden{display:none}
+.dialog{width:390px;max-width:92vw;background:var(--card);border-radius:14px;padding:18px;box-shadow:0 10px 40px rgba(0,0,0,.2)}
+.dialog h3{font-size:15px;margin-bottom:12px}
+.field-label{font-size:12px;color:var(--muted);margin:12px 0 6px}
+.foods{display:flex;gap:8px;flex-wrap:wrap}
+.food{padding:6px 14px;border:1px solid var(--border-strong);border-radius:999px;background:var(--tile);cursor:pointer;font:inherit;font-size:13px}
+.food.selected{background:var(--accent-soft);border-color:var(--accent);color:var(--accent-deep);font-weight:600}
+.dialog input[type=datetime-local]{width:100%;padding:7px 10px;border:1px solid var(--border-strong);border-radius:8px;font:inherit;background:var(--card);color:var(--text)}
+.dialog textarea{width:100%;height:56px;padding:7px 10px;border:1px solid var(--border-strong);border-radius:8px;font:inherit;resize:none;background:var(--card);color:var(--text);margin-top:2px}
+.dlg-btns{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+.btn{padding:7px 18px;border-radius:9px;border:1px solid var(--border-strong);background:var(--card);cursor:pointer;font:inherit}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.btn.primary:hover{background:var(--accent-deep)}
+
+/* toast / 水印 */
+#toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%) translateY(20px);background:var(--toast-bg);color:var(--toast-fg);padding:9px 20px;border-radius:999px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:99;max-width:80vw}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.stamp{position:fixed;right:12px;bottom:10px;font-size:11px;color:var(--muted);opacity:.75;z-index:5}
+</style>
+</head>
+<body>
+
+<header><div class="hbar">
+  <div class="brand">🐜 蚂蚁饲养日志</div>
+  <nav>
+    <span class="tab active" data-hint="你现在看的就是首页示意稿">首页</span>
+    <span class="tab" data-hint="对应另一份示意稿 mock-b-stats.html">统计</span>
+    <span class="tab" data-hint="记录列表页：按窝/操作/时间筛选，备注可搜索">记录</span>
+  </nav>
+  <div class="today">2026-09-18 周五</div>
+  <div class="tools">
+    <span class="ghost-btn" data-hint="一键导出 CSV / JSON 备份">⤓ 导出</span>
+    <span class="ghost-btn" data-hint="设置：操作/食物清单、每个操作设「提醒 or 仅登记」、建议间隔（仅提醒类）、通知开关、开机自启">⚙ 设置</span>
+  </div>
+</div></header>
+
+<main>
+
+  <section class="group">
+    <div class="group-head"><h2>🏠 家</h2><span class="cnt">1 窝</span><div class="rule"></div></div>
+    <div class="cards">
+
+      <div class="card" data-colony="a1">
+        <div class="chead">
+          <div>
+            <div class="cname">大头一号</div>
+            <div class="chips">
+              <span class="chip sp">大头收获蚁</span>
+              <span class="chip st">● 活跃</span>
+            </div>
+          </div>
+          <div class="daysbox"><div class="n">241</div><div class="l">已饲养 / 天</div></div>
+        </div>
+        <div class="start">开始饲养 2026-01-20</div>
+        <div class="tiles">
+          <button class="tile ok" data-colony="a1" data-act="feed"    data-last="1" data-limit="3"><span class="t-head"><span class="t-ico">🌾</span>喂食</span><span class="pill"></span></button>
+          <button class="tile" data-colony="a1" data-act="water"   data-last="2" data-reg="1"><span class="t-head"><span class="t-ico">💧</span>活动区换水<span class="t-tag">仅登记</span></span><span class="pill"></span></button>
+          <button class="tile" data-colony="a1" data-act="hydrate" data-last="6" data-reg="1"><span class="t-head"><span class="t-ico">🌫️</span>巢穴保湿<span class="t-tag">仅登记</span></span><span class="pill"></span></button>
+          <button class="tile ok" data-colony="a1" data-act="trash"   data-last="4" data-limit="7"><span class="t-head"><span class="t-ico">🧹</span>垃圾清理</span><span class="pill"></span></button>
+        </div>
+        <div class="recent">最近：09-17 喂食（种子）· 09-12 巢穴保湿</div>
+      </div>
+
+    </div>
+  </section>
+
+  <section class="group">
+    <div class="group-head"><h2>💼 公司</h2><span class="cnt">2 窝</span><div class="rule"></div></div>
+    <div class="cards">
+
+      <div class="card" data-colony="a2">
+        <div class="chead">
+          <div>
+            <div class="cname">针毛</div>
+            <div class="chips">
+              <span class="chip sp">针毛收获蚁</span>
+              <span class="chip st">● 活跃</span>
+            </div>
+          </div>
+          <div class="daysbox"><div class="n">96</div><div class="l">已饲养 / 天</div></div>
+        </div>
+        <div class="start">开始饲养 2026-06-14</div>
+        <div class="tiles">
+          <button class="tile ok" data-colony="a2" data-act="feed"    data-last="0" data-limit="3"><span class="t-head"><span class="t-ico">🌾</span>喂食</span><span class="pill"></span></button>
+          <button class="tile" data-colony="a2" data-act="water"   data-last="5" data-reg="1"><span class="t-head"><span class="t-ico">💧</span>活动区换水<span class="t-tag">仅登记</span></span><span class="pill"></span></button>
+          <button class="tile ok" data-colony="a2" data-act="hydrate" data-last="4" data-limit="5"><span class="t-head"><span class="t-ico">🌫️</span>巢穴保湿</span><span class="pill"></span></button>
+          <button class="tile ok" data-colony="a2" data-act="trash"   data-last="9" data-limit="7"><span class="t-head"><span class="t-ico">🧹</span>垃圾清理</span><span class="pill"></span></button>
+        </div>
+        <div class="recent">最近：09-18 喂食（干虾仁、面包虫）· 09-14 巢穴保湿</div>
+      </div>
+
+      <div class="card hib" data-colony="a3">
+        <div class="chead">
+          <div>
+            <div class="cname">大头二号</div>
+            <div class="chips">
+              <span class="chip sp">大头收获蚁</span>
+              <span class="chip st hib">❄ 冬眠中</span>
+            </div>
+          </div>
+          <div class="daysbox"><div class="n">220</div><div class="l">已饲养 / 天</div></div>
+        </div>
+        <div class="start">开始饲养 2026-02-10</div>
+        <div class="banner">
+          ❄ 冬眠中 · 08-20 入眠 · 预计出眠 09-25（还有 7 天）
+          <span class="chip wake">临近出眠提醒已发</span>
+        </div>
+        <div class="tiles">
+          <button class="tile mute" data-colony="a3" data-act="feed"    data-last="29" data-limit="3" data-muted="1"><span class="t-head"><span class="t-ico">🌾</span>喂食</span><span class="pill"></span></button>
+          <button class="tile mute" data-colony="a3" data-act="water"   data-last="27" data-limit="3" data-muted="1"><span class="t-head"><span class="t-ico">💧</span>活动区换水</span><span class="pill"></span></button>
+          <button class="tile mute" data-colony="a3" data-act="hydrate" data-last="26" data-limit="5" data-muted="1"><span class="t-head"><span class="t-ico">🌫️</span>巢穴保湿</span><span class="pill"></span></button>
+          <button class="tile mute" data-colony="a3" data-act="trash"   data-last="33" data-limit="7" data-muted="1"><span class="t-head"><span class="t-ico">🧹</span>垃圾清理</span><span class="pill"></span></button>
+        </div>
+        <div class="recent">冬眠期间提醒静音，仍可点击记录（如偶尔开箱检查）· 入眠前最后投喂 08-19（种子）</div>
+      </div>
+
+      <button class="new-colony" id="newColony">＋ 新建窝（名字 / 物种 / 地点 / 开始饲养日期 / 状态）</button>
+    </div>
+  </section>
+
+</main>
+
+<!-- 喂食弹窗 -->
+<div class="overlay hidden" id="overlay">
+  <div class="dialog">
+    <h3 id="dlgTitle">记录喂食</h3>
+    <div class="field-label">食物（可多选）</div>
+    <div class="foods" id="foods">
+      <button class="food selected" data-food="种子">🌾 种子</button>
+      <button class="food" data-food="干虾仁">🦐 干虾仁</button>
+      <button class="food" data-food="面包虫">🐛 面包虫</button>
+    </div>
+    <div class="field-label">时间（默认现在，可补录）</div>
+    <input type="datetime-local" id="dlgTime" value="2026-09-18T20:00">
+    <div class="field-label">备注（可选）</div>
+    <textarea id="dlgNote" placeholder="如：换了新一批面包虫"></textarea>
+    <div class="dlg-btns">
+      <button class="btn" id="dlgCancel">取消</button>
+      <button class="btn primary" id="dlgOk">记录</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+<div class="stamp">静态示意稿 · 假数据 · mock-a-light（浅色）</div>
+
+<script>
+const NAMES = {feed:'喂食', water:'活动区换水', hydrate:'巢穴保湿', trash:'垃圾清理'};
+const COLONY_NAMES = {a1:'大头一号', a2:'针毛', a3:'大头二号'};
+
+const $ = s => document.querySelector(s);
+let toastTimer;
+function toast(msg){
+  const t = $('#toast');
+  t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>t.classList.remove('show'), 2400);
+}
+
+/* 初始化每块操作的状态灯 */
+function renderPill(tile){
+  const last = +tile.dataset.last, limit = +(tile.dataset.limit || 0);
+  const pill = tile.querySelector('.pill');
+  tile.classList.remove('ok','bad','reg');
+  if (tile.dataset.muted){
+    tile.classList.add('mute');
+    pill.textContent = `距上次 ${last} 天（静音）`;
+    return;
+  }
+  if (tile.dataset.reg){ /* 登记类：只显示，永不催促 */
+    tile.classList.add('reg');
+    pill.textContent = last === 0 ? '今天 · 已记录' : `距上次 ${last} 天`;
+    return;
+  }
+  if (last === 0){ pill.textContent = '今天 · 已记录'; tile.classList.add('ok'); }
+  else if (last > limit){ pill.textContent = `⚠ 超期 ${last-limit} 天`; tile.classList.add('bad'); }
+  else { pill.textContent = `距上次 ${last} 天`; tile.classList.add('ok'); }
+}
+document.querySelectorAll('.tile').forEach(renderPill);
+
+/* 一键记录 */
+function doLog(colonyId, act, foods){
+  const tile = document.querySelector(`.tile[data-colony="${colonyId}"][data-act="${act}"]`);
+  tile.dataset.last = 0;
+  renderPill(tile);
+  const food = foods ? `（${foods.join('、')}）` : '';
+  toast(`已记录 · ${COLONY_NAMES[colonyId]} · ${NAMES[act]}${food}`);
+}
+
+/* 点击：喂食弹窗，其他直接记 */
+let dlgColony = null;
+document.querySelectorAll('.tile').forEach(tile=>{
+  tile.addEventListener('click', ()=>{
+    const {colony, act} = tile.dataset;
+    if (act === 'feed'){
+      dlgColony = colony;
+      $('#dlgTitle').textContent = `记录喂食 · ${COLONY_NAMES[colony]}`;
+      $('#overlay').classList.remove('hidden');
+    } else {
+      doLog(colony, act, null);
+    }
+  });
+});
+
+/* 弹窗交互 */
+document.querySelectorAll('.food').forEach(f=>{
+  f.addEventListener('click', ()=>f.classList.toggle('selected'));
+});
+function closeDlg(){ $('#overlay').classList.add('hidden'); }
+$('#dlgCancel').addEventListener('click', closeDlg);
+$('#overlay').addEventListener('click', e=>{ if(e.target === $('#overlay')) closeDlg(); });
+$('#dlgOk').addEventListener('click', ()=>{
+  const foods = [...document.querySelectorAll('.food.selected')].map(f=>f.dataset.food);
+  if (!foods.length){ toast('先选至少一种食物'); return; }
+  doLog(dlgColony, 'feed', foods);
+  closeDlg();
+});
+
+/* 无功能按钮的提示 */
+document.querySelectorAll('[data-hint]').forEach(el=>{
+  el.addEventListener('click', ()=>toast(el.dataset.hint));
+});
+$('#newColony').addEventListener('click', ()=>toast('示意稿：新建窝表单（名字 / 物种 / 地点 / 开始饲养日期 / 状态）'));
+</script>
+</body>
+</html>

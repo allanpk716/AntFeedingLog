@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>蚂蚁饲养日志 · 界面示意稿入口</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:#f6f4f1;color:#2c2822;font-size:14px;line-height:1.6;padding:60px 20px}
+.wrap{max-width:760px;margin:0 auto}
+h1{font-size:22px;margin-bottom:6px}
+.sub{color:#8f887d;margin-bottom:30px}
+a.card{display:block;background:#fff;border:1px solid #e8e2d8;border-radius:14px;padding:20px 22px;margin-bottom:14px;text-decoration:none;color:inherit;transition:.15s;box-shadow:0 1px 2px rgba(60,50,30,.05),0 4px 14px rgba(60,50,30,.06)}
+a.card:hover{border-color:#d97706;transform:translateY(-2px)}
+a.card .t{font-size:17px;font-weight:700}
+a.card .t .tag{font-size:12px;font-weight:400;color:#b45309;background:#fdf1de;padding:1px 10px;border-radius:999px;margin-left:10px;vertical-align:2px}
+a.card .d{color:#8f887d;font-size:13px;margin-top:5px}
+.note{margin-top:28px;font-size:12px;color:#8f887d}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🐜 蚂蚁饲养日志 · 界面示意稿</h1>
+  <div class="sub">三份静态假数据稿，双击或点开对比。建议用 Edge / Chrome 打开。</div>
+
+  <a class="card" href="mock-a-light.html">
+    <div class="t">mock A · 卡片仪表盘（浅色）<span class="tag">首页</span></div>
+    <div class="d">每窝一张卡片，按地点分组；四个一键记录按钮 + "距上次 X 天 / 超期"状态灯；含冬眠中卡片的演示。点"喂食"会弹食物多选窗口。</div>
+  </a>
+
+  <a class="card" href="mock-a-dark.html">
+    <div class="t">mock A · 卡片仪表盘（深色）<span class="tag">首页 · 同款换主题</span></div>
+    <div class="d">与上面完全相同的布局和交互，换成深色主题。正式版也可以做成"深浅可切换"，先看你更喜欢哪个当默认。</div>
+  </a>
+
+  <a class="card" href="mock-b-stats.html">
+    <div class="t">mock B · 统计页<span class="tag">第二页</span></div>
+    <div class="d">日历热力图（悬停看当天明细）、喂食构成占比、每周操作次数、实际间隔 vs 建议间隔。左上角可以切换窝、切换时间范围，都能点。</div>
+  </a>
+
+  <div class="note">看的时候可以留意：卡片上还想多看到什么信息？按钮的排布顺不顺手？热力图/占比图对你有没有用？——都记下来告诉我，正式版照改。</div>
+</div>
+</body>
+</html>
