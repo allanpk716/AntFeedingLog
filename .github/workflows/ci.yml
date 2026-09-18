@@ -51,4 +51,8 @@ jobs:
         # 但本流水线只读、没有签名私钥（TAURI_SIGNING_PRIVATE_KEY 只在 tag 发布
         # job 的 Secrets 注入）——不覆盖关闭的话 updater 产物在签名步直接失败。
         # 这里用 --config 覆盖只关本次构建的 updater 产物，conf 文件本身不动。
-        run: pnpm tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
+        # 2026-09-19 修复：内联 JSON 经 pnpm 的 Windows 命令行中转会丢双引号
+        # （6039c8d CI 实证 "key must be a string"），改写临时文件传路径。
+        run: |
+          printf '%s' '{"bundle":{"createUpdaterArtifacts":false}}' > .tauri-ci.config.json
+          pnpm tauri build --config .tauri-ci.config.json
