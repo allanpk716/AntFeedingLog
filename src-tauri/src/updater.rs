@@ -38,6 +38,16 @@
 //! reminder::check_and_notify，取舍记在各处注释）。挂点在 [`build_updater`] 的
 //! `on_before_exit`（插件 2.11.0 在 Windows 安装器启动前、进程退出前回调，闭包
 //! 签名 `Fn()` 无参）；快照失败只记日志，绝不阻塞安装流程。
+//!
+//! 确认流与失败兜底（票 05）：用户确认升级后 [`run_confirm_flow`] 编排
+//! 再次检查 → 写 pending 标记 → 下载 → install，三步经 [`ConfirmSteps`] 注入
+//!（生产 [`PluginConfirmSteps`] 薄封装，测试 FakeSteps）；标记是数据目录小 JSON
+//!（[`PENDING_MARKER_FILE`]，不进数据库），**先标记后下载**顺序硬性。Windows 下
+//! 安装成功即进程退出，标记保留为"想升到 vX"的跨启动凭据；下次启动
+//! [`startup_judgment`] 对比标记目标与当前运行版本（语义化比较 [`version_cmp`]），
+//! 三态判定后清标记并暂存可查状态（[`current_update_state`]，get_update_state
+//! command 消费）。安装失败（install 返回 Err、进程存活）由失败臂复位禁写标志
+//!（评审 M-1 契约）+ 暂存"升级未完成"，UI 据此给重试/手动下载引导。
 
 use std::path::Path;
 
@@ -183,6 +193,249 @@ pub fn is_write_blocked() -> bool {
 /// 写请求统一入口的闸门：读进程级标志并放行/拒绝。
 pub fn ensure_writable() -> Result<(), String> {
     gate_write(is_write_blocked())
+}
+
+// ── 核心：pending 标记与启动判定（票 05）───────────────────────────────────
+//
+// 确认升级后的完整执行链与失败兜底。标记是应用数据目录下的一个小 JSON 文件
+//（[`PENDING_MARKER_FILE`]，刻意不进数据库——安装窗口期数据库可能正被迁移/
+// 快照，落盘凭据必须与库无关）。生命周期：
+// 1. 确认流**先写标记再下载**（顺序硬性：下载失败时标记仍在，启动检测才能
+//    发现"想升没升成"）；
+// 2. 安装（成功 = 进程随即退出），标记保留——它是"想升到 vX"的跨启动凭据；
+// 3. 下次启动 [`startup_judgment`] 对比标记目标版本与当前运行版本：目标 ≤ 当前
+//    → 升级成功；目标 > 当前 → 上次升级未完成（已知残余风险：Windows 下安装
+//    器 spawn 后应用即退出，中途失败无法回传 UI）。判定后标记即清，结果暂存
+//    进程内供 [`current_update_state`]（get_update_state command）查询。
+// 标记文件损坏/缺失一律按无标记处理，绝不影响启动。
+
+/// pending 标记文件名（应用数据目录下的小 JSON，不进数据库）。
+pub const PENDING_MARKER_FILE: &str = "update-pending.json";
+
+/// pending 标记：想升到的目标版本 + 写入时间戳（yyyymmdd-HHMMSS）。
+/// serde 形态落盘即持久化格式；跨启动只读这一份。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingMarker {
+    pub target_version: String,
+    pub stamped_at: String,
+}
+
+/// 语义化版本比较（票面硬性：0.2.0 < 0.10.0，禁用字符串比较）：按 '.' 分段逐段
+/// 取数字比较，缺段补 0（0.2 与 0.2.0 等价）；段内非数字按字典序兜底（本应用
+/// 不发 prerelease，正常只走数字分支）；容忍前导 `v`。
+pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    fn segs(s: &str) -> Vec<&str> {
+        s.trim().trim_start_matches('v').split('.').collect()
+    }
+    let (a, b) = (segs(a), segs(b));
+    for i in 0..a.len().max(b.len()) {
+        let av = a.get(i).copied().unwrap_or("0");
+        let bv = b.get(i).copied().unwrap_or("0");
+        let ord = match (av.parse::<u64>(), bv.parse::<u64>()) {
+            (Ok(x), Ok(y)) => x.cmp(&y),
+            _ => av.cmp(bv),
+        };
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// 写 pending 标记（确认流在下载前调用——顺序硬性）。返回标记文件完整路径。
+/// 数据目录缺失则先建（首启即确认升级的极端路径也成立）。
+pub fn write_pending_marker(
+    data_dir: &Path,
+    target_version: &str,
+    stamp: &str,
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
+    let marker = PendingMarker {
+        target_version: target_version.to_string(),
+        stamped_at: stamp.to_string(),
+    };
+    let path = data_dir.join(PENDING_MARKER_FILE);
+    let text =
+        serde_json::to_string_pretty(&marker).map_err(|e| format!("序列化更新标记失败: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("写入更新标记失败: {e}"))?;
+    Ok(path)
+}
+
+/// 读 pending 标记：缺失一律 None；损坏（不可解析/字段缺失/目标版本为空）按
+/// 无标记处理并顺手删掉坏文件（避免每次启动重复报错）；读取失败（权限等）
+/// 也按无标记——标记只影响升级提示，绝不挡启动。
+pub fn load_pending_marker(data_dir: &Path) -> Option<PendingMarker> {
+    let path = data_dir.join(PENDING_MARKER_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            eprintln!("[updater] 读取 pending 标记失败（按无标记处理）: {e}");
+            return None;
+        }
+    };
+    match serde_json::from_str::<PendingMarker>(&text) {
+        Ok(marker) if !marker.target_version.trim().is_empty() => Some(marker),
+        other => {
+            eprintln!("[updater] pending 标记损坏（按无标记处理并清除）: {other:?}");
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
+}
+
+/// 清除 pending 标记（启动判定后调用）；文件本来就不存在也按成功。
+pub fn clear_pending_marker(data_dir: &Path) -> Result<(), String> {
+    match std::fs::remove_file(data_dir.join(PENDING_MARKER_FILE)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("清除更新标记失败: {e}")),
+    }
+}
+
+/// 更新状态（get_update_state 的返回，票 06 前端契约）：无残留 / 上次升级成功
+///（可提示"已升级到 vX"）/ 上次升级未完成（含目标版本，供重试/手动下载引导）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum UpdateState {
+    Idle,
+    LastInstallSucceeded { version: String },
+    LastInstallIncomplete { version: String },
+}
+
+/// 进程内暂存的最近一次更新状态（启动判定 / 确认流失败路径写入；只活在本进程，
+/// 无需跨启动——跨启动凭据是标记文件本身）。
+static LAST_UPDATE_STATE: std::sync::Mutex<Option<UpdateState>> = std::sync::Mutex::new(None);
+
+/// 暂存更新状态（锁毒化按原值续用：状态只是提示性数据，不值得 panic）。
+fn stage_update_state(state: UpdateState) {
+    let mut guard = LAST_UPDATE_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(state);
+}
+
+/// 当前更新状态（从未暂存过 = [`UpdateState::Idle`]）。
+pub fn current_update_state() -> UpdateState {
+    let guard = LAST_UPDATE_STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.clone().unwrap_or(UpdateState::Idle)
+}
+
+/// 启动判定（票面三态纯逻辑）：无标记（含损坏/缺失按无标记口径）→ 正常路径；
+/// 标记目标 ≤ 当前版本 → 升级成功；目标 > 当前版本 → 上次升级未完成。
+/// 比较走 [`version_cmp`] 语义化比较（0.2.0 < 0.10.0）。
+pub fn judge_startup(pending: Option<&PendingMarker>, current_version: &str) -> UpdateState {
+    match pending {
+        None => UpdateState::Idle,
+        Some(marker) => {
+            if version_cmp(&marker.target_version, current_version) == std::cmp::Ordering::Greater {
+                UpdateState::LastInstallIncomplete {
+                    version: marker.target_version.clone(),
+                }
+            } else {
+                UpdateState::LastInstallSucceeded {
+                    version: marker.target_version.clone(),
+                }
+            }
+        }
+    }
+}
+
+/// 启动时应用判定：读标记 → 判定 → 清标记 → 暂存结果（get_update_state 可查）。
+/// 返回判定结果供调用方记日志。判定完即清：标记只服务于"跨启动这一次"判定，
+/// 成败结果已转为可查状态；清除失败只记日志（下次启动会再判定一次，幂等）。
+pub fn startup_judgment(data_dir: &Path, current_version: &str) -> UpdateState {
+    let pending = load_pending_marker(data_dir);
+    if pending.is_none() {
+        // 无标记（或损坏已被 load 清掉；missing 时 clear 是 no-op）
+        let _ = clear_pending_marker(data_dir);
+        stage_update_state(UpdateState::Idle);
+        return UpdateState::Idle;
+    }
+    let state = judge_startup(pending.as_ref(), current_version);
+    if let Err(e) = clear_pending_marker(data_dir) {
+        eprintln!("[updater] 清除 pending 标记失败（下次启动会再判定一次）: {e}");
+    }
+    stage_update_state(state.clone());
+    state
+}
+
+// ── 核心：确认流编排（票 05，可注入纯函数层）──────────────────────────────
+//
+// 流程 = 再次检查拿最新 Update → 写 pending 标记 → 下载 → install。
+// 三步经 [`ConfirmSteps`] 注入：生产实现是插件薄封装（[`PluginConfirmSteps`]），
+// 测试用 FakeSteps（照 FakeChecker 模式）——编排顺序与失败路径在纯函数层锚定，
+// 插件 install 本体不进单测。
+
+/// 确认流的三个外部步骤（seam）。全部同步：生产实现内部用
+/// tauri::async_runtime::block_on 桥接插件 async API（只允许在非运行时线程上，
+/// 生产经 spawn_blocking 进入，见 lib.rs confirm_and_install）。
+pub trait ConfirmSteps {
+    /// 再次检查拿最新 Update（确认动作可能距用户看到提示已有时隔，必须复查）。
+    /// Err = 检查失败；查无新版也按 Err（无可装之物，流程中止）。
+    fn fresh_update(&self) -> Result<UpdateInfo, String>;
+    /// 下载新版本安装包（生产实现附带进度事件）。
+    fn download(&self) -> Result<(), String>;
+    /// 拉起安装器（Windows：快照钩子+置位禁写在插件 install_inner 内触发；
+    /// 成功即进程退出不再返回；返回 Err = 进程存活，调用方必须兑现复位契约）。
+    fn install(&self) -> Result<(), String>;
+}
+
+/// 确认流的对外结果（票 06 前端契约）。下载/安装失败是"状态"不是 Err：
+/// 残留物（标记/暂存状态）已就位，前端按 `install_failed` 给重试/手动下载引导；
+/// 检查失败/写标记失败则折为 Err 一次性展示（与 manual_check 同口径）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum InstallOutcome {
+    InstallStarted { version: String },
+    InstallFailed { version: String, message: String },
+}
+
+/// 确认流编排（票 05 本体）：
+/// 1. 再次检查（失败 → Err，不写标记不下载）；
+/// 2. **先写 pending 标记再下载**（顺序硬性：下载失败时标记仍在，启动检测才能
+///    发现"想升没升成"；写标记失败同样在下载前中止）；
+/// 3. 下载 → install（Windows 成功 = 进程退出不再返回；标记保留作启动判定凭据）；
+/// 4. 任一步失败（进程存活）：复位禁写标志（评审 M-1 契约——快照置位后 install
+///    返回 Err 时应用不得卡在只读态）、保留标记、暂存"升级未完成"，返回
+///    [`InstallOutcome::InstallFailed`]。
+pub fn run_confirm_flow<S: ConfirmSteps>(
+    data_dir: &Path,
+    steps: &S,
+) -> Result<InstallOutcome, String> {
+    // 1. 再次检查拿最新
+    let info = steps.fresh_update()?;
+
+    // 2. 先写标记（下载前落盘凭据；时间戳与快照同款秒级格式）
+    let stamp = now_stamp();
+    write_pending_marker(data_dir, &info.version, &stamp)?;
+
+    // 3. 下载 → 4. 安装
+    match (|| -> Result<(), String> {
+        steps.download()?;
+        steps.install()
+    })() {
+        Ok(()) => {
+            // Windows 下 install 成功即进程退出；标记保留，交下次启动判定
+            Ok(InstallOutcome::InstallStarted {
+                version: info.version,
+            })
+        }
+        Err(message) => {
+            // 评审 M-1 契约：失败且进程存活 → 复位禁写标志（此刻本进程再无安装
+            // 窗口，禁写只会卡死应用）；标记保留（启动判定兜底）；状态暂存可查。
+            set_write_blocked(false);
+            stage_update_state(UpdateState::LastInstallIncomplete {
+                version: info.version.clone(),
+            });
+            Ok(InstallOutcome::InstallFailed {
+                version: info.version,
+                message,
+            })
+        }
+    }
 }
 
 fn db_err(e: rusqlite::Error) -> String {
@@ -333,6 +586,104 @@ impl UpdateChecker for PluginChecker {
         // 版本比较由插件内部完成：远端不比当前新时返回 None
         Ok(update.map(update_to_info))
     }
+}
+
+/// 确认流的生产步骤（票 05 薄封装，不进单测）：编排顺序与失败路径由
+/// [`run_confirm_flow`] + FakeSteps 在纯函数层锚定，本结构只桥接插件 API。
+/// 插件 2.11.0 的 `Update::download` 返回安装包字节，`install(bytes)` 拉起
+/// 安装器（Windows 成功即进程退出）；三步都经 block_on 桥接（只在
+/// spawn_blocking 线程上跑，见 lib.rs confirm_and_install）。
+pub struct PluginConfirmSteps {
+    app: tauri::AppHandle,
+    /// fresh_update 检查到的 Update，download/install 两步续用同一份。
+    update: std::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    /// download 落好的安装包字节，install 步取走。
+    bytes: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl PluginConfirmSteps {
+    pub fn new(app: tauri::AppHandle) -> Self {
+        Self {
+            app,
+            update: std::sync::Mutex::new(None),
+            bytes: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+impl ConfirmSteps for PluginConfirmSteps {
+    fn fresh_update(&self) -> Result<UpdateInfo, String> {
+        let updater = build_updater(&self.app)?;
+        let update = tauri::async_runtime::block_on(updater.check())
+            .map_err(|e| format!("检查更新失败: {e}"))?
+            .ok_or_else(|| "远端已没有比当前更新的版本".to_string())?;
+        let info = update_to_info(update.clone());
+        *self
+            .update
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(update);
+        Ok(info)
+    }
+
+    fn download(&self) -> Result<(), String> {
+        let bytes = {
+            let guard = self
+                .update
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let update = guard
+                .as_ref()
+                .ok_or_else(|| "内部状态错误：尚未检查到更新".to_string())?;
+            let app = self.app.clone();
+            let mut downloaded: u64 = 0;
+            tauri::async_runtime::block_on(update.download(
+                move |chunk, total| {
+                    // 进度事件（票 06 前端契约：update-download-progress，
+                    // 负载 {downloaded, total}）；emit 失败静默（副产物不拦流程）
+                    use tauri::Emitter;
+                    downloaded += chunk as u64;
+                    let _ = app.emit(
+                        "update-download-progress",
+                        DownloadProgress { downloaded, total },
+                    );
+                },
+                || {},
+            ))
+            .map_err(|e| format!("下载更新失败: {e}"))?
+        };
+        *self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bytes);
+        Ok(())
+    }
+
+    fn install(&self) -> Result<(), String> {
+        let guard = self
+            .update
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let update = guard
+            .as_ref()
+            .ok_or_else(|| "内部状态错误：尚未检查到更新".to_string())?;
+        let bytes = self
+            .bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| "内部状态错误：尚未下载更新包".to_string())?;
+        update
+            .install(bytes)
+            .map_err(|e| format!("启动安装器失败: {e}"))
+    }
+}
+
+/// 下载进度事件负载（事件名 `update-download-progress`；票 06 前端契约）。
+/// `downloaded` 为累计字节数，`total` 为远端未给 Content-Length 时 None。
+#[derive(Clone, serde::Serialize)]
+struct DownloadProgress {
+    downloaded: u64,
+    total: Option<u64>,
 }
 
 /// 手动检查入口（设置页 `check_update_now`）。async：同步 command 跑在主线程/
@@ -864,7 +1215,9 @@ mod tests {
 
     #[test]
     fn write_block_flag_roundtrip() {
-        // 进程级标志：置位后写请求被拒、复位后恢复（Drop 兜底复位，不污染其他测试）
+        // 进程级标志：置位后写请求被拒、复位后恢复（Drop 兜底复位，不污染其他测试）。
+        // 与票 05 的标志/状态测试共用 GLOBAL_LOCK 串行（并行测试互不踩全局）。
+        let _g = lock_globals();
         struct ResetFlag;
         impl Drop for ResetFlag {
             fn drop(&mut self) {
@@ -890,6 +1243,8 @@ mod tests {
         // 拿到锁后由"锁内复查"拒绝。生产形态：with_conn / daily_tick 段 3 /
         // check_and_notify 均在拿到锁之后才调 ensure_writable / is_write_blocked
         //（真锁无法进单测，这里按同一时序在纯逻辑层模拟闸门顺序）。
+        // 与票 05 的标志/状态测试共用 GLOBAL_LOCK 串行（并行测试互不踩全局）。
+        let _g = lock_globals();
         struct ResetFlag;
         impl Drop for ResetFlag {
             fn drop(&mut self) {
@@ -906,5 +1261,421 @@ mod tests {
 
         // 3. 在途写拿到锁 → 锁内复查必须拒绝（写落在快照之后 = 禁止）
         assert!(ensure_writable().is_err(), "锁内复查拒绝在途写");
+    }
+
+    // ── 票 05：pending 标记 / 启动判定 / 确认流编排 ─────────────────────────
+
+    use std::cell::RefCell;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::MutexGuard;
+
+    /// 串行化触及进程级全局（禁写标志 / 暂存更新状态）的测试：并行测试互不踩踏。
+    static GLOBAL_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn lock_globals() -> MutexGuard<'static, ()> {
+        GLOBAL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// 测试期间的禁写标志复位兜底（全局标志，绝不把置位泄漏给其他测试）。
+    struct ResetWriteFlag;
+    impl Drop for ResetWriteFlag {
+        fn drop(&mut self) {
+            set_write_blocked(false);
+        }
+    }
+
+    fn marker_path(dir: &Path) -> std::path::PathBuf {
+        dir.join(PENDING_MARKER_FILE)
+    }
+
+    /// 假确认流步骤：预置各步结果并按序记录调用，绝不碰真网络/真安装器
+    ///（照 FakeChecker 模式——编排顺序与失败路径在纯函数层锚定）。
+    struct FakeSteps {
+        update: Result<UpdateInfo, String>,
+        download: Result<(), String>,
+        install: Result<(), String>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl FakeSteps {
+        fn ok_flow(version: &str) -> Self {
+            FakeSteps {
+                update: Ok(UpdateInfo {
+                    version: version.into(),
+                    notes: None,
+                }),
+                download: Ok(()),
+                install: Ok(()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+        fn call_log(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl ConfirmSteps for FakeSteps {
+        fn fresh_update(&self) -> Result<UpdateInfo, String> {
+            self.calls.borrow_mut().push("check");
+            self.update.clone()
+        }
+        fn download(&self) -> Result<(), String> {
+            self.calls.borrow_mut().push("download");
+            self.download.clone()
+        }
+        fn install(&self) -> Result<(), String> {
+            self.calls.borrow_mut().push("install");
+            self.install.clone()
+        }
+    }
+
+    #[test]
+    fn version_cmp_is_semantic_not_lexicographic() {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        // 票面硬锚：0.2.0 < 0.10.0（字符串比较会得出反结论）
+        assert_eq!(version_cmp("0.2.0", "0.10.0"), Less);
+        assert_eq!(version_cmp("0.9.9", "0.10.0"), Less);
+        assert_eq!(version_cmp("0.2.0", "0.2.0"), Equal);
+        assert_eq!(version_cmp("0.2.0", "0.2.1"), Less);
+        assert_eq!(version_cmp("0.3.0", "0.2.9"), Greater);
+        assert_eq!(version_cmp("1.0.0", "0.99.99"), Greater);
+        // 段数不等补 0：0.2 等价 0.2.0
+        assert_eq!(version_cmp("0.2", "0.2.0"), Equal);
+        assert_eq!(version_cmp("0.2", "0.2.1"), Less);
+        // 前导 v 容忍（远端清单异常带 v 也不误判）
+        assert_eq!(version_cmp("v0.10.0", "0.2.0"), Greater);
+    }
+
+    #[test]
+    fn pending_marker_write_read_roundtrip() {
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let path = write_pending_marker(dir.path(), "0.3.0", "20260918-181223").unwrap();
+        assert_eq!(path.parent(), Some(dir.path()), "标记落在数据目录");
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            PENDING_MARKER_FILE,
+            "文件名固定，不进数据库"
+        );
+
+        let marker = load_pending_marker(dir.path()).expect("刚写的标记应能读回");
+        assert_eq!(marker.target_version, "0.3.0");
+        assert_eq!(marker.stamped_at, "20260918-181223");
+
+        // 落盘 JSON 含目标版本（跨启动唯一的"想升没升成"凭据）
+        let text = std::fs::read_to_string(marker_path(dir.path())).unwrap();
+        assert!(text.contains("0.3.0"), "JSON 里应含目标版本，实际：{text}");
+    }
+
+    #[test]
+    fn pending_marker_clear_and_missing_tolerated() {
+        let dir = TempDir::new().expect("创建临时目录失败");
+
+        // 从来没有标记：清除是 no-op 成功
+        clear_pending_marker(dir.path()).unwrap();
+        assert!(load_pending_marker(dir.path()).is_none());
+
+        write_pending_marker(dir.path(), "0.3.0", "s").unwrap();
+        clear_pending_marker(dir.path()).unwrap();
+        assert!(load_pending_marker(dir.path()).is_none(), "清除后应读不到");
+    }
+
+    #[test]
+    fn corrupted_marker_treated_as_no_marker_and_cleaned() {
+        let dir = TempDir::new().expect("创建临时目录失败");
+
+        // 纯垃圾字节
+        std::fs::write(marker_path(dir.path()), "不是 JSON{{{").unwrap();
+        assert!(
+            load_pending_marker(dir.path()).is_none(),
+            "损坏按无标记处理"
+        );
+        assert!(
+            !marker_path(dir.path()).exists(),
+            "坏文件顺手清掉，不反复报错"
+        );
+
+        // JSON 合法但字段缺失
+        std::fs::write(marker_path(dir.path()), r#"{"version":"0.3.0"}"#).unwrap();
+        assert!(load_pending_marker(dir.path()).is_none());
+
+        // 目标版本为空串也算损坏
+        std::fs::write(
+            marker_path(dir.path()),
+            r#"{"target_version":"","stamped_at":"t"}"#,
+        )
+        .unwrap();
+        assert!(load_pending_marker(dir.path()).is_none());
+    }
+
+    #[test]
+    fn judge_startup_three_states() {
+        let m = |v: &str| PendingMarker {
+            target_version: v.into(),
+            stamped_at: "s".into(),
+        };
+
+        // 无标记 → 正常路径
+        assert_eq!(judge_startup(None, "0.2.0"), UpdateState::Idle);
+
+        // 标记 == 当前 → 升级成功
+        assert_eq!(
+            judge_startup(Some(&m("0.2.0")), "0.2.0"),
+            UpdateState::LastInstallSucceeded {
+                version: "0.2.0".into()
+            }
+        );
+        // 标记 < 当前（成功后又升过）也算成功
+        assert_eq!(
+            judge_startup(Some(&m("0.2.0")), "0.3.0"),
+            UpdateState::LastInstallSucceeded {
+                version: "0.2.0".into()
+            }
+        );
+
+        // 标记 > 当前 → 上次升级未完成
+        assert_eq!(
+            judge_startup(Some(&m("0.3.0")), "0.2.0"),
+            UpdateState::LastInstallIncomplete {
+                version: "0.3.0".into()
+            }
+        );
+        // 语义化判定：0.10.0 > 0.2.0（字符串比较会误判成"成功"）
+        assert_eq!(
+            judge_startup(Some(&m("0.10.0")), "0.2.0"),
+            UpdateState::LastInstallIncomplete {
+                version: "0.10.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn startup_judgment_consumes_marker_and_stages_result() {
+        let _g = lock_globals();
+        let dir = TempDir::new().expect("创建临时目录失败");
+
+        // 无标记：Idle，不炸、可查
+        assert_eq!(startup_judgment(dir.path(), "0.2.0"), UpdateState::Idle);
+        assert_eq!(current_update_state(), UpdateState::Idle);
+
+        // 未完成：判定 → 清标记 → 暂存可查（get_update_state 口径）
+        write_pending_marker(dir.path(), "0.3.0", "s").unwrap();
+        assert_eq!(
+            startup_judgment(dir.path(), "0.2.0"),
+            UpdateState::LastInstallIncomplete {
+                version: "0.3.0".into()
+            }
+        );
+        assert!(!marker_path(dir.path()).exists(), "判定后标记即清");
+        assert_eq!(
+            current_update_state(),
+            UpdateState::LastInstallIncomplete {
+                version: "0.3.0".into()
+            }
+        );
+
+        // 成功：同上，状态换成"已升级到 vX"
+        write_pending_marker(dir.path(), "0.2.0", "s").unwrap();
+        assert_eq!(
+            startup_judgment(dir.path(), "0.2.0"),
+            UpdateState::LastInstallSucceeded {
+                version: "0.2.0".into()
+            }
+        );
+        assert!(!marker_path(dir.path()).exists());
+        assert_eq!(
+            current_update_state(),
+            UpdateState::LastInstallSucceeded {
+                version: "0.2.0".into()
+            }
+        );
+
+        // 损坏标记：按无标记处理（Idle），坏文件顺手清掉，启动不受影响
+        std::fs::write(marker_path(dir.path()), "{{{损坏").unwrap();
+        assert_eq!(startup_judgment(dir.path(), "0.2.0"), UpdateState::Idle);
+        assert!(!marker_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn confirm_flow_success_checks_marker_then_downloads_then_installs() {
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let steps = FakeSteps::ok_flow("0.3.0");
+
+        let out = run_confirm_flow(dir.path(), &steps).unwrap();
+
+        assert_eq!(
+            out,
+            InstallOutcome::InstallStarted {
+                version: "0.3.0".into()
+            }
+        );
+        assert_eq!(
+            steps.call_log(),
+            vec!["check", "download", "install"],
+            "流程顺序：再次检查 → 下载 → 安装"
+        );
+        // 成功路径标记保留：它是"想升到 0.3.0"的凭据（Windows 下安装器拉起后进程
+        // 即退出），由下次启动的判定消费（成功/未完成由此分辨）
+        assert!(
+            marker_path(dir.path()).exists(),
+            "安装成功后标记保留，交启动判定"
+        );
+    }
+
+    #[test]
+    fn confirm_flow_download_failure_keeps_marker_and_resets_flag() {
+        // 票面硬性顺序锚点 + 评审 M-1 契约：
+        // 先写标记后下载 —— 下载失败时标记必须仍在（启动检测才能发现"想升没升成"）；
+        // 失败且进程存活 —— 禁写标志必须复位。
+        let _g = lock_globals();
+        let _reset = ResetWriteFlag;
+        let dir = TempDir::new().expect("创建临时目录失败");
+
+        let mut steps = FakeSteps::ok_flow("0.3.0");
+        steps.download = Err("网络断了".into());
+        steps.install = Err("下载失败后不得走到安装".into());
+
+        // 预置置位（真实时序里置位发生在 install 内部钩子；这里验证失败臂复位语义）
+        set_write_blocked(true);
+
+        let out = run_confirm_flow(dir.path(), &steps).unwrap();
+
+        assert_eq!(
+            out,
+            InstallOutcome::InstallFailed {
+                version: "0.3.0".into(),
+                message: "网络断了".into()
+            }
+        );
+        assert_eq!(
+            steps.call_log(),
+            vec!["check", "download"],
+            "下载失败后不得触发安装"
+        );
+        // 锚点：标记先于下载写入，下载失败后仍在
+        let marker = load_pending_marker(dir.path()).expect("下载失败标记必须仍在");
+        assert_eq!(marker.target_version, "0.3.0");
+        // M-1：失败路径复位禁写标志，应用不得卡在只读态
+        assert!(!is_write_blocked(), "失败路径必须复位禁写标志");
+        // 失败状态暂存可查（供 UI 重试/手动下载引导）
+        assert_eq!(
+            current_update_state(),
+            UpdateState::LastInstallIncomplete {
+                version: "0.3.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn confirm_flow_install_failure_keeps_marker_and_resets_flag() {
+        // 评审 M-1 契约主路径：Windows 下插件 install_inner（快照+置位）先跑，
+        // 安装器启动失败 → install() 返回 Err 且进程存活 → 必须复位禁写标志，
+        // 否则应用永久禁写。
+        let _g = lock_globals();
+        let _reset = ResetWriteFlag;
+        let dir = TempDir::new().expect("创建临时目录失败");
+
+        let mut steps = FakeSteps::ok_flow("0.3.0");
+        steps.install = Err("启动安装器失败: ShellExecute".into());
+
+        set_write_blocked(true); // 模拟 on_before_exit 快照完成后的置位
+
+        let out = run_confirm_flow(dir.path(), &steps).unwrap();
+
+        assert_eq!(
+            out,
+            InstallOutcome::InstallFailed {
+                version: "0.3.0".into(),
+                message: "启动安装器失败: ShellExecute".into()
+            }
+        );
+        assert_eq!(steps.call_log(), vec!["check", "download", "install"]);
+        assert!(
+            !is_write_blocked(),
+            "M-1：install 返回 Err 且进程存活必须复位禁写标志"
+        );
+        assert!(
+            load_pending_marker(dir.path()).is_some(),
+            "安装失败标记保留（残余风险的启动判定兜底）"
+        );
+        assert_eq!(
+            current_update_state(),
+            UpdateState::LastInstallIncomplete {
+                version: "0.3.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn confirm_flow_check_failure_writes_no_marker() {
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let mut steps = FakeSteps::ok_flow("0.3.0");
+        steps.update = Err("HTTP 404：latest.json 不存在".into());
+
+        let out = run_confirm_flow(dir.path(), &steps);
+
+        assert_eq!(out.unwrap_err(), "HTTP 404：latest.json 不存在");
+        assert_eq!(
+            steps.call_log(),
+            vec!["check"],
+            "检查失败：不写标记、不下载、不安装"
+        );
+        assert!(!marker_path(dir.path()).exists(), "检查失败不落标记");
+    }
+
+    #[test]
+    fn confirm_flow_marker_write_failure_aborts_before_download() {
+        // data_dir 是一个普通文件 → 写标记必失败 → 必须在下载前中止
+        //（没有"想升"凭据就绝不下载安装包）
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let steps = FakeSteps::ok_flow("0.3.0");
+        let out = run_confirm_flow(&blocker, &steps);
+
+        assert!(out.is_err(), "写标记失败应报错中止");
+        assert_eq!(steps.call_log(), vec!["check"], "写标记失败：绝不下载");
+        // 禁写标志断言刻意不写在此处：此刻还没走到 install，标志本就不可能置位
+        //（ ambient 状态归 write_block_flag_roundtrip / M-1 两个专项测试管）
+    }
+
+    #[test]
+    fn install_and_update_states_serialize_for_frontend() {
+        // 票 06 前端契约：tag = status，snake_case
+        assert_eq!(
+            serde_json::to_string(&InstallOutcome::InstallStarted {
+                version: "0.3.0".into()
+            })
+            .unwrap(),
+            r#"{"status":"install_started","version":"0.3.0"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&InstallOutcome::InstallFailed {
+                version: "0.3.0".into(),
+                message: "boom".into(),
+            })
+            .unwrap(),
+            r#"{"status":"install_failed","version":"0.3.0","message":"boom"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&UpdateState::Idle).unwrap(),
+            r#"{"status":"idle"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&UpdateState::LastInstallSucceeded {
+                version: "0.2.0".into()
+            })
+            .unwrap(),
+            r#"{"status":"last_install_succeeded","version":"0.2.0"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&UpdateState::LastInstallIncomplete {
+                version: "0.3.0".into()
+            })
+            .unwrap(),
+            r#"{"status":"last_install_incomplete","version":"0.3.0"}"#
+        );
     }
 }
