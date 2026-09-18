@@ -31,6 +31,8 @@ pub struct CareAction {
     pub suggested_interval_days: Option<i64>,
     pub enabled: bool,
     pub sort: i64,
+    /// 预置项禁删，可停用（反馈第二轮 F2）。
+    pub is_preset: bool,
     pub referenced: bool,
 }
 
@@ -105,7 +107,7 @@ fn validate_interval(days: Option<i64>) -> Result<(), String> {
 // ── 操作 ─────────────────────────────────────────────────────────────────
 
 const ACTION_SQL: &str = concat!(
-    "SELECT a.id, a.name, a.icon, a.kind, a.is_feeding, a.suggested_interval_days, a.enabled, a.sort, ",
+    "SELECT a.id, a.name, a.icon, a.kind, a.is_feeding, a.suggested_interval_days, a.enabled, a.sort, a.is_preset, ",
     "(EXISTS(SELECT 1 FROM care_log l WHERE l.action_id = a.id) ",
     "OR EXISTS(SELECT 1 FROM reminder_ledger g WHERE g.action_id = a.id)) ",
     "FROM care_action a ",
@@ -121,7 +123,8 @@ fn row_to_action(row: &rusqlite::Row<'_>) -> rusqlite::Result<CareAction> {
         suggested_interval_days: row.get(5)?,
         enabled: row.get::<_, i64>(6)? != 0,
         sort: row.get(7)?,
-        referenced: row.get::<_, i64>(8)? != 0,
+        is_preset: row.get::<_, i64>(8)? != 0,
+        referenced: row.get::<_, i64>(9)? != 0,
     })
 }
 
@@ -209,8 +212,18 @@ pub fn set_action_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(
     Ok(())
 }
 
-/// 物理删；被 care_log 或 reminder_ledger 引用则拒绝（友好文案，规则 10）。
+/// 物理删；预置项禁删（反馈第二轮 F2）；被 care_log 或 reminder_ledger 引用则拒绝
+/// （友好文案，规则 10）。
 pub fn erase_action(conn: &Connection, id: i64) -> Result<(), String> {
+    let preset: i64 = conn
+        .query_row("SELECT is_preset FROM care_action WHERE id = ?1", params![id], |r| r.get(0))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "操作不存在".to_string(),
+            other => db_err(other),
+        })?;
+    if preset == 1 {
+        return Err("预置操作不能删除；可改为停用".into());
+    }
     let logs: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM care_log WHERE action_id = ?1",
@@ -319,8 +332,17 @@ pub fn set_food_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(),
     Ok(())
 }
 
-/// 物理删；被 log_food 引用则拒绝（规则 10）。
+/// 物理删；预置项禁删（反馈第二轮 F2）；被 log_food 引用则拒绝（规则 10）。
 pub fn erase_food(conn: &Connection, id: i64) -> Result<(), String> {
+    let preset: i64 = conn
+        .query_row("SELECT is_preset FROM food WHERE id = ?1", params![id], |r| r.get(0))
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "食物不存在".to_string(),
+            other => db_err(other),
+        })?;
+    if preset == 1 {
+        return Err("预置食物不能删除；可改为停用".into());
+    }
     let used_by: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM log_food WHERE food_id = ?1",
@@ -627,37 +649,61 @@ mod tests {
     fn erase_action_referenced_by_care_log_rejected_then_deactivate_works() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        let feed = action_id(&conn, "喂食");
-        log(&conn, c, "喂食", "2026-09-17 20:00:00");
+        // F2 起预置操作由预置守护先拒删；care_log 引用分支改用自建操作验证
+        let custom = save_action(
+            &conn,
+            &ActionInput {
+                id: None,
+                name: "降温".into(),
+                kind: "log_only".into(),
+                is_feeding: false,
+                suggested_interval_days: None,
+                sort: 5,
+            },
+        )
+        .unwrap();
+        log(&conn, c, "降温", "2026-09-17 20:00:00");
 
-        let err = erase_action(&conn, feed).unwrap_err();
+        let err = erase_action(&conn, custom.id).unwrap_err();
         assert!(err.contains("停用"), "实际错误：{err}");
-        assert_eq!(count_where_id(&conn, "care_action", feed), 1, "行保留");
+        assert_eq!(count_where_id(&conn, "care_action", custom.id), 1, "行保留");
 
         // 被引用删不掉，但可以停用（规则 10）
-        set_action_enabled(&conn, feed, false).unwrap();
+        set_action_enabled(&conn, custom.id, false).unwrap();
         let actions = list_actions(&conn).unwrap();
-        assert!(!by_name(&actions, "喂食").enabled);
+        assert!(!actions.iter().find(|a| a.id == custom.id).unwrap().enabled);
         // 历史记录展示不受影响（验收 2 的操作版：名字照常）
         let recent = crate::care::recent_for_colony(&conn, c, 5).unwrap();
-        assert_eq!(recent[0].action_name, "喂食");
+        assert_eq!(recent[0].action_name, "降温");
     }
 
     #[test]
     fn erase_action_referenced_only_by_reminder_ledger_rejected() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        let trash = action_id(&conn, "垃圾清理");
+        // F2 起预置操作由预置守护先拒删；提醒台账引用分支改用自建操作验证
+        let custom = save_action(
+            &conn,
+            &ActionInput {
+                id: None,
+                name: "降温".into(),
+                kind: "log_only".into(),
+                is_feeding: false,
+                suggested_interval_days: None,
+                sort: 5,
+            },
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
              VALUES (?1, 'overdue', ?2, '2026-09-10', '2026-09-10 08:00:00')",
-            params![c, trash],
+            params![c, custom.id],
         )
         .unwrap();
 
-        let err = erase_action(&conn, trash).unwrap_err();
+        let err = erase_action(&conn, custom.id).unwrap_err();
         assert!(err.contains("台账"), "实际错误：{err}");
-        assert_eq!(count_where_id(&conn, "care_action", trash), 1);
+        assert_eq!(count_where_id(&conn, "care_action", custom.id), 1);
     }
 
     #[test]
@@ -839,20 +885,21 @@ mod tests {
 
     #[test]
     fn erase_food_referenced_by_log_food_rejected_then_deactivate_works() {
-        // 验收 3（食物）：被记录引用的删除被拒
+        // 验收 3（食物）：被记录引用的删除被拒。
+        // F2 起预置食物由预置守护先拒删；log_food 引用分支改用自建食物验证
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        let seed = food_id(&conn, "种子");
-        log_feeding(&conn, c, "2026-09-17 20:00:00", vec![seed]);
+        let custom = save_food(&conn, &FoodInput { id: None, name: "糖水".into(), sort: 9 }).unwrap();
+        log_feeding(&conn, c, "2026-09-17 20:00:00", vec![custom.id]);
 
-        let err = erase_food(&conn, seed).unwrap_err();
+        let err = erase_food(&conn, custom.id).unwrap_err();
         assert!(err.contains("停用"), "实际错误：{err}");
-        assert_eq!(count_where_id(&conn, "food", seed), 1, "行保留");
+        assert_eq!(count_where_id(&conn, "food", custom.id), 1, "行保留");
 
-        set_food_enabled(&conn, seed, false).unwrap();
+        set_food_enabled(&conn, custom.id, false).unwrap();
         let foods = crate::care::list_foods(&conn).unwrap();
-        assert!(!foods.iter().find(|f| f.id == seed).unwrap().enabled);
-        assert!(foods.iter().find(|f| f.id == seed).unwrap().referenced);
+        assert!(!foods.iter().find(|f| f.id == custom.id).unwrap().enabled);
+        assert!(foods.iter().find(|f| f.id == custom.id).unwrap().referenced);
     }
 
     #[test]
@@ -879,5 +926,44 @@ mod tests {
     fn erase_missing_food_rejected() {
         let conn = mem_conn();
         assert!(erase_food(&conn, 999).unwrap_err().contains("食物不存在"));
+    }
+
+    // ── 预置项禁删（反馈第二轮 F2）──
+
+    #[test]
+    fn erase_action_rejects_all_four_presets_even_unreferenced() {
+        let conn = mem_conn();
+        for name in ["喂食", "活动区换水", "巢穴保湿", "垃圾清理"] {
+            let err = erase_action(&conn, action_id(&conn, name)).unwrap_err();
+            assert!(err.contains("预置"), "{name} 应拒删，实际：{err}");
+        }
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_action"), 4);
+        // 改名/停用不受影响
+        let water = action_id(&conn, "活动区换水");
+        save_action(&conn, &ActionInput { id: Some(water), name: "换水".into(), kind: "log_only".into(), is_feeding: false, suggested_interval_days: None, sort: 2 }).unwrap();
+        set_action_enabled(&conn, water, false).unwrap();
+    }
+
+    #[test]
+    fn erase_food_rejects_three_presets() {
+        let conn = mem_conn();
+        for name in ["种子", "干虾仁", "面包虫"] {
+            let err = erase_food(&conn, food_id(&conn, name)).unwrap_err();
+            assert!(err.contains("预置"), "{name} 应拒删，实际：{err}");
+        }
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM food"), 3);
+    }
+
+    #[test]
+    fn list_actions_and_foods_expose_is_preset() {
+        let conn = mem_conn();
+        let created = save_action(&conn, &ActionInput { id: None, name: "降温".into(), kind: "log_only".into(), is_feeding: false, suggested_interval_days: None, sort: 5 }).unwrap();
+        let actions = list_actions(&conn).unwrap();
+        assert!(by_name(&actions, "喂食").is_preset);
+        assert!(!actions.iter().find(|a| a.id == created.id).unwrap().is_preset);
+        let foods = crate::care::list_foods(&conn).unwrap();
+        assert!(foods.iter().find(|f| f.name == "种子").unwrap().is_preset);
+        let custom = save_food(&conn, &FoodInput { id: None, name: "糖水".into(), sort: 9 }).unwrap();
+        assert!(!custom.is_preset);
     }
 }

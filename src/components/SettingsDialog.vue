@@ -3,8 +3,8 @@
  * 设置弹窗（票 04 字典管理 + 票 06 通知 + 票 09 数据收口）：操作 / 食物 / 地点 / 通知 / 数据 五个 tab。
  * - 操作行可编辑：名字、性质（提醒/仅登记）、建议间隔（提醒类显示）、
  *   「喂食」标记（带提示，允许编辑不强制唯一）、停用/启用、删除
- *   （被历史记录/提醒台账引用时删除禁用，只能停用——规则 10）。
- * - 食物行：名字、停用/启用、删除（被引用禁用）。
+ *   （预置项或被历史记录/提醒台账引用时删除禁用，只能停用——规则 10 + 反馈第二轮 F2）。
+ * - 食物行：名字、停用/启用、删除（预置或被引用禁用）。
  * - 地点 tab 复用 LocationManagerPanel。
  * - 通知 tab（票 06）：总开关/超期/冬眠三开关 + 临近出眠提前天数 +
  *   「发送测试通知」按钮（排障用）；开机自启开关（票 09）随保存一起落库，
@@ -97,11 +97,12 @@ async function addActionRow(kind: "actions" | "foods") {
       isFeeding: false,
       intervalText: "7",
       enabled: true,
+      isPreset: false,
       referenced: false,
     });
     addActionName.value = "";
   } else {
-    foodRows.value.push({ id: null, name: raw, enabled: true, referenced: false });
+    foodRows.value.push({ id: null, name: raw, enabled: true, isPreset: false, referenced: false });
     addFoodName.value = "";
   }
   error.value = "";
@@ -302,8 +303,9 @@ async function exportData(format: "csv" | "json") {
   }
 }
 
-function eraseTitle(referenced: boolean): string {
-  return referenced ? "被历史记录引用，只能停用，不能删除" : "";
+function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
+  if (row.isPreset) return "预置项不能删除；可改为停用";
+  return row.referenced ? "被历史记录引用，只能停用，不能删除" : "";
 }
 </script>
 
@@ -357,7 +359,7 @@ function eraseTitle(referenced: boolean): string {
           <span v-if="!row.enabled" class="disabled-chip">已停用</span>
           <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setActionEnabled(row, false)">停用</button>
           <button v-else class="row-btn" type="button" @click="setActionEnabled(row, true)">启用</button>
-          <button class="row-btn erase-btn" type="button" :disabled="row.referenced" :title="eraseTitle(row.referenced)" @click="eraseAction(row)">
+          <button class="row-btn erase-btn" type="button" :disabled="row.referenced || row.isPreset" :title="eraseTitle(row)" @click="eraseAction(row)">
             删除
           </button>
         </div>
@@ -385,7 +387,7 @@ function eraseTitle(referenced: boolean): string {
           <span v-if="!row.enabled" class="disabled-chip">已停用</span>
           <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setFoodEnabled(row, false)">停用</button>
           <button v-else class="row-btn" type="button" @click="setFoodEnabled(row, true)">启用</button>
-          <button class="row-btn erase-btn" type="button" :disabled="row.referenced" :title="eraseTitle(row.referenced)" @click="eraseFood(row)">
+          <button class="row-btn erase-btn" type="button" :disabled="row.referenced || row.isPreset" :title="eraseTitle(row)" @click="eraseFood(row)">
             删除
           </button>
         </div>

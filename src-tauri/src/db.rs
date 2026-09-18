@@ -14,7 +14,8 @@ use rusqlite::Connection;
 /// v2：care_action 增加 is_feeding 标记位（R1 评审：喂食判定与名字解耦）。
 /// v3：reminder_ledger 冬眠侧唯一键把种类并入（窝,种类,基准日）——v2 是
 ///     (窝,基准日)，提前天数设 0 时临近/出眠日两种提醒同日互斥（票 01 停靠）。
-pub const SCHEMA_VERSION: i64 = 3;
+/// v4：字典预置项保护位（反馈第二轮 F2，Q5）——care_action/food 各加 is_preset。
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -100,6 +101,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             0 => migrate_v0_to_v1(conn)?,
             1 => migrate_v1_to_v2(conn)?,
             2 => migrate_v2_to_v3(conn)?,
+            3 => migrate_v3_to_v4(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -152,6 +154,28 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<(), rusqlite::Error> {
         "#,
     )?;
     tx.pragma_update(None, "user_version", 3)?;
+    tx.commit()
+}
+
+/// v3 → v4：字典预置项保护位（反馈第二轮 F2，Q5）。care_action/food 各加 is_preset，
+/// 按名字回填预置行（喂食/活动区换水/巢穴保湿/垃圾清理、种子/干虾仁/面包虫）。
+/// 已改名且从未被引用的预置回填不到——已知边界（单人工具可接受，见共识文档）。
+/// 新库走同一条路：v0→v1 seed 不带该列，v4 统一回填。
+fn migrate_v3_to_v4(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        ALTER TABLE care_action
+            ADD COLUMN is_preset INTEGER NOT NULL DEFAULT 0 CHECK (is_preset IN (0, 1));
+        UPDATE care_action SET is_preset = 1
+            WHERE name IN ('喂食', '活动区换水', '巢穴保湿', '垃圾清理');
+
+        ALTER TABLE food
+            ADD COLUMN is_preset INTEGER NOT NULL DEFAULT 0 CHECK (is_preset IN (0, 1));
+        UPDATE food SET is_preset = 1 WHERE name IN ('种子', '干虾仁', '面包虫');
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 4)?;
     tx.commit()
 }
 
@@ -346,7 +370,7 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(SCHEMA_VERSION, 4);
     }
 
     #[test]
@@ -524,6 +548,43 @@ mod tests {
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_log"), 1);
         // 升级后再 migrate 幂等
         migrate(&conn).expect("对 v2 库再次 migrate 不应失败");
+    }
+
+    #[test]
+    fn v4_flags_preset_actions_and_foods() {
+        let (conn, _dir) = fresh_conn();
+        let action_names: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(action_names, vec!["喂食", "活动区换水", "巢穴保湿", "垃圾清理"]);
+        let food_names: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM food WHERE is_preset = 1 ORDER BY sort").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(food_names, vec!["种子", "干虾仁", "面包虫"]);
+    }
+
+    #[test]
+    fn v3_db_with_custom_rows_upgrades_to_v4_and_backfills() {
+        // 真实 v3 库 + 用户自建行 + 一个改过名的预置（回填盲区，见共识文档边界）
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).unwrap();
+        seed_v1_presets(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        conn.execute("UPDATE care_action SET name = '换水' WHERE name = '活动区换水'", []).unwrap();
+        conn.execute("INSERT INTO care_action (name, kind, enabled, sort) VALUES ('降温', 'log_only', 1, 5)", []).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+        let flagged: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        // 已改名的预置匹配不到（已知边界，接受）；自建项不误标
+        assert_eq!(flagged, vec!["喂食", "巢穴保湿", "垃圾清理"]);
     }
 
     #[test]

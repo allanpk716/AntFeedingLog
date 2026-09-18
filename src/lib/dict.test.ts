@@ -21,6 +21,7 @@ function actionItem(partial: Partial<CareActionItem> & { id: number }): CareActi
     enabled: true,
     sort: partial.id,
     referenced: false,
+    is_preset: false,
     ...partial,
   };
 }
@@ -31,6 +32,7 @@ function foodItem(partial: Partial<FoodItem> & { id: number }): FoodItem {
     enabled: true,
     sort: partial.id,
     referenced: false,
+    is_preset: false,
     ...partial,
   };
 }
@@ -45,6 +47,15 @@ describe("操作行：字典 → 本地编辑态", () => {
     expect(rows.map((r) => r.name)).toEqual(["喂食", "垃圾清理", "换水"]);
     expect(rows[0]).toMatchObject({ kind: "reminding", isFeeding: true, intervalText: "3", enabled: true });
     expect(rows[2]).toMatchObject({ enabled: false, referenced: true, intervalText: "" });
+  });
+
+  it("预置位映射到行：isPreset 跟随 is_preset", () => {
+    const rows = buildActionRows([
+      actionItem({ id: 1, name: "喂食", is_preset: true }),
+      actionItem({ id: 2, name: "降温", is_preset: false }),
+    ]);
+    expect(rows[0]!.isPreset).toBe(true);
+    expect(rows[1]!.isPreset).toBe(false);
   });
 });
 
@@ -74,7 +85,7 @@ describe("操作行：本地编辑态 → save 入参", () => {
     expect(parseInterval(0)).toBe(0);
     expect(validateActionRows([{
       id: 1, name: "喂食", kind: "reminding", isFeeding: true,
-      intervalText: 3, enabled: true, referenced: false,
+      intervalText: 3, enabled: true, isPreset: true, referenced: false,
     }])).toBe("");
   });
 });
@@ -126,7 +137,7 @@ describe("食物行", () => {
     expect(rows[0]!.referenced).toBe(true);
     expect(rows[2]!.enabled).toBe(false);
 
-    rows.push({ id: null, name: " 糖水 ", enabled: true, referenced: false });
+    rows.push({ id: null, name: " 糖水 ", enabled: true, referenced: false, isPreset: false });
     expect(toFoodInputs(rows)).toEqual([
       { id: 1, name: "种子", sort: 0 },
       { id: 2, name: "干虾仁", sort: 1 },
@@ -135,11 +146,20 @@ describe("食物行", () => {
     ]);
   });
 
+  it("buildFoodRows 映射 isPreset：预置跟随 is_preset", () => {
+    const rows = buildFoodRows([
+      foodItem({ id: 1, name: "种子", is_preset: true }),
+      foodItem({ id: 2, name: "糖水", is_preset: false }),
+    ]);
+    expect(rows[0]!.isPreset).toBe(true);
+    expect(rows[1]!.isPreset).toBe(false);
+  });
+
   it("validateFoodRows 拦空名与重名", () => {
     const rows = buildFoodRows([foodItem({ id: 1, name: "种子" })]);
     expect(validateFoodRows([{ ...rows[0]!, name: "  " }])).toContain("不能为空");
     expect(
-      validateFoodRows([...rows, { id: null, name: " 种子 ", enabled: true, referenced: false }]),
+      validateFoodRows([...rows, { id: null, name: " 种子 ", enabled: true, referenced: false, isPreset: false }]),
     ).toContain("已存在");
     expect(validateFoodRows(rows)).toBe("");
   });

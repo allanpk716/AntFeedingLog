@@ -90,6 +90,8 @@ export interface FoodItem {
   name: string;
   enabled: boolean;
   sort: number;
+  /** 预置项禁删可停用（反馈第二轮 F2） */
+  is_preset: boolean;
   referenced: boolean;
 }
 
@@ -104,6 +106,8 @@ export interface CareActionItem {
   suggested_interval_days: number | null;
   enabled: boolean;
   sort: number;
+  /** 预置项禁删可停用（反馈第二轮 F2） */
+  is_preset: boolean;
   referenced: boolean;
 }
 

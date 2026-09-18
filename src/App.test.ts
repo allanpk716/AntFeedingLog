@@ -30,17 +30,17 @@ const locations: LocationItem[] = [
 ];
 
 const foods: FoodItem[] = [
-  { id: 1, name: "种子", enabled: true, sort: 1, referenced: false },
-  { id: 2, name: "干虾仁", enabled: true, sort: 2, referenced: false },
-  { id: 3, name: "面包虫", enabled: true, sort: 3, referenced: false },
-  { id: 4, name: "蚕蛹", enabled: false, sort: 4, referenced: false },
+  { id: 1, name: "种子", enabled: true, sort: 1, referenced: false, is_preset: true },
+  { id: 2, name: "干虾仁", enabled: true, sort: 2, referenced: false, is_preset: true },
+  { id: 3, name: "面包虫", enabled: true, sort: 3, referenced: false, is_preset: true },
+  { id: 4, name: "蚕蛹", enabled: false, sort: 4, referenced: false, is_preset: false },
 ];
 
 const actions: CareActionItem[] = [
-  { id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: 3, enabled: true, sort: 1, referenced: false },
-  { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, referenced: true },
-  { id: 3, name: "巢穴保湿", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 3, referenced: false },
-  { id: 4, name: "垃圾清理", icon: null, kind: "reminding", is_feeding: false, suggested_interval_days: 7, enabled: true, sort: 4, referenced: false },
+  { id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: 3, enabled: true, sort: 1, referenced: false, is_preset: true },
+  { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, referenced: true, is_preset: true },
+  { id: 3, name: "巢穴保湿", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 3, referenced: false, is_preset: true },
+  { id: 4, name: "垃圾清理", icon: null, kind: "reminding", is_feeding: false, suggested_interval_days: 7, enabled: true, sort: 4, referenced: false, is_preset: true },
 ];
 
 const colonies: Colony[] = [
@@ -457,7 +457,7 @@ describe("设置 · 字典管理（票 04）", () => {
 
   // ── 操作 tab ──
 
-  it("操作 tab：列出全部操作，被引用的行删除禁用并提示只能停用", async () => {
+  it("操作 tab：列出全部操作，四个预置行删除一律禁用并提示可停用（反馈第二轮 F2）", async () => {
     const wrapper = await mountApp();
     const dlg = await openSettings(wrapper);
 
@@ -466,12 +466,11 @@ describe("设置 · 字典管理（票 04）", () => {
       rows.map((r) => (r.find(".name-input").element as HTMLInputElement).value),
     ).toEqual(["喂食", "活动区换水", "巢穴保湿", "垃圾清理"]);
 
-    // 活动区换水被历史记录引用 → 删除禁用（规则 10）
-    const water = rows[1];
-    expect(water.find(".erase-btn").attributes("disabled")).toBeDefined();
-    expect(water.find(".erase-btn").attributes("title")).toContain("只能停用");
-    // 未被引用的可删
-    expect(rows[2].find(".erase-btn").attributes("disabled")).toBeUndefined();
+    // 预置操作删除全部禁用（含未被引用的巢穴保湿），标题提示可停用（F2）
+    for (const row of rows) {
+      expect(row.find(".erase-btn").attributes("disabled")).toBeDefined();
+      expect(row.find(".erase-btn").attributes("title")).toContain("预置项不能删除");
+    }
   });
 
   it("操作 tab：登记类切提醒 + 填建议间隔，保存发出 save_action 并刷新首页（验收 4 的链路）", async () => {
@@ -527,6 +526,8 @@ describe("设置 · 字典管理（票 04）", () => {
     await dlg.find(".add-input").setValue("糖水");
     await dlg.find(".add-btn").trigger("click");
     expect(dlg.findAll(".dict-row").length).toBe(5);
+    // 新增行非预置、未被引用：删除可用（F2 只禁预置与被引用）
+    expect(dlg.findAll(".dict-row")[4].find(".erase-btn").attributes("disabled")).toBeUndefined();
 
     invokeMock.mockClear();
     await dlg.find(".tab-body .btn.primary").trigger("click");
@@ -558,6 +559,9 @@ describe("设置 · 字典管理（票 04）", () => {
     // 停用的「蚕蛹」整行置灰 + 行级第一按钮是「启用」
     expect(rows[3].classes()).toContain("row-disabled");
     expect(rows[3].find(".row-btn").text()).toBe("启用");
+    // 预置食物删除禁用、非预置未被引用的「蚕蛹」删除可用（F2）
+    expect(rows[0].find(".erase-btn").attributes("disabled")).toBeDefined();
+    expect(rows[3].find(".erase-btn").attributes("disabled")).toBeUndefined();
 
     await rows[0].find(".name-input").setValue("瓜子");
     invokeMock.mockClear();

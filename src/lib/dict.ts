@@ -17,6 +17,8 @@ export interface ActionRow {
   isFeeding: boolean;
   intervalText: string | number;
   enabled: boolean;
+  /** 预置项禁删可停用（反馈第二轮 F2） */
+  isPreset: boolean;
   referenced: boolean;
 }
 
@@ -31,6 +33,7 @@ export function buildActionRows(actions: CareActionItem[]): ActionRow[] {
       isFeeding: a.is_feeding,
       intervalText: a.suggested_interval_days === null ? "" : String(a.suggested_interval_days),
       enabled: a.enabled,
+      isPreset: a.is_preset,
       referenced: a.referenced,
     }));
 }
@@ -95,6 +98,8 @@ export interface FoodRow {
   id: number | null;
   name: string;
   enabled: boolean;
+  /** 预置项禁删可停用（反馈第二轮 F2） */
+  isPreset: boolean;
   referenced: boolean;
 }
 
@@ -102,7 +107,13 @@ export interface FoodRow {
 export function buildFoodRows(foods: FoodItem[]): FoodRow[] {
   return [...foods]
     .sort((a, b) => a.sort - b.sort || a.id - b.id)
-    .map((f) => ({ id: f.id, name: f.name, enabled: f.enabled, referenced: f.referenced }));
+    .map((f) => ({
+      id: f.id,
+      name: f.name,
+      enabled: f.enabled,
+      isPreset: f.is_preset,
+      referenced: f.referenced,
+    }));
 }
 
 /** 行列表 → save_food 入参：sort = 行下标，名字 trim。 */

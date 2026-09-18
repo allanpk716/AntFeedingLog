@@ -24,6 +24,8 @@ pub struct Food {
     pub name: String,
     pub enabled: bool,
     pub sort: i64,
+    /// 预置项禁删，可停用（反馈第二轮 F2）。
+    pub is_preset: bool,
     pub referenced: bool,
 }
 
@@ -618,7 +620,7 @@ pub fn recent_for_colony(
 // ── 字典查询 ─────────────────────────────────────────────────────────────
 
 const FOOD_SQL: &str = concat!(
-    "SELECT f.id, f.name, f.enabled, f.sort, ",
+    "SELECT f.id, f.name, f.enabled, f.sort, f.is_preset, ",
     "EXISTS(SELECT 1 FROM log_food lf WHERE lf.food_id = f.id) ",
     "FROM food f ",
 );
@@ -629,7 +631,8 @@ fn row_to_food(row: &rusqlite::Row<'_>) -> rusqlite::Result<Food> {
         name: row.get(1)?,
         enabled: row.get::<_, i64>(2)? != 0,
         sort: row.get(3)?,
-        referenced: row.get::<_, i64>(4)? != 0,
+        is_preset: row.get::<_, i64>(4)? != 0,
+        referenced: row.get::<_, i64>(5)? != 0,
     })
 }
 
