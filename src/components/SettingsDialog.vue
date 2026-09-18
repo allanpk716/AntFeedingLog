@@ -13,6 +13,10 @@
  *   Rust 侧 set_settings 同步自启插件状态。
  * - 数据 tab（票 09）：打开数据文件夹 / 安全备份（Rust 拷贝库文件，无需退出）/
  *   导出 CSV / JSON（归档带走）；帮助文案写明手动拷贝需先从托盘真实退出。
+ *   数据 tab 自动备份区（数据安全二期票 02）：开关 / 备份目录（系统文件夹选择框）/
+ *   保留份数（1–365 校验）/ 上次备份状态（尚未备份/成功/失败+原因）；
+ *   开关开着 ∧ 目录未设时显示「未生效」提示。配置存数据目录 backup-config.json
+ *   （D1：库外文件，恢复整库不回滚备份设置）。
  * - 更新 tab（release-update 票 06）：当前版本 / 立即检查更新 / 确认下载安装，
  *   全部走 Tauri command；升级未完成残留的引导也挂在本节顶（UpdatePanel）。
  *
@@ -22,7 +26,17 @@
  */
 import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings, CareActionItem, FoodItem, LocationItem, PushoverStatus, TestNotifyOutcome, AbnormalExitInfo } from "../types";
+import type {
+  AppSettings,
+  BackupConfigInput,
+  BackupConfigInfo,
+  CareActionItem,
+  FoodItem,
+  LocationItem,
+  PushoverStatus,
+  TestNotifyOutcome,
+  AbnormalExitInfo,
+} from "../types";
 import {
   buildActionRows,
   buildFoodRows,
@@ -36,6 +50,12 @@ import {
 } from "../lib/dict";
 import { DAYS_AHEAD_ERROR, toForm, toSettings, type NotifySettingsForm } from "../lib/notifySettings";
 import { formatAbnormalExit } from "../lib/applog";
+import {
+  KEEP_COUNT_ERROR,
+  autoBackupInactive,
+  formatLastBackup,
+  validateKeepCount,
+} from "../lib/backupUi";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
 
@@ -84,6 +104,8 @@ onMounted(async () => {
   }
   // 日志区（票 01）加载失败静默：日志区是辅助信息，不值得为它报错打扰
   await loadLogSection();
+  // 自动备份区（票 02）加载失败同样静默：配置读不出时整区隐藏，不挡其他功能区
+  await loadBackupSection();
 });
 
 // ── 行级即时操作 ──
@@ -344,6 +366,75 @@ async function openLogs() {
   }
 }
 
+// ── 数据 tab：自动备份区（数据安全二期票 02）──
+// 批量保存模式（沿通知页签先例）：开关/目录/保留份数在本地表单上积累，
+// 「保存」一次性落库；未生效提示与上次备份状态绑「已保存」的配置值。
+
+const backupConfig = ref<BackupConfigInfo | null>(null);
+const autoForm = ref<{ enabled: boolean; backupDir: string | null; keepText: string }>({
+  enabled: true,
+  backupDir: null,
+  keepText: "30",
+});
+const backupError = ref("");
+const backupSaved = ref("");
+const backupBusy = ref(false);
+
+function applyBackupConfig(c: BackupConfigInfo | null) {
+  if (!c) return;
+  backupConfig.value = c;
+  autoForm.value = {
+    enabled: c.enabled,
+    backupDir: c.backup_dir,
+    keepText: String(c.keep_count),
+  };
+}
+
+async function loadBackupSection() {
+  try {
+    applyBackupConfig(await invoke<BackupConfigInfo>("get_backup_config"));
+  } catch {
+    // 静默：配置读不出（理论外路径，Rust 侧缺失/损坏都回默认值）不挡其他功能区
+  }
+}
+
+async function pickBackupDir() {
+  backupError.value = "";
+  backupSaved.value = "";
+  try {
+    const dir = await invoke<string | null>("pick_backup_dir");
+    if (dir) autoForm.value.backupDir = dir;
+  } catch (e) {
+    backupError.value = String(e);
+  }
+}
+
+async function saveBackupConfig() {
+  const keep = validateKeepCount(autoForm.value.keepText);
+  if (keep === null) {
+    backupError.value = KEEP_COUNT_ERROR;
+    backupSaved.value = "";
+    return;
+  }
+  backupBusy.value = true;
+  backupError.value = "";
+  backupSaved.value = "";
+  try {
+    const input: BackupConfigInput = {
+      enabled: autoForm.value.enabled,
+      backup_dir: autoForm.value.backupDir,
+      keep_count: keep,
+    };
+    // 返回收敛后的生效值（Rust 侧已规整目录/校验份数），回显以它为准
+    applyBackupConfig(await invoke<BackupConfigInfo>("set_backup_config", { input }));
+    backupSaved.value = "已保存";
+  } catch (e) {
+    backupError.value = String(e);
+  } finally {
+    backupBusy.value = false;
+  }
+}
+
 function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   if (row.isPreset) return "预置项不能删除；可改为停用";
   return row.referenced ? "被历史记录引用，只能停用，不能删除" : "";
@@ -509,8 +600,57 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         <UpdatePanel />
       </div>
 
-      <!-- 数据（票 09）：打开数据文件夹 / 安全备份 / 导出归档 -->
+      <!-- 数据（票 09 手动出口 + 数据安全二期票 02 自动备份区 + 票 01 日志区） -->
       <div v-else-if="activeTab === 'data'" class="tab-body">
+        <!-- 自动备份区（数据安全二期票 02）：开关 / 目录 / 保留份数 / 上次备份状态 -->
+        <div v-if="backupConfig" class="backup-section">
+          <div class="notify-row">
+            <label>
+              <input v-model="autoForm.enabled" class="auto-enabled-input" type="checkbox" />
+              自动备份（每天第一次产生新数据时备份一次，只保留最近 N 份）
+            </label>
+          </div>
+          <div class="notify-row">
+            <span>备份目录：</span>
+            <span v-if="autoForm.backupDir" class="backup-dir-current">{{ autoForm.backupDir }}</span>
+            <span v-else class="backup-dir-current backup-dir-none">未设置</span>
+            <button
+              class="btn data-btn pick-backup-dir-btn"
+              type="button"
+              title="系统文件夹选择框选取；可放进网盘同步目录等任意位置"
+              @click="pickBackupDir"
+            >
+              选择目录…
+            </button>
+          </div>
+          <div class="notify-row">
+            <label>
+              保留份数
+              <input
+                v-model="autoForm.keepText"
+                class="days-input keep-count-input"
+                type="number"
+                min="1"
+                max="365"
+                title="备份目录里只留最近 N 份，超出自动删最旧（只清理本应用自动备份的文件）"
+              />
+              份
+            </label>
+          </div>
+          <p v-if="autoBackupInactive(backupConfig)" class="backup-inactive">
+            未设置备份目录，自动备份未生效
+          </p>
+          <p class="backup-last-status">上次备份：{{ formatLastBackup(backupConfig.last_result) }}</p>
+          <p v-if="backupError" class="form-error backup-error">{{ backupError }}</p>
+          <p v-if="backupSaved" class="saved-hint backup-saved-hint">{{ backupSaved }}</p>
+          <div class="dlg-btns">
+            <span class="spacer"></span>
+            <button class="btn primary save-backup-btn" type="button" :disabled="backupBusy" @click="saveBackupConfig">
+              保存
+            </button>
+          </div>
+        </div>
+
         <div class="data-actions">
           <button class="btn data-btn reveal-btn" type="button" title="在资源管理器中打开库文件所在目录" @click="revealFolder">
             打开数据文件夹
@@ -669,6 +809,35 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   flex-wrap: wrap;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+/* 数据 tab 自动备份区（数据安全二期票 02） */
+.backup-section {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  margin-bottom: 14px;
+}
+
+.backup-dir-current {
+  font-size: 13px;
+  word-break: break-all;
+}
+
+.backup-dir-none {
+  color: var(--muted);
+}
+
+.backup-inactive {
+  font-size: 13px;
+  color: var(--bad);
+  margin-bottom: 6px;
+}
+
+.backup-last-status {
+  font-size: 13px;
+  color: var(--muted);
+  word-break: break-all;
 }
 
 .data-btn {

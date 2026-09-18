@@ -299,3 +299,37 @@ export interface AbnormalExitInfo {
   /** 原因行（上次会话的 panic 日志）；null = 无崩溃日志，疑强杀/断电 */
   reason: string | null;
 }
+
+/** 上次备份结果（backup-config.json 内嵌；null = 尚未备份过） */
+export interface LastBackupOutcome {
+  /** true=成功 / false=失败 */
+  ok: boolean;
+  /** 结果发生时间（YYYY-MM-DD HH:MM:SS） */
+  at: string;
+  /** 失败原因（成功为 null） */
+  reason: string | null;
+}
+
+/** 备份配置（Rust backup_config::BackupConfig；落数据目录 backup-config.json，
+ * 不进 SQLite——D1：恢复整库不回滚备份设置） */
+export interface BackupConfigInfo {
+  /** 自动备份开关（默认开） */
+  enabled: boolean;
+  /** 备份目录；null = 未设（未设时自动备份不生效） */
+  backup_dir: string | null;
+  /** 保留份数 1–365（默认 30） */
+  keep_count: number;
+  /** 最后成功备份日期（YYYY-MM-DD；票 03 接真数据） */
+  last_backup_date: string | null;
+  /** 最后业务写入日期（YYYY-MM-DD；票 03 接真数据） */
+  last_data_write_date: string | null;
+  /** 上次备份结果与时间；null = 尚未备份 */
+  last_result: LastBackupOutcome | null;
+}
+
+/** set_backup_config 入参：只含用户可改的三项（账目字段 Rust 侧维护，前端不可覆写） */
+export interface BackupConfigInput {
+  enabled: boolean;
+  backup_dir: string | null;
+  keep_count: number;
+}
