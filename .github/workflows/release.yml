@@ -89,4 +89,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         shell: bash
-        run: gh release edit "$TAG_NAME" --generate-notes
+        # 2026-09-19 修复：runner 的 gh 不支持 `release edit --generate-notes`（那是
+        # create 的旗标，35403657235 实证 unknown flag）。改走 REST API 生成再落，
+        # 语义与 --generate-notes 一致，任何 gh 版本可用。
+        run: |
+          gh api "repos/{owner}/{repo}/releases/generate-notes" -f tag_name="$TAG_NAME" -q .body > release-notes.md
+          gh release edit "$TAG_NAME" --notes-file release-notes.md
