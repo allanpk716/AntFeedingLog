@@ -31,6 +31,8 @@ pnpm tauri build        # 打包安装包
 
 数据文件位于 `%APPDATA%/com.antfeedinglog.app/`，设置里有"打开数据文件夹"。
 
+发新版（生成签名密钥 → 配 Secrets → 打 tag → 验收产物）看 [docs/release.md](./docs/release.md)。
+
 ## 文档
 
 - [CONTEXT.md](./CONTEXT.md) — 领域术语表（窝 / 冬眠 / 提醒类 / 登记类…）
