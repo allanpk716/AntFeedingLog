@@ -21,6 +21,7 @@
 //! Tauri command 薄封装在 lib.rs（目录选择对话框 rfd 也在那边）。
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -162,6 +163,19 @@ pub fn status_of(config: &BackupConfig) -> BackupStatus {
 
 // ── IO 薄层（TempDir 直测）───────────────────────────────────────────────
 
+/// 配置文件单写者锁（评审转记，票 03 起）：后台备份记账线程与 UI 设置保存会
+/// 并发读改写同一文件——所有「load → 改 → save」全程持锁，交错不丢更新。
+/// 无锁的读（load）不持锁：最坏撞上写入中途读到半截 JSON，按默认值处理且不
+/// 落盘（会落盘的路径都在锁内），不会造成持久性丢失。
+static CONFIG_FILE_LOCK: Mutex<()> = Mutex::new(());
+
+/// 拿配置写锁（锁毒化按原值续用：配置是提示性数据，不值得 panic）。
+fn lock_config_file() -> std::sync::MutexGuard<'static, ()> {
+    CONFIG_FILE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// 读配置：文件缺失/损坏/半损坏按默认值（serde(default) 补齐缺字段），
 /// 读后收敛脏值。绝不 panic、不挡启动（spec D1）。
 pub fn load(data_dir: &Path) -> BackupConfig {
@@ -193,11 +207,26 @@ pub fn save(data_dir: &Path, config: &BackupConfig) -> Result<(), String> {
 }
 
 /// 读 → 合并校验 → 写（set_backup_config 编排）。校验失败时不落盘，原配置原样。
+/// 读改写全程持单写者锁（与备份记账并发安全）。
 pub fn update_and_save(data_dir: &Path, input: &BackupConfigInput) -> Result<BackupConfig, String> {
+    let _guard = lock_config_file();
     let current = load(data_dir);
     let next = merge_input(&current, input)?;
     save(data_dir, &next)?;
     Ok(next)
+}
+
+/// 账目更新（票 03 备份引擎记账入口）：锁内 load → 按 `f` 改账目字段 → save。
+/// 与 [`update_and_save`] 共用同一把单写者锁，交错不丢更新。
+pub fn update_accounting(
+    data_dir: &Path,
+    f: impl FnOnce(&mut BackupConfig),
+) -> Result<BackupConfig, String> {
+    let _guard = lock_config_file();
+    let mut current = load(data_dir);
+    f(&mut current);
+    save(data_dir, &current)?;
+    Ok(current)
 }
 
 // ── 测试：只测外部行为（spec「Testing Decisions」）────────────────────────
@@ -417,6 +446,44 @@ mod tests {
         let c = load(dir.path());
         assert!(!c.enabled && c.keep_count == 7, "拒绝后原配置原样");
         assert_eq!(c.backup_dir.as_deref(), Some("D:/keep"));
+    }
+
+    // ── 配置并发保护（评审转记：双线程交错 update 断言不丢更新）──
+
+    #[test]
+    fn concurrent_updates_do_not_lose_writes() {
+        // 后台备份记账线程（写 last_data_write_date / last_result）与 UI 设置保存
+        // 会并发读改写同一文件——load→改→save 全程持单写者锁，交错不丢更新。
+        let dir = temp_data_dir();
+        let data_dir = dir.path();
+        std::thread::scope(|s| {
+            // 线程甲：连写 28 次业务写入日（1 日 → 28 日递增）
+            s.spawn(|| {
+                for i in 0..28 {
+                    update_accounting(data_dir, |c| {
+                        c.last_data_write_date = Some(format!("2026-09-{:02}", i + 1))
+                    })
+                    .unwrap();
+                }
+            });
+            // 线程乙：连写 28 次备份结果
+            s.spawn(|| {
+                for i in 0..28 {
+                    update_accounting(data_dir, |c| {
+                        c.last_result = outcome(true, &format!("2026-09-18 00:{:02}:00", i), None)
+                    })
+                    .unwrap();
+                }
+            });
+        });
+        let latest = load(data_dir);
+        assert_eq!(
+            latest.last_data_write_date.as_deref(),
+            Some("2026-09-28"),
+            "线程甲的最后一次更新必须幸存"
+        );
+        let r = latest.last_result.expect("线程乙的最后一次更新必须幸存");
+        assert_eq!(r.at, "2026-09-18 00:27:00");
     }
 
     // ── 状态投影（get_backup_status，D10 契约）──

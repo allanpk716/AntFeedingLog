@@ -1,4 +1,5 @@
 mod applog;
+mod auto_backup;
 mod backup_config;
 mod care;
 mod colony;
@@ -81,6 +82,9 @@ fn log_care(
     let result = with_conn(state, |conn| care::log_care(conn, &input, &care::now_local()));
     // 停靠 C：数据变了 → 托盘 tooltip 即时重算（在锁释放后调用，避免自锁）
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app); // 票 03：业务写入成功 → 自动备份触发点
+    }
     result
 }
 
@@ -108,6 +112,9 @@ fn update_log(
 ) -> Result<(), String> {
     let result = with_conn(state, |conn| care::update_log(conn, id, &input, &care::now_local()));
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -119,6 +126,9 @@ fn delete_log(
 ) -> Result<(), String> {
     let result = with_conn(state, |conn| care::delete_log(conn, id));
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -132,63 +142,101 @@ fn list_actions(state: tauri::State<'_, DbState>) -> Result<Vec<dict::CareAction
 #[tauri::command]
 fn save_action(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     input: dict::ActionInput,
 ) -> Result<dict::CareAction, String> {
-    with_conn(state, |conn| dict::save_action(conn, &input))
+    let result = with_conn(state, |conn| dict::save_action(conn, &input));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 #[tauri::command]
 fn set_action_enabled(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     id: i64,
     enabled: bool,
 ) -> Result<(), String> {
-    with_conn(state, |conn| dict::set_action_enabled(conn, id, enabled))
+    let result = with_conn(state, |conn| dict::set_action_enabled(conn, id, enabled));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 #[tauri::command]
-fn erase_action(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
-    with_conn(state, |conn| dict::erase_action(conn, id))
+fn erase_action(state: tauri::State<'_, DbState>, app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    let result = with_conn(state, |conn| dict::erase_action(conn, id));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 #[tauri::command]
 fn set_action_policy(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     id: i64,
     input: dict::ActionPolicyInput,
 ) -> Result<dict::CareAction, String> {
-    with_conn(state, |conn| dict::set_action_policy(conn, id, &input))
+    let result = with_conn(state, |conn| dict::set_action_policy(conn, id, &input));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 #[tauri::command]
 fn save_food(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     input: dict::FoodInput,
 ) -> Result<care::Food, String> {
-    with_conn(state, |conn| dict::save_food(conn, &input))
+    let result = with_conn(state, |conn| dict::save_food(conn, &input));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 #[tauri::command]
 fn set_food_enabled(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     id: i64,
     enabled: bool,
 ) -> Result<(), String> {
-    with_conn(state, |conn| dict::set_food_enabled(conn, id, enabled))
+    let result = with_conn(state, |conn| dict::set_food_enabled(conn, id, enabled));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 #[tauri::command]
-fn erase_food(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
-    with_conn(state, |conn| dict::erase_food(conn, id))
+fn erase_food(state: tauri::State<'_, DbState>, app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    let result = with_conn(state, |conn| dict::erase_food(conn, id));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 #[tauri::command]
 fn set_location_enabled(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     id: i64,
     enabled: bool,
 ) -> Result<(), String> {
-    with_conn(state, |conn| colony::set_location_enabled(conn, id, enabled))
+    let result = with_conn(state, |conn| colony::set_location_enabled(conn, id, enabled));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 // ── 窝（票 02）──
@@ -210,6 +258,9 @@ fn create_colony(
         colony::create_colony(conn, &input, &colony::today_iso())
     });
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -224,6 +275,9 @@ fn update_colony(
         colony::update_colony(conn, id, &input, &colony::today_iso())
     });
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -235,6 +289,9 @@ fn archive_colony(
 ) -> Result<colony::Colony, String> {
     let result = with_conn(state, |conn| colony::archive_colony(conn, id, &colony::today_iso()));
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -246,6 +303,9 @@ fn delete_colony(
 ) -> Result<(), String> {
     let result = with_conn(state, |conn| colony::delete_colony(conn, id));
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -259,14 +319,23 @@ fn list_locations(state: tauri::State<DbState>) -> Result<Vec<colony::Location>,
 #[tauri::command]
 fn save_location(
     state: tauri::State<DbState>,
+    app: tauri::AppHandle,
     input: colony::LocationInput,
 ) -> Result<colony::Location, String> {
-    with_conn(state, |conn| colony::save_location(conn, &input))
+    let result = with_conn(state, |conn| colony::save_location(conn, &input));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 #[tauri::command]
-fn erase_location(state: tauri::State<DbState>, id: i64) -> Result<(), String> {
-    with_conn(state, |conn| colony::erase_location(conn, id))
+fn erase_location(state: tauri::State<DbState>, app: tauri::AppHandle, id: i64) -> Result<(), String> {
+    let result = with_conn(state, |conn| colony::erase_location(conn, id));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
 }
 
 // ── 冬眠（票 05）──
@@ -289,6 +358,9 @@ fn start_hibernation(
         )
     });
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -303,6 +375,9 @@ fn confirm_wake(
         hibernation::confirm_wake(conn, colony_id, &actual_end_date, &colony::today_iso())
     });
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -318,6 +393,9 @@ fn add_past_hibernation(
         hibernation::add_past_hibernation(conn, colony_id, &start_date, &end_date)
     });
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -341,6 +419,9 @@ fn update_expected_end(
         hibernation::update_expected_end(conn, colony_id, &new_expected_end_date)
     });
     reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
     result
 }
 
@@ -612,6 +693,43 @@ fn get_backup_status() -> Result<backup_config::BackupStatus, String> {
     Ok(backup_config::status_of(&backup_config::load(&data_dir)))
 }
 
+// ── 自动备份引擎（数据安全二期票 03，D2/D3/D4；引擎本体在 auto_backup.rs）──
+
+/// 业务写入成功后的触发点（D2 ①）：先同步记 `last_data_write_date`（配置锁内
+/// 快速落账，账目不丢），再后台线程判定 + 备份——网络盘等慢速目标目录不阻塞
+/// 命令返回与 UI（spec D3 锁外拷贝）。备份失败静默（记账+日志），绝不把错误
+/// 报给业务命令：写入照常成功返回（票面铁律）。
+fn trigger_after_write(app: &tauri::AppHandle) {
+    let data_dir = match current_data_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            applog::log_error(&format!("自动备份触发跳过（数据目录未就绪）: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = auto_backup::record_data_write(&data_dir, chrono::Local::now().date_naive()) {
+        // 记账失败不回滚业务写入；日志留痕排查配置文件 IO 问题
+        applog::log_error(&format!("记录业务写入日期失败: {e}"));
+    }
+    spawn_auto_backup(app);
+}
+
+/// 启动触发点（D2 ②）与写入触发点共用的后台执行入口：判定（含时钟回拨钳制）
+/// → 需要才真备份，谓词不满足时线程空转一次即退。
+fn spawn_auto_backup(app: &tauri::AppHandle) {
+    let Ok(data_dir) = current_data_dir() else {
+        return;
+    };
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some(state) = app.try_state::<DbState>() else {
+            eprintln!("[auto_backup] 库状态未就绪，本次触发跳过");
+            return;
+        };
+        auto_backup::run_triggered(state.inner(), &data_dir);
+    });
+}
+
 // ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──
 
 /// 打开数据文件夹（opener 打开 app data 目录；目录不存在先创建）。
@@ -746,6 +864,10 @@ pub fn run() {
             // 每日更新检查（票 02）：托盘常驻进程内跑，窗口关闭也查；
             // 内部按"上次检查日"决定真查还是跳过（重启不重查）。
             updater::spawn_daily_checker(app.handle().clone());
+            // 自动备份启动触发点（数据安全二期票 03 D2 ②）：接在票 01 startup
+            // 序列后，后台判定（含时钟回拨钳制）→ 有未备份的新数据才补跑
+            // （跨日空启动不备；备份失败留给本触发点下次启动补）。
+            spawn_auto_backup(app.handle());
             // 关窗 = 最小化到托盘（票 09 验收 1）：拦截关闭请求只隐藏，托盘「退出」才真退。
             if let Some(window) = app.get_webview_window("main") {
                 let win = window.clone();
