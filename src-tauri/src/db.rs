@@ -14,7 +14,13 @@ use rusqlite::Connection;
 /// v2：care_action 增加 is_feeding 标记位（R1 评审：喂食判定与名字解耦）。
 /// v3：reminder_ledger 冬眠侧唯一键把种类并入（窝,种类,基准日）——v2 是
 ///     (窝,基准日)，提前天数设 0 时临近/出眠日两种提醒同日互斥（票 01 停靠）。
-pub const SCHEMA_VERSION: i64 = 3;
+/// v4：字典预置项保护位（反馈第二轮 F2，Q5）——care_action/food 各加 is_preset。
+/// v5：提醒台账推送列（反馈第二轮 F4，Q3/Q4/Q8）——push_title/push_body = 发送当时
+///     的通知文案快照（补发直接用、不重算），pushover_done = 手机侧已了结。
+/// v6：双层喂食周期（反馈第二轮 F3）——food 加 suggested_interval_days（预置按名
+///     回填）；reminder_ledger 整表重建加 food_id 维度（v1 的 kind CHECK 不含
+///     'food_overdue'，重建时顺带去掉该 CHECK、改由应用层保证）。
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -100,6 +106,9 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             0 => migrate_v0_to_v1(conn)?,
             1 => migrate_v1_to_v2(conn)?,
             2 => migrate_v2_to_v3(conn)?,
+            3 => migrate_v3_to_v4(conn)?,
+            4 => migrate_v4_to_v5(conn)?,
+            5 => migrate_v5_to_v6(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -152,6 +161,93 @@ fn migrate_v2_to_v3(conn: &Connection) -> Result<(), rusqlite::Error> {
         "#,
     )?;
     tx.pragma_update(None, "user_version", 3)?;
+    tx.commit()
+}
+
+/// v3 → v4：字典预置项保护位（反馈第二轮 F2，Q5）。care_action/food 各加 is_preset，
+/// 按名字回填预置行（喂食/活动区换水/巢穴保湿/垃圾清理、种子/干虾仁/面包虫）。
+/// 已改名且从未被引用的预置回填不到——已知边界（单人工具可接受，见共识文档）。
+/// 新库走同一条路：v0→v1 seed 不带该列，v4 统一回填。
+fn migrate_v3_to_v4(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        ALTER TABLE care_action
+            ADD COLUMN is_preset INTEGER NOT NULL DEFAULT 0 CHECK (is_preset IN (0, 1));
+        UPDATE care_action SET is_preset = 1
+            WHERE name IN ('喂食', '活动区换水', '巢穴保湿', '垃圾清理');
+
+        ALTER TABLE food
+            ADD COLUMN is_preset INTEGER NOT NULL DEFAULT 0 CHECK (is_preset IN (0, 1));
+        UPDATE food SET is_preset = 1 WHERE name IN ('种子', '干虾仁', '面包虫');
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 4)?;
+    tx.commit()
+}
+
+/// v5 → v?（F4）：台账加推送列。push_title/push_body = 发送当时的通知文案快照
+/// （补发时直接用，不重算）；pushover_done = 手机侧已了结（已送达或超窗放弃）。
+/// 历史行升级即了结（它们的桌面通知在当天已发过，不补手机）。
+fn migrate_v4_to_v5(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        ALTER TABLE reminder_ledger ADD COLUMN push_title TEXT;
+        ALTER TABLE reminder_ledger ADD COLUMN push_body TEXT;
+        ALTER TABLE reminder_ledger ADD COLUMN pushover_done INTEGER NOT NULL DEFAULT 0;
+        UPDATE reminder_ledger SET pushover_done = 1;
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 5)?;
+    tx.commit()
+}
+
+/// v6（F3）：① food 加 suggested_interval_days（按名回填 种子3/干虾仁7/面包虫7）；
+/// ② reminder_ledger 整表重建——v1 的 kind CHECK 不含 'food_overdue' 且 SQLite 不能
+/// 改列约束，顺带加 food_id 维度；kind 合法性改由应用层（compute 只产四种）保证。
+/// 数据、推送列（v5）、既有唯一键语义全部原样保留。
+fn migrate_v5_to_v6(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        ALTER TABLE food ADD COLUMN suggested_interval_days INTEGER;
+        UPDATE food SET suggested_interval_days = CASE name
+            WHEN '种子' THEN 3
+            WHEN '干虾仁' THEN 7
+            WHEN '面包虫' THEN 7
+        END
+        WHERE name IN ('种子', '干虾仁', '面包虫');
+
+        CREATE TABLE reminder_ledger_v6 (
+            id             INTEGER PRIMARY KEY,
+            colony_id      INTEGER NOT NULL REFERENCES colony(id),
+            kind           TEXT    NOT NULL,
+            action_id      INTEGER REFERENCES care_action(id),
+            food_id        INTEGER REFERENCES food(id),
+            base_date      TEXT    NOT NULL,
+            sent_at        TEXT    NOT NULL,
+            push_title     TEXT,
+            push_body      TEXT,
+            pushover_done  INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO reminder_ledger_v6
+            (id, colony_id, kind, action_id, base_date, sent_at, push_title, push_body, pushover_done)
+            SELECT id, colony_id, kind, action_id, base_date, sent_at, push_title, push_body, pushover_done
+            FROM reminder_ledger;
+        DROP TABLE reminder_ledger;
+        ALTER TABLE reminder_ledger_v6 RENAME TO reminder_ledger;
+
+        CREATE UNIQUE INDEX uq_ledger_overdue
+            ON reminder_ledger(colony_id, action_id, base_date) WHERE kind = 'overdue';
+        CREATE UNIQUE INDEX uq_ledger_food
+            ON reminder_ledger(colony_id, action_id, food_id, base_date) WHERE kind = 'food_overdue';
+        CREATE UNIQUE INDEX uq_ledger_wake
+            ON reminder_ledger(colony_id, kind, base_date)
+            WHERE kind IN ('approaching_wake', 'wake_day');
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 6)?;
     tx.commit()
 }
 
@@ -346,7 +442,92 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 3);
+        assert_eq!(SCHEMA_VERSION, 6);
+    }
+
+    #[test]
+    fn v5_adds_push_columns_and_settles_legacy_rows() {
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).unwrap();
+        seed_v1_presets(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        conn.execute("INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')", []).unwrap();
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
+             VALUES (1, 'overdue', 1, '2026-09-15', '2026-09-15 08:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap(); // F2 之后真实库至少是 v4
+
+        migrate(&conn).unwrap();
+        // 历史行只走过桌面通道：直接视为已了结，不参与补发
+        let done: i64 = conn.query_row("SELECT pushover_done FROM reminder_ledger", [], |r| r.get(0)).unwrap();
+        assert_eq!(done, 1);
+        // 新列存在且可为空
+        let (title, body): (Option<String>, Option<String>) = conn
+            .query_row("SELECT push_title, push_body FROM reminder_ledger", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((title, body), (None, None));
+    }
+
+    #[test]
+    fn v6_adds_food_interval_and_rebuilds_ledger_with_food_dimension() {
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).unwrap();
+        seed_v1_presets(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
+        // v5 列（F4 之后真实库至少 v5；这里手工补齐等价结构再升 v6）
+        conn.execute_batch(
+            "ALTER TABLE reminder_ledger ADD COLUMN push_title TEXT;
+             ALTER TABLE reminder_ledger ADD COLUMN push_body TEXT;
+             ALTER TABLE reminder_ledger ADD COLUMN pushover_done INTEGER NOT NULL DEFAULT 0;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 5).unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at, push_title, push_body, pushover_done)
+             VALUES (1, 'overdue', 1, '2026-09-15', '2026-09-15 08:00:00', '喂食超期', '正文', 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // 食物周期：预置三样按名回填，自建为 NULL
+        let intervals: Vec<(String, Option<i64>)> = {
+            let mut stmt = conn.prepare("SELECT name, suggested_interval_days FROM food ORDER BY sort").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(intervals, vec![
+            ("种子".into(), Some(3)), ("干虾仁".into(), Some(7)), ("面包虫".into(), Some(7)),
+        ]);
+
+        // 台账重建后：旧行与推送列原样保留 + 新 food_id 列（NULL）
+        let row: (Option<i64>, Option<String>, i64) = conn
+            .query_row("SELECT food_id, push_title, pushover_done FROM reminder_ledger", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap();
+        assert_eq!(row, (None, Some("喂食超期".into()), 1));
+
+        // food_overdue 维度的唯一键生效：同窝同操作同日、不同食物共存；同食物重复被拒
+        let insert = |food: Option<i64>| {
+            conn.execute(
+                "INSERT INTO reminder_ledger (colony_id, kind, action_id, food_id, base_date, sent_at)
+                 VALUES (1, 'food_overdue', 1, ?1, '2026-09-15', '2026-09-15 08:00:00')",
+                params![food],
+            )
+        };
+        assert_eq!(insert(Some(1)).unwrap(), 1);
+        assert_eq!(insert(Some(2)).unwrap(), 1);
+        assert!(insert(Some(1)).is_err());
     }
 
     #[test]
@@ -524,6 +705,43 @@ mod tests {
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_log"), 1);
         // 升级后再 migrate 幂等
         migrate(&conn).expect("对 v2 库再次 migrate 不应失败");
+    }
+
+    #[test]
+    fn v4_flags_preset_actions_and_foods() {
+        let (conn, _dir) = fresh_conn();
+        let action_names: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(action_names, vec!["喂食", "活动区换水", "巢穴保湿", "垃圾清理"]);
+        let food_names: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM food WHERE is_preset = 1 ORDER BY sort").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        assert_eq!(food_names, vec!["种子", "干虾仁", "面包虫"]);
+    }
+
+    #[test]
+    fn v3_db_with_custom_rows_upgrades_to_v4_and_backfills() {
+        // 真实 v3 库 + 用户自建行 + 一个改过名的预置（回填盲区，见共识文档边界）
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).unwrap();
+        seed_v1_presets(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        conn.execute("UPDATE care_action SET name = '换水' WHERE name = '活动区换水'", []).unwrap();
+        conn.execute("INSERT INTO care_action (name, kind, enabled, sort) VALUES ('降温', 'log_only', 1, 5)", []).unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+        let flagged: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort").unwrap();
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+        };
+        // 已改名的预置匹配不到（已知边界，接受）；自建项不误标
+        assert_eq!(flagged, vec!["喂食", "巢穴保湿", "垃圾清理"]);
     }
 
     #[test]

@@ -11,32 +11,33 @@ const settings: AppSettings = {
 };
 
 describe("通知设置：设置态 ↔ 表单态", () => {
-  it("toForm 回显开关与提前天数文本", () => {
+  it("toForm 回显总开关与提前天数文本（分类子开关不再出现在表单）", () => {
     expect(toForm(settings)).toEqual({
       master: true,
-      overdue: false,
-      hibernation: true,
       daysAheadText: "7",
     });
   });
 
-  it("toSettings 带上开关与提前天数，autostart 原样透传", () => {
-    const out = toSettings(
-      { master: false, overdue: true, hibernation: false, daysAheadText: "3" },
-      true,
-    );
+  it("toSettings 带上总开关与提前天数，分类开关固定回写 true，autostart 原样透传", () => {
+    const out = toSettings({ master: false, daysAheadText: "3" }, true);
     expect(out).toEqual({
       notify_master_enabled: false,
       notify_overdue_enabled: true,
-      notify_hibernation_enabled: false,
+      notify_hibernation_enabled: true,
       wake_remind_days_ahead: 3,
       autostart_enabled: true,
     });
   });
 
-  it("toForm → toSettings 往返保持设置（autostart 除外）", () => {
+  it("toForm → toSettings 往返保持设置（分类开关作废、固定回写 true，autostart 除外）", () => {
     const out = toSettings(toForm(settings), settings.autostart_enabled);
-    expect(out).toEqual(settings);
+    expect(out).toEqual({
+      notify_master_enabled: true,
+      notify_overdue_enabled: true,
+      notify_hibernation_enabled: true,
+      wake_remind_days_ahead: 7,
+      autostart_enabled: true,
+    });
   });
 });
 
@@ -59,7 +60,7 @@ describe("通知设置：提前天数校验", () => {
 
   it("非法提前天数时 toSettings 返回 null（不落库）", () => {
     const out = toSettings(
-      { master: true, overdue: true, hibernation: true, daysAheadText: "-1" },
+      { master: true, daysAheadText: "-1" },
       true,
     );
     expect(out).toBeNull();

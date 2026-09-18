@@ -17,14 +17,33 @@ use serde::{Deserialize, Serialize};
 
 // ── DTO ──────────────────────────────────────────────────────────────────
 
-/// 食物（含停用的：前端新建入口过滤 enabled；referenced=被历史记录引用，只能停用不能删）。
+/// 食物（含停用的：前端新建入口过滤 enabled；referenced=被历史记录或提醒台账
+/// （food 维度，F3）引用，只能停用不能删）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Food {
     pub id: i64,
     pub name: String,
     pub enabled: bool,
     pub sort: i64,
+    /// 食物建议间隔（天，F3）：距上次喂「该食物」超过它就单独提醒；NULL = 未设，
+    /// 该食物只受喂食操作统一周期管。
+    pub suggested_interval_days: Option<i64>,
+    /// 预置项禁删，可停用（反馈第二轮 F2）。
+    pub is_preset: bool,
     pub referenced: bool,
+}
+
+/// 喂食块里单个食物的「距上次」明细（反馈第二轮 F3）。
+/// 基线与操作层同口径：max(该窝该食物最近一次喂食日期, 最近出眠日期)。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FoodTileStatus {
+    pub food_id: i64,
+    pub name: String,
+    pub suggested_interval_days: Option<i64>,
+    /// 该食物从未被喂过且无出眠史为 None。
+    pub days_since_last: Option<i64>,
+    /// 仅操作 kind=reminding 且已设周期且 > 周期；否则恒 false。
+    pub overdue: bool,
 }
 
 /// 窝卡片上单个操作块的后端算好的展示数据。
@@ -39,8 +58,11 @@ pub struct ActionTile {
     pub suggested_interval_days: Option<i64>,
     /// 今天 − max(最近一次发生日期, 最近出眠日期)（自然日，规则 5）；从未记录且无出眠史为 None。
     pub days_since_last: Option<i64>,
-    /// 仅提醒类且 > 建议间隔；登记类/从未记录恒 false。
+    /// 仅提醒类且 > 建议间隔；喂食类任一设周期食物超期也算（F3，Q2 决议）；
+    /// 登记类/从未记录恒 false。
     pub overdue: bool,
+    /// 逐食物「距上次」明细（F3）；仅喂食类非空，其余操作恒空数组。
+    pub foods: Vec<FoodTileStatus>,
 }
 
 /// 最近记录摘要的一行（前端拼成「最近：09-17 喂食（种子）· …」）。
@@ -498,6 +520,8 @@ pub fn delete_log(conn: &Connection, id: i64) -> Result<(), String> {
 /// 某窝每个「启用中」操作一块，按 sort、id 排序（字典新增操作自动出现）。
 /// 「距上次」基线（规则 5）：有出眠史的窝取 max(最近一次记录日期, 最近出眠日期)，
 /// 出眠当天全窝 0 天、不会一睁眼全红；登记类显示同样基准（只影响文案，永不红的性质不变）。
+/// 喂食块（F3）另带逐食物明细：基线同口径（max(该食物最近喂食, 出眠日)），
+/// 任一设周期食物超期整块红（Q2）。
 pub fn tiles_for_colony(
     conn: &Connection,
     colony_id: i64,
@@ -524,6 +548,27 @@ pub fn tiles_for_colony(
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
+
+    // 启用中的食物（含周期，F3 食物层用）；全动作共用，取一次
+    let food_rows: Vec<(i64, String, Option<i64>)> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, suggested_interval_days FROM food WHERE enabled = 1 ORDER BY sort, id",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows
+    };
 
     let mut tiles = Vec::with_capacity(rows.len());
     for (action_id, name, icon, kind, is_feeding, interval) in rows {
@@ -556,7 +601,56 @@ pub fn tiles_for_colony(
         };
         let last = base.map(|d| d.format("%Y-%m-%d").to_string());
         let days = days_since_last(last.as_deref(), today)?;
-        let overdue = is_overdue(&kind, days, interval);
+
+        // F3 食物层：喂食类逐食物算「距上次该食物」，基线与操作层同口径（含出眠重置）；
+        // 脏行同样逐食物跳过；食物超期仅提醒类且已设周期时判定
+        let mut foods = Vec::with_capacity(if is_feeding != 0 { food_rows.len() } else { 0 });
+        if is_feeding != 0 {
+            for (food_id, food_name, food_interval) in &food_rows {
+                let occurred: Vec<String> = {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT l.occurred_at FROM log_food lf
+                             JOIN care_log l ON l.id = lf.log_id
+                             JOIN care_action a ON a.id = l.action_id
+                             WHERE lf.food_id = ?1 AND l.colony_id = ?2 AND a.is_feeding = 1",
+                        )
+                        .map_err(db_err)?;
+                    let rows = stmt
+                        .query_map(params![food_id, colony_id], |row| row.get(0))
+                        .map_err(db_err)?
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(db_err)?;
+                    rows
+                };
+                let food_latest = occurred
+                    .iter()
+                    .filter_map(|s| chrono::NaiveDate::parse_from_str(s.get(0..10).unwrap_or(""), "%Y-%m-%d").ok())
+                    .max();
+                let food_base = match (food_latest, wake) {
+                    (Some(log), Some(w)) => Some(log.max(w)),
+                    (log, w) => log.or(w),
+                };
+                let food_days = days_since_last(
+                    food_base.map(|d| d.format("%Y-%m-%d").to_string()).as_deref(),
+                    today,
+                )?;
+                let food_overdue = if kind == "reminding" {
+                    is_overdue("reminding", food_days, *food_interval)
+                } else {
+                    false
+                };
+                foods.push(FoodTileStatus {
+                    food_id: *food_id,
+                    name: food_name.clone(),
+                    suggested_interval_days: *food_interval,
+                    days_since_last: food_days,
+                    overdue: food_overdue,
+                });
+            }
+        }
+        let food_any = foods.iter().any(|f| f.overdue);
+        let overdue = is_overdue(&kind, days, interval) || food_any;
         tiles.push(ActionTile {
             action_id,
             name,
@@ -566,6 +660,7 @@ pub fn tiles_for_colony(
             suggested_interval_days: interval,
             days_since_last: days,
             overdue,
+            foods,
         });
     }
     Ok(tiles)
@@ -618,8 +713,9 @@ pub fn recent_for_colony(
 // ── 字典查询 ─────────────────────────────────────────────────────────────
 
 const FOOD_SQL: &str = concat!(
-    "SELECT f.id, f.name, f.enabled, f.sort, ",
-    "EXISTS(SELECT 1 FROM log_food lf WHERE lf.food_id = f.id) ",
+    "SELECT f.id, f.name, f.enabled, f.sort, f.suggested_interval_days, f.is_preset, ",
+    "(EXISTS(SELECT 1 FROM log_food lf WHERE lf.food_id = f.id) ",
+    "OR EXISTS(SELECT 1 FROM reminder_ledger g WHERE g.food_id = f.id)) ",
     "FROM food f ",
 );
 
@@ -629,7 +725,9 @@ fn row_to_food(row: &rusqlite::Row<'_>) -> rusqlite::Result<Food> {
         name: row.get(1)?,
         enabled: row.get::<_, i64>(2)? != 0,
         sort: row.get(3)?,
-        referenced: row.get::<_, i64>(4)? != 0,
+        suggested_interval_days: row.get(4)?,
+        is_preset: row.get::<_, i64>(5)? != 0,
+        referenced: row.get::<_, i64>(6)? != 0,
     })
 }
 
@@ -647,7 +745,8 @@ pub fn get_food(conn: &Connection, id: i64) -> Result<Food, String> {
 }
 
 /// 全部食物（含停用的，与 list_locations 同口径；新建入口由前端过滤 enabled）。
-/// `referenced` = 被 log_food 引用：删除会被拒，只能停用（规则 10）。
+/// `referenced` = 被 log_food 或 reminder_ledger（food 维度，F3）引用：
+/// 删除会被拒，只能停用（规则 10）。
 pub fn list_foods(conn: &Connection) -> Result<Vec<Food>, String> {
     let mut stmt = conn
         .prepare(&format!("{FOOD_SQL} ORDER BY f.sort, f.id"))
@@ -1239,6 +1338,24 @@ mod tests {
         assert!(!foods.iter().find(|f| f.name == "干虾仁").unwrap().referenced);
     }
 
+    #[test]
+    fn list_foods_flags_referenced_by_reminder_ledger_food_dimension() {
+        // F3：food_overdue 台账行也是引用——否则从未喂过的食物（被补发过提醒）
+        // 会显示可删，DELETE 撞 reminder_ledger.food_id 外键报原始错误
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, food_id, base_date, sent_at)
+             VALUES (?1, 'food_overdue', ?2, ?3, '2026-09-11', '2026-09-18 08:00:00')",
+            params![c, action_id(&conn, "喂食"), food_id(&conn, "面包虫")],
+        )
+        .unwrap();
+
+        let foods = list_foods(&conn).unwrap();
+        assert!(foods.iter().find(|f| f.name == "面包虫").unwrap().referenced);
+        assert!(!foods.iter().find(|f| f.name == "干虾仁").unwrap().referenced);
+    }
+
     // ── 记录列表 / 编辑 / 删除（票 08）──
 
     /// 带备注与食物的喂食记录（搭列表/编辑场景用）。
@@ -1703,6 +1820,65 @@ mod tests {
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         assert_eq!(tile(&tiles, "喂食").days_since_last, Some(10), "距上次跟随新发生时间");
         assert!(tile(&tiles, "喂食").overdue, "10 天 > 建议 3 天 → 超期红");
+    }
+
+    #[test]
+    fn feeding_tile_lists_per_food_days_and_flags_food_overdue() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        // 2 天前喂了种子；8 天前喂过面包虫（周期 7 → 面包虫超期）
+        feed_log(&conn, c, "2026-09-16 20:00:00", None, &["种子"]);
+        feed_log(&conn, c, "2026-09-10 20:00:00", None, &["面包虫"]);
+
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        let feed = tile(&tiles, "喂食");
+        // 统一层 2 ≤ 3 自身不红，但面包虫食物层超期 → 任一层超期即红（Q2 决议；
+        // 简报原文此处误写 !feed.overdue，与下方 Q2 测试同数据互斥，按 Q2 修正）
+        assert!(feed.overdue, "面包虫食物层超期 → 整块红（Q2 决议）");
+        assert_eq!(feed.days_since_last, Some(2));
+
+        let foods: Vec<(String, Option<i64>, bool)> = feed.foods.iter()
+            .map(|f| (f.name.clone(), f.days_since_last, f.overdue)).collect();
+        assert_eq!(foods, vec![
+            ("种子".into(), Some(2), false),
+            ("干虾仁".into(), None, false),   // 从未喂过且设了周期 → None 不超期（同"从未记录"口径）
+            ("面包虫".into(), Some(8), true), // 8 > 7 → 食物层超期
+        ]);
+
+        // 非喂食 tile 不带食物明细
+        assert!(tile(&tiles, "垃圾清理").foods.is_empty());
+    }
+
+    #[test]
+    fn feeding_tile_red_when_any_food_overdue_even_if_operation_layer_fresh() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        feed_log(&conn, c, "2026-09-16 20:00:00", None, &["种子"]);
+        feed_log(&conn, c, "2026-09-10 20:00:00", None, &["面包虫"]);
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert!(tile(&tiles, "喂食").overdue, "任一层超期即红（Q2 决议）");
+    }
+
+    #[test]
+    fn food_without_interval_never_flags_and_wake_resets_food_clock() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        conn.execute("UPDATE food SET suggested_interval_days = NULL WHERE name = '种子'", []).unwrap();
+        feed_log(&conn, c, "2026-08-01 20:00:00", None, &["种子"]); // 48 天前
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        let seed = tile(&tiles, "喂食").foods.iter().find(|f| f.name == "种子").unwrap();
+        assert!(!seed.overdue, "未设周期只受统一周期管（统一层 48>3 会红，但食物项自身不标）");
+
+        // 出眠基线同样作用于食物层：出眠当天全部归零
+        conn.execute(
+            "INSERT INTO hibernation (colony_id, start_date, expected_end_date, actual_end_date)
+             VALUES (?1, '2026-09-10', '2026-10-01', '2026-09-18')",
+            params![c],
+        )
+        .unwrap();
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        let worm = tile(&tiles, "喂食").foods.iter().find(|f| f.name == "面包虫").unwrap();
+        assert_eq!(worm.days_since_last, Some(0), "从未喂过的食物从出眠日起算");
     }
 
     #[test]

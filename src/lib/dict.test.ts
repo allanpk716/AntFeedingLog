@@ -21,6 +21,7 @@ function actionItem(partial: Partial<CareActionItem> & { id: number }): CareActi
     enabled: true,
     sort: partial.id,
     referenced: false,
+    is_preset: false,
     ...partial,
   };
 }
@@ -30,7 +31,9 @@ function foodItem(partial: Partial<FoodItem> & { id: number }): FoodItem {
     name: `食物${partial.id}`,
     enabled: true,
     sort: partial.id,
+    suggested_interval_days: null,
     referenced: false,
+    is_preset: false,
     ...partial,
   };
 }
@@ -45,6 +48,15 @@ describe("操作行：字典 → 本地编辑态", () => {
     expect(rows.map((r) => r.name)).toEqual(["喂食", "垃圾清理", "换水"]);
     expect(rows[0]).toMatchObject({ kind: "reminding", isFeeding: true, intervalText: "3", enabled: true });
     expect(rows[2]).toMatchObject({ enabled: false, referenced: true, intervalText: "" });
+  });
+
+  it("预置位映射到行：isPreset 跟随 is_preset", () => {
+    const rows = buildActionRows([
+      actionItem({ id: 1, name: "喂食", is_preset: true }),
+      actionItem({ id: 2, name: "降温", is_preset: false }),
+    ]);
+    expect(rows[0]!.isPreset).toBe(true);
+    expect(rows[1]!.isPreset).toBe(false);
   });
 });
 
@@ -74,7 +86,7 @@ describe("操作行：本地编辑态 → save 入参", () => {
     expect(parseInterval(0)).toBe(0);
     expect(validateActionRows([{
       id: 1, name: "喂食", kind: "reminding", isFeeding: true,
-      intervalText: 3, enabled: true, referenced: false,
+      intervalText: 3, enabled: true, isPreset: true, referenced: false,
     }])).toBe("");
   });
 });
@@ -116,31 +128,62 @@ describe("操作行排序", () => {
 });
 
 describe("食物行", () => {
-  it("buildFoodRows 排序并携带停用/被引用；toFoodInputs 按行下标落 sort、名字 trim", () => {
+  it("buildFoodRows 排序并携带停用/被引用/间隔；toFoodInputs 按行下标落 sort、名字 trim、间隔转数字或 null", () => {
     const rows = buildFoodRows([
-      foodItem({ id: 2, name: "干虾仁", sort: 2 }),
-      foodItem({ id: 1, name: "种子", sort: 1, referenced: true }),
+      foodItem({ id: 2, name: "干虾仁", sort: 2, suggested_interval_days: 7 }),
+      foodItem({ id: 1, name: "种子", sort: 1, referenced: true, suggested_interval_days: 3 }),
       foodItem({ id: 5, name: "面包虫", enabled: false }),
     ]);
     expect(rows.map((r) => r.name)).toEqual(["种子", "干虾仁", "面包虫"]);
     expect(rows[0]!.referenced).toBe(true);
+    expect(rows[0]!.intervalText).toBe("3");
+    expect(rows[1]!.intervalText).toBe("7");
     expect(rows[2]!.enabled).toBe(false);
+    expect(rows[2]!.intervalText).toBe("");
 
-    rows.push({ id: null, name: " 糖水 ", enabled: true, referenced: false });
+    rows.push({ id: null, name: " 糖水 ", enabled: true, intervalText: "", referenced: false, isPreset: false });
     expect(toFoodInputs(rows)).toEqual([
-      { id: 1, name: "种子", sort: 0 },
-      { id: 2, name: "干虾仁", sort: 1 },
-      { id: 5, name: "面包虫", sort: 2 },
-      { id: null, name: "糖水", sort: 3 },
+      { id: 1, name: "种子", sort: 0, suggested_interval_days: 3 },
+      { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7 },
+      { id: 5, name: "面包虫", sort: 2, suggested_interval_days: null },
+      { id: null, name: "糖水", sort: 3, suggested_interval_days: null },
     ]);
+    rows[3]!.intervalText = " 5 ";
+    expect(toFoodInputs(rows)[3]!.suggested_interval_days).toBe(5);
+  });
+
+  it("buildFoodRows 映射 isPreset：预置跟随 is_preset", () => {
+    const rows = buildFoodRows([
+      foodItem({ id: 1, name: "种子", is_preset: true }),
+      foodItem({ id: 2, name: "糖水", is_preset: false }),
+    ]);
+    expect(rows[0]!.isPreset).toBe(true);
+    expect(rows[1]!.isPreset).toBe(false);
   });
 
   it("validateFoodRows 拦空名与重名", () => {
     const rows = buildFoodRows([foodItem({ id: 1, name: "种子" })]);
     expect(validateFoodRows([{ ...rows[0]!, name: "  " }])).toContain("不能为空");
     expect(
-      validateFoodRows([...rows, { id: null, name: " 种子 ", enabled: true, referenced: false }]),
+      validateFoodRows([
+        ...rows,
+        { id: null, name: " 种子 ", enabled: true, intervalText: "", referenced: false, isPreset: false },
+      ]),
     ).toContain("已存在");
+    expect(validateFoodRows(rows)).toBe("");
+  });
+
+  it("validateFoodRows 拦非法间隔（F3：与操作同款校验），通过返回空串", () => {
+    const rows = buildFoodRows([foodItem({ id: 1, name: "种子", suggested_interval_days: 3 })]);
+    rows[0]!.intervalText = "0";
+    expect(validateFoodRows(rows)).toBe("食物「种子」的建议间隔应是不小于 1 的整数天数");
+    rows[0]!.intervalText = "-2";
+    expect(validateFoodRows(rows)).toContain("建议间隔");
+    rows[0]!.intervalText = "abc";
+    expect(validateFoodRows(rows)).toContain("建议间隔");
+    rows[0]!.intervalText = 7; // type=number 输入框给回数字同样放行
+    expect(validateFoodRows(rows)).toBe("");
+    rows[0]!.intervalText = ""; // 空串 = 未设，合法
     expect(validateFoodRows(rows)).toBe("");
   });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { ColonyAction, RecentLog } from "../types";
-import { actionTile, formatRecent, isFeeding, nowLocalDateTime } from "./care";
+import type { ColonyAction, FoodTileInfo, RecentLog } from "../types";
+import { actionTile, feedingTooltip, formatRecent, isFeeding, nowLocalDateTime } from "./care";
 
 function action(partial: Partial<ColonyAction> & { action_id: number }): ColonyAction {
   return {
@@ -11,6 +11,7 @@ function action(partial: Partial<ColonyAction> & { action_id: number }): ColonyA
     suggested_interval_days: 3,
     days_since_last: null,
     overdue: false,
+    foods: [],
     ...partial,
   };
 }
@@ -57,6 +58,61 @@ describe("操作块展示态", () => {
     ).toEqual({ tone: "reg", text: "今天 · 已记录" });
   });
 
+  it("食物层顶的红：报「该喂X了」，不拿统一层数字硬算（F3 评审：统一层新鲜时会出现负数）", () => {
+    const food = (id: number, name: string, overdue: boolean): FoodTileInfo => ({
+      food_id: id,
+      name,
+      suggested_interval_days: 7,
+      days_since_last: overdue ? 8 : 1,
+      overdue,
+    });
+
+    // 面包虫 8 > 7 食物超期、统一层 2 ≤ 3 新鲜 → 整块红但报「该喂面包虫了」
+    expect(
+      actionTile(
+        action({
+          action_id: 1,
+          is_feeding: true,
+          days_since_last: 2,
+          suggested_interval_days: 3,
+          overdue: true,
+          foods: [food(3, "面包虫", true)],
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 该喂面包虫了" });
+
+    // 两种食物都超期：顿号连接
+    expect(
+      actionTile(
+        action({
+          action_id: 1,
+          is_feeding: true,
+          days_since_last: 2,
+          suggested_interval_days: 3,
+          overdue: true,
+          foods: [food(1, "种子", true), food(3, "面包虫", true)],
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 该喂种子、面包虫了" });
+
+    // 统一层自己也超（8 > 3）：维持「超期 N 天」原句式，操作层措辞优先
+    expect(
+      actionTile(
+        action({
+          action_id: 1,
+          is_feeding: true,
+          days_since_last: 8,
+          suggested_interval_days: 3,
+          overdue: true,
+          foods: [food(3, "面包虫", true)],
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 超期 5 天" });
+  });
+
   it("冬眠静音：永不红、文案加（静音）", () => {
     expect(
       actionTile(action({ action_id: 1, days_since_last: 4, overdue: true }), true),
@@ -83,6 +139,20 @@ describe("喂食判定", () => {
     // 名字叫「喂食」但标记位为假 → 不弹
     expect(isFeeding(action({ action_id: 2, name: "喂食", is_feeding: false }))).toBe(false);
     expect(isFeeding(action({ action_id: 3, name: "垃圾清理", is_feeding: false }))).toBe(false);
+  });
+});
+
+describe("喂食块悬停提示（反馈第二轮 F3）", () => {
+  it("feedingTooltip 逐食物三态：距上次 / 超期标注 / 尚未记录；空明细为空串", () => {
+    const foods: FoodTileInfo[] = [
+      { food_id: 1, name: "种子", suggested_interval_days: 3, days_since_last: 2, overdue: false },
+      { food_id: 3, name: "面包虫", suggested_interval_days: 7, days_since_last: 8, overdue: true },
+      { food_id: 2, name: "干虾仁", suggested_interval_days: 7, days_since_last: null, overdue: false },
+    ];
+    expect(feedingTooltip(foods)).toBe(
+      "种子：距上次 2 天\n面包虫：距上次 8 天 · 超期\n干虾仁：尚未记录",
+    );
+    expect(feedingTooltip([])).toBe("");
   });
 });
 

@@ -35,16 +35,16 @@ const colonies: Colony[] = [
 ];
 
 const actions: CareActionItem[] = [
-  { id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: 3, enabled: true, sort: 1, referenced: false },
-  { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, referenced: true },
-  { id: 3, name: "降温", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: false, sort: 3, referenced: true },
+  { id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: 3, enabled: true, sort: 1, referenced: false, is_preset: true },
+  { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, referenced: true, is_preset: true },
+  { id: 3, name: "降温", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: false, sort: 3, referenced: true, is_preset: false },
 ];
 
 const foods: FoodItem[] = [
-  { id: 1, name: "种子", enabled: true, sort: 1, referenced: false },
-  { id: 2, name: "干虾仁", enabled: false, sort: 2, referenced: true },
-  { id: 3, name: "面包虫", enabled: true, sort: 3, referenced: false },
-  { id: 4, name: "糖水", enabled: false, sort: 4, referenced: false },
+  { id: 1, name: "种子", enabled: true, sort: 1, suggested_interval_days: 3, referenced: false, is_preset: true },
+  { id: 2, name: "干虾仁", enabled: false, sort: 2, suggested_interval_days: 7, referenced: true, is_preset: true },
+  { id: 3, name: "面包虫", enabled: true, sort: 3, suggested_interval_days: 7, referenced: false, is_preset: true },
+  { id: 4, name: "糖水", enabled: false, sort: 4, suggested_interval_days: null, referenced: false, is_preset: false },
 ];
 
 /** 行 101：喂食、引用了停用食物「干虾仁」；行 102：换水（非喂食）；行 103 留给「加载更多」 */

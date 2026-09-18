@@ -25,6 +25,7 @@ function action(overrides: Partial<CareActionItem>): CareActionItem {
     enabled: true,
     sort: 1,
     referenced: false,
+    is_preset: true,
     ...overrides,
   };
 }
@@ -35,7 +36,9 @@ function food(overrides: Partial<FoodItem>): FoodItem {
     name: "种子",
     enabled: true,
     sort: 1,
+    suggested_interval_days: null,
     referenced: false,
+    is_preset: true,
     ...overrides,
   };
 }

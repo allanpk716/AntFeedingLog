@@ -5,7 +5,7 @@
  * 冬眠整卡静音（票 05 接管横幅）。
  */
 
-import type { ColonyAction, RecentLog } from "../types";
+import type { ColonyAction, FoodTileInfo, RecentLog } from "../types";
 
 /** 操作块展示态：ok=绿 / bad=红（超期）/ reg=中性灰（登记类）/ none=尚未记录 / mute=冬眠静音 */
 export type TileTone = "ok" | "bad" | "reg" | "none" | "mute";
@@ -26,8 +26,17 @@ export function actionTile(a: ColonyAction, hibernating: boolean): TileView {
     return { tone: "reg", text: baseText };
   }
   if (a.overdue && days !== null) {
-    const overDays = days - (a.suggested_interval_days ?? 0);
-    return { tone: "bad", text: `⚠ 超期 ${overDays} 天` };
+    const interval = a.suggested_interval_days;
+    if (interval !== null && days > interval) {
+      // 操作层自己超期：维持「超期 N 天」原句式（措辞优先于食物层）
+      return { tone: "bad", text: `⚠ 超期 ${days - interval} 天` };
+    }
+    // 红是食物层顶的（统一层还新鲜，拿它算超期天数会出负数）：报该喂哪些食物
+    const names = a.foods
+      .filter((f) => f.overdue)
+      .map((f) => f.name)
+      .join("、");
+    return { tone: "bad", text: `⚠ 该喂${names}了` };
   }
   if (days === null) {
     return { tone: "none", text: baseText };
@@ -38,6 +47,17 @@ export function actionTile(a: ColonyAction, hibernating: boolean): TileView {
 /** 是否喂食类操作（点它弹食物多选，其余一点即记）。按 schema 的 is_feeding 标记位，与名字无关。 */
 export function isFeeding(a: ColonyAction): boolean {
   return a.is_feeding;
+}
+
+/** 喂食 tile 悬停提示：逐食物"距上次"，超期的标出来。 */
+export function feedingTooltip(foods: FoodTileInfo[]): string {
+  return foods
+    .map((f) => {
+      const days = f.days_since_last === null ? "尚未记录" : `距上次 ${f.days_since_last} 天`;
+      const mark = f.overdue ? " · 超期" : "";
+      return `${f.name}：${days}${mark}`;
+    })
+    .join("\n");
 }
 
 /**

@@ -30,17 +30,19 @@ const locations: LocationItem[] = [
 ];
 
 const foods: FoodItem[] = [
-  { id: 1, name: "种子", enabled: true, sort: 1, referenced: false },
-  { id: 2, name: "干虾仁", enabled: true, sort: 2, referenced: false },
-  { id: 3, name: "面包虫", enabled: true, sort: 3, referenced: false },
-  { id: 4, name: "蚕蛹", enabled: false, sort: 4, referenced: false },
+  { id: 1, name: "种子", enabled: true, sort: 1, suggested_interval_days: 3, referenced: false, is_preset: true },
+  { id: 2, name: "干虾仁", enabled: true, sort: 2, suggested_interval_days: 7, referenced: false, is_preset: true },
+  { id: 3, name: "面包虫", enabled: true, sort: 3, suggested_interval_days: 7, referenced: false, is_preset: true },
+  { id: 4, name: "蚕蛹", enabled: false, sort: 4, suggested_interval_days: null, referenced: false, is_preset: false },
 ];
 
 const actions: CareActionItem[] = [
-  { id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: 3, enabled: true, sort: 1, referenced: false },
-  { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, referenced: true },
-  { id: 3, name: "巢穴保湿", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 3, referenced: false },
-  { id: 4, name: "垃圾清理", icon: null, kind: "reminding", is_feeding: false, suggested_interval_days: 7, enabled: true, sort: 4, referenced: false },
+  { id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: 3, enabled: true, sort: 1, referenced: false, is_preset: true },
+  { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, referenced: true, is_preset: true },
+  { id: 3, name: "巢穴保湿", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 3, referenced: false, is_preset: true },
+  { id: 4, name: "垃圾清理", icon: null, kind: "reminding", is_feeding: false, suggested_interval_days: 7, enabled: true, sort: 4, referenced: false, is_preset: true },
+  // 自建被引用行：保住规则 10 的 UI 分支（删除禁用 + 「只能停用」标题）不被 F2 预置断言淹没
+  { id: 5, name: "降温", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 5, referenced: true, is_preset: false },
 ];
 
 const colonies: Colony[] = [
@@ -457,21 +459,25 @@ describe("设置 · 字典管理（票 04）", () => {
 
   // ── 操作 tab ──
 
-  it("操作 tab：列出全部操作，被引用的行删除禁用并提示只能停用", async () => {
+  it("操作 tab：列出全部操作，四个预置行删除一律禁用并提示可停用（反馈第二轮 F2）", async () => {
     const wrapper = await mountApp();
     const dlg = await openSettings(wrapper);
 
     const rows = dlg.findAll(".dict-row");
     expect(
       rows.map((r) => (r.find(".name-input").element as HTMLInputElement).value),
-    ).toEqual(["喂食", "活动区换水", "巢穴保湿", "垃圾清理"]);
+    ).toEqual(["喂食", "活动区换水", "巢穴保湿", "垃圾清理", "降温"]);
 
-    // 活动区换水被历史记录引用 → 删除禁用（规则 10）
-    const water = rows[1];
-    expect(water.find(".erase-btn").attributes("disabled")).toBeDefined();
-    expect(water.find(".erase-btn").attributes("title")).toContain("只能停用");
-    // 未被引用的可删
-    expect(rows[2].find(".erase-btn").attributes("disabled")).toBeUndefined();
+    // 四个预置操作删除全部禁用（含未被引用的巢穴保湿），标题提示可停用（F2）
+    for (const row of rows.slice(0, 4)) {
+      expect(row.find(".erase-btn").attributes("disabled")).toBeDefined();
+      expect(row.find(".erase-btn").attributes("title")).toContain("预置项不能删除");
+    }
+
+    // 自建被引用行（规则 10）：删除同样禁用，标题走引用文案而非预置文案
+    const custom = rows[4];
+    expect(custom.find(".erase-btn").attributes("disabled")).toBeDefined();
+    expect(custom.find(".erase-btn").attributes("title")).toContain("只能停用");
   });
 
   it("操作 tab：登记类切提醒 + 填建议间隔，保存发出 save_action 并刷新首页（验收 4 的链路）", async () => {
@@ -526,7 +532,9 @@ describe("设置 · 字典管理（票 04）", () => {
 
     await dlg.find(".add-input").setValue("糖水");
     await dlg.find(".add-btn").trigger("click");
-    expect(dlg.findAll(".dict-row").length).toBe(5);
+    expect(dlg.findAll(".dict-row").length).toBe(6);
+    // 新增行非预置、未被引用：删除可用（F2 只禁预置与被引用）
+    expect(dlg.findAll(".dict-row")[5].find(".erase-btn").attributes("disabled")).toBeUndefined();
 
     invokeMock.mockClear();
     await dlg.find(".tab-body .btn.primary").trigger("click");
@@ -539,7 +547,7 @@ describe("设置 · 字典管理（票 04）", () => {
         kind: "reminding",
         is_feeding: false,
         suggested_interval_days: 7,
-        sort: 4,
+        sort: 5,
       },
     });
   });
@@ -558,13 +566,21 @@ describe("设置 · 字典管理（票 04）", () => {
     // 停用的「蚕蛹」整行置灰 + 行级第一按钮是「启用」
     expect(rows[3].classes()).toContain("row-disabled");
     expect(rows[3].find(".row-btn").text()).toBe("启用");
+    // 预置食物删除禁用、非预置未被引用的「蚕蛹」删除可用（F2）
+    expect(rows[0].find(".erase-btn").attributes("disabled")).toBeDefined();
+    expect(rows[3].find(".erase-btn").attributes("disabled")).toBeUndefined();
 
     await rows[0].find(".name-input").setValue("瓜子");
+    // F3：食物行带建议间隔输入框，回显预置值；保存一并落库
+    expect((rows[0].find(".interval-input").element as HTMLInputElement).value).toBe("3");
+    expect((rows[3].find(".interval-input").element as HTMLInputElement).value).toBe("");
+    expect(dlg.text()).toContain("任一超期喂食块就变红并单独提醒");
+    await rows[0].find(".interval-input").setValue("5");
     invokeMock.mockClear();
     await dlg.find(".tab-body .btn.primary").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("save_food", {
-      input: { id: 1, name: "瓜子", sort: 0 },
+      input: { id: 1, name: "瓜子", sort: 0, suggested_interval_days: 5 },
     });
 
     invokeMock.mockClear();
@@ -632,21 +648,18 @@ describe("设置 · 通知（票 06）", () => {
     return dlg;
   }
 
-  it("通知 tab：回显开关与提前天数，保存发出 set_settings 并刷新首页", async () => {
+  it("通知 tab：回显总开关与提前天数，保存发出 set_settings 并刷新首页", async () => {
     const wrapper = await mountApp();
     const dlg = await openNotifyTab(wrapper);
 
     const boxes = dlg.findAll(".notify-row input[type=checkbox]");
-    // 通知三开关 + 开机自启（票 09）
-    expect(boxes.length).toBe(4);
+    // 总开关 + 开机自启（票 09）；分类子开关已作废（反馈第二轮 Q7/Q9）
+    expect(boxes.length).toBe(2);
     expect((boxes[0].element as HTMLInputElement).checked).toBe(true);
-    expect((boxes[1].element as HTMLInputElement).checked).toBe(true);
-    expect((boxes[2].element as HTMLInputElement).checked).toBe(true);
     // 开机自启默认开
-    expect((boxes[3].element as HTMLInputElement).checked).toBe(true);
+    expect((boxes[1].element as HTMLInputElement).checked).toBe(true);
     expect((dlg.find(".days-input").element as HTMLInputElement).value).toBe("7");
 
-    await boxes[1].setValue(false); // 关超期分类
     await dlg.find(".days-input").setValue("3");
 
     invokeMock.mockClear();
@@ -658,7 +671,7 @@ describe("设置 · 通知（票 06）", () => {
     expect(invokeMock).toHaveBeenCalledWith("set_settings", {
       input: {
         notify_master_enabled: true,
-        notify_overdue_enabled: false,
+        notify_overdue_enabled: true, // 分类开关作废：前端固定回写 true（键保留在库里）
         notify_hibernation_enabled: true,
         wake_remind_days_ahead: 3,
         autostart_enabled: true,
@@ -676,7 +689,7 @@ describe("设置 · 通知（票 06）", () => {
     const dlg = await openNotifyTab(wrapper);
 
     const boxes = dlg.findAll(".notify-row input[type=checkbox]");
-    await boxes[3].setValue(false);
+    await boxes[1].setValue(false);
 
     invokeMock.mockClear();
     invokeMock.mockResolvedValueOnce({ ...currentSettings, autostart_enabled: false });
@@ -690,17 +703,12 @@ describe("设置 · 通知（票 06）", () => {
     const boxesAfter = wrapper
       .find(".settings-dialog")
       .findAll(".notify-row input[type=checkbox]");
-    expect((boxesAfter[3].element as HTMLInputElement).checked).toBe(false);
+    expect((boxesAfter[1].element as HTMLInputElement).checked).toBe(false);
   });
 
-  it("通知 tab：总开关关闭禁用子开关；提前天数非法时报错且不落库", async () => {
+  it("通知 tab：提前天数非法时报错且不落库", async () => {
     const wrapper = await mountApp();
     const dlg = await openNotifyTab(wrapper);
-
-    const boxes = dlg.findAll(".notify-row input[type=checkbox]");
-    await boxes[0].setValue(false);
-    expect(boxes[1].attributes("disabled")).toBeDefined();
-    expect(boxes[2].attributes("disabled")).toBeDefined();
 
     await dlg.find(".days-input").setValue("-1");
     await dlg.find(".tab-body .btn.primary").trigger("click");
@@ -710,16 +718,18 @@ describe("设置 · 通知（票 06）", () => {
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_settings")).toBe(false);
   });
 
-  it("通知 tab：发送测试通知按钮发出 send_test_notification", async () => {
+  it("通知 tab：发送测试通知按钮双通道回显结果（反馈第二轮 F4）", async () => {
     const wrapper = await mountApp();
     const dlg = await openNotifyTab(wrapper);
 
     invokeMock.mockClear();
+    // 未配置 Pushover：pushover=null（桌面真发在 Rust 侧，这里只验前端接线）
+    invokeMock.mockResolvedValueOnce({ desktop_ok: true, desktop_error: null, pushover: null });
     await dlg.find(".tab-body .btn:not(.primary)").trigger("click");
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("send_test_notification");
-    expect(dlg.find(".saved-hint").text()).toContain("测试通知已发出");
+    expect(dlg.find(".saved-hint").text()).toContain("测试结果：桌面 ✓ · 手机：未配置");
   });
 });
 
@@ -814,6 +824,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: 3,
     days_since_last: 4,
     overdue: true,
+    foods: [],
   };
   const waterReg: ColonyAction = {
     action_id: 2,
@@ -824,6 +835,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: null,
     days_since_last: 2,
     overdue: false,
+    foods: [],
   };
   const hydrateNever: ColonyAction = {
     action_id: 3,
@@ -834,6 +846,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: null,
     days_since_last: null,
     overdue: false,
+    foods: [],
   };
   const trashToday: ColonyAction = {
     action_id: 4,
@@ -844,6 +857,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: 7,
     days_since_last: 0,
     overdue: false,
+    foods: [],
   };
   // 名字不含「喂食」的喂食类操作：弹窗触发与标题只认 is_feeding 位（R1 解耦）
   const feedCustom: ColonyAction = {
@@ -855,6 +869,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     suggested_interval_days: 3,
     days_since_last: 9,
     overdue: true,
+    foods: [],
   };
 
   const recent: RecentLog[] = [
@@ -899,32 +914,65 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(card.find(".recent").text()).toBe("最近：09-17 喂食（种子）");
   });
 
-  it("非喂食一点即记：log_care 带默认现在时间、无食物，成功后数据驱动刷新且块变「今天 · 已记录」", async () => {
+  it("喂食块带食物明细：食物层超期整块红，悬停 title 逐食物列「距上次」并标注超期（反馈第二轮 F3）", async () => {
+    const feedWithFoods: ColonyAction = {
+      ...feedOverdue,
+      days_since_last: 8,
+      foods: [
+        { food_id: 1, name: "种子", suggested_interval_days: 3, days_since_last: 8, overdue: true },
+        { food_id: 2, name: "干虾仁", suggested_interval_days: 7, days_since_last: 1, overdue: false },
+        { food_id: 3, name: "面包虫", suggested_interval_days: 7, days_since_last: null, overdue: false },
+      ],
+    };
+    colony1With([feedWithFoods, waterReg]);
+    const wrapper = await mountApp();
+
+    const feed = wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="1"]');
+    expect(feed.classes()).toContain("bad");
+    expect(feed.find(".pill").text()).toBe("⚠ 超期 5 天");
+    expect(feed.attributes("title")).toBe(
+      "种子：距上次 8 天 · 超期\n干虾仁：距上次 1 天\n面包虫：尚未记录",
+    );
+
+    // 非喂食块无食物明细 → 不带 title
+    const water = wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]');
+    expect(water.attributes("title")).toBeUndefined();
+  });
+
+  it("非喂食弹打卡面板：默认今天可补录，点「记录」才落库并刷新", async () => {
     colony1With([waterReg]);
     const wrapper = await mountApp();
 
-    invokeMock.mockClear();
-    const click = wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
-    // 记账成功后外层 refresh，后端算出距上次 0
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
+    const dialog = wrapper.find(".quick-dialog");
+    expect(dialog.exists()).toBe(true);
+    expect(dialog.find("h3").text()).toBe("记录活动区换水 · 大头一号");
+
+    await dialog.find(".time-input").setValue("2026-09-17T21:00");
     colony1With([{ ...waterReg, days_since_last: 0 }]);
-    await click;
+    invokeMock.mockClear();
+    await dialog.find(".record-btn").trigger("click");
     await flushPromises();
 
     const logCall = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
     expect(logCall).toBeDefined();
-    expect(logCall![0]).toBe("log_care");
-    const input = logCall![1] as { input: { colony_id: number; action_id: number; happened_at: string; note: string | null; food_ids: number[] } };
+    const input = logCall![1] as { input: { colony_id: number; action_id: number; happened_at: string } };
     expect(input.input.colony_id).toBe(1);
     expect(input.input.action_id).toBe(2);
-    expect(input.input.happened_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
-    expect(input.input.note).toBeNull();
-    expect(input.input.food_ids).toEqual([]);
+    expect(input.input.happened_at).toBe("2026-09-17T21:00");
+    expect(wrapper.find(".quick-dialog").exists()).toBe(false);
+    expect(wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"] .pill').text()).toBe("今天 · 已记录");
+  });
 
-    const refreshCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_colonies");
-    expect(refreshCalls.length).toBeGreaterThanOrEqual(1);
-    expect(
-      wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"] .pill').text(),
-    ).toBe("今天 · 已记录");
+  it("打卡面板点「取消」不记账", async () => {
+    colony1With([waterReg]);
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
+    invokeMock.mockClear();
+    await wrapper.find(".quick-dialog .cancel-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".quick-dialog").exists()).toBe(false);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "log_care")).toBe(false);
   });
 
   it("点喂食类操作弹食物多选弹窗（只认 is_feeding 位）：只列启用食物，勾两种 + 补录时间 + 备注，确认生成一条带两食物的记录", async () => {
@@ -1011,29 +1059,22 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(tile.find(".pill").text()).toBe("距上次 4 天（静音）");
   });
 
-  it("一键记账失败：卡片上展示原因，不误刷数据", async () => {
+  it("打卡面板提交失败：原因展示在面板内、面板不关", async () => {
     colony1With([waterReg]);
     const wrapper = await mountApp();
-    invokeMock.mockClear();
-
     invokeMock.mockImplementation(async (cmd: string) => {
       switch (cmd) {
-        case "log_care":
-          throw "操作「活动区换水」已停用，不能新记";
-        case "list_colonies":
-          return currentColonies;
-        case "list_locations":
-          return locations;
-        default:
-          return null;
+        case "log_care": throw "操作「活动区换水」已停用，不能新记";
+        case "list_colonies": return currentColonies;
+        case "list_locations": return locations;
+        default: return null;
       }
     });
-
     await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]').trigger("click");
+    await wrapper.find(".quick-dialog .record-btn").trigger("click");
     await flushPromises();
-
-    expect(wrapper.find('.card[data-colony-id="1"] .tile-error').text()).toContain("不能新记");
-    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(false);
+    expect(wrapper.find(".quick-dialog .form-error").text()).toContain("停用");
+    expect(wrapper.find(".quick-dialog").exists()).toBe(true);
   });
 });
 
@@ -1216,13 +1257,16 @@ describe("冬眠管理（票 05）", () => {
       suggested_interval_days: 3,
       days_since_last: 4,
       overdue: true,
+      foods: [],
     };
     colony3With({ id: 9, start_date: "2026-08-20", expected_end_date: "2099-01-01" });
     currentColonies = currentColonies.map((c) => (c.id === 3 ? { ...c, actions: [feedOverdue] } : c));
     const wrapper = await mountApp();
 
     invokeMock.mockClear();
+    // F1 起：点击先弹打卡面板，点「记录」才落库（灰化静音仍可记账的验收不变）
     await wrapper.find('.card[data-colony-id="3"] .tile[data-action-id="1"]').trigger("click");
+    await wrapper.find(".quick-dialog .record-btn").trigger("click");
     await flushPromises();
 
     const logCall = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
