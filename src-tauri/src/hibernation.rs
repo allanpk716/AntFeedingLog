@@ -153,12 +153,14 @@ fn ensure_no_overlap(
 // ── 开始 / 出眠 / 补录 / 列表 ────────────────────────────────────────────
 
 /// 开始冬眠：插入开放段并把窝状态置冬眠（同事务）。
-/// 仅活跃窝可入眠；结束日期不得早于开始日期；与既有段不重叠。
+/// 仅活跃窝可入眠；结束日期不得早于开始日期；开始日期不得晚于今天
+/// （预计结束日期是计划，允许在未来——spec 用户故事 10/11）；与既有段不重叠。
 pub fn start_hibernation(
     conn: &Connection,
     colony_id: i64,
     start_date: &str,
     expected_end_date: &str,
+    today: &str,
 ) -> Result<Hibernation, String> {
     let status: String = conn
         .query_row(
@@ -183,6 +185,15 @@ pub fn start_hibernation(
             "预计结束日期（{}）不能早于开始日期（{}）",
             expected_end_date.trim(),
             start_date.trim()
+        ));
+    }
+    // 开始日期是"已发生的事实"，不得晚于今天（预计结束是计划，允许未来）
+    let today_date = parse_iso(today).map_err(|_| format!("今天日期异常：{today}"))?;
+    if start > today_date {
+        return Err(format!(
+            "开始日期（{}）不能晚于今天（{}）",
+            start_date.trim(),
+            today.trim()
         ));
     }
 
@@ -220,11 +231,13 @@ pub fn start_hibernation(
 }
 
 /// 确认出眠：回填该窝开放段的实际结束日期并把状态回活跃（同事务）。
-/// 实际结束可与预计不同；不得早于该段入眠日。
+/// 实际结束可与预计不同；不得早于该段入眠日，也不得晚于今天
+/// （出眠是已发生的事实，care::ensure_not_future 的日期版，票 05 停靠②）。
 pub fn confirm_wake(
     conn: &Connection,
     colony_id: i64,
     actual_end_date: &str,
+    today: &str,
 ) -> Result<Hibernation, String> {
     let actual_end = parse_iso(actual_end_date)?;
     let (seg_id, start_date, expected_end_date): (i64, String, String) = conn
@@ -244,6 +257,15 @@ pub fn confirm_wake(
         return Err(format!(
             "实际结束日期（{}）不能早于入眠日期（{start_date}）",
             actual_end_date.trim()
+        ));
+    }
+    // 出眠是"已发生的事实"，不得晚于今天（care::ensure_not_future 的日期版）
+    let today_date = parse_iso(today).map_err(|_| format!("今天日期异常：{today}"))?;
+    if actual_end > today_date {
+        return Err(format!(
+            "实际结束日期（{}）不能晚于今天（{}）",
+            actual_end_date.trim(),
+            today.trim()
         ));
     }
 
@@ -371,17 +393,30 @@ pub fn open_segment(conn: &Connection, colony_id: i64) -> Result<Option<OpenSegm
     .map_err(db_err)
 }
 
-/// 某窝最近一次出眠日期（actual_end_date 最大值）。
-/// 无闭合段或日期是脏数据时返回 None（跳过异常行，不毒死首页——票 04 停靠①口径）。
+/// 某窝最近一次出眠日期：逐行解析 actual_end_date、跳过脏行后取最大合法值。
+/// 旧实现 `MAX(actual_end_date)` 按文本取最大——脏行（如 'not-a-date'）字典序往往
+/// 最大，一条脏行会把合法出眠日整个吞掉（票 05 停靠①，票 04 停靠①同口径）。
+/// 无闭合段或全部脏行返回 None。
 pub fn latest_wake_date(conn: &Connection, colony_id: i64) -> Option<chrono::NaiveDate> {
-    let raw: Option<String> = conn
-        .query_row(
-            "SELECT MAX(actual_end_date) FROM hibernation WHERE colony_id = ?1",
-            params![colony_id],
-            |row| row.get(0),
+    let mut stmt = conn
+        .prepare(
+            "SELECT actual_end_date FROM hibernation
+             WHERE colony_id = ?1 AND actual_end_date IS NOT NULL",
         )
         .ok()?;
-    parse_iso(&raw?).ok()
+    let rows = stmt
+        .query_map(params![colony_id], |row| row.get::<_, String>(0))
+        .ok()?;
+    let mut best: Option<chrono::NaiveDate> = None;
+    for row in rows.flatten() {
+        if let Ok(day) = parse_iso(&row) {
+            best = Some(match best {
+                Some(prev) if prev >= day => prev,
+                _ => day,
+            });
+        }
+    }
+    best
 }
 
 // ── 测试：只测外部行为（spec「Testing Decisions」）────────────────────────
@@ -458,7 +493,7 @@ mod tests {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
 
-        let h = start_hibernation(&conn, c, "2026-12-01", "2027-03-01").unwrap();
+        let h = start_hibernation(&conn, c, "2026-12-01", "2027-03-01", "2026-12-01").unwrap();
 
         assert_eq!(h.colony_id, c);
         assert_eq!(h.start_date, "2026-12-01");
@@ -475,17 +510,17 @@ mod tests {
         seg(&conn, c, "2025-12-01", "2026-03-01", Some("2026-03-01"));
 
         // 新段起点与既有段终点同天：共享 03-01 一天也算重叠
-        let err = start_hibernation(&conn, c, "2026-03-01", "2026-04-01").unwrap_err();
+        let err = start_hibernation(&conn, c, "2026-03-01", "2026-04-01", "2026-03-01").unwrap_err();
         assert!(err.contains("重叠"), "实际错误：{err}");
         // 新段终点与既有段起点同天，同样重叠
-        assert!(start_hibernation(&conn, c, "2025-11-01", "2025-12-01").is_err());
+        assert!(start_hibernation(&conn, c, "2025-11-01", "2025-12-01", "2026-03-01").is_err());
         // 完全包住既有段
-        assert!(start_hibernation(&conn, c, "2025-11-01", "2026-04-01").is_err());
+        assert!(start_hibernation(&conn, c, "2025-11-01", "2026-04-01", "2026-03-01").is_err());
         // 落在既有段内部
-        assert!(start_hibernation(&conn, c, "2025-12-15", "2026-01-15").is_err());
+        assert!(start_hibernation(&conn, c, "2025-12-15", "2026-01-15", "2026-03-01").is_err());
 
         // 隔一天即可（约束只禁共享自然日）
-        assert!(start_hibernation(&conn, c, "2026-03-03", "2026-04-01").is_ok());
+        assert!(start_hibernation(&conn, c, "2026-03-03", "2026-04-01", "2026-03-03").is_ok());
         assert_eq!(status_of(&conn, c), "hibernating", "后落的开放段同样联动状态");
     }
 
@@ -498,11 +533,11 @@ mod tests {
         set_status(&conn, c, "active");
 
         // 与开放段重叠的新段 → 重叠拒绝
-        let err = start_hibernation(&conn, c, "2026-12-01", "2027-03-01").unwrap_err();
+        let err = start_hibernation(&conn, c, "2026-12-01", "2027-03-01", "2026-12-01").unwrap_err();
         assert!(err.contains("重叠"), "实际错误：{err}");
 
         // 不重叠的过去段也拒：每窝至多一段开放段（部分唯一索引兜底 + 预检）
-        let err = start_hibernation(&conn, c, "2025-01-01", "2025-02-01").unwrap_err();
+        let err = start_hibernation(&conn, c, "2025-01-01", "2025-02-01", "2025-01-01").unwrap_err();
         assert!(err.contains("冬眠"), "实际错误：{err}");
         assert_eq!(hiber_count(&conn, c), 1, "被拒不落库");
         assert_eq!(
@@ -524,12 +559,12 @@ mod tests {
 
         // 已结束的窝不可开始冬眠（spec schema 约束）
         set_status(&conn, c, "ended");
-        let err = start_hibernation(&conn, c, "2026-12-01", "2027-03-01").unwrap_err();
+        let err = start_hibernation(&conn, c, "2026-12-01", "2027-03-01", "2026-12-01").unwrap_err();
         assert!(err.contains("已结束"), "实际错误：{err}");
 
         // 已在冬眠中的窝先出眠再入眠
         set_status(&conn, c, "hibernating");
-        let err = start_hibernation(&conn, c, "2026-12-01", "2027-03-01").unwrap_err();
+        let err = start_hibernation(&conn, c, "2026-12-01", "2027-03-01", "2026-12-01").unwrap_err();
         assert!(err.contains("冬眠"), "实际错误：{err}");
     }
 
@@ -539,17 +574,17 @@ mod tests {
         let c = colony(&conn, "大头一号");
 
         // 结束日期早于开始日期（验收 1：日期先后拒绝）
-        let err = start_hibernation(&conn, c, "2026-12-01", "2026-11-01").unwrap_err();
+        let err = start_hibernation(&conn, c, "2026-12-01", "2026-11-01", "2026-12-01").unwrap_err();
         assert!(err.contains("不能早于"), "实际错误：{err}");
         // 日期格式
-        let err = start_hibernation(&conn, c, "2026/12/01", "2027-03-01").unwrap_err();
+        let err = start_hibernation(&conn, c, "2026/12/01", "2027-03-01", "2026-12-01").unwrap_err();
         assert!(err.contains("YYYY-MM-DD"), "实际错误：{err}");
         // 窝不存在
-        let err = start_hibernation(&conn, 999, "2026-12-01", "2027-03-01").unwrap_err();
+        let err = start_hibernation(&conn, 999, "2026-12-01", "2027-03-01", "2026-12-01").unwrap_err();
         assert!(err.contains("窝不存在"), "实际错误：{err}");
 
         // 同一天开始并结束（一天冬眠）允许；格式允许首尾空格
-        assert!(start_hibernation(&conn, c, " 2026-12-01 ", "2026-12-01").is_ok());
+        assert!(start_hibernation(&conn, c, " 2026-12-01 ", "2026-12-01", "2026-12-01").is_ok());
         // 全部被拒的调用不落库（此时应只有最后成功那 1 条）
         assert_eq!(hiber_count(&conn, c), 1);
     }
@@ -560,10 +595,10 @@ mod tests {
     fn confirm_wake_backfills_actual_end_and_sets_status_active() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        start_hibernation(&conn, c, "2025-12-01", "2026-03-01").unwrap();
+        start_hibernation(&conn, c, "2025-12-01", "2026-03-01", "2025-12-01").unwrap();
 
         // 实际出眠 02-15，与预计 03-01 不同没关系
-        let h = confirm_wake(&conn, c, "2026-02-15").unwrap();
+        let h = confirm_wake(&conn, c, "2026-02-15", "2026-02-15").unwrap();
         assert_eq!(h.actual_end_date, Some("2026-02-15".into()));
         assert_eq!(h.expected_end_date, "2026-03-01");
         assert_eq!(status_of(&conn, c), "active", "确认出眠 → 状态回活跃");
@@ -584,18 +619,51 @@ mod tests {
         let c = colony(&conn, "大头一号");
 
         // 没有开放段
-        let err = confirm_wake(&conn, c, "2026-02-15").unwrap_err();
+        let err = confirm_wake(&conn, c, "2026-02-15", "2026-02-15").unwrap_err();
         assert!(err.contains("没有进行中的冬眠段"), "实际错误：{err}");
 
-        start_hibernation(&conn, c, "2026-02-15", "2026-03-01").unwrap();
+        start_hibernation(&conn, c, "2026-02-15", "2026-03-01", "2026-02-15").unwrap();
         // 实际结束早于入眠日
-        let err = confirm_wake(&conn, c, "2026-02-14").unwrap_err();
+        let err = confirm_wake(&conn, c, "2026-02-14", "2026-02-15").unwrap_err();
         assert!(err.contains("不能早于"), "实际错误：{err}");
         // 出眠日 = 入眠日允许（当天进当天出）
-        assert!(confirm_wake(&conn, c, "2026-02-15").is_ok());
+        assert!(confirm_wake(&conn, c, "2026-02-15", "2026-02-15").is_ok());
         // 出眠后再确认：已无开放段
-        let err = confirm_wake(&conn, c, "2026-02-16").unwrap_err();
+        let err = confirm_wake(&conn, c, "2026-02-16", "2026-02-16").unwrap_err();
         assert!(err.contains("没有进行中的冬眠段"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn start_hibernation_rejects_start_date_in_the_future() {
+        // 票 05 停靠②：开始日期不得晚于今天（care::ensure_not_future 的日期版）。
+        // 预计结束日期是计划，允许在未来（spec 用户故事 10/11 出眠提醒以此为锚）。
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+
+        let err = start_hibernation(&conn, c, "2026-09-19", "2027-03-01", "2026-09-18").unwrap_err();
+        assert!(err.contains("不能晚于今天"), "实际错误：{err}");
+        assert_eq!(hiber_count(&conn, c), 0, "被拒不落库");
+
+        // 今天开始 + 预计结束在未来：合法
+        assert!(start_hibernation(&conn, c, "2026-09-18", "2027-03-01", "2026-09-18").is_ok());
+        assert_eq!(status_of(&conn, c), "hibernating");
+    }
+
+    #[test]
+    fn confirm_wake_rejects_actual_end_in_the_future() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        start_hibernation(&conn, c, "2026-02-15", "2026-03-01", "2026-02-15").unwrap();
+
+        // 实际出眠日在未来 → 拒绝，状态与开放段不动
+        let err = confirm_wake(&conn, c, "2026-02-20", "2026-02-19").unwrap_err();
+        assert!(err.contains("不能晚于今天"), "实际错误：{err}");
+        assert_eq!(status_of(&conn, c), "hibernating");
+
+        // 今天出眠合法
+        let h = confirm_wake(&conn, c, "2026-02-19", "2026-02-19").unwrap();
+        assert_eq!(h.actual_end_date, Some("2026-02-19".into()));
+        assert_eq!(status_of(&conn, c), "active");
     }
 
     // ── 补录历史段（不碰状态）──
@@ -612,7 +680,7 @@ mod tests {
         assert_eq!(status_of(&conn, c), "active", "补录不改当前状态");
 
         // 冬眠中的窝同样可以补更早的历史段
-        start_hibernation(&conn, c, "2026-12-01", "2027-03-01").unwrap();
+        start_hibernation(&conn, c, "2026-12-01", "2027-03-01", "2026-12-01").unwrap();
         assert!(add_past_hibernation(&conn, c, "2024-12-01", "2025-01-31").is_ok());
     }
 
@@ -655,6 +723,30 @@ mod tests {
 
         let err = list_hibernations(&conn, 999).unwrap_err();
         assert!(err.contains("窝不存在"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn latest_wake_date_takes_max_of_valid_rows_skipping_dirty() {
+        // 票 05 停靠①：脏行（解析失败的 actual_end_date）被跳过，不丢合法出眠日。
+        // 旧实现 MAX(actual_end_date) 取整列最大——脏行字典序往往最大（'x' > '2'），
+        // 一条脏行会把合法出眠日整个吞掉。
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        seg(&conn, c, "2024-12-01", "2025-02-01", Some("2025-01-15"));
+        seg(&conn, c, "2025-12-01", "2026-02-01", Some("not-a-date"));
+
+        assert_eq!(
+            latest_wake_date(&conn, c),
+            Some(d("2025-01-15")),
+            "脏出眠日跳过，取剩余合法行的最大值"
+        );
+
+        // 全部脏 / 无闭合段 → None
+        let c2 = colony(&conn, "倒霉二号");
+        seg(&conn, c2, "2025-12-01", "2026-02-01", Some("???"));
+        assert_eq!(latest_wake_date(&conn, c2), None);
+        let c3 = colony(&conn, " Fresh 三号");
+        assert_eq!(latest_wake_date(&conn, c3), None);
     }
 
     // ── 重叠天数纯函数（规则 6，供统计/间隔扣减复用）──

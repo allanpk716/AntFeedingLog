@@ -12,7 +12,9 @@ use rusqlite::Connection;
 
 /// 当前 schema 版本。schema 变更时 +1，并在 `migrate` 的 match 里加对应分支。
 /// v2：care_action 增加 is_feeding 标记位（R1 评审：喂食判定与名字解耦）。
-pub const SCHEMA_VERSION: i64 = 2;
+/// v3：reminder_ledger 冬眠侧唯一键把种类并入（窝,种类,基准日）——v2 是
+///     (窝,基准日)，提前天数设 0 时临近/出眠日两种提醒同日互斥（票 01 停靠）。
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -97,6 +99,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
         match version {
             0 => migrate_v0_to_v1(conn)?,
             1 => migrate_v1_to_v2(conn)?,
+            2 => migrate_v2_to_v3(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -120,6 +123,7 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), rusqlite::Error> {
 
 /// v1 → v2：care_action 增加 is_feeding 标记位（喂食判定与名字解耦，R1 评审方案 A），
 /// 回填预置「喂食」行 = 1。单事务原子完成；v1 时期用户自建的操作回填为 0。
+/// 版本号钉死为 2（每级迁移只盖自己的章，测试可用它搭出真实的 v2 库）。
 fn migrate_v1_to_v2(conn: &Connection) -> Result<(), rusqlite::Error> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(
@@ -130,7 +134,24 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<(), rusqlite::Error> {
         UPDATE care_action SET is_feeding = 1 WHERE name = '喂食';
         "#,
     )?;
-    tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    tx.pragma_update(None, "user_version", 2)?;
+    tx.commit()
+}
+
+/// v2 → v3：reminder_ledger 冬眠侧唯一键把种类并入（窝,种类,基准日）。
+/// v2 的 uq_ledger_wake 是 (窝,基准日)——提前天数设 0 时临近/出眠日两种提醒同日、
+/// 第二条被拒（票 01 停靠）；v3 改为 (窝,种类,基准日)，同日各一条，旧台账行原样
+/// 保留。超期侧 (窝,操作,基准日) 本就正确，不动。单事务原子完成。
+fn migrate_v2_to_v3(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        DROP INDEX IF EXISTS uq_ledger_wake;
+        CREATE UNIQUE INDEX uq_ledger_wake
+            ON reminder_ledger(colony_id, kind, base_date) WHERE kind != 'overdue';
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 3)?;
     tx.commit()
 }
 
@@ -325,7 +346,93 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 2);
+        assert_eq!(SCHEMA_VERSION, 3);
+    }
+
+    #[test]
+    fn v3_ledger_identity_is_four_tuple_allowing_same_day_wake_kinds() {
+        // 票 01 停靠：v2 里临近/出眠日共用 (colony, base_date) 唯一键——提前天数设 0 时
+        // 两种提醒同日、第二条被拒。v3 改为 spec 契约的四元组唯一（窝,种类,操作,基准日）。
+        let (conn, _dir) = fresh_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .expect("建窝失败");
+
+        let insert = |kind: &str, action: Option<i64>, base: &str| {
+            conn.execute(
+                "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
+                 VALUES (1, ?1, ?2, ?3, '2026-09-18 08:00:00')",
+                params![kind, action, base],
+            )
+        };
+
+        // 提前天数=0：临近与出眠日同日（同窝同基准日、种类不同）→ 两条共存
+        assert_eq!(insert("approaching_wake", None, "2026-10-01").unwrap(), 1);
+        assert_eq!(insert("wake_day", None, "2026-10-01").unwrap(), 1);
+
+        // 同四元组重复仍被拒（去重兜底在库层）
+        assert!(insert("wake_day", None, "2026-10-01").is_err());
+        assert!(insert("approaching_wake", None, "2026-10-01").is_err());
+
+        // 超期类：同窝同操作同基准日唯一；不同操作互不干扰
+        assert_eq!(insert("overdue", Some(1), "2026-09-15").unwrap(), 1);
+        assert!(insert("overdue", Some(1), "2026-09-15").is_err());
+        assert_eq!(insert("overdue", Some(4), "2026-09-15").unwrap(), 1);
+
+        // 出眠日改期后按新基准日重发：同种类不同基准日共存（重算的前提）
+        assert_eq!(insert("wake_day", None, "2026-10-10").unwrap(), 1);
+    }
+
+    #[test]
+    fn v2_ledger_rows_survive_migration_to_v3() {
+        // 手工搭 v2 库（真实迁移链 v0→v1→v2），灌 v2 时期合法的台账行，升 v3 后原样保留。
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).expect("建 v1 schema 失败");
+        seed_v1_presets(&conn).expect("灌 v1 预置数据失败");
+        migrate_v1_to_v2(&conn).expect("升 v2 失败");
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .expect("建窝失败");
+        conn.execute_batch(
+            r#"
+            INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at) VALUES
+                (1, 'overdue',          1,    '2026-09-15', '2026-09-15 08:00:00'),
+                (1, 'approaching_wake', NULL, '2026-10-01', '2026-09-24 08:00:00');
+            "#,
+        )
+        .expect("灌台账失败");
+
+        migrate(&conn).expect("v2 → v3 升级失败");
+
+        assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM reminder_ledger"),
+            2,
+            "旧台账数据迁移后原样保留"
+        );
+        // 新索引生效：同日临近+出眠可共存（v2 索引下这组会互斥）
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
+             VALUES (1, 'wake_day', NULL, '2026-10-01', '2026-10-01 08:00:00')",
+            [],
+        )
+        .expect("v3 下同日出眠日台账应可写入");
+        // 旧的两条部分唯一索引已被替换：冬眠侧唯一键现在含种类列
+        let wake_index_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'uq_ledger_wake'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("查 uq_ledger_wake 失败");
+        assert!(
+            wake_index_sql.contains("kind"),
+            "v3 的 uq_ledger_wake 应把种类并入唯一键，实际：{wake_index_sql}"
+        );
     }
 
     #[test]

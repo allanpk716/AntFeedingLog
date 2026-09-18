@@ -636,7 +636,8 @@ mod tests {
             params![a.id],
         )
         .unwrap();
-        crate::hibernation::start_hibernation(&conn, b.id, "2026-09-01", "2026-12-01").unwrap();
+        crate::hibernation::start_hibernation(&conn, b.id, "2026-09-01", "2026-12-01", TODAY)
+            .unwrap();
 
         let list = list_colonies(&conn, TODAY).unwrap();
         let ha = list.iter().find(|c| c.id == a.id).unwrap();

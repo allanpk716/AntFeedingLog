@@ -195,7 +195,13 @@ fn start_hibernation(
     expected_end_date: String,
 ) -> Result<hibernation::Hibernation, String> {
     with_conn(state, |conn| {
-        hibernation::start_hibernation(conn, colony_id, &start_date, &expected_end_date)
+        hibernation::start_hibernation(
+            conn,
+            colony_id,
+            &start_date,
+            &expected_end_date,
+            &colony::today_iso(),
+        )
     })
 }
 
@@ -206,7 +212,7 @@ fn confirm_wake(
     actual_end_date: String,
 ) -> Result<hibernation::Hibernation, String> {
     with_conn(state, |conn| {
-        hibernation::confirm_wake(conn, colony_id, &actual_end_date)
+        hibernation::confirm_wake(conn, colony_id, &actual_end_date, &colony::today_iso())
     })
 }
 
