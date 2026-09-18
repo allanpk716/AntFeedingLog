@@ -12,8 +12,9 @@ Windows 桌面的多窝蚂蚁饲养记录工具：一键记账、超期提醒、
 - **冬眠管理**：手动入眠（填预计出眠日）→ 期间提醒静音、仍可记账 → 临近出眠提前提醒 → 出眠日提醒 → 手动确认出眠；统计自动扣除冬眠天数，出眠后"距上次"重新起算
 - **统计**：日历热力图（悬停看当天明细）、喂食食物构成占比、每周操作次数、实际间隔 vs 建议间隔；按窝与时间范围筛选
 - **记录流水**：按窝/操作/时间筛选、备注搜索、行内编辑、删除；补录历史时间合法
-- **数据自持**：SQLite 单文件（`journal_mode=DELETE`，拷贝即完整备份）；应用内一键安全备份、导出 CSV（Excel 直开，含公式注入防护）/ JSON
-- **托盘常驻**：关窗即收进托盘、开机自启、悬停显示概要（"2 窝活跃 · 某窝喂食超期 1 天"）
+- **数据自持**：SQLite 单文件（`journal_mode=DELETE`，拷贝即完整备份）；**自动备份**（每天第一次新数据时备一份到指定目录、保留份数可配、失败静默自动补跑）+ **应用内从备份整库恢复**（摘要预览 / 恢复前自动快照 / 失败当前库零改动）+ 一键安全备份、导出 CSV（Excel 直开，含公式注入防护）/ JSON
+- **日志与异常退出溯源**：错误与关键动作流水按天滚动落盘（留 14 天），设置页可看最近错误摘要、打开日志文件夹；崩溃/强杀后下次启动显示"上次异常退出"
+- **托盘常驻**：关窗即收进托盘、开机自启、悬停显示概要（"2 窝活跃 · 某窝喂食超期 1 天"）；单实例
 
 ## 技术栈
 
@@ -24,14 +25,16 @@ Tauri 2（Rust + rusqlite 独占数据层，逐版本迁移链）· Vue 3 + Type
 ```bash
 pnpm install
 pnpm tauri dev          # 开发运行（首次 Rust 编译约 5-10 分钟）
-pnpm test               # 前端测试（148 个）
-cd src-tauri && cargo test   # Rust 测试（162 个）
+pnpm test               # 前端测试（255 个）
+cd src-tauri && cargo test   # Rust 测试（297 个）
 pnpm tauri build        # 打包安装包
 ```
 
 数据文件位于 `%APPDATA%/com.antfeedinglog.app/`，设置里有"打开数据文件夹"。
 
-发新版（生成签名密钥 → 配 Secrets → 打 tag → 验收产物）看 [docs/release.md](./docs/release.md)。
+发新版（打 tag → GitHub Actions 自动构建签名发布 → 验收产物）看 [docs/release.md](./docs/release.md)。
+
+> **发版硬依赖：更新签名密钥对（私钥 + 密码）。** 私钥存在 GitHub Secrets（`TAURI_SIGNING_PRIVATE_KEY` / `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`），原件在开发机 `~/.tauri/`；**灾备副本与恢复说明存放在群晖 Drive 同步目录的 `AntFeedingLog` 文件夹**（含 README）。私钥或密码一旦丢失，已装用户将永远无法收到应用内更新（只能换密钥对并让所有人手动重装）。
 
 ## 文档
 

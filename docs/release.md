@@ -6,6 +6,8 @@
 >
 > 全程约 30 分钟（大部分时间在等 GitHub Actions 编译，约 10-20 分钟）。
 
+> **状态（2026-09-19）：第 1–4 步已全部完成**——密钥对已生成（开发机 `~/.tauri/`）、公钥已入 `tauri.conf.json`、两个 Secrets 已配置、灾备副本已存群晖 Drive 的 `AntFeedingLog` 文件夹（内含 README：文件清单/恢复步骤/丢失后果）。**以后发版直接看文末附 3**，本页第 1–4 步仅存档备查（换密钥对或重配 Secrets 时才需要）。
+
 ---
 
 ## 第 1 步：生成 minisign 密钥对
@@ -63,6 +65,7 @@ CI 在云端签名，需要拿到私钥和密码。到 GitHub 仓库页面 → *
 ## 第 4 步：私钥灾备 + 安全红线
 
 - **灾备**：把 `~/.tauri/antfeedinglog.key`（私钥）和它的密码另存一份到你的密码管理器（或离线 U 盘等不吃系统重装的介质）。这台电脑坏了，密钥就没了，以后所有已装用户都验不了新包的签名。
+  - ✅ 已执行（2026-09-19）：灾备副本 = **群晖 Drive 同步目录的 `AntFeedingLog` 文件夹**（`antfeedinglog.key` / `.key.passphrase` / `.key.pub` + 恢复用 README）。该文件夹经 NAS 同步，视为第三份副本；恢复步骤见其 README，或重配 Secrets：`gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/antfeedinglog.key` 与 `gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD < ~/.tauri/antfeedinglog.key.passphrase`。
 - **红线：私钥绝不入 git。** 仓库 `.gitignore` 已加 `.tauri/` 和 `*.key`（放行 `.key.pub`）兜底；生成路径 `~/.tauri/` 本身也在仓库外。如果你另存到仓库目录里，确认 `git status` 里没出现它再提交。
 
 ## 第 5 步：打 tag 并 push，等 CI 发版
