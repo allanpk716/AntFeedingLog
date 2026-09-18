@@ -41,6 +41,8 @@ const actions: CareActionItem[] = [
   { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, referenced: true, is_preset: true },
   { id: 3, name: "巢穴保湿", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 3, referenced: false, is_preset: true },
   { id: 4, name: "垃圾清理", icon: null, kind: "reminding", is_feeding: false, suggested_interval_days: 7, enabled: true, sort: 4, referenced: false, is_preset: true },
+  // 自建被引用行：保住规则 10 的 UI 分支（删除禁用 + 「只能停用」标题）不被 F2 预置断言淹没
+  { id: 5, name: "降温", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 5, referenced: true, is_preset: false },
 ];
 
 const colonies: Colony[] = [
@@ -464,13 +466,18 @@ describe("设置 · 字典管理（票 04）", () => {
     const rows = dlg.findAll(".dict-row");
     expect(
       rows.map((r) => (r.find(".name-input").element as HTMLInputElement).value),
-    ).toEqual(["喂食", "活动区换水", "巢穴保湿", "垃圾清理"]);
+    ).toEqual(["喂食", "活动区换水", "巢穴保湿", "垃圾清理", "降温"]);
 
-    // 预置操作删除全部禁用（含未被引用的巢穴保湿），标题提示可停用（F2）
-    for (const row of rows) {
+    // 四个预置操作删除全部禁用（含未被引用的巢穴保湿），标题提示可停用（F2）
+    for (const row of rows.slice(0, 4)) {
       expect(row.find(".erase-btn").attributes("disabled")).toBeDefined();
       expect(row.find(".erase-btn").attributes("title")).toContain("预置项不能删除");
     }
+
+    // 自建被引用行（规则 10）：删除同样禁用，标题走引用文案而非预置文案
+    const custom = rows[4];
+    expect(custom.find(".erase-btn").attributes("disabled")).toBeDefined();
+    expect(custom.find(".erase-btn").attributes("title")).toContain("只能停用");
   });
 
   it("操作 tab：登记类切提醒 + 填建议间隔，保存发出 save_action 并刷新首页（验收 4 的链路）", async () => {
@@ -525,9 +532,9 @@ describe("设置 · 字典管理（票 04）", () => {
 
     await dlg.find(".add-input").setValue("糖水");
     await dlg.find(".add-btn").trigger("click");
-    expect(dlg.findAll(".dict-row").length).toBe(5);
+    expect(dlg.findAll(".dict-row").length).toBe(6);
     // 新增行非预置、未被引用：删除可用（F2 只禁预置与被引用）
-    expect(dlg.findAll(".dict-row")[4].find(".erase-btn").attributes("disabled")).toBeUndefined();
+    expect(dlg.findAll(".dict-row")[5].find(".erase-btn").attributes("disabled")).toBeUndefined();
 
     invokeMock.mockClear();
     await dlg.find(".tab-body .btn.primary").trigger("click");
@@ -540,7 +547,7 @@ describe("设置 · 字典管理（票 04）", () => {
         kind: "reminding",
         is_feeding: false,
         suggested_interval_days: 7,
-        sort: 4,
+        sort: 5,
       },
     });
   });
