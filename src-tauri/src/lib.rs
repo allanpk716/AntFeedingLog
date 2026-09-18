@@ -7,6 +7,7 @@ mod reminder;
 mod settings;
 mod stats;
 mod system;
+mod updater;
 
 use std::sync::Mutex;
 
