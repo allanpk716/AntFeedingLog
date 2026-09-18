@@ -87,6 +87,22 @@ describe("更新面板（票 06）：挂载与启动残留引导", () => {
     wrapper.unmount();
     expect(unlistenMock).toHaveBeenCalledTimes(1);
   });
+
+  it("挂载后 listen 未 resolve 就卸载：resolve 后立即退订，不泄漏监听（评审 R2 Minor-1）", async () => {
+    let resolveListen!: (fn: typeof unlistenMock) => void;
+    listenMock.mockImplementationOnce(
+      () =>
+        new Promise<typeof unlistenMock>((resolve) => {
+          resolveListen = resolve;
+        }),
+    );
+    baseMock();
+    const wrapper = mount(UpdatePanel);
+    wrapper.unmount(); // listen 还没 resolve 就卸载
+    resolveListen(unlistenMock);
+    await flushPromises();
+    expect(unlistenMock).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("更新面板：立即检查更新三态", () => {
@@ -279,5 +295,39 @@ describe("更新面板：确认安装交互流", () => {
     await wrapper.find(".install-failed .manual-dl-btn").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("open_releases_page");
+  });
+
+  it("在途安装时重复确认（Rust 防重入拒绝）→ 平静「进行中」提示，不出失败引导（评审 R2 Important）", async () => {
+    const wrapper = await mountWithAvailable();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "confirm_and_install") throw "已有安装流程正在进行，请稍候";
+      return null;
+    });
+
+    await wrapper.find(".install-btn").trigger("click");
+    await flushPromises();
+
+    const calm = wrapper.find(".install-in-progress");
+    expect(calm.exists()).toBe(true);
+    expect(calm.text()).toContain("正在进行");
+    // 误报防护锚点：不渲染失败文案与重试/手动下载出口
+    expect(wrapper.find(".install-failed-text").exists()).toBe(false);
+    expect(wrapper.find(".retry-btn").exists()).toBe(false);
+    expect(wrapper.find(".manual-dl-btn").exists()).toBe(false);
+  });
+
+  it("install_started 后「立即检查更新」禁用（将重启窗口期，评审 R2 Minor-2）", async () => {
+    const wrapper = await mountWithAvailable();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "confirm_and_install")
+        return { status: "install_started", version: "0.3.0" };
+      return null;
+    });
+
+    await wrapper.find(".install-btn").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".install-started").exists()).toBe(true);
+    expect((wrapper.find(".check-btn").element as HTMLButtonElement).disabled).toBe(true);
   });
 });

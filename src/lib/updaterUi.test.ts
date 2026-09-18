@@ -76,6 +76,35 @@ describe("安装结果 → 展示视图", () => {
   });
 });
 
+// ── 状态映射：确认流的 Err（评审 R2）───────────────────────────────────────
+
+describe("确认安装 Err → 展示视图（评审 R2 Important：防重入拒绝不是失败）", () => {
+  it("Rust 防重入固定拒绝串（安装已在后台健康进行）→ 「进行中」平静态，不走失败引导", () => {
+    const view = installViewForOutcome("已有安装流程正在进行，请稍候", "0.3.0");
+    expect(view.kind).toBe("in_progress");
+    expect(view.kind === "in_progress" && view.text).toContain("正在进行");
+    // 不带失败语义：文案与视图都不出现「未完成」
+    expect(view.kind === "in_progress" && view.text).not.toContain("未完成");
+    // 兜底版本不参与「进行中」文案
+    expect(view).not.toHaveProperty("version");
+  });
+
+  it("其余 Err 仍折为失败视图，带上 fallback 版本", () => {
+    const view = installViewForOutcome("远端已没有比当前更新的版本", "0.3.0");
+    expect(view.kind).toBe("failed");
+    expect(view.kind === "failed" && view.version).toBe("0.3.0");
+    expect(view.kind === "failed" && view.text).toContain("v0.3.0");
+  });
+
+  it("Err 且拿不到版本（fallback 空）→ 失败文案不留悬空的「v」", () => {
+    const view = installViewForOutcome("写更新标记失败");
+    expect(view.kind).toBe("failed");
+    expect(view.kind === "failed" && view.version).toBe("");
+    expect(view.kind === "failed" && view.text.startsWith("升级未完成")).toBe(true);
+    expect(view.kind === "failed" && view.text).not.toContain("v ");
+  });
+});
+
 // ── 状态映射：启动残留（get_update_state）→ 引导横幅 ──
 
 describe("更新状态 → 引导横幅", () => {

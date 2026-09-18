@@ -40,12 +40,16 @@ const checking = ref(false);
 /** 安装流视图；null = 不在安装流（确认行可见的条件之一） */
 const install = ref<InstallView | null>(null);
 const installing = ref(false);
+/** 已进入安装启动态（进程将退出重启）：窗口期内检查/确认都不再放行 */
+const installStarted = computed(() => install.value?.kind === "started");
 /** 用户点了「暂不更新」：收起确认行，再点「立即检查更新」会重新给出 */
 const declined = ref(false);
 /** 上屏的进度（节流后的展示值）；null = 尚未有事件（显示「准备下载…」） */
 const progress = ref<ProgressView | null>(null);
 let lastShown: ShownProgress | null = null;
 let unlistenProgress: (() => void) | null = null;
+/** 已卸载标志：listen 的 resolve 与卸载赛跑时，输了就立即退订（评审 R2 Minor-1） */
+let disposed = false;
 const releasesError = ref("");
 
 const progressWidth = computed(() => {
@@ -80,14 +84,21 @@ function onProgressEvent(payload: unknown) {
 }
 
 onMounted(async () => {
-  unlistenProgress = await listen<{ downloaded: number; total: number | null }>(
+  const unlisten = await listen<{ downloaded: number; total: number | null }>(
     "update-download-progress",
     (event) => onProgressEvent(event.payload),
   );
+  if (disposed) {
+    // 挂载即卸载（listen 未 resolve 前组件已销毁）：立即退订，监听器不泄漏
+    unlisten();
+    return;
+  }
+  unlistenProgress = unlisten;
   await loadVersionAndState();
 });
 
 onUnmounted(() => {
+  disposed = true;
   unlistenProgress?.();
   unlistenProgress = null;
 });
@@ -115,19 +126,20 @@ async function installNow() {
   progress.value = null;
   lastShown = null;
   install.value = { kind: "installing" };
+  // 失败视图的版本兜底：优先当前检查到的新版，其次残留目标版本（Err 时
+  // install_started/install_failed 载荷拿不到版本，靠它让文案带上目标）
+  const fallbackVersion =
+    checkView.value.kind === "available"
+      ? checkView.value.version
+      : banner.value.kind === "incomplete"
+        ? banner.value.version
+        : "";
   try {
-    const outcome = await invoke<InstallOutcome>("confirm_and_install");
-    install.value = installViewForOutcome(outcome);
-  } catch (e) {
-    // 前置失败（再次检查失败/写标记失败）折为 Err：同走失败出口
-    const message = String(e);
-    const version =
-      checkView.value.kind === "available"
-        ? checkView.value.version
-        : banner.value.kind === "incomplete"
-          ? banner.value.version
-          : "";
-    install.value = installViewForOutcome({ status: "install_failed", version, message });
+    // Err（防重入拒绝/再次检查失败/写标记失败）折为字符串进映射层：
+    // 防重入拒绝 = 安装健康进行中，映射为平静「进行中」态，不走失败引导
+    //（评审 R2 Important：切 tab 回来重复确认时不得误报失败）
+    const outcome = await invoke<InstallOutcome>("confirm_and_install").catch((e) => String(e));
+    install.value = installViewForOutcome(outcome, fallbackVersion);
   } finally {
     installing.value = false;
   }
@@ -156,7 +168,7 @@ async function openReleases() {
 
     <div class="update-row">
       <span class="current-version">当前版本：v{{ currentVersion || "…" }}</span>
-      <button class="btn check-btn" type="button" :disabled="checking || installing" @click="checkNow">
+      <button class="btn check-btn" type="button" :disabled="checking || installing || installStarted" @click="checkNow">
         {{ checking ? "检查中…" : "立即检查更新" }}
       </button>
     </div>
@@ -188,6 +200,7 @@ async function openReleases() {
         <p class="progress-text">{{ progress ? progressText(progress) : "准备下载…" }}</p>
       </template>
       <p v-else-if="install.kind === 'started'" class="saved-hint install-started">{{ install.text }}</p>
+      <p v-else-if="install.kind === 'in_progress'" class="update-ok install-in-progress">{{ install.text }}</p>
       <div v-else class="install-failed">
         <p class="form-error install-failed-text">{{ install.text }}</p>
         <div class="confirm-row">

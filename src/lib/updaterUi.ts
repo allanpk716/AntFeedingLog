@@ -55,9 +55,24 @@ export function incompleteGuidance(version: string): string {
   return `上次升级未完成（目标 v${version}），可在下方重试，或手动下载安装包。`;
 }
 
-/** 安装失败文案：版本 + 原因（重试/手动下载按钮由组件给出口） */
+/** 安装失败文案：版本 + 原因（重试/手动下载按钮由组件给出口）；版本未知时不留悬空的「v」 */
 export function installFailedText(version: string, message: string): string {
-  return `升级到 v${version} 未完成：${message}`;
+  const prefix = version ? `升级到 v${version} 未完成` : "升级未完成";
+  return `${prefix}：${message}`;
+}
+
+/** Rust lib.rs 防重入（CONFIRM_IN_FLIGHT）的固定拒绝串：安装其实已在后台健康
+ * 进行（评审 R2 Important）——必须与真失败区分，否则误报失败诱导重试/手动下载。 */
+const INSTALL_IN_PROGRESS_MARKER = "已有安装流程正在进行";
+
+/** 识别防重入拒绝（在途安装误报防护） */
+export function isInstallInProgressError(message: string): boolean {
+  return message.includes(INSTALL_IN_PROGRESS_MARKER);
+}
+
+/** 「安装已在进行中」的平静提示：不出重试/手动下载（下载正在正常走，别劝退） */
+export function installInProgressText(): string {
+  return "安装正在进行中，请稍候。下载完成时应用将重启以完成安装。";
 }
 
 /** 安装已启动提示（进程将退出重启） */
@@ -86,13 +101,33 @@ export function checkViewForOutcome(outcome: CheckOutcome | string): CheckView {
 
 // ── 安装结果两态 → 展示视图 ────────────────────────────────────────────────
 
-/** 安装流的展示视图：进行中 / 已启动（将重启）/ 失败 */
+/** 安装流的展示视图：进行中 / 已启动（将重启）/ 后台已在安装（平静等待）/ 失败 */
 export type InstallView =
   | { kind: "installing" }
   | { kind: "started"; version: string; text: string }
+  | { kind: "in_progress"; text: string }
   | { kind: "failed"; version: string; message: string; text: string };
 
-export function installViewForOutcome(outcome: InstallOutcome): InstallView {
+/**
+ * 安装结果 → 展示视图。字符串 = invoke 的 Err（再次检查失败/写标记失败/
+ * Rust 防重入拒绝等）：防重入拒绝映射为「进行中」平静态（不走失败引导），
+ * 其余折为失败态（version 用 fallbackVersion 兜底，让文案带上目标版本）。
+ */
+export function installViewForOutcome(
+  outcome: InstallOutcome | string,
+  fallbackVersion = "",
+): InstallView {
+  if (typeof outcome === "string") {
+    if (isInstallInProgressError(outcome)) {
+      return { kind: "in_progress", text: installInProgressText() };
+    }
+    return {
+      kind: "failed",
+      version: fallbackVersion,
+      message: outcome,
+      text: installFailedText(fallbackVersion, outcome),
+    };
+  }
   return outcome.status === "install_started"
     ? { kind: "started", version: outcome.version, text: installStartedText() }
     : {
