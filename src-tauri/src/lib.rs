@@ -1,3 +1,4 @@
+mod applog;
 mod care;
 mod colony;
 mod db;
@@ -37,9 +38,25 @@ fn with_conn<T>(
     state: tauri::State<'_, DbState>,
     f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
 ) -> Result<T, String> {
-    let conn = state.0.lock().map_err(|e| e.to_string())?;
-    updater::ensure_writable()?;
-    f(&conn)
+    let conn = match state.0.lock() {
+        Ok(conn) => conn,
+        Err(e) => {
+            // 票 01：命令失败落日志（库锁不可用）
+            applog::log_error(&format!("命令执行失败（库锁不可用）: {e}"));
+            return Err(e.to_string());
+        }
+    };
+    if let Err(e) = updater::ensure_writable() {
+        // 票 01：禁写窗口拒绝也留痕（安装窗口期的在途写，排查升级问题时用）
+        applog::log_error(&format!("命令执行失败（更新安装禁写窗口）: {e}"));
+        return Err(e);
+    }
+    let result = f(&conn);
+    if let Err(e) = &result {
+        // 票 01：命令失败落日志（D7 错误记录——统一入口一处挂，覆盖全部库命令）
+        applog::log_error(&format!("命令执行失败: {e}"));
+    }
+    result
 }
 
 /// IPC 通路健康检查：返回 schema 版本（迁移正常时应为 1）。
@@ -499,6 +516,53 @@ fn open_releases_page(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| format!("打开发布页失败: {e}"))
 }
 
+// ── 日志与异常退出（数据安全二期票 01，D10 命令契约）──
+
+/// 打开日志文件夹（opener 打开数据目录下 logs/；目录不存在先创建）。
+#[tauri::command]
+fn open_logs_folder(app: tauri::AppHandle) -> Result<String, String> {
+    use tauri_plugin_opener::OpenerExt;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("解析数据目录失败: {e}"))?;
+    let logs_dir = data_dir.join(applog::LOG_DIR_NAME);
+    std::fs::create_dir_all(&logs_dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+    app.opener()
+        .open_path(logs_dir.to_string_lossy(), None::<&str>)
+        .map_err(|e| format!("打开日志文件夹失败: {e}"))?;
+    Ok(logs_dir.to_string_lossy().to_string())
+}
+
+/// 最近错误摘要（[ERROR]/[PANIC] 行，新→旧，限量 [`applog::MAX_RECENT_ERRORS`]）。
+#[tauri::command]
+fn get_recent_errors() -> Result<Vec<String>, String> {
+    let data_dir = current_data_dir()?;
+    Ok(applog::recent_errors_from(&data_dir, applog::MAX_RECENT_ERRORS))
+}
+
+/// 上次异常退出（启动判定暂存结果；None = 上次正常退出）。
+#[tauri::command]
+fn get_last_abnormal_exit() -> Result<Option<applog::AbnormalExit>, String> {
+    Ok(applog::last_abnormal_exit())
+}
+
+/// 前端未捕获异常转发落盘（window.onerror / unhandledrejection → main.ts 调用）。
+/// 入参截断与单行化在 format_line 内统一做，超长堆栈不撑破行结构。
+#[tauri::command]
+fn log_frontend_error(message: String) -> Result<(), String> {
+    applog::log_error(&format!("前端未捕获异常: {message}"));
+    Ok(())
+}
+
+/// 当前数据目录（日志命令共用；全局未初始化时回退解析一次）。
+fn current_data_dir() -> Result<std::path::PathBuf, String> {
+    if let Some(dir) = applog::data_dir() {
+        return Ok(dir.to_path_buf());
+    }
+    Err("日志底座未初始化（数据目录未知）".into())
+}
+
 // ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──
 
 /// 打开数据文件夹（opener 打开 app data 目录；目录不存在先创建）。
@@ -579,7 +643,17 @@ async fn export_data(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
+        // 单实例（数据安全二期票 01 D9）：必须注册在最前（插件文档要求）。
+        // 第二实例启动时本回调在【主实例】进程里执行：聚焦已有主窗口，第二实例
+        // 自身随即退出——运行标记、备份账目、库单写者都以单实例为前提。
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_notification::init())
         // 开机自启（票 09）：状态权威在 settings，启动/改设置时对齐插件
         .plugin(tauri_plugin_autostart::init(
@@ -593,6 +667,11 @@ pub fn run() {
         .setup(|app| {
             // 库文件放系统应用数据目录（Windows: %APPDATA%\<identifier>\），非项目目录。
             let data_dir = app.path().app_data_dir()?;
+            // 日志底座先行（数据安全二期票 01）：panic 钩子 + 过期日志清理，再跑
+            // 启动序列——读上次运行标记 → 判定异常退出并暂存（get_last_abnormal_exit
+            // 查询）→ 清旧标记 → 写本次标记 → 记「应用启动」流水。
+            applog::init(&data_dir);
+            applog::startup_sequence(&data_dir);
             let db_path = data_dir.join(db::DB_FILE_NAME);
             let conn = db::open_and_migrate(&db_path).map_err(|e| e.to_string())?;
             let autostart_on = settings::get_settings(&conn)
@@ -673,13 +752,27 @@ pub fn run() {
             open_releases_page,
             pushover_status,
             reveal_data_folder,
+            open_logs_folder,
+            get_recent_errors,
+            get_last_abnormal_exit,
+            log_frontend_error,
             backup_to,
             export_data,
             get_stats,
             earliest_log_date,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // 主事件循环（数据安全二期票 01 D8）：RunEvent::Exit 汇拢全部优雅退出路径——
+    // 托盘「退出」（app.exit）与 OS 关机/注销的常规销毁序列都经这里收尾，
+    // 清运行标记 + 记「应用正常退出」。更新安装路径不经事件循环（插件在
+    // on_before_exit 里自清，见 updater.rs），双保险互不重叠。
+    app.run(|_app, event| {
+        if let tauri::RunEvent::Exit = event {
+            applog::graceful_exit();
+        }
+    });
 }
 
 // ── 测试：command 层裁决语义（纯函数，spec「Testing Decisions」）──────────

@@ -435,6 +435,12 @@ pub fn run_confirm_flow<S: ConfirmSteps>(
             stage_update_state(UpdateState::LastInstallIncomplete {
                 version: info.version.clone(),
             });
+            // 数据安全二期票 01 D8：安装失败进程存活——重启前运行标记可能已被
+            // on_before_exit 清掉，重写一份（宁误报不漏报：此后若强杀，下次启动
+            // 仍能判异常退出）。失败只 eprintln，不吞安装失败的主结果。
+            if let Err(e) = crate::applog::write_run_marker(data_dir, &crate::applog::now_local()) {
+                eprintln!("[updater] 安装失败后重写运行标记失败: {e}");
+            }
             Ok(InstallOutcome::InstallFailed {
                 version: info.version,
                 message,
@@ -530,14 +536,21 @@ fn now_stamp() -> String {
 }
 
 /// on_before_exit 挂点本体（票 04，薄封装不进单测；核心 pre_update_snapshot /
-/// set_write_blocked 全测）：拿锁挡并发写 → 拷贝快照 → 锁内先置禁写标志 → 放锁。
+/// set_write_blocked 全测）：**先清运行标记**（数据安全二期票 01 D8：更新重启是
+/// 优雅退出路径之一，本钩子在进程 std::process::exit 前触发、不经主事件循环，
+/// 必须在这里自清）→ 拿锁挡并发写 → 拷贝快照 → 锁内先置禁写标志 → 放锁。
 /// 标志在持锁期间置位：放锁后所有写路径都在各自锁内复查标志（with_conn /
 /// daily_tick 段 3 / check_and_notify；评审 R1 TOCTOU——置位前已过检查、阻塞在
 /// 锁上的在途写由锁内复查拦下），新发起与在途写都不再落库，快照与实际库之间
 /// 不存在漂移窗口。
 /// 任何失败只记日志、绝不阻塞安装（票面：失败不阻塞升级，状态即本函数日志）；
 /// 快照失败也不置禁写——没有快照可保护，且安装失败残留时应用需保持可用。
+/// 安装失败（进程存活）由 run_confirm_flow 失败臂重写运行标记（防漏报）。
 fn before_exit_snapshot(app: &tauri::AppHandle) {
+    // 更新安装重启前清运行标记（票 01）：标记被清后即使安装器拉起失败、进程
+    // 存活，后续退出仍走常规优雅路径；只有"清了标记又强杀"的窗口会漏报，由
+    // run_confirm_flow 失败臂重写标记兜底。
+    crate::applog::graceful_exit();
     let Some(state) = app.try_state::<crate::DbState>() else {
         return;
     };
@@ -1644,6 +1657,31 @@ mod tests {
         assert_eq!(steps.call_log(), vec!["check"], "写标记失败：绝不下载");
         // 禁写标志断言刻意不写在此处：此刻还没走到 install，标志本就不可能置位
         //（ ambient 状态归 write_block_flag_roundtrip / M-1 两个专项测试管）
+    }
+
+    #[test]
+    fn confirm_flow_failure_rewrites_run_marker_for_abnormal_exit_detection() {
+        // 数据安全二期票 01 D8：下载/安装失败且进程存活 → 重写运行标记
+        //（重启前可能已被 on_before_exit 清掉），此后强杀仍能被判异常退出
+        //（宁误报不漏报）。
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let mut steps = FakeSteps::ok_flow("0.3.0");
+        steps.install = Err("启动安装器失败".into());
+        run_confirm_flow(dir.path(), &steps).unwrap();
+        assert!(
+            dir.path().join(crate::applog::RUN_MARKER_FILE).exists(),
+            "安装失败后运行标记必须被重写"
+        );
+
+        // 检查失败路径：流程在写任何东西前中止，不落运行标记
+        let dir2 = TempDir::new().expect("创建临时目录失败");
+        let mut steps2 = FakeSteps::ok_flow("0.3.0");
+        steps2.update = Err("HTTP 404：latest.json 不存在".into());
+        assert!(run_confirm_flow(dir2.path(), &steps2).is_err());
+        assert!(
+            !dir2.path().join(crate::applog::RUN_MARKER_FILE).exists(),
+            "检查失败不写运行标记"
+        );
     }
 
     #[test]
