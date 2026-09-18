@@ -3,6 +3,8 @@ mod colony;
 mod db;
 mod dict;
 mod hibernation;
+mod reminder;
+mod settings;
 
 use std::sync::Mutex;
 
