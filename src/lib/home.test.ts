@@ -12,6 +12,7 @@ function colony(partial: Partial<Colony> & { id: number }): Colony {
     days_raised: 100,
     actions: [],
     recent: [],
+    hibernation: null,
     ...partial,
   };
 }

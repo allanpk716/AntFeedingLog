@@ -30,6 +30,22 @@ export interface RecentLog {
   food_names: string[];
 }
 
+/** 冬眠段（list_hibernations 行；actual_end_date 为 null = 开放段） */
+export interface HibernationSegment {
+  id: number;
+  colony_id: number;
+  start_date: string;
+  expected_end_date: string;
+  actual_end_date: string | null;
+}
+
+/** 开放段摘要（Colony.hibernation，冬眠卡片横幅数据；无开放段为 null） */
+export interface HibernationPreview {
+  id: number;
+  start_date: string;
+  expected_end_date: string;
+}
+
 /** 窝（Rust 已算好饲养天数、操作块、最近摘要） */
 export interface Colony {
   id: number;
@@ -41,6 +57,7 @@ export interface Colony {
   days_raised: number;
   actions: ColonyAction[];
   recent: RecentLog[];
+  hibernation: HibernationPreview | null;
 }
 
 /** 新建/编辑窝入参 */

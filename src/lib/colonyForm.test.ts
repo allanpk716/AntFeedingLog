@@ -13,6 +13,7 @@ const existing: Colony[] = [
     days_raised: 241,
     actions: [],
     recent: [],
+    hibernation: null,
   },
 ];
 

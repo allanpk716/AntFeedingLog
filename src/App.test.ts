@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "./App.vue";
 import type { CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
+import { addDays, todayIso } from "./lib/dates";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -37,6 +38,7 @@ const colonies: Colony[] = [
     days_raised: 241,
     actions: [],
     recent: [],
+    hibernation: null,
   },
   {
     id: 2,
@@ -48,6 +50,7 @@ const colonies: Colony[] = [
     days_raised: 96,
     actions: [],
     recent: [],
+    hibernation: null,
   },
   {
     id: 3,
@@ -59,6 +62,7 @@ const colonies: Colony[] = [
     days_raised: 220,
     actions: [],
     recent: [],
+    hibernation: null,
   },
   {
     id: 4,
@@ -70,6 +74,7 @@ const colonies: Colony[] = [
     days_raised: 626,
     actions: [],
     recent: [],
+    hibernation: null,
   },
 ];
 
@@ -744,5 +749,170 @@ describe("卡片操作块与一键记账（票 03）", () => {
 
     expect(wrapper.find('.card[data-colony-id="1"] .tile-error').text()).toContain("不能新记");
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(false);
+  });
+});
+
+describe("冬眠管理（票 05）", () => {
+  /** 把 3 号窝（冬眠中）换成带开放段数据的版本。 */
+  function colony3With(hibernation: { id: number; start_date: string; expected_end_date: string } | null): void {
+    currentColonies = colonies.map((c) => (c.id === 3 ? { ...c, hibernation } : c));
+  }
+
+  it("冬眠卡灰化 + 横幅：入眠日/预计出眠/剩余天数；未到临近窗口不显角标", async () => {
+    // 预计出眠远在将来（2099）：剩余天数很多 → 无「临近出眠」角标（与真实今天无关，判定稳定）
+    colony3With({ id: 9, start_date: "2026-08-20", expected_end_date: "2099-01-01" });
+    const wrapper = await mountApp();
+
+    const card = wrapper.find('.card[data-colony-id="3"]');
+    expect(card.classes()).toContain("hib");
+    const banner = card.find(".banner");
+    expect(banner.exists()).toBe(true);
+    expect(banner.text()).toContain("08-20 入眠");
+    expect(banner.text()).toContain("预计出眠 01-01");
+    expect(banner.text()).toMatch(/还有 \d+ 天/);
+    expect(banner.find(".chip.wake").exists()).toBe(false);
+  });
+
+  it("预计出眠已过仍冬眠：横幅提示已过 N 天并显示「临近出眠」角标", async () => {
+    colony3With({ id: 9, start_date: "2026-08-20", expected_end_date: "1999-01-01" });
+    const wrapper = await mountApp();
+
+    const banner = wrapper.find('.card[data-colony-id="3"] .banner');
+    expect(banner.text()).toContain("预计日已过");
+    expect(banner.find(".chip.wake").text()).toBe("临近出眠");
+  });
+
+  it("活跃卡有「开始冬眠」入口：默认开始=今天、预计结束=开始+120 天，可改后提交 start_hibernation 并刷新", async () => {
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .hib-btn').trigger("click");
+
+    const dialog = wrapper.find(".hibernation-dialog");
+    expect(dialog.exists()).toBe(true);
+    const start = (dialog.find(".start-input").element as HTMLInputElement).value;
+    expect(start).toBe(todayIso());
+    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe(addDays(start, 120));
+
+    await dialog.find(".start-input").setValue("2026-12-01");
+    // 手动改预计结束（选完开始日自动预填、但用户可改）
+    await dialog.find(".end-input").setValue("2027-04-15");
+
+    invokeMock.mockClear();
+    await dialog.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("start_hibernation", {
+      colonyId: 1,
+      startDate: "2026-12-01",
+      expectedEndDate: "2027-04-15",
+    });
+    expect(wrapper.find(".hibernation-dialog").exists()).toBe(false);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(true);
+  });
+
+  it("改开始日且未手动改过预计结束时，预计结束自动跟随重填（+120 天）", async () => {
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .hib-btn').trigger("click");
+
+    const dialog = wrapper.find(".hibernation-dialog");
+    await dialog.find(".start-input").setValue("2026-12-01");
+    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe("2027-03-31");
+
+    // 手动改过之后不再自动覆盖
+    await dialog.find(".end-input").setValue("2027-05-01");
+    await dialog.find(".start-input").setValue("2026-12-10");
+    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe("2027-05-01");
+  });
+
+  it("开始冬眠被后端拒绝（如重叠）时弹窗内展示原因且弹窗保持", async () => {
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .hib-btn').trigger("click");
+
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "start_hibernation") {
+        throw "与该窝既有冬眠段时间重叠（相邻两段至少要隔一天）";
+      }
+      if (cmd === "list_colonies") return currentColonies;
+      if (cmd === "list_locations") return locations;
+      return null;
+    });
+
+    await wrapper.find(".hibernation-dialog .submit-btn").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".hibernation-dialog .form-error").text()).toContain("重叠");
+    expect(wrapper.find(".hibernation-dialog").exists()).toBe(true);
+  });
+
+  it("冬眠卡「确认出眠」：实际结束默认今天可改，提交 confirm_wake（实际≠预计没关系）", async () => {
+    colony3With({ id: 9, start_date: "2026-08-20", expected_end_date: "2026-09-25" });
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="3"] .wake-btn').trigger("click");
+
+    const dialog = wrapper.find(".hibernation-dialog");
+    expect(dialog.find("h3").text()).toContain("确认出眠");
+    expect((dialog.find(".actual-input").element as HTMLInputElement).value).toBe(todayIso());
+    await dialog.find(".actual-input").setValue("2026-09-12");
+
+    invokeMock.mockClear();
+    await dialog.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("confirm_wake", {
+      colonyId: 3,
+      actualEndDate: "2026-09-12",
+    });
+    expect(wrapper.find(".hibernation-dialog").exists()).toBe(false);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(true);
+  });
+
+  it("「补录冬眠」：空日期前端拦截；两段日期齐后提交 add_past_hibernation", async () => {
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .past-btn').trigger("click");
+
+    const dialog = wrapper.find(".hibernation-dialog");
+    expect(dialog.find("h3").text()).toContain("补录");
+
+    invokeMock.mockClear();
+    // 空日期直接提交：前端拦截，不发 IPC
+    await dialog.find(".submit-btn").trigger("click");
+    await flushPromises();
+    expect(dialog.find(".form-error").text()).toContain("日期");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "add_past_hibernation")).toBe(false);
+
+    await dialog.find(".past-start-input").setValue("2025-12-01");
+    await dialog.find(".past-end-input").setValue("2026-02-01");
+    await dialog.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("add_past_hibernation", {
+      colonyId: 1,
+      startDate: "2025-12-01",
+      endDate: "2026-02-01",
+    });
+    expect(wrapper.find(".hibernation-dialog").exists()).toBe(false);
+  });
+
+  it("冬眠卡仍可记账：静音块点击照常发 log_care（验收 5：灰化静音但可记账）", async () => {
+    const feedOverdue: ColonyAction = {
+      action_id: 1,
+      name: "喂食",
+      icon: null,
+      kind: "reminding",
+      is_feeding: false,
+      suggested_interval_days: 3,
+      days_since_last: 4,
+      overdue: true,
+    };
+    colony3With({ id: 9, start_date: "2026-08-20", expected_end_date: "2099-01-01" });
+    currentColonies = currentColonies.map((c) => (c.id === 3 ? { ...c, actions: [feedOverdue] } : c));
+    const wrapper = await mountApp();
+
+    invokeMock.mockClear();
+    await wrapper.find('.card[data-colony-id="3"] .tile[data-action-id="1"]').trigger("click");
+    await flushPromises();
+
+    const logCall = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
+    expect(logCall).toBeDefined();
+    expect((logCall![1] as { input: { colony_id: number } }).input.colony_id).toBe(3);
   });
 });

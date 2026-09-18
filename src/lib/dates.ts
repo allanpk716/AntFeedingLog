@@ -46,6 +46,18 @@ export function daysRaised(startIso: string, todayIso: string): number {
   return Math.round((today - start) / MS_PER_DAY);
 }
 
+/** to − from 的自然日数（半开口径不含端点进位，同 daysRaised：同一天 0，to 更早为负）。 */
+export function daysBetween(fromIso: string, toIso: string): number {
+  return Math.round((parseIsoDateUtc(toIso) - parseIsoDateUtc(fromIso)) / MS_PER_DAY);
+}
+
+/** iso + days 天的 YYYY-MM-DD（自动进位月/年，days 可为负）。 */
+export function addDays(iso: string, days: number): string {
+  const date = new Date(parseIsoDateUtc(iso) + days * MS_PER_DAY);
+  const pad = (v: number) => String(v).padStart(2, "0");
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}`;
+}
+
 /** 本机今天的 YYYY-MM-DD（表单默认值用）。 */
 export function todayIso(): string {
   const now = new Date();
