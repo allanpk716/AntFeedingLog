@@ -67,11 +67,50 @@ export interface LocationInput {
   sort: number;
 }
 
-/** 食物（含停用的：新建入口前端过滤 enabled） */
+/** 食物（含停用的：新建入口前端过滤 enabled；referenced=被历史引用，只能停用不能删） */
 export interface FoodItem {
   id: number;
   name: string;
   enabled: boolean;
+  sort: number;
+  referenced: boolean;
+}
+
+/** 维护操作字典项（含停用的；referenced=被记录/提醒台账引用，只能停用不能删） */
+export interface CareActionItem {
+  id: number;
+  name: string;
+  icon: string | null;
+  kind: ActionKind;
+  /** 是否喂食类操作（可编辑、不强制全局唯一，界面提示自理） */
+  is_feeding: boolean;
+  suggested_interval_days: number | null;
+  enabled: boolean;
+  sort: number;
+  referenced: boolean;
+}
+
+/** 新增(id=null)/修改(id=有值) 操作入参；停用/删除走单独命令 */
+export interface ActionInput {
+  id: number | null;
+  name: string;
+  kind: ActionKind;
+  is_feeding: boolean;
+  suggested_interval_days: number | null;
+  sort: number;
+}
+
+/** set_action_policy 入参：性质 + 建议间隔（null=保留现值）+ 可选 is_feeding（null=不改） */
+export interface ActionPolicyInput {
+  kind: ActionKind;
+  suggested_interval_days: number | null;
+  is_feeding: boolean | null;
+}
+
+/** 新增(id=null)/修改(id=有值) 食物入参；停用/删除走单独命令 */
+export interface FoodInput {
+  id: number | null;
+  name: string;
   sort: number;
 }
 
