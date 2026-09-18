@@ -35,7 +35,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRFNjQxRDUxQkE0NzgxOQpSV1FaZUtRYjFVSG1CUHdiQU1EN0l0WGNSNXZmZVEvUnNmeEJSbUV5Ym8xeEh1NSswTTlRMndEUgo=",
       "endpoints": [
         "https://github.com/allanpk716/AntFeedingLog/releases/latest/download/latest.json"
       ]
