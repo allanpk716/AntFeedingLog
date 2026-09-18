@@ -396,11 +396,12 @@ fn send_test_notification(app: tauri::AppHandle) -> Result<(), String> {
 
 // ── 更新检查（票 02）──
 
-/// 手动检查更新（设置页按钮，票 06 接 UI）：三态中"检查失败"折为 Err 一次性
-/// 展示；成功返回 `{"status":"up_to_date"}` 或 `{"status":"update_available",..}`。
+/// 手动检查更新（设置页按钮，票 06 接 UI）：async command（评审 R1-2——同步
+/// command 跑在主线程，阻塞网络会冻住整个 UI）。三态中"检查失败"折为 Err
+/// 一次性展示；成功返回 `{"status":"up_to_date"}` 或 `{"status":"update_available",..}`。
 #[tauri::command]
-fn check_update_now(app: tauri::AppHandle) -> Result<updater::CheckOutcome, String> {
-    updater::manual_check(&app)
+async fn check_update_now(app: tauri::AppHandle) -> Result<updater::CheckOutcome, String> {
+    updater::manual_check(app).await
 }
 
 // ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──

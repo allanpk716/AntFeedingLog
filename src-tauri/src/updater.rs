@@ -7,7 +7,10 @@
 //! - [`fold_daily`]：每日路径错误折叠——任何失败（404/网络/超时/解析）一律按
 //!   "无更新"记日志静默，绝不外抛失败态；
 //! - [`manual_result`]：手动路径出口——检查失败折为 Err（前端一次性展示）；
-//! - [`run_daily_check`]：一轮每日检查（读上次检查日 → 该查则查 → 记今天），
+//! - 每日检查拆成两段纯函数（评审 R1-1：网络段绝不持 DB 锁）：
+//!   [`should_run_daily_check`]（持锁段：读记账定该不该查）→ 调用方放锁执行
+//!   `checker.check()`（网络段）→ [`finish_daily_check`]（持锁段：记账+折算，
+//!   签名只吃已取回的结果值，结构上不存在网络调用）；
 //!   检查执行器经 [`UpdateChecker`] trait 注入：生产实现走 tauri-plugin-updater，
 //!   测试用假实现，不碰真网络。
 //!
@@ -138,19 +141,22 @@ fn set_last_check_day(conn: &Connection, day: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 一轮每日检查（纯逻辑，节奏与错误映射在这里汇合）：
-/// 今天已查过 → `Skipped`；否则执行检查（失败按无更新静默）→ 记今天 → 返回结果。
-/// 查到新版时由调用方（薄封装）发系统通知；失败也记今天（当天不再重试，跨天自愈）。
-pub fn run_daily_check<C: UpdateChecker>(
+/// 每日检查 · 段 1（持锁段）：读"上次检查日"判断今天该不该查。调用方拿锁调它、
+/// 拿到结果立即放锁，网络检查在锁外做（评审 R1-1）。
+pub fn should_run_daily_check(conn: &Connection, today: &str) -> Result<bool, String> {
+    Ok(should_check_today(last_check_day(conn)?.as_deref(), today))
+}
+
+/// 每日检查 · 段 3（持锁段）：对"已取回的检查结果"折算 + 记账（记今天）。
+/// 签名只吃结果值、没有检查器参数——结构上保证本段不可能发起网络调用。
+/// 失败结果也记今天（当天不再重试，跨天自愈）；记账失败按 Err 返回，
+/// 调用方记日志、下个周期重试当天这轮。
+pub fn finish_daily_check(
     conn: &Connection,
-    checker: &C,
+    result: Result<Option<UpdateInfo>, String>,
     today: &str,
 ) -> Result<DailyOutcome, String> {
-    if !should_check_today(last_check_day(conn)?.as_deref(), today) {
-        return Ok(DailyOutcome::Skipped);
-    }
-    let outcome = fold_daily(to_outcome(checker.check()));
-    // 先记账再返回：记账失败按 Err 走（下个周期重试当天这轮），不吞
+    let outcome = fold_daily(to_outcome(result));
     set_last_check_day(conn, today)?;
     Ok(match outcome {
         CheckOutcome::UpdateAvailable { version, notes } => {
@@ -163,34 +169,58 @@ pub fn run_daily_check<C: UpdateChecker>(
 
 // ── 薄封装：生产检查器 / 手动入口 / 每日定时（Tauri 侧，系统行为不进单测）──
 
+use std::time::Duration;
 use tauri::Manager;
 
-/// 生产检查器：走 tauri-plugin-updater（endpoints / pubkey 来自 tauri.conf.json）。
+/// 单次检查的总超时（评审 R1-3）：插件 builder 默认无超时（reqwest 无总超时），
+/// 网络黑洞会把锁外网络段和手动路径的 UI 等待拖到无上限。
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 带总超时的 updater 构造（endpoints / pubkey 来自 tauri.conf.json）。
+fn build_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    app.updater_builder()
+        .timeout(CHECK_TIMEOUT)
+        .build()
+        .map_err(|e| format!("初始化更新器失败: {e}"))
+}
+
+/// 插件 Update → 最小信息（每日/手动两条路径共用）。
+fn update_to_info(u: tauri_plugin_updater::Update) -> UpdateInfo {
+    UpdateInfo {
+        version: u.version.clone(),
+        notes: u.body.clone(),
+    }
+}
+
+/// 生产检查器：走 tauri-plugin-updater。只在每日定时的独立 std 线程里用
+/// （线程内无异步运行时，block_on 安全）。
 struct PluginChecker {
     app: tauri::AppHandle,
 }
 
 impl UpdateChecker for PluginChecker {
     fn check(&self) -> Result<Option<UpdateInfo>, String> {
-        use tauri_plugin_updater::UpdaterExt;
-        let updater = self
-            .app
-            .updater()
-            .map_err(|e| format!("初始化更新器失败: {e}"))?;
+        let updater = build_updater(&self.app)?;
         let update = tauri::async_runtime::block_on(updater.check())
             .map_err(|e| format!("检查更新失败: {e}"))?;
         // 版本比较由插件内部完成：远端不比当前新时返回 None
-        Ok(update.map(|u| UpdateInfo {
-            version: u.version.clone(),
-            notes: u.body.clone(),
-        }))
+        Ok(update.map(update_to_info))
     }
 }
 
-/// 手动检查入口（设置页 `check_update_now`）：失败折为 Err 一次性展示。
-/// 刻意不写每日记账（last_check_day）：两条路径互不干扰，当天每日检查照常执行。
-pub fn manual_check(app: &tauri::AppHandle) -> Result<CheckOutcome, String> {
-    manual_result(to_outcome(PluginChecker { app: app.clone() }.check()))
+/// 手动检查入口（设置页 `check_update_now`）。async：同步 command 跑在主线程/
+/// 事件循环上，阻塞网络会把整个 UI 冻住（评审 R1-2），改 async 由 Tauri 丢进
+/// 异步运行时、内部直接 `.await`（此处不得再 block_on）。
+/// 失败折为 Err 一次性展示。刻意不写每日记账（last_check_day）：两条路径互不
+/// 干扰，当天每日检查照常执行。
+pub async fn manual_check(app: tauri::AppHandle) -> Result<CheckOutcome, String> {
+    let updater = build_updater(&app)?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("检查更新失败: {e}"))?;
+    manual_result(to_outcome(Ok(update.map(update_to_info))))
 }
 
 /// 发现新版的系统通知（每日路径唯一的对外打扰；复用 tauri-plugin-notification，
@@ -213,22 +243,49 @@ fn notify_update(handle: &tauri::AppHandle, version: &str, notes: Option<&str>) 
         .show();
 }
 
-/// 一轮每日 tick：该查则查 → 查到新版发系统通知（窗口关着也跑，托盘常驻线程）。
-/// 任何一步失败都止于日志，绝不弹错误通知（spec 错误路径约定）。
+/// 一轮每日 tick（评审 R1-1 锁拆分三段式，与测试侧 `run_daily_flow` 同序）：
+/// 段 1 持锁读记账、立即放锁 → 段 2 锁外做网络检查（30s 总超时兜底）→
+/// 段 3 持锁记账折算 → 查到新版发系统通知（窗口关着也跑，托盘常驻线程）。
+/// DB 锁被全应用的页面 command 与提醒调度线程共用，绝不持锁等网络。
+/// 任何失败都止于日志，绝不弹错误通知（spec 错误路径约定；
+/// 评审 R1-4：DB 侧 Err 也记日志，不静默丢弃）。
 fn daily_tick(handle: &tauri::AppHandle) {
     let Some(state) = handle.try_state::<crate::DbState>() else {
         return;
     };
     let today = crate::colony::today_iso();
+
+    // 段 1（持锁）：今天该不该查——纯 DB 读，拿到结果立即放锁
+    let should = {
+        let Ok(conn) = state.0.lock() else { return };
+        should_run_daily_check(&conn, &today)
+    };
+    match should {
+        Ok(false) => return,
+        Err(e) => {
+            eprintln!("[updater] 每日更新检查读记账失败（本轮跳过）: {e}");
+            return;
+        }
+        Ok(true) => {}
+    }
+
+    // 段 2（放锁）：网络检查——锁已归还，堵也只堵本线程
     let checker = PluginChecker {
         app: handle.clone(),
     };
+    let result = checker.check();
+
+    // 段 3（持锁）：记账 + 折算
     let outcome = {
         let Ok(conn) = state.0.lock() else { return };
-        run_daily_check(&conn, &checker, &today)
+        finish_daily_check(&conn, result, &today)
     };
-    if let Ok(DailyOutcome::UpdateAvailable { version, notes }) = outcome {
-        notify_update(handle, &version, notes.as_deref());
+    match outcome {
+        Ok(DailyOutcome::UpdateAvailable { version, notes }) => {
+            notify_update(handle, &version, notes.as_deref());
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[updater] 每日更新检查记账失败（下个 30 分钟周期重试当天这轮）: {e}"),
     }
 }
 
@@ -301,6 +358,19 @@ mod tests {
 
     const D1: &str = "2026-09-18";
     const D2: &str = "2026-09-19";
+
+    /// daily_tick 的同序纯逻辑镜像（评审 R1-1 锁拆分后）：段 1 持锁查记账 →
+    /// 段 2 放锁做网络（fake）→ 段 3 持锁记账折算。与薄封装里的三段一一对应。
+    fn run_daily_flow<C: UpdateChecker>(
+        conn: &Connection,
+        checker: &C,
+        today: &str,
+    ) -> Result<DailyOutcome, String> {
+        if !should_run_daily_check(conn, today)? {
+            return Ok(DailyOutcome::Skipped);
+        }
+        finish_daily_check(conn, checker.check(), today)
+    }
 
     // ── 三态映射 ──
 
@@ -427,6 +497,51 @@ mod tests {
         assert!(!should_check_today(Some(D1), D1));
     }
 
+    // ── 三段式拆分（评审 R1-1：网络段不持 DB 锁）──
+
+    #[test]
+    fn should_run_daily_check_reads_bookkeeping() {
+        let conn = mem_conn();
+        // 从没查过 → 查；记了今天 → 不查；记了昨天 → 查
+        assert!(should_run_daily_check(&conn, D1).unwrap());
+        set_last_check_day(&conn, D1).unwrap();
+        assert!(!should_run_daily_check(&conn, D1).unwrap());
+        set_last_check_day(&conn, "2026-09-17").unwrap();
+        assert!(should_run_daily_check(&conn, D1).unwrap());
+    }
+
+    #[test]
+    fn finish_daily_check_records_without_network_access() {
+        // 结构锚点（R1-1）：finish_daily_check 只吃"已取回的结果值"、没有检查器
+        // 参数——记账段结构上不可能发起网络调用；网络段在两段之间的锁外完成。
+
+        // 查到新版：记账 + 原样折算
+        let conn = mem_conn();
+        let out = finish_daily_check(
+            &conn,
+            Ok(Some(UpdateInfo {
+                version: "0.3.0".into(),
+                notes: Some("n".into()),
+            })),
+            D1,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            DailyOutcome::UpdateAvailable {
+                version: "0.3.0".into(),
+                notes: Some("n".into())
+            }
+        );
+        assert_eq!(last_check_day(&conn).unwrap().as_deref(), Some(D1));
+
+        // 失败结果：同样记账（当天不重试），折为无更新（每日静默）
+        let conn = mem_conn();
+        let out = finish_daily_check(&conn, Err("请求超时".into()), D1).unwrap();
+        assert_eq!(out, DailyOutcome::NoUpdate);
+        assert_eq!(last_check_day(&conn).unwrap().as_deref(), Some(D1));
+    }
+
     #[test]
     fn daily_checks_once_per_day_and_again_next_day() {
         let conn = mem_conn();
@@ -435,7 +550,7 @@ mod tests {
         let checker = FakeChecker::new_version();
 
         // 第一次（无记录）：查到新版，并记下今天
-        let out = run_daily_check(&conn, &checker, D1).unwrap();
+        let out = run_daily_flow(&conn, &checker, D1).unwrap();
         assert_eq!(
             out,
             DailyOutcome::UpdateAvailable {
@@ -447,12 +562,12 @@ mod tests {
         assert_eq!(last_check_day(&conn).unwrap().as_deref(), Some(D1), "查完记今天");
 
         // 同日再来（模拟重启）：跳过，不再打远端
-        let out = run_daily_check(&conn, &checker, D1).unwrap();
+        let out = run_daily_flow(&conn, &checker, D1).unwrap();
         assert_eq!(out, DailyOutcome::Skipped);
         assert_eq!(checker.call_count(), 1, "同一天只查一次");
 
         // 跨天：重查，记录推进到新的一天
-        let out = run_daily_check(&conn, &checker, D2).unwrap();
+        let out = run_daily_flow(&conn, &checker, D2).unwrap();
         assert_eq!(
             out,
             DailyOutcome::UpdateAvailable {
@@ -471,12 +586,12 @@ mod tests {
         let conn = mem_conn();
         let checker = FakeChecker::failing();
 
-        let out = run_daily_check(&conn, &checker, D1).unwrap();
+        let out = run_daily_flow(&conn, &checker, D1).unwrap();
         assert_eq!(out, DailyOutcome::NoUpdate, "失败按无更新");
         assert_eq!(last_check_day(&conn).unwrap().as_deref(), Some(D1));
 
         // 同日再跑：跳过（失败的当天也不查第二次）
-        let out = run_daily_check(&conn, &checker, D1).unwrap();
+        let out = run_daily_flow(&conn, &checker, D1).unwrap();
         assert_eq!(out, DailyOutcome::Skipped);
         assert_eq!(checker.call_count(), 1);
     }
@@ -487,11 +602,11 @@ mod tests {
         let conn = mem_conn();
         let checker = FakeChecker::up_to_date();
 
-        let out = run_daily_check(&conn, &checker, D1).unwrap();
+        let out = run_daily_flow(&conn, &checker, D1).unwrap();
         assert_eq!(out, DailyOutcome::NoUpdate);
         assert_eq!(last_check_day(&conn).unwrap().as_deref(), Some(D1));
 
-        let out = run_daily_check(&conn, &checker, D2).unwrap();
+        let out = run_daily_flow(&conn, &checker, D2).unwrap();
         assert_eq!(out, DailyOutcome::NoUpdate);
         assert_eq!(checker.call_count(), 2);
     }
@@ -511,7 +626,7 @@ mod tests {
         );
 
         // 每日照常可查
-        let out = run_daily_check(&conn, &checker, D1).unwrap();
+        let out = run_daily_flow(&conn, &checker, D1).unwrap();
         assert_eq!(out, DailyOutcome::NoUpdate);
     }
 }
