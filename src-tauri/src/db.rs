@@ -15,7 +15,9 @@ use rusqlite::Connection;
 /// v3：reminder_ledger 冬眠侧唯一键把种类并入（窝,种类,基准日）——v2 是
 ///     (窝,基准日)，提前天数设 0 时临近/出眠日两种提醒同日互斥（票 01 停靠）。
 /// v4：字典预置项保护位（反馈第二轮 F2，Q5）——care_action/food 各加 is_preset。
-pub const SCHEMA_VERSION: i64 = 4;
+/// v5：提醒台账推送列（反馈第二轮 F4，Q3/Q4/Q8）——push_title/push_body = 发送当时
+///     的通知文案快照（补发直接用、不重算），pushover_done = 手机侧已了结。
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -102,6 +104,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             1 => migrate_v1_to_v2(conn)?,
             2 => migrate_v2_to_v3(conn)?,
             3 => migrate_v3_to_v4(conn)?,
+            4 => migrate_v4_to_v5(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -176,6 +179,23 @@ fn migrate_v3_to_v4(conn: &Connection) -> Result<(), rusqlite::Error> {
         "#,
     )?;
     tx.pragma_update(None, "user_version", 4)?;
+    tx.commit()
+}
+
+/// v5 → v?（F4）：台账加推送列。push_title/push_body = 发送当时的通知文案快照
+/// （补发时直接用，不重算）；pushover_done = 手机侧已了结（已送达或超窗放弃）。
+/// 历史行升级即了结（它们的桌面通知在当天已发过，不补手机）。
+fn migrate_v4_to_v5(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        ALTER TABLE reminder_ledger ADD COLUMN push_title TEXT;
+        ALTER TABLE reminder_ledger ADD COLUMN push_body TEXT;
+        ALTER TABLE reminder_ledger ADD COLUMN pushover_done INTEGER NOT NULL DEFAULT 0;
+        UPDATE reminder_ledger SET pushover_done = 1;
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 5)?;
     tx.commit()
 }
 
@@ -370,7 +390,34 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 4);
+        assert_eq!(SCHEMA_VERSION, 5);
+    }
+
+    #[test]
+    fn v5_adds_push_columns_and_settles_legacy_rows() {
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).unwrap();
+        seed_v1_presets(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        conn.execute("INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')", []).unwrap();
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
+             VALUES (1, 'overdue', 1, '2026-09-15', '2026-09-15 08:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap(); // F2 之后真实库至少是 v4
+
+        migrate(&conn).unwrap();
+        // 历史行只走过桌面通道：直接视为已了结，不参与补发
+        let done: i64 = conn.query_row("SELECT pushover_done FROM reminder_ledger", [], |r| r.get(0)).unwrap();
+        assert_eq!(done, 1);
+        // 新列存在且可为空
+        let (title, body): (Option<String>, Option<String>) = conn
+            .query_row("SELECT push_title, push_body FROM reminder_ledger", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((title, body), (None, None));
     }
 
     #[test]

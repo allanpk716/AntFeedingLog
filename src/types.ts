@@ -259,3 +259,17 @@ export interface AppSettings {
   /** 开机自启（票 09：通知 tab 开关随保存落库，Rust 同步自启插件状态） */
   autostart_enabled: boolean;
 }
+
+/** pushover_status 返回体：环境变量在/不在（不含值） */
+export interface PushoverStatus {
+  user_found: boolean;
+  token_found: boolean;
+}
+
+/** send_test_notification 返回体：分渠道结果（pushover=null 表示未配置） */
+export interface PushoverTestResult { ok: boolean; error: string | null; }
+export interface TestNotifyOutcome {
+  desktop_ok: boolean;
+  desktop_error: string | null;
+  pushover: PushoverTestResult | null;
+}

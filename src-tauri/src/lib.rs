@@ -3,6 +3,7 @@ mod colony;
 mod db;
 mod dict;
 mod hibernation;
+mod pushover;
 mod reminder;
 mod settings;
 mod stats;
@@ -388,9 +389,16 @@ fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> 
 }
 
 /// 发送测试通知（设置弹窗按钮；不经开关与台账，排障用）。
+/// 双通道各测各的：桌面失败不影响手机，pushover=None 表示未配置环境变量。
 #[tauri::command]
-fn send_test_notification(app: tauri::AppHandle) -> Result<(), String> {
-    reminder::send_test_notification(&app)
+fn send_test_notification(app: tauri::AppHandle) -> reminder::TestNotifyOutcome {
+    reminder::send_test_notification_dual(&app)
+}
+
+/// Pushover 配置状态探测：只报环境变量在/不在，不回报值。
+#[tauri::command]
+fn pushover_status() -> pushover::PushoverStatus {
+    pushover::status_from_env()
 }
 
 // ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──
@@ -541,6 +549,7 @@ pub fn run() {
             get_settings,
             set_settings,
             send_test_notification,
+            pushover_status,
             reveal_data_folder,
             backup_to,
             export_data,

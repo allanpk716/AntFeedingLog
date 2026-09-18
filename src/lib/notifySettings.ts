@@ -10,8 +10,6 @@ import type { AppSettings } from "../types";
 /** 通知 tab 的表单态：提前天数保持文本，便于清空重输 */
 export interface NotifySettingsForm {
   master: boolean;
-  overdue: boolean;
-  hibernation: boolean;
   daysAheadText: string | number;
 }
 
@@ -22,8 +20,6 @@ export const DAYS_AHEAD_ERROR = "临近出眠提前天数应为 0–365 的整�
 export function toForm(s: AppSettings): NotifySettingsForm {
   return {
     master: s.notify_master_enabled,
-    overdue: s.notify_overdue_enabled,
-    hibernation: s.notify_hibernation_enabled,
     daysAheadText: String(s.wake_remind_days_ahead),
   };
 }
@@ -40,14 +36,15 @@ export function parseDaysAhead(text: string | number): number | null {
 /**
  * 表单态 → 设置态（保存入参）。提前天数非法返回 null（调用方报错不落库）；
  * autostart 由通知 tab 的「开机自启」开关提供（票 09），随保存一起落库。
+ * 分类子开关作废（反馈第二轮 Q7/Q9）：键保留在库里，行为由总开关统一，固定回写 true。
  */
 export function toSettings(f: NotifySettingsForm, autostart: boolean): AppSettings | null {
   const days = parseDaysAhead(f.daysAheadText);
   if (days === null) return null;
   return {
     notify_master_enabled: f.master,
-    notify_overdue_enabled: f.overdue,
-    notify_hibernation_enabled: f.hibernation,
+    notify_overdue_enabled: true,
+    notify_hibernation_enabled: true,
     wake_remind_days_ahead: days,
     autostart_enabled: autostart,
   };

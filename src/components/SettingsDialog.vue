@@ -6,8 +6,9 @@
  *   （预置项或被历史记录/提醒台账引用时删除禁用，只能停用——规则 10 + 反馈第二轮 F2）。
  * - 食物行：名字、停用/启用、删除（预置或被引用禁用）。
  * - 地点 tab 复用 LocationManagerPanel。
- * - 通知 tab（票 06）：总开关/超期/冬眠三开关 + 临近出眠提前天数 +
- *   「发送测试通知」按钮（排障用）；开机自启开关（票 09）随保存一起落库，
+ * - 通知 tab（票 06 + 反馈第二轮 F4）：推送通知总开关（桌面 + 手机，分类子开关作废）+
+ *   临近出眠提前天数 + Pushover 配置状态 + 「发送测试通知」按钮（双通道分别回显结果，
+ *   排障用）；开机自启开关（票 09）随保存一起落库，
  *   Rust 侧 set_settings 同步自启插件状态。
  * - 数据 tab（票 09）：打开数据文件夹 / 安全备份（Rust 拷贝库文件，无需退出）/
  *   导出 CSV / JSON（归档带走）；帮助文案写明手动拷贝需先从托盘真实退出。
@@ -18,7 +19,7 @@
  */
 import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings, CareActionItem, FoodItem, LocationItem } from "../types";
+import type { AppSettings, CareActionItem, FoodItem, LocationItem, PushoverStatus, TestNotifyOutcome } from "../types";
 import {
   buildActionRows,
   buildFoodRows,
@@ -46,25 +47,28 @@ const addFoodName = ref("");
 const error = ref("");
 const busy = ref(false);
 
-// ── 通知 tab（票 06）──
-const notifyForm = ref<NotifySettingsForm>({ master: true, overdue: true, hibernation: true, daysAheadText: "7" });
+// ── 通知 tab（票 06 + 反馈第二轮 F4）──
+const notifyForm = ref<NotifySettingsForm>({ master: true, daysAheadText: "7" });
 const autostart = ref(true);
 const notifyError = ref("");
 const notifySaved = ref("");
 const notifyBusy = ref(false);
+const pushoverStatus = ref<PushoverStatus | null>(null);
 
 async function load() {
-  const [actions, foods, locs, s] = await Promise.all([
+  const [actions, foods, locs, s, pushStatus] = await Promise.all([
     invoke<CareActionItem[]>("list_actions"),
     invoke<FoodItem[]>("list_foods"),
     invoke<LocationItem[]>("list_locations"),
     invoke<AppSettings>("get_settings"),
+    invoke<PushoverStatus>("pushover_status"),
   ]);
   actionRows.value = buildActionRows(actions);
   foodRows.value = buildFoodRows(foods);
   locations.value = locs;
   notifyForm.value = toForm(s);
   autostart.value = s.autostart_enabled;
+  pushoverStatus.value = pushStatus;
 }
 
 onMounted(async () => {
@@ -246,8 +250,12 @@ async function testNotify() {
   notifyError.value = "";
   notifySaved.value = "";
   try {
-    await invoke("send_test_notification");
-    notifySaved.value = "测试通知已发出，看一下系统通知";
+    const r = await invoke<TestNotifyOutcome>("send_test_notification");
+    const parts = [
+      r.desktop_ok ? "桌面 ✓" : `桌面 ✗（${r.desktop_error ?? "未知错误"}）`,
+      r.pushover === null ? "手机：未配置" : r.pushover.ok ? "手机 ✓" : `手机 ✗（${r.pushover.error}）`,
+    ];
+    notifySaved.value = `测试结果：${parts.join(" · ")}`;
   } catch (e) {
     notifyError.value = String(e);
   }
@@ -408,23 +416,22 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         <LocationManagerPanel :locations="locations" @saved="onPanelSaved" @changed="onPanelChanged" />
       </div>
 
-      <!-- 通知（票 06）+ 开机自启（票 09） -->
+      <!-- 通知（票 06）+ 开机自启（票 09）+ Pushover 双通道（反馈第二轮 F4） -->
       <div v-else-if="activeTab === 'notify'" class="tab-body">
         <div class="notify-row">
-          <label class="switch-label">
+          <label>
             <input v-model="notifyForm.master" type="checkbox" />
-            系统通知总开关
+            推送通知（桌面 + 手机）
           </label>
         </div>
-        <div class="notify-row notify-sub" :class="{ 'notify-sub-off': !notifyForm.master }">
-          <label>
-            <input v-model="notifyForm.overdue" type="checkbox" :disabled="!notifyForm.master" />
-            超期提醒（喂食 / 垃圾清理等提醒类）
-          </label>
-          <label>
-            <input v-model="notifyForm.hibernation" type="checkbox" :disabled="!notifyForm.master" />
-            冬眠提醒（临近出眠 / 出眠日）
-          </label>
+        <div class="notify-row">
+          <span>手机推送（Pushover）：</span>
+          <span v-if="pushoverStatus?.user_found && pushoverStatus?.token_found" class="push-ok">
+            已配置（环境变量 PUSHOVER_USER / PUSHOVER_TOKEN）
+          </span>
+          <span v-else class="push-miss">
+            未检测到（需设置环境变量 PUSHOVER_USER / PUSHOVER_TOKEN，配置后重启应用生效）
+          </span>
         </div>
         <div class="notify-row">
           <label>
@@ -558,12 +565,12 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   cursor: pointer;
 }
 
-.notify-sub {
-  padding-left: 24px;
+.push-ok {
+  color: var(--ok, #2e7d32);
 }
 
-.notify-sub-off {
-  opacity: 0.55;
+.push-miss {
+  color: var(--bad);
 }
 
 .days-input {

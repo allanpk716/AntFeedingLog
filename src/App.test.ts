@@ -643,21 +643,18 @@ describe("设置 · 通知（票 06）", () => {
     return dlg;
   }
 
-  it("通知 tab：回显开关与提前天数，保存发出 set_settings 并刷新首页", async () => {
+  it("通知 tab：回显总开关与提前天数，保存发出 set_settings 并刷新首页", async () => {
     const wrapper = await mountApp();
     const dlg = await openNotifyTab(wrapper);
 
     const boxes = dlg.findAll(".notify-row input[type=checkbox]");
-    // 通知三开关 + 开机自启（票 09）
-    expect(boxes.length).toBe(4);
+    // 总开关 + 开机自启（票 09）；分类子开关已作废（反馈第二轮 Q7/Q9）
+    expect(boxes.length).toBe(2);
     expect((boxes[0].element as HTMLInputElement).checked).toBe(true);
-    expect((boxes[1].element as HTMLInputElement).checked).toBe(true);
-    expect((boxes[2].element as HTMLInputElement).checked).toBe(true);
     // 开机自启默认开
-    expect((boxes[3].element as HTMLInputElement).checked).toBe(true);
+    expect((boxes[1].element as HTMLInputElement).checked).toBe(true);
     expect((dlg.find(".days-input").element as HTMLInputElement).value).toBe("7");
 
-    await boxes[1].setValue(false); // 关超期分类
     await dlg.find(".days-input").setValue("3");
 
     invokeMock.mockClear();
@@ -669,7 +666,7 @@ describe("设置 · 通知（票 06）", () => {
     expect(invokeMock).toHaveBeenCalledWith("set_settings", {
       input: {
         notify_master_enabled: true,
-        notify_overdue_enabled: false,
+        notify_overdue_enabled: true, // 分类开关作废：前端固定回写 true（键保留在库里）
         notify_hibernation_enabled: true,
         wake_remind_days_ahead: 3,
         autostart_enabled: true,
@@ -687,7 +684,7 @@ describe("设置 · 通知（票 06）", () => {
     const dlg = await openNotifyTab(wrapper);
 
     const boxes = dlg.findAll(".notify-row input[type=checkbox]");
-    await boxes[3].setValue(false);
+    await boxes[1].setValue(false);
 
     invokeMock.mockClear();
     invokeMock.mockResolvedValueOnce({ ...currentSettings, autostart_enabled: false });
@@ -701,17 +698,12 @@ describe("设置 · 通知（票 06）", () => {
     const boxesAfter = wrapper
       .find(".settings-dialog")
       .findAll(".notify-row input[type=checkbox]");
-    expect((boxesAfter[3].element as HTMLInputElement).checked).toBe(false);
+    expect((boxesAfter[1].element as HTMLInputElement).checked).toBe(false);
   });
 
-  it("通知 tab：总开关关闭禁用子开关；提前天数非法时报错且不落库", async () => {
+  it("通知 tab：提前天数非法时报错且不落库", async () => {
     const wrapper = await mountApp();
     const dlg = await openNotifyTab(wrapper);
-
-    const boxes = dlg.findAll(".notify-row input[type=checkbox]");
-    await boxes[0].setValue(false);
-    expect(boxes[1].attributes("disabled")).toBeDefined();
-    expect(boxes[2].attributes("disabled")).toBeDefined();
 
     await dlg.find(".days-input").setValue("-1");
     await dlg.find(".tab-body .btn.primary").trigger("click");
@@ -721,16 +713,18 @@ describe("设置 · 通知（票 06）", () => {
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_settings")).toBe(false);
   });
 
-  it("通知 tab：发送测试通知按钮发出 send_test_notification", async () => {
+  it("通知 tab：发送测试通知按钮双通道回显结果（反馈第二轮 F4）", async () => {
     const wrapper = await mountApp();
     const dlg = await openNotifyTab(wrapper);
 
     invokeMock.mockClear();
+    // 未配置 Pushover：pushover=null（桌面真发在 Rust 侧，这里只验前端接线）
+    invokeMock.mockResolvedValueOnce({ desktop_ok: true, desktop_error: null, pushover: null });
     await dlg.find(".tab-body .btn:not(.primary)").trigger("click");
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("send_test_notification");
-    expect(dlg.find(".saved-hint").text()).toContain("测试通知已发出");
+    expect(dlg.find(".saved-hint").text()).toContain("测试结果：桌面 ✓ · 手机：未配置");
   });
 });
 
