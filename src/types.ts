@@ -145,3 +145,17 @@ export const COLONY_STATUS_LABELS: Record<ColonyStatus, string> = {
   hibernating: "冬眠",
   ended: "已结束",
 };
+
+/** 设置模型（Rust settings::AppSettings；落 settings 键值表） */
+export interface AppSettings {
+  /** 通知总开关 */
+  notify_master_enabled: boolean;
+  /** 超期提醒开关 */
+  notify_overdue_enabled: boolean;
+  /** 冬眠提醒开关（临近出眠/出眠日） */
+  notify_hibernation_enabled: boolean;
+  /** 临近出眠提前天数（0–365；0=出眠日当天才提醒） */
+  wake_remind_days_ahead: number;
+  /** 开机自启（本票只透传，不接 UI） */
+  autostart_enabled: boolean;
+}

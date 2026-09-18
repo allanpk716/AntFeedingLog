@@ -279,6 +279,109 @@ pub fn tray_summary(colonies: &[crate::colony::Colony]) -> String {
     }
 }
 
+// ── 薄封装：通知发送 / 调度 / 托盘（Tauri 侧，系统行为不进单测）─────────
+
+use tauri::Manager;
+use tauri_plugin_notification::NotificationExt;
+
+/// 主托盘 id（refresh_tray_tooltip 按它找回托盘句柄）。
+pub const TRAY_ID: &str = "ant-main-tray";
+
+/// 发一条系统通知。失败静默忽略：通知是副产物，不应打断调度循环。
+pub fn send_notification(handle: &tauri::AppHandle, r: &Reminder) {
+    let (title, body) = r.notification_text();
+    let _ = handle.notification().builder().title(title).body(body).show();
+}
+
+/// 发送测试通知（设置弹窗按钮，排障用；不经开关与台账，发送失败要报给用户）。
+pub fn send_test_notification(handle: &tauri::AppHandle) -> Result<(), String> {
+    handle
+        .notification()
+        .builder()
+        .title("测试通知")
+        .body("蚂蚁饲养记录：通知通道正常，超期和出眠提醒会这样弹出。")
+        .show()
+        .map_err(|e| format!("发送测试通知失败: {e}"))
+}
+
+/// 一轮「检查 → 发通知 → 刷新托盘概要」。启动首查与调度线程共用。
+/// 单轮失败不致命，静默等下一个 30 分钟周期。
+pub fn check_and_notify(handle: &tauri::AppHandle) {
+    let Some(state) = handle.try_state::<crate::DbState>() else {
+        return;
+    };
+    let today = crate::colony::today_iso();
+    let now = crate::care::now_local();
+    let sent = {
+        let Ok(conn) = state.0.lock() else { return };
+        match run_check(&conn, &today, &now) {
+            Ok(sent) => sent,
+            Err(_) => return,
+        }
+    };
+    for r in &sent {
+        send_notification(handle, r);
+    }
+    refresh_tray_tooltip(handle);
+}
+
+/// 托盘 tooltip 概要与首页同源：list_colonies → tray_summary。
+pub fn refresh_tray_tooltip(handle: &tauri::AppHandle) {
+    let Some(state) = handle.try_state::<crate::DbState>() else {
+        return;
+    };
+    let today = crate::colony::today_iso();
+    let text = {
+        let Ok(conn) = state.0.lock() else { return };
+        crate::colony::list_colonies(&conn, &today)
+            .map(|colonies| tray_summary(&colonies))
+            .unwrap_or_else(|_| "蚂蚁饲养记录".to_string())
+    };
+    if let Some(tray) = handle.tray_by_id(TRAY_ID) {
+        let _ = tray.set_tooltip(Some(text));
+    }
+}
+
+/// 启动调度：启动即查一次，此后每 30 分钟一轮（评审附录规则 1）。
+/// 独立 std 线程 + sleep：锁竞争每半小时一次，不值得占 async 运行时。
+pub fn spawn_scheduler(handle: tauri::AppHandle) {
+    std::thread::spawn(move || loop {
+        check_and_notify(&handle);
+        std::thread::sleep(std::time::Duration::from_secs(30 * 60));
+    });
+}
+
+/// 建托盘：悬停看概要 tooltip；右键菜单 显示主窗口 / 退出（spec 用户故事 19）。
+pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "quit" => app.exit(0),
+            "show" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            }
+            _ => {}
+        })
+        .tooltip("蚂蚁饲养记录");
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
 // ── 测试：只测外部行为（spec「Testing Decisions」）────────────────────────
 
 #[cfg(test)]

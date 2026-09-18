@@ -238,15 +238,40 @@ fn list_hibernations(
     with_conn(state, |conn| hibernation::list_hibernations(conn, colony_id))
 }
 
+// ── 设置与通知（票 06）──
+
+#[tauri::command]
+fn get_settings(state: tauri::State<'_, DbState>) -> Result<settings::AppSettings, String> {
+    with_conn(state, settings::get_settings)
+}
+
+#[tauri::command]
+fn set_settings(
+    state: tauri::State<'_, DbState>,
+    input: settings::AppSettings,
+) -> Result<settings::AppSettings, String> {
+    with_conn(state, |conn| settings::set_settings(conn, &input))
+}
+
+/// 发送测试通知（设置弹窗按钮；不经开关与台账，排障用）。
+#[tauri::command]
+fn send_test_notification(app: tauri::AppHandle) -> Result<(), String> {
+    reminder::send_test_notification(&app)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             // 库文件放系统应用数据目录（Windows: %APPDATA%\<identifier>\），非项目目录。
             let data_dir = app.path().app_data_dir()?;
             let conn = db::open_and_migrate(&data_dir.join(db::DB_FILE_NAME))
                 .map_err(|e| e.to_string())?;
             app.manage(DbState(Mutex::new(conn)));
+            // 托盘常驻 + 提醒调度（启动即查一次，此后每 30 分钟；评审附录规则 1）。
+            reminder::setup_tray(app)?;
+            reminder::spawn_scheduler(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -275,6 +300,9 @@ pub fn run() {
             confirm_wake,
             add_past_hibernation,
             list_hibernations,
+            get_settings,
+            set_settings,
+            send_test_notification,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

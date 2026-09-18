@@ -1,12 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "./App.vue";
-import type { CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
+import type { AppSettings, CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
 import { addDays, todayIso } from "./lib/dates";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+
+/** 票 06：get_settings 的回放数据（测试里可整体替换） */
+const defaultSettings: AppSettings = {
+  notify_master_enabled: true,
+  notify_overdue_enabled: true,
+  notify_hibernation_enabled: true,
+  wake_remind_days_ahead: 7,
+  autostart_enabled: true,
+};
+let currentSettings: AppSettings = defaultSettings;
 
 const locations: LocationItem[] = [
   { id: 1, name: "家", enabled: true, sort: 1 },
@@ -92,6 +102,8 @@ function baseMock() {
         return foods;
       case "list_actions":
         return actions;
+      case "get_settings":
+        return currentSettings;
       default:
         return null;
     }
@@ -107,6 +119,7 @@ async function mountApp() {
 beforeEach(() => {
   invokeMock.mockReset();
   currentColonies = colonies;
+  currentSettings = defaultSettings;
   baseMock();
 });
 
@@ -516,6 +529,82 @@ describe("设置 · 字典管理（票 04）", () => {
     await dlg.findAll(".dict-row")[1].find(".row-btn").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("set_food_enabled", { id: 2, enabled: false });
+  });
+});
+
+describe("设置 · 通知（票 06）", () => {
+  async function openNotifyTab(wrapper: Awaited<ReturnType<typeof mountApp>>) {
+    await wrapper.find(".settings-btn").trigger("click");
+    await flushPromises();
+    const dlg = wrapper.find(".settings-dialog");
+    await dlg.find(".tab-notify").trigger("click");
+    await flushPromises();
+    return dlg;
+  }
+
+  it("通知 tab：回显开关与提前天数，保存发出 set_settings 并刷新首页", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openNotifyTab(wrapper);
+
+    const boxes = dlg.findAll(".notify-row input[type=checkbox]");
+    expect(boxes.length).toBe(3);
+    expect((boxes[0].element as HTMLInputElement).checked).toBe(true);
+    expect((boxes[1].element as HTMLInputElement).checked).toBe(true);
+    expect((boxes[2].element as HTMLInputElement).checked).toBe(true);
+    expect((dlg.find(".days-input").element as HTMLInputElement).value).toBe("7");
+
+    await boxes[1].setValue(false); // 关超期分类
+    await dlg.find(".days-input").setValue("3");
+
+    invokeMock.mockClear();
+    // set_settings 回显保存后的设置（Rust 返回收敛后的生效值）
+    invokeMock.mockResolvedValueOnce(currentSettings);
+    await dlg.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("set_settings", {
+      input: {
+        notify_master_enabled: true,
+        notify_overdue_enabled: false,
+        notify_hibernation_enabled: true,
+        wake_remind_days_ahead: 3,
+        autostart_enabled: true,
+      },
+    });
+    // changed → 外层刷新首页
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(true);
+    // 刷新重渲染后重查弹窗（旧 wrapper 可能已脱离文档）
+    const dlgAfter = wrapper.find(".settings-dialog");
+    expect(dlgAfter.find(".saved-hint").text()).toContain("已保存");
+  });
+
+  it("通知 tab：总开关关闭禁用子开关；提前天数非法时报错且不落库", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openNotifyTab(wrapper);
+
+    const boxes = dlg.findAll(".notify-row input[type=checkbox]");
+    await boxes[0].setValue(false);
+    expect(boxes[1].attributes("disabled")).toBeDefined();
+    expect(boxes[2].attributes("disabled")).toBeDefined();
+
+    await dlg.find(".days-input").setValue("-1");
+    await dlg.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(dlg.find(".form-error").text()).toContain("0–365");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "set_settings")).toBe(false);
+  });
+
+  it("通知 tab：发送测试通知按钮发出 send_test_notification", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openNotifyTab(wrapper);
+
+    invokeMock.mockClear();
+    await dlg.find(".tab-body .btn:not(.primary)").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("send_test_notification");
+    expect(dlg.find(".saved-hint").text()).toContain("测试通知已发出");
   });
 });
 

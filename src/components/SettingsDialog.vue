@@ -1,11 +1,13 @@
 <script setup lang="ts">
 /**
- * 设置弹窗 · 字典管理部分（票 04）：操作 / 食物 / 地点 三个 tab。
+ * 设置弹窗（票 04 字典管理 + 票 06 通知）：操作 / 食物 / 地点 / 通知 四个 tab。
  * - 操作行可编辑：名字、性质（提醒/仅登记）、建议间隔（提醒类显示）、
  *   「喂食」标记（带提示，允许编辑不强制唯一）、停用/启用、删除
  *   （被历史记录/提醒台账引用时删除禁用，只能停用——规则 10）。
  * - 食物行：名字、停用/启用、删除（被引用禁用）。
  * - 地点 tab 复用 LocationManagerPanel。
+ * - 通知 tab（票 06）：总开关/超期/冬眠三开关 + 临近出眠提前天数 +
+ *   「发送测试通知」按钮（排障用）；保存整体落库，autostart 本票透传不动。
  *
  * 行级 停用/启用/删除 即时落库并抛 changed（外层刷新首页，卡片红/灰随之变化）；
  * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
@@ -13,7 +15,7 @@
  */
 import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { CareActionItem, FoodItem, LocationItem } from "../types";
+import type { AppSettings, CareActionItem, FoodItem, LocationItem } from "../types";
 import {
   buildActionRows,
   buildFoodRows,
@@ -25,9 +27,10 @@ import {
   type ActionRow,
   type FoodRow,
 } from "../lib/dict";
+import { DAYS_AHEAD_ERROR, toForm, toSettings, type NotifySettingsForm } from "../lib/notifySettings";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 
-type Tab = "actions" | "foods" | "locations";
+type Tab = "actions" | "foods" | "locations" | "notify";
 
 const emit = defineEmits<{ close: []; changed: [] }>();
 
@@ -40,15 +43,25 @@ const addFoodName = ref("");
 const error = ref("");
 const busy = ref(false);
 
+// ── 通知 tab（票 06）──
+const notifyForm = ref<NotifySettingsForm>({ master: true, overdue: true, hibernation: true, daysAheadText: "7" });
+const autostart = ref(true);
+const notifyError = ref("");
+const notifySaved = ref("");
+const notifyBusy = ref(false);
+
 async function load() {
-  const [actions, foods, locs] = await Promise.all([
+  const [actions, foods, locs, s] = await Promise.all([
     invoke<CareActionItem[]>("list_actions"),
     invoke<FoodItem[]>("list_foods"),
     invoke<LocationItem[]>("list_locations"),
+    invoke<AppSettings>("get_settings"),
   ]);
   actionRows.value = buildActionRows(actions);
   foodRows.value = buildFoodRows(foods);
   locations.value = locs;
+  notifyForm.value = toForm(s);
+  autostart.value = s.autostart_enabled;
 }
 
 onMounted(async () => {
@@ -201,6 +214,41 @@ async function saveFoods() {
   }
 }
 
+// ── 通知 tab 操作（票 06）──
+
+async function saveNotify() {
+  const input = toSettings(notifyForm.value, autostart.value);
+  if (input === null) {
+    notifyError.value = DAYS_AHEAD_ERROR;
+    return;
+  }
+  notifyBusy.value = true;
+  notifyError.value = "";
+  notifySaved.value = "";
+  try {
+    const saved = await invoke<AppSettings>("set_settings", { input });
+    notifyForm.value = toForm(saved);
+    autostart.value = saved.autostart_enabled;
+    notifySaved.value = "已保存";
+    emit("changed");
+  } catch (e) {
+    notifyError.value = String(e);
+  } finally {
+    notifyBusy.value = false;
+  }
+}
+
+async function testNotify() {
+  notifyError.value = "";
+  notifySaved.value = "";
+  try {
+    await invoke("send_test_notification");
+    notifySaved.value = "测试通知已发出，看一下系统通知";
+  } catch (e) {
+    notifyError.value = String(e);
+  }
+}
+
 function onPanelChanged() {
   emit("changed");
 }
@@ -228,6 +276,9 @@ function eraseTitle(referenced: boolean): string {
         </button>
         <button class="tab tab-locations" :class="{ active: activeTab === 'locations' }" type="button" @click="activeTab = 'locations'">
           地点
+        </button>
+        <button class="tab tab-notify" :class="{ active: activeTab === 'notify' }" type="button" @click="activeTab = 'notify'">
+          通知
         </button>
       </div>
 
@@ -303,8 +354,46 @@ function eraseTitle(referenced: boolean): string {
       </div>
 
       <!-- 地点 -->
-      <div v-else class="tab-body">
+      <div v-else-if="activeTab === 'locations'" class="tab-body">
         <LocationManagerPanel :locations="locations" :show-cancel="false" @saved="onPanelSaved" @changed="onPanelChanged" />
+      </div>
+
+      <!-- 通知（票 06） -->
+      <div v-else class="tab-body">
+        <div class="notify-row">
+          <label class="switch-label">
+            <input v-model="notifyForm.master" type="checkbox" />
+            系统通知总开关
+          </label>
+        </div>
+        <div class="notify-row notify-sub" :class="{ 'notify-sub-off': !notifyForm.master }">
+          <label>
+            <input v-model="notifyForm.overdue" type="checkbox" :disabled="!notifyForm.master" />
+            超期提醒（喂食 / 垃圾清理等提醒类）
+          </label>
+          <label>
+            <input v-model="notifyForm.hibernation" type="checkbox" :disabled="!notifyForm.master" />
+            冬眠提醒（临近出眠 / 出眠日）
+          </label>
+        </div>
+        <div class="notify-row">
+          <label>
+            临近出眠提前
+            <input v-model="notifyForm.daysAheadText" class="days-input" type="number" min="0" max="365" />
+            天通知
+          </label>
+        </div>
+        <p class="hint">
+          超期每天最多提醒一条；冬眠中的窝静音；改预计出眠日后，没发过的提醒按新日期重算。
+          总开关关闭时完全静默（不写提醒台账），重开后照常提醒。
+        </p>
+        <p v-if="notifyError" class="form-error">{{ notifyError }}</p>
+        <p v-if="notifySaved" class="saved-hint">{{ notifySaved }}</p>
+        <div class="dlg-btns">
+          <button class="btn" type="button" :disabled="notifyBusy" @click="testNotify">发送测试通知</button>
+          <span class="spacer"></span>
+          <button class="btn primary" type="button" :disabled="notifyBusy" @click="saveNotify">保存</button>
+        </div>
       </div>
 
       <p v-if="error && activeTab !== 'locations'" class="form-error">{{ error }}</p>
@@ -370,6 +459,46 @@ function eraseTitle(referenced: boolean): string {
 
 .tab-body {
   min-height: 120px;
+}
+
+/* 通知 tab（票 06） */
+.notify-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 10px;
+  font-size: 14px;
+}
+
+.notify-row label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.notify-sub {
+  padding-left: 24px;
+}
+
+.notify-sub-off {
+  opacity: 0.55;
+}
+
+.days-input {
+  width: 64px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font: inherit;
+  background: var(--card);
+  color: var(--text);
+}
+
+.saved-hint {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--ok, #2e7d32);
 }
 
 .dict-row {
