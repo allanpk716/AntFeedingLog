@@ -37,5 +37,6 @@ tempfile = "3"
 codegen-units = 1
 lto = true
 opt-level = 3
-panic = "abort"
+# panic = "abort" 刻意不设（终局评审定点修 3）：提醒调度线程靠 catch_unwind
+# 隔离单轮 panic，abort 会让它失效、panic 直接带走整个进程。
 strip = true

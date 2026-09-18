@@ -21,12 +21,20 @@ const CSV_HEADER: [&str; 7] = ["id", "窝", "操作", "发生时间", "录入时
 
 // ── CSV ──────────────────────────────────────────────────────────────────
 
-/// CSV 单字段转义：含逗号/引号/换行才加引号，引号翻倍（RFC 4180）。
+/// CSV 单字段转义：
+/// 1. 公式注入防护——以 `=`/`+`/`-`/`@` 开头的值会被 Excel 当公式执行，加 `'`
+///    前缀强制按文本处理（ODSF 惯例，终局评审定点修 1）；
+/// 2. 含逗号/引号/换行才加引号，引号翻倍（RFC 4180）。
 pub fn csv_escape(field: &str) -> String {
-    if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
-        format!("\"{}\"", field.replace('"', "\"\""))
+    let guarded = match field.chars().next() {
+        Some('=') | Some('+') | Some('-') | Some('@') => format!("'{field}"),
+        _ => field.to_string(),
+    };
+    if guarded.contains(',') || guarded.contains('"') || guarded.contains('\n') || guarded.contains('\r')
+    {
+        format!("\"{}\"", guarded.replace('"', "\"\""))
     } else {
-        field.to_string()
+        guarded
     }
 }
 
@@ -328,6 +336,51 @@ mod tests {
         assert_eq!(csv_escape("a,b"), "\"a,b\"");
         assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
         assert_eq!(csv_escape("line\nbreak"), "\"line\nbreak\"");
+    }
+
+    #[test]
+    fn csv_escape_guards_formula_injection_prefixes() {
+        // 终局评审定点修 1：= + - @ 开头会被 Excel 当公式执行，加 ' 前缀按文本处理
+        assert_eq!(csv_escape("=cmd|' /C calc'!A0"), "'=cmd|' /C calc'!A0");
+        assert_eq!(csv_escape("+1+1"), "'+1+1");
+        assert_eq!(csv_escape("-2"), "'-2");
+        assert_eq!(csv_escape("@SUM(1)"), "'@SUM(1)");
+        // 日期/数字等无害开头不前缀
+        assert_eq!(csv_escape("2026-09-18 08:00:00"), "2026-09-18 08:00:00");
+        // 危险开头 + 需引号字符：先前缀再引号
+        assert_eq!(csv_escape("=a,b"), "\"'=a,b\"");
+    }
+
+    #[test]
+    fn export_csv_guards_formula_injection_in_field_values() {
+        let (conn, _db_path, dir) = file_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('=公式窝', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        let c = conn.last_insert_rowid();
+        log(
+            &conn,
+            c,
+            "垃圾清理",
+            "2026-09-10 08:00:00",
+            Some("=HYPERLINK(\"http://evil.example\")"),
+            &[],
+        );
+
+        let path = dir.path().join("inject.csv");
+        export_csv_to(&conn, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("'=公式窝"), "窝名公式前缀，实际：{text}");
+        assert!(
+            text.contains("'=HYPERLINK"),
+            "备注公式前缀（未加引号时原样带 '），实际：{text}"
+        );
+        assert!(
+            !text.contains("\n=HYPERLINK") && !text.contains(",=HYPERLINK"),
+            "任何字段值都不得以裸 = 开头"
+        );
     }
 
     // ── 导出 CSV（票面验收 4：行数=记录数，内容写临时文件断言）──

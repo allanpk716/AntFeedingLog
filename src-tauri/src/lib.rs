@@ -165,6 +165,8 @@ fn set_location_enabled(
 }
 
 // ── 窝（票 02）──
+// 窝/冬眠的增改会动状态与超期摘要 → 命令收尾统一刷托盘 tooltip（终局评审定点修 4，
+// 与 log_care 同一锁外模式）。
 
 #[tauri::command]
 fn list_colonies(state: tauri::State<DbState>) -> Result<Vec<colony::Colony>, String> {
@@ -174,32 +176,50 @@ fn list_colonies(state: tauri::State<DbState>) -> Result<Vec<colony::Colony>, St
 #[tauri::command]
 fn create_colony(
     state: tauri::State<DbState>,
+    app: tauri::AppHandle,
     input: colony::ColonyInput,
 ) -> Result<colony::Colony, String> {
-    with_conn(state, |conn| {
+    let result = with_conn(state, |conn| {
         colony::create_colony(conn, &input, &colony::today_iso())
-    })
+    });
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 #[tauri::command]
 fn update_colony(
     state: tauri::State<DbState>,
+    app: tauri::AppHandle,
     id: i64,
     input: colony::ColonyInput,
 ) -> Result<colony::Colony, String> {
-    with_conn(state, |conn| {
+    let result = with_conn(state, |conn| {
         colony::update_colony(conn, id, &input, &colony::today_iso())
-    })
+    });
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 #[tauri::command]
-fn archive_colony(state: tauri::State<DbState>, id: i64) -> Result<colony::Colony, String> {
-    with_conn(state, |conn| colony::archive_colony(conn, id, &colony::today_iso()))
+fn archive_colony(
+    state: tauri::State<DbState>,
+    app: tauri::AppHandle,
+    id: i64,
+) -> Result<colony::Colony, String> {
+    let result = with_conn(state, |conn| colony::archive_colony(conn, id, &colony::today_iso()));
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 #[tauri::command]
-fn delete_colony(state: tauri::State<DbState>, id: i64) -> Result<(), String> {
-    with_conn(state, |conn| colony::delete_colony(conn, id))
+fn delete_colony(
+    state: tauri::State<DbState>,
+    app: tauri::AppHandle,
+    id: i64,
+) -> Result<(), String> {
+    let result = with_conn(state, |conn| colony::delete_colony(conn, id));
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 // ── 地点（票 02）──
@@ -227,11 +247,12 @@ fn erase_location(state: tauri::State<DbState>, id: i64) -> Result<(), String> {
 #[tauri::command]
 fn start_hibernation(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     colony_id: i64,
     start_date: String,
     expected_end_date: String,
 ) -> Result<hibernation::Hibernation, String> {
-    with_conn(state, |conn| {
+    let result = with_conn(state, |conn| {
         hibernation::start_hibernation(
             conn,
             colony_id,
@@ -239,30 +260,38 @@ fn start_hibernation(
             &expected_end_date,
             &colony::today_iso(),
         )
-    })
+    });
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 #[tauri::command]
 fn confirm_wake(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     colony_id: i64,
     actual_end_date: String,
 ) -> Result<hibernation::Hibernation, String> {
-    with_conn(state, |conn| {
+    let result = with_conn(state, |conn| {
         hibernation::confirm_wake(conn, colony_id, &actual_end_date, &colony::today_iso())
-    })
+    });
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 #[tauri::command]
 fn add_past_hibernation(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     colony_id: i64,
     start_date: String,
     end_date: String,
 ) -> Result<hibernation::Hibernation, String> {
-    with_conn(state, |conn| {
+    let result = with_conn(state, |conn| {
         hibernation::add_past_hibernation(conn, colony_id, &start_date, &end_date)
-    })
+    });
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 #[tauri::command]
@@ -277,12 +306,15 @@ fn list_hibernations(
 #[tauri::command]
 fn update_expected_end(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     colony_id: i64,
     new_expected_end_date: String,
 ) -> Result<hibernation::Hibernation, String> {
-    with_conn(state, |conn| {
+    let result = with_conn(state, |conn| {
         hibernation::update_expected_end(conn, colony_id, &new_expected_end_date)
-    })
+    });
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 // ── 统计页（票 07）──
@@ -316,11 +348,31 @@ fn set_settings(
     app: tauri::AppHandle,
     input: settings::AppSettings,
 ) -> Result<settings::AppSettings, String> {
-    let effective = with_conn(state, |conn| settings::set_settings(conn, &input))?;
-    // 开机自启：设置是权威，插件状态跟随同步（票 09；用户主动改，失败要报给用户）
-    apply_autostart(&app, effective.autostart_enabled)?;
-    // 通知设置变化后顺手刷新托盘概要（停靠 C；锁已释放）
+    let saved = with_conn(state, |conn| settings::set_settings(conn, &input));
+    // 半成功语义（终局评审定点修 2）：自启同步失败不再整条 Err——设置已落库，
+    // 下次启动还会按设置重新同步收敛；tooltip 刷新放最后，成功失败都执行（无 ? 短路）。
+    let outcome = match saved {
+        Ok(effective) => {
+            let sync = apply_autostart(&app, effective.autostart_enabled);
+            settle_settings_save(Ok(effective), sync)
+        }
+        Err(e) => settle_settings_save(Err(e), Ok(())),
+    };
     reminder::refresh_tray_tooltip(&app);
+    outcome
+}
+
+/// 设置保存的 command 层裁决（纯函数，测试用）：落库结果 + 自启同步结果 → 前端口径。
+/// 落库失败恒报错；自启同步失败只记日志、不吞掉已保存的设置（设置是权威，
+/// 启动时按设置重新对齐插件——与启动路径同一宽宽策略）。
+fn settle_settings_save(
+    saved: Result<settings::AppSettings, String>,
+    autostart_sync: Result<(), String>,
+) -> Result<settings::AppSettings, String> {
+    let effective = saved?;
+    if let Err(e) = autostart_sync {
+        eprintln!("[autostart] 保存设置后同步开机自启失败（下次启动按设置重试）: {e}");
+    }
     Ok(effective)
 }
 
@@ -497,4 +549,30 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ── 测试：command 层裁决语义（纯函数，spec「Testing Decisions」）──────────
+
+#[cfg(test)]
+mod tests {
+    use super::settle_settings_save;
+    use crate::settings::AppSettings;
+
+    #[test]
+    fn autostart_sync_failure_does_not_sink_saved_settings() {
+        // 终局评审定点修 2：设置落库成功后自启同步失败 → 不整条 Err，
+        // 已保存的设置照常返回（下次启动按设置重新同步收敛）
+        let saved = Ok(AppSettings {
+            autostart_enabled: false,
+            ..Default::default()
+        });
+        let outcome = settle_settings_save(saved, Err("注册表被组策略锁住".into()));
+        let effective = outcome.expect("自启同步失败不应吞掉已落库的设置");
+        assert!(!effective.autostart_enabled, "返回收敛后的生效值");
+
+        // 落库失败恒报错（自启同步成功也救不了落库失败）
+        let outcome = settle_settings_save(Err("数据库已锁定".into()), Ok(()));
+        let err = outcome.unwrap_err();
+        assert!(err.contains("锁定"), "实际错误：{err}");
+    }
 }

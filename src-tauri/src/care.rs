@@ -1213,7 +1213,7 @@ mod tests {
         let foods = list_foods(&conn).unwrap();
         let names: Vec<&str> = foods.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(names, vec!["种子", "干虾仁", "面包虫"]);
-        assert_eq!(foods.iter().find(|f| f.name == "面包虫").unwrap().enabled, false);
+        assert!(!foods.iter().find(|f| f.name == "面包虫").unwrap().enabled);
     }
 
     #[test]

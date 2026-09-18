@@ -246,7 +246,7 @@ describe("编辑窝", () => {
     expect((dialog.find(".date-input").element as HTMLInputElement).value).toBe("2026-01-20");
 
     await dialog.find(".name-input").setValue("大头一号B");
-    await dialog.find(".status-select").setValue("hibernating");
+    await dialog.find(".status-select").setValue("ended");
 
     invokeMock.mockClear();
     await dialog.find(".submit-btn").trigger("click");
@@ -259,8 +259,42 @@ describe("编辑窝", () => {
         species: "大头收获蚁",
         location_id: 1,
         start_date: "2026-01-20",
-        status: "hibernating",
+        status: "ended",
       },
+    });
+  });
+
+  it("状态下拉只有 活跃/已结束（冬眠走「开始冬眠」流程，定点修 5）；编辑冬眠窝时该状态禁用显示且保存不改变它", async () => {
+    // 新建：无「冬眠中」选项
+    const wrapper = await mountApp();
+    await wrapper.find(".new-colony").trigger("click");
+    let options = wrapper.findAll(".status-select option");
+    expect(options.map((o) => o.text())).toEqual(["活跃", "已结束"]);
+
+    // 编辑冬眠中的窝：多一个禁用的「冬眠中」项用于显示当前状态
+    await wrapper.find(".dialog .cancel-btn").trigger("click");
+    await wrapper.find('.card[data-colony-id="3"] .edit-btn').trigger("click");
+    const select = wrapper.find(".status-select");
+    options = select.findAll("option");
+    // 活跃 + 已结束 + 当前冬眠态（禁用显示）
+    expect(options.length).toBe(3);
+    const hibernatingOption = options.find(
+      (o) => (o.element as HTMLOptionElement).value === "hibernating",
+    );
+    expect(hibernatingOption).toBeDefined();
+    expect((hibernatingOption!.element as HTMLOptionElement).disabled).toBe(true);
+    expect(hibernatingOption!.text()).toContain("冬眠");
+    expect((select.element as HTMLSelectElement).value).toBe("hibernating");
+
+    // 只改名字保存：状态保持冬眠（不经编辑窗解档）
+    await wrapper.find(".dialog .name-input").setValue("大头二号B");
+    invokeMock.mockClear();
+    await wrapper.find(".dialog .submit-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("update_colony", {
+      id: 3,
+      input: expect.objectContaining({ status: "hibernating" }),
     });
   });
 

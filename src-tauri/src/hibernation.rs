@@ -797,7 +797,7 @@ mod tests {
         start_hibernation(&conn, c, "2026-02-15", "2026-03-01", "2026-02-15").unwrap();
 
         let h = update_expected_end(&conn, c, " 2026-04-10 ").unwrap();
-        assert_eq!(h.id > 0, true);
+        assert!(h.id > 0);
         assert_eq!(h.colony_id, c);
         assert_eq!(h.start_date, "2026-02-15");
         assert_eq!(h.expected_end_date, "2026-04-10", "首尾空白被 trim");

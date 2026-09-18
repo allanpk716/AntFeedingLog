@@ -1,6 +1,8 @@
 <script setup lang="ts">
 /**
  * 新建/编辑窝弹窗：名字、物种、地点下拉、开始日期、状态。
+ * 状态下拉只开放 活跃/已结束——冬眠只能走卡片「开始冬眠/确认出眠」流程（定点修 5）；
+ * 编辑冬眠中的窝时该状态以禁用项显示、保存不改变它。
  * 编辑模式额外提供「置为已结束」与「删除」（删除是否成功由 Rust 判定：仅无记录窝可删）。
  * 本组件自己发 IPC（create/update/archive/delete_colony），成功后抛 saved 让外层刷新。
  */
@@ -34,10 +36,24 @@ const form = ref(
 const formError = ref("");
 const busy = ref(false);
 
-const statusOptions = Object.entries(COLONY_STATUS_LABELS).map(([value, label]) => ({
-  value: value as ColonyStatus,
-  label,
-}));
+// 状态下拉（终局评审定点修 5）：只开放 活跃/已结束（「置为已结束」是唯一解档通道）；
+// 冬眠只能走卡片上的「开始冬眠 / 确认出眠」流程，不在编辑里手选。
+// 编辑冬眠中的窝时追加一个禁用项，仅用于显示当前状态（改名保存不改状态）。
+const selectableStatuses: { value: ColonyStatus; label: string }[] = [
+  { value: "active", label: COLONY_STATUS_LABELS.active },
+  { value: "ended", label: COLONY_STATUS_LABELS.ended },
+];
+
+const statusOptions = computed(() => {
+  if (props.editing?.status !== "hibernating") return selectableStatuses;
+  return [
+    ...selectableStatuses,
+    {
+      value: "hibernating" as ColonyStatus,
+      label: `${COLONY_STATUS_LABELS.hibernating}（用卡片上的「确认出眠」管理）`,
+    },
+  ];
+});
 
 // 编辑时原地点若已停用仍要能显示（规则 10 精神：原引用照常显示）
 const locationOptions = computed<LocationItem[]>(() => {
@@ -139,7 +155,12 @@ async function remove() {
 
       <div class="field-label">状态</div>
       <select v-model="form.status" class="status-select">
-        <option v-for="opt in statusOptions" :key="opt.value" :value="opt.value">
+        <option
+          v-for="opt in statusOptions"
+          :key="opt.value"
+          :value="opt.value"
+          :disabled="editing?.status === 'hibernating' && opt.value === 'hibernating'"
+        >
           {{ opt.label }}
         </option>
       </select>
