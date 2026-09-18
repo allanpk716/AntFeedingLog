@@ -140,6 +140,44 @@ export interface CareLogInput {
   food_ids: number[];
 }
 
+/** 记录列表筛选入参（list_logs；各筛选项可空、组合生效；start/end 为 ISO 日期） */
+export interface LogFilter {
+  colony_id: number | null;
+  action_id: number | null;
+  start: string | null;
+  end: string | null;
+  note_keyword: string | null;
+  limit: number | null;
+  offset: number | null;
+}
+
+/** 记录流水一行（食物按字典顺序；停用操作/食物照常返回显示名，规则 10） */
+export interface LogRow {
+  id: number;
+  colony_id: number;
+  colony_name: string;
+  action_id: number;
+  action_name: string;
+  occurred_at: string;
+  note: string;
+  food_ids: number[];
+  food_names: string[];
+}
+
+/** list_logs 返回体：一页行 + 命中总数（total 不随分页变） */
+export interface LogPage {
+  total: number;
+  rows: LogRow[];
+}
+
+/** 编辑记录入参：字段 null = 保持原值；food_ids 传空数组 = 清空食物关联 */
+export interface LogUpdateInput {
+  occurred_at: string | null;
+  note: string | null;
+  action_id: number | null;
+  food_ids: number[] | null;
+}
+
 /** 统计页 payload（Rust stats::StatsPayload；spec API 契约 getStats） */
 export interface StatsDailyCount {
   date: string;

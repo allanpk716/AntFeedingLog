@@ -56,6 +56,30 @@ fn list_foods(state: tauri::State<'_, DbState>) -> Result<Vec<care::Food>, Strin
     with_conn(state, care::list_foods)
 }
 
+// ── 记录列表 / 编辑 / 删除（票 08）──
+
+#[tauri::command]
+fn list_logs(
+    state: tauri::State<'_, DbState>,
+    filter: care::LogFilter,
+) -> Result<care::LogPage, String> {
+    with_conn(state, |conn| care::list_logs(conn, &filter))
+}
+
+#[tauri::command]
+fn update_log(
+    state: tauri::State<'_, DbState>,
+    id: i64,
+    input: care::LogUpdateInput,
+) -> Result<(), String> {
+    with_conn(state, |conn| care::update_log(conn, id, &input, &care::now_local()))
+}
+
+#[tauri::command]
+fn delete_log(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
+    with_conn(state, |conn| care::delete_log(conn, id))
+}
+
 // ── 字典管理与操作性质设置（票 04）──
 
 #[tauri::command]
@@ -297,6 +321,9 @@ pub fn run() {
             health_check,
             log_care,
             list_foods,
+            list_logs,
+            update_log,
+            delete_log,
             list_actions,
             save_action,
             set_action_enabled,

@@ -200,6 +200,295 @@ pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i6
     Ok(log_id)
 }
 
+// ── 记录列表 / 编辑 / 删除（票 08）──────────────────────────────────────
+
+/// 记录流水一行（食物按字典顺序；停用操作/食物照常返回显示名，规则 10）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LogRow {
+    pub id: i64,
+    pub colony_id: i64,
+    pub colony_name: String,
+    pub action_id: i64,
+    pub action_name: String,
+    pub occurred_at: String,
+    pub note: String,
+    pub food_ids: Vec<i64>,
+    pub food_names: Vec<String>,
+}
+
+/// list_logs 返回体：一页行 + 命中总数（total 恒为全量命中数，不随分页变）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LogPage {
+    pub total: i64,
+    pub rows: Vec<LogRow>,
+}
+
+/// 记录流水筛选入参：各筛选项可空，组合生效（AND）。
+/// start/end 为 ISO 日期，按 occurred_at 日期部分闭区间过滤；note_keyword 为
+/// 备注子串匹配（LIKE 通配符转义）；limit 缺省 50、上限 500，offset 缺省 0。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct LogFilter {
+    #[serde(default)]
+    pub colony_id: Option<i64>,
+    #[serde(default)]
+    pub action_id: Option<i64>,
+    #[serde(default)]
+    pub start: Option<String>,
+    #[serde(default)]
+    pub end: Option<String>,
+    #[serde(default)]
+    pub note_keyword: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+/// 编辑入参：字段为 None = 保持原值；food_ids 传空数组 = 清空食物关联。
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct LogUpdateInput {
+    #[serde(default)]
+    pub occurred_at: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub action_id: Option<i64>,
+    #[serde(default)]
+    pub food_ids: Option<Vec<i64>>,
+}
+
+/// 筛选用日期（`YYYY-MM-DD`），非法格式给友好错误。
+fn parse_filter_date(s: &str) -> Result<String, String> {
+    chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .map_err(|_| format!("日期格式应为 YYYY-MM-DD：{s}"))
+}
+
+/// 记录流水查询（spec API 契约 listLogs）：按 occurred_at DESC（同刻 id DESC），
+/// 分页返回；total = 组合筛选命中总数。LIKE 通配符按字面匹配（转义 `_`/`%`/`\`）。
+pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, String> {
+    let mut wheres: Vec<String> = Vec::new();
+    let mut args: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(colony_id) = filter.colony_id {
+        args.push(colony_id.into());
+        wheres.push(format!("l.colony_id = ?{}", args.len()));
+    }
+    if let Some(action_id) = filter.action_id {
+        args.push(action_id.into());
+        wheres.push(format!("l.action_id = ?{}", args.len()));
+    }
+    if let Some(s) = filter.start.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        args.push(parse_filter_date(s)?.into());
+        wheres.push(format!("substr(l.occurred_at, 1, 10) >= ?{}", args.len()));
+    }
+    if let Some(e) = filter.end.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        args.push(parse_filter_date(e)?.into());
+        wheres.push(format!("substr(l.occurred_at, 1, 10) <= ?{}", args.len()));
+    }
+    if let Some(kw) = filter.note_keyword.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let escaped = kw.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        args.push(format!("%{escaped}%").into());
+        wheres.push(format!("l.note LIKE ?{} ESCAPE '\\'", args.len()));
+    }
+    let where_sql = if wheres.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", wheres.join(" AND "))
+    };
+    let limit = filter.limit.unwrap_or(50).clamp(1, 500);
+    let offset = filter.offset.unwrap_or(0).max(0);
+
+    let total: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM care_log l {where_sql}"),
+            rusqlite::params_from_iter(args.iter()),
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT l.id, l.colony_id, c.name, l.action_id, a.name, l.occurred_at, l.note
+             FROM care_log l
+             JOIN colony c ON c.id = l.colony_id
+             JOIN care_action a ON a.id = l.action_id
+             {where_sql}
+             ORDER BY l.occurred_at DESC, l.id DESC
+             LIMIT {limit} OFFSET {offset}"
+        ))
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (id, colony_id, colony_name, action_id, action_name, occurred_at, note) in rows {
+        let mut stmt_food = conn
+            .prepare(
+                "SELECT lf.food_id, f.name FROM log_food lf JOIN food f ON f.id = lf.food_id
+                 WHERE lf.log_id = ?1 ORDER BY f.sort, f.id",
+            )
+            .map_err(db_err)?;
+        let pairs = stmt_food
+            .query_map(params![id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        out.push(LogRow {
+            id,
+            colony_id,
+            colony_name,
+            action_id,
+            action_name,
+            occurred_at,
+            note,
+            food_ids: pairs.iter().map(|(fid, _)| *fid).collect(),
+            food_names: pairs.into_iter().map(|(_, name)| name).collect(),
+        });
+    }
+    Ok(LogPage { total, rows: out })
+}
+
+/// 编辑一条记录（spec API 契约 updateLog）：走完整校验——时间规整 + 不许未来
+/// （票 04 停靠②同口径）、is_feeding 位约束、字典引用规则——并与 log_food 关联
+/// 同事务重写，任一失败整体不动。规则 10 裁定：该记录**原引用**的停用操作/食物
+/// 可以原样保留；**新挂**的停用项一律拒绝。
+pub fn update_log(conn: &Connection, id: i64, input: &LogUpdateInput, now: &str) -> Result<(), String> {
+    let (cur_action_id, cur_occurred_at, cur_note): (i64, String, String) = conn
+        .query_row(
+            "SELECT action_id, occurred_at, note FROM care_log WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "记录不存在".to_string(),
+            other => db_err(other),
+        })?;
+
+    // 目标操作：None = 保持原操作（停用中的原操作允许原样保留）；换了就必须启用
+    let new_action_id = input.action_id.unwrap_or(cur_action_id);
+    let (action_enabled, is_feeding, action_name): (i64, i64, String) = conn
+        .query_row(
+            "SELECT enabled, is_feeding, name FROM care_action WHERE id = ?1",
+            params![new_action_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "操作不存在".to_string(),
+            other => db_err(other),
+        })?;
+    if new_action_id != cur_action_id && action_enabled == 0 {
+        return Err(format!("操作「{action_name}」已停用，不能改挂"));
+    }
+
+    // 发生时间：None = 保持（库内已是规整格式）；给了就完整校验
+    let occurred_at = match &input.occurred_at {
+        Some(s) => {
+            let normalized = normalize_happened_at(s)?;
+            ensure_not_future(&normalized, now)?;
+            normalized
+        }
+        None => cur_occurred_at,
+    };
+    let note = match &input.note {
+        Some(s) => s.trim().to_string(),
+        None => cur_note,
+    };
+
+    // 原引用食物 = 保留通道；food_ids: None = 原样保留，Some(空) = 清空
+    let original_foods: HashSet<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT food_id FROM log_food WHERE log_id = ?1")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![id], |row| row.get::<_, i64>(0))
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows.into_iter().collect()
+    };
+    let food_ids: Vec<i64> = match &input.food_ids {
+        Some(list) => {
+            let mut seen = HashSet::new();
+            list.iter().filter(|fid| seen.insert(**fid)).copied().collect()
+        }
+        None => original_foods.iter().copied().collect(),
+    };
+
+    // is_feeding 位约束：非喂食不允许带食物（换到非喂食必须显式清空）
+    if is_feeding == 0 && !food_ids.is_empty() {
+        return Err(format!("操作「{action_name}」不是喂食，不能关联食物"));
+    }
+
+    // 食物：存在；启用；停用仅当为原引用（保留通道），新挂停用项拒绝
+    for fid in &food_ids {
+        let row: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT enabled, name FROM food WHERE id = ?1",
+                params![fid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+        match row {
+            None => return Err(format!("食物不存在（id={fid}）")),
+            Some((0, name)) if !original_foods.contains(fid) => {
+                return Err(format!("食物「{name}」已停用，不能新选"));
+            }
+            _ => {}
+        }
+    }
+
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    tx.execute(
+        "UPDATE care_log SET action_id = ?1, occurred_at = ?2, note = ?3 WHERE id = ?4",
+        params![new_action_id, occurred_at, note, id],
+    )
+    .map_err(db_err)?;
+    tx.execute("DELETE FROM log_food WHERE log_id = ?1", params![id]).map_err(db_err)?;
+    for fid in &food_ids {
+        tx.execute(
+            "INSERT INTO log_food (log_id, food_id) VALUES (?1, ?2)",
+            params![id, fid],
+        )
+        .map_err(db_err)?;
+    }
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
+/// 删除一条记录（spec API 契约 deleteLog）：log_food 子行与主记录同事务删除。
+pub fn delete_log(conn: &Connection, id: i64) -> Result<(), String> {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM care_log WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if exists == 0 {
+        return Err("记录不存在".into());
+    }
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    tx.execute("DELETE FROM log_food WHERE log_id = ?1", params![id]).map_err(db_err)?;
+    tx.execute("DELETE FROM care_log WHERE id = ?1", params![id]).map_err(db_err)?;
+    tx.commit().map_err(db_err)?;
+    Ok(())
+}
+
 // ── 卡片展示数据 ─────────────────────────────────────────────────────────
 
 /// 某窝每个「启用中」操作一块，按 sort、id 排序（字典新增操作自动出现）。
@@ -944,5 +1233,491 @@ mod tests {
         let foods = list_foods(&conn).unwrap();
         assert!(foods.iter().find(|f| f.name == "种子").unwrap().referenced);
         assert!(!foods.iter().find(|f| f.name == "干虾仁").unwrap().referenced);
+    }
+
+    // ── 记录列表 / 编辑 / 删除（票 08）──
+
+    /// 带备注与食物的喂食记录（搭列表/编辑场景用）。
+    fn feed_log(
+        conn: &Connection,
+        colony_id: i64,
+        happened_at: &str,
+        note: Option<&str>,
+        foods: &[&str],
+    ) -> i64 {
+        log_care(
+            conn,
+            &CareLogInput {
+                colony_id,
+                action_id: action_id(conn, "喂食"),
+                happened_at: happened_at.into(),
+                note: note.map(String::from),
+                food_ids: foods.iter().map(|f| food_id(conn, f)).collect(),
+            },
+            "2026-09-18 08:00:00",
+        )
+        .expect("记账失败")
+    }
+
+    #[test]
+    fn list_logs_orders_desc_and_each_filter_applies_alone() {
+        let conn = mem_conn();
+        let c1 = colony(&conn, "大头一号");
+        let c2 = colony(&conn, "针毛一号");
+        let feed_latest = feed_log(&conn, c1, "2026-09-17 20:00:00", Some("换了水盆"), &["种子"]);
+        let water = log(&conn, c1, "活动区换水", "2026-09-10 09:00:00");
+        let feed_old = feed_log(&conn, c1, "2026-09-05 08:00:00", Some("加餐面包虫"), &["面包虫"]);
+        let c2_feed = log(&conn, c2, "喂食", "2026-09-16 21:00:00");
+
+        // 无筛选：total 全量、occurred_at DESC（同刻再按 id DESC）
+        let all = list_logs(&conn, &LogFilter::default()).unwrap();
+        assert_eq!(all.total, 4);
+        let occurred: Vec<&str> = all.rows.iter().map(|r| r.occurred_at.as_str()).collect();
+        assert_eq!(
+            occurred,
+            [
+                "2026-09-17 20:00:00",
+                "2026-09-16 21:00:00",
+                "2026-09-10 09:00:00",
+                "2026-09-05 08:00:00",
+            ]
+        );
+        let first = &all.rows[0];
+        assert_eq!(first.id, feed_latest);
+        assert_eq!(first.colony_id, c1);
+        assert_eq!(first.colony_name, "大头一号");
+        assert_eq!(first.action_id, action_id(&conn, "喂食"));
+        assert_eq!(first.action_name, "喂食");
+        assert_eq!(first.note, "换了水盆");
+        assert_eq!(first.food_names, vec!["种子"]);
+        assert_eq!(first.food_ids, vec![food_id(&conn, "种子")]);
+
+        // 窝筛选
+        let only_c2 = list_logs(&conn, &LogFilter { colony_id: Some(c2), ..Default::default() }).unwrap();
+        assert_eq!(only_c2.total, 1);
+        assert_eq!(only_c2.rows[0].id, c2_feed);
+
+        // 操作筛选
+        let water_only = list_logs(
+            &conn,
+            &LogFilter { action_id: Some(action_id(&conn, "活动区换水")), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(water_only.total, 1);
+        assert_eq!(water_only.rows[0].id, water);
+        assert!(water_only.rows[0].food_names.is_empty(), "非喂食记录无食物");
+
+        // 时间范围：按 occurred_at 日期部分闭区间
+        let ranged = list_logs(
+            &conn,
+            &LogFilter {
+                start: Some("2026-09-10".into()),
+                end: Some("2026-09-16".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(ranged.total, 2);
+        let ids: Vec<i64> = ranged.rows.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![c2_feed, water]);
+
+        // 只给一端
+        let from_10 = list_logs(&conn, &LogFilter { start: Some("2026-09-10".into()), ..Default::default() }).unwrap();
+        assert_eq!(from_10.total, 3);
+        let to_16 = list_logs(&conn, &LogFilter { end: Some("2026-09-16".into()), ..Default::default() }).unwrap();
+        assert_eq!(to_16.total, 3);
+
+        // 备注关键词（子串）
+        let kw = list_logs(
+            &conn,
+            &LogFilter { note_keyword: Some("面包虫".into()), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(kw.total, 1);
+        assert_eq!(kw.rows[0].id, feed_old);
+    }
+
+    #[test]
+    fn list_logs_combined_filters_narrow_together() {
+        // 验收 1：三条件组合 + 备注搜索，全部 AND 叠加
+        let conn = mem_conn();
+        let c1 = colony(&conn, "大头一号");
+        let c2 = colony(&conn, "针毛一号");
+        feed_log(&conn, c1, "2026-09-17 20:00:00", Some("换了水盆"), &["种子"]);
+        let target = feed_log(&conn, c1, "2026-09-05 08:00:00", Some("加餐面包虫"), &["面包虫"]);
+        log(&conn, c1, "活动区换水", "2026-09-10 09:00:00");
+        feed_log(&conn, c2, "2026-09-06 08:00:00", Some("面包虫大餐"), &["面包虫"]);
+
+        let combined = list_logs(
+            &conn,
+            &LogFilter {
+                colony_id: Some(c1),
+                action_id: Some(action_id(&conn, "喂食")),
+                start: Some("2026-09-01".into()),
+                end: Some("2026-09-18".into()),
+                note_keyword: Some("面包虫".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(combined.total, 1, "窝+操作+范围+关键词一起收口");
+        assert_eq!(combined.rows[0].id, target);
+        // 范围之外的关键词命中被组合条件排除（换水 09-10 不在喂食筛选里）
+        assert!(combined.rows.iter().all(|r| r.action_name == "喂食"));
+    }
+
+    #[test]
+    fn list_logs_keyword_escapes_like_wildcards() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let underscore = feed_log(&conn, c, "2026-09-10 08:00:00", Some("配方 a_b 升级"), &[]);
+        let _similar = feed_log(&conn, c, "2026-09-11 08:00:00", Some("配方 axb 试运行"), &[]);
+        let pct = feed_log(&conn, c, "2026-09-12 08:00:00", Some("剩余 50% 量"), &[]);
+        let _no_pct = feed_log(&conn, c, "2026-09-13 08:00:00", Some("投喂 50 只面包虫"), &[]);
+
+        // `_`/`%` 按字面匹配：不转义时 LIKE 会把 axb / 50 只 也捞进来
+        let kw1 = list_logs(&conn, &LogFilter { note_keyword: Some("a_b".into()), ..Default::default() }).unwrap();
+        assert_eq!(kw1.total, 1);
+        assert_eq!(kw1.rows[0].id, underscore);
+
+        let kw2 = list_logs(&conn, &LogFilter { note_keyword: Some("50%".into()), ..Default::default() }).unwrap();
+        assert_eq!(kw2.total, 1);
+        assert_eq!(kw2.rows[0].id, pct);
+    }
+
+    #[test]
+    fn list_logs_paginates_with_stable_total() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        for day in 10..=17 {
+            log(&conn, c, "喂食", &format!("2026-09-{day} 08:00:00"));
+        }
+
+        let page1 = list_logs(
+            &conn,
+            &LogFilter { limit: Some(3), offset: Some(0), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(page1.total, 8, "total 恒为命中总数，不随分页变");
+        assert_eq!(page1.rows.len(), 3);
+        assert_eq!(page1.rows[0].occurred_at, "2026-09-17 08:00:00");
+
+        let page2 = list_logs(
+            &conn,
+            &LogFilter { limit: Some(3), offset: Some(3), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(page2.rows.len(), 3);
+        assert_ne!(page1.rows[0].id, page2.rows[0].id);
+
+        let tail = list_logs(
+            &conn,
+            &LogFilter { limit: Some(3), offset: Some(6), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(tail.rows.len(), 2, "不足一页给余量");
+
+        let past_end = list_logs(
+            &conn,
+            &LogFilter { limit: Some(3), offset: Some(99), ..Default::default() },
+        )
+        .unwrap();
+        assert_eq!(past_end.rows.len(), 0);
+        assert_eq!(past_end.total, 8);
+    }
+
+    #[test]
+    fn list_logs_keeps_disabled_dict_display_names() {
+        // 规则 10：停用操作/食物在历史记录里照常显示（显示名仍在）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let id = feed_log(&conn, c, "2026-09-15 08:00:00", None, &["种子"]);
+        conn.execute("UPDATE care_action SET enabled = 0 WHERE name = '喂食'", []).unwrap();
+        conn.execute("UPDATE food SET enabled = 0 WHERE name = '种子'", []).unwrap();
+
+        let page = list_logs(&conn, &LogFilter::default()).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].id, id);
+        assert_eq!(page.rows[0].action_name, "喂食");
+        assert_eq!(page.rows[0].food_names, vec!["种子"]);
+    }
+
+    #[test]
+    fn update_log_swaps_foods_and_edits_fields_in_place() {
+        // 验收 2：编辑喂食记录更换食物生效（log_food 关联同事务重写）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let id = feed_log(&conn, c, "2026-09-17 08:00:00", Some("  原备注  "), &["种子"]);
+
+        update_log(
+            &conn,
+            id,
+            &LogUpdateInput {
+                occurred_at: Some("2026-09-10T08:30".into()),
+                note: Some("  改投干虾仁和面包虫  ".into()),
+                action_id: None,
+                food_ids: Some(vec![food_id(&conn, "干虾仁"), food_id(&conn, "面包虫")]),
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap();
+
+        let (action, occurred, note): (i64, String, String) = conn
+            .query_row(
+                "SELECT action_id, occurred_at, note FROM care_log WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(action, action_id(&conn, "喂食"), "action_id None = 保持");
+        assert_eq!(occurred, "2026-09-10 08:30:00", "发生时间规整后落库");
+        assert_eq!(note, "改投干虾仁和面包虫", "备注 trim");
+
+        let links: Vec<i64> = {
+            let mut stmt = conn
+                .prepare("SELECT food_id FROM log_food WHERE log_id = ?1 ORDER BY food_id")
+                .unwrap();
+            stmt.query_map(params![id], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            links,
+            vec![food_id(&conn, "干虾仁"), food_id(&conn, "面包虫")],
+            "旧关联删净、新关联写入（验收 2）"
+        );
+
+        // 列表读回也是新食物
+        let page = list_logs(&conn, &LogFilter::default()).unwrap();
+        assert_eq!(page.rows[0].food_names, vec!["干虾仁", "面包虫"]);
+    }
+
+    #[test]
+    fn update_log_keeps_original_disabled_refs_and_rejects_new_ones() {
+        // 规则 10 裁定：编辑时允许保存原引用的停用操作/食物，新挂停用项拒绝
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let seed = food_id(&conn, "种子");
+        let mealworm = food_id(&conn, "面包虫");
+        let feed = action_id(&conn, "喂食");
+        let water = action_id(&conn, "活动区换水");
+        let id = feed_log(&conn, c, "2026-09-15 08:00:00", None, &["种子"]);
+
+        conn.execute(
+            "UPDATE food SET enabled = 0 WHERE id IN (?1, ?2)",
+            params![seed, mealworm],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE care_action SET enabled = 0 WHERE id IN (?1, ?2)",
+            params![feed, water],
+        )
+        .unwrap();
+
+        // ① 原引用的停用食物原样保留 → OK
+        update_log(
+            &conn,
+            id,
+            &LogUpdateInput {
+                occurred_at: None,
+                note: None,
+                action_id: None,
+                food_ids: Some(vec![seed]),
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap();
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")),
+            1
+        );
+
+        // ② 新挂停用食物 → 拒
+        let err = update_log(
+            &conn,
+            id,
+            &LogUpdateInput {
+                occurred_at: None,
+                note: None,
+                action_id: None,
+                food_ids: Some(vec![mealworm]),
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap_err();
+        assert!(err.contains("停用"), "实际错误：{err}");
+
+        // ③ 原操作（已停用）保持不动 → OK（food_ids 传空数组 = 清空食物）
+        update_log(
+            &conn,
+            id,
+            &LogUpdateInput {
+                occurred_at: None,
+                note: Some("改备注".into()),
+                action_id: Some(feed),
+                food_ids: Some(vec![]),
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap();
+
+        // ④ 新挂停用操作 → 拒
+        let err = update_log(
+            &conn,
+            id,
+            &LogUpdateInput {
+                occurred_at: None,
+                note: None,
+                action_id: Some(water),
+                food_ids: None,
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap_err();
+        assert!(err.contains("停用"), "实际错误：{err}");
+
+        // ⑤ 启用后新挂 → OK
+        conn.execute("UPDATE care_action SET enabled = 1 WHERE id = ?1", params![water]).unwrap();
+        update_log(
+            &conn,
+            id,
+            &LogUpdateInput {
+                occurred_at: None,
+                note: None,
+                action_id: Some(water),
+                food_ids: Some(vec![]),
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap();
+        let action: i64 = conn
+            .query_row("SELECT action_id FROM care_log WHERE id = ?1", params![id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(action, water);
+    }
+
+    #[test]
+    fn update_log_full_validation_rejects_and_leaves_row_untouched() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let seed = food_id(&conn, "种子");
+        let feed = action_id(&conn, "喂食");
+        let water = action_id(&conn, "活动区换水");
+        let id = feed_log(&conn, c, "2026-09-17 08:00:00", None, &["种子"]);
+
+        let input = |occurred: Option<String>, action: Option<i64>, foods: Option<Vec<i64>>| {
+            LogUpdateInput { occurred_at: occurred, note: None, action_id: action, food_ids: foods }
+        };
+
+        // 未来发生时间（票 04 停靠②同口径：编辑也不许预记未来）
+        let err = update_log(
+            &conn,
+            id,
+            &input(Some("2026-09-19T09:00".into()), None, None),
+            "2026-09-18 08:00:00",
+        )
+        .unwrap_err();
+        assert!(err.contains("未来"), "实际错误：{err}");
+
+        // 非喂食操作带食物 → 拒
+        let err = update_log(
+            &conn,
+            id,
+            &input(None, Some(water), Some(vec![seed])),
+            "2026-09-18 08:00:00",
+        )
+        .unwrap_err();
+        assert!(err.contains("食物"), "实际错误：{err}");
+
+        // 部分更新踩到 is_feeding 约束：原记录带食物、改成非喂食又不给 food_ids → 拒
+        let err = update_log(
+            &conn,
+            id,
+            &input(None, Some(water), None),
+            "2026-09-18 08:00:00",
+        )
+        .unwrap_err();
+        assert!(err.contains("食物"), "实际错误：{err}");
+
+        // 不存在的食物
+        let err = update_log(
+            &conn,
+            id,
+            &input(None, None, Some(vec![999])),
+            "2026-09-18 08:00:00",
+        )
+        .unwrap_err();
+        assert!(err.contains("不存在"), "实际错误：{err}");
+
+        // 不存在的记录
+        let err = update_log(
+            &conn,
+            999,
+            &input(Some("2026-09-10 08:00:00".into()), None, None),
+            "2026-09-18 08:00:00",
+        )
+        .unwrap_err();
+        assert!(err.contains("记录不存在"), "实际错误：{err}");
+
+        // 一连串失败后原记录原样（校验全部在事务前，无部分落库）
+        let (action, occurred): (i64, String) = conn
+            .query_row(
+                "SELECT action_id, occurred_at FROM care_log WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action, feed);
+        assert_eq!(occurred, "2026-09-17 08:00:00");
+        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")), 1);
+    }
+
+    #[test]
+    fn update_log_backdate_recomputes_days_since_last_and_overdue() {
+        // 验收 5：补录到过去时间后，首页红绿态按新发生时间重算（数据驱动）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let id = log(&conn, c, "喂食", "2026-09-18 08:00:00");
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert_eq!(tile(&tiles, "喂食").days_since_last, Some(0));
+        assert!(!tile(&tiles, "喂食").overdue);
+
+        update_log(
+            &conn,
+            id,
+            &LogUpdateInput {
+                occurred_at: Some("2026-09-08 09:00:00".into()),
+                note: None,
+                action_id: None,
+                food_ids: None,
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap();
+
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert_eq!(tile(&tiles, "喂食").days_since_last, Some(10), "距上次跟随新发生时间");
+        assert!(tile(&tiles, "喂食").overdue, "10 天 > 建议 3 天 → 超期红");
+    }
+
+    #[test]
+    fn delete_log_removes_links_and_tile_returns_to_no_record() {
+        // 验收 3：删除最后一条记录后，对应操作块「距上次」变为无记录态
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let id = feed_log(&conn, c, "2026-09-18 08:00:00", None, &["种子"]);
+
+        delete_log(&conn, id).unwrap();
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM log_food"), 0, "食物关联一并删除");
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert_eq!(tile(&tiles, "喂食").days_since_last, None, "回到无记录态");
+        assert!(!tile(&tiles, "喂食").overdue);
+
+        // 再删同一 id → 记录不存在
+        let err = delete_log(&conn, id).unwrap_err();
+        assert!(err.contains("不存在"), "实际错误：{err}");
     }
 }

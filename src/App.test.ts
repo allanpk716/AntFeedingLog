@@ -108,6 +108,8 @@ function baseMock() {
         return foods;
       case "list_actions":
         return actions;
+      case "list_logs":
+        return { total: 0, rows: [] };
       case "get_settings":
         return currentSettings;
       default:
@@ -538,14 +540,13 @@ describe("设置 · 字典管理（票 04）", () => {
   });
 });
 
-describe("顶栏导航（票 07）", () => {
-  it("三页 nav 骨架：首页/统计可切换，记录占位禁用（票 08）", async () => {
+describe("顶栏导航（票 07/08）", () => {
+  it("三页 nav：首页/统计/记录可切换，记录页挂载后拉记录列表", async () => {
     const wrapper = await mountApp();
 
     const tabs = wrapper.findAll(".topbar .tab");
     expect(tabs.map((t) => t.text())).toEqual(["首页", "统计", "记录"]);
     expect(tabs[0].classes()).toContain("active");
-    expect(tabs[2].attributes("disabled")).toBeDefined();
 
     // 切到统计：统计页渲染并拉数据
     invokeMock.mockClear();
@@ -554,10 +555,30 @@ describe("顶栏导航（票 07）", () => {
     expect(wrapper.find(".stats-page").exists()).toBe(true);
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "get_stats")).toBe(true);
 
+    // 切到记录（票 08）：记录列表页渲染并拉数据
+    invokeMock.mockClear();
+    await wrapper.findAll(".topbar .tab")[2].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".log-list").exists()).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_logs")).toBe(true);
+
     // 切回首页：卡片墙回来
     await wrapper.findAll(".topbar .tab")[0].trigger("click");
     expect(wrapper.find(".group-title").exists()).toBe(true);
     expect(wrapper.find(".stats-page").exists()).toBe(false);
+    expect(wrapper.find(".log-list").exists()).toBe(false);
+  });
+
+  it("记录页里改动记录后抛 changed：首页数据即时重算（票 08 验收 5 的接线）", async () => {
+    const wrapper = await mountApp();
+    await wrapper.findAll(".topbar .tab")[2].trigger("click");
+    await flushPromises();
+
+    invokeMock.mockClear();
+    wrapper.findComponent({ name: "LogListPage" }).vm.$emit("changed");
+    await flushPromises();
+
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(true);
   });
 });
 

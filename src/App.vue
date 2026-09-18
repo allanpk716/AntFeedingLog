@@ -13,9 +13,10 @@ import ColonyCard from "./components/ColonyCard.vue";
 import ColonyFormDialog from "./components/ColonyFormDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import StatsPage from "./components/StatsPage.vue";
+import LogListPage from "./components/LogListPage.vue";
 
-/** 顶栏三页 nav（票 07 加「统计」，「记录」占位给票 08） */
-type Page = "home" | "stats";
+/** 顶栏三页 nav（票 08 接活「记录」） */
+type Page = "home" | "stats" | "logs";
 const page = ref<Page>("home");
 
 const colonies = ref<Colony[]>([]);
@@ -95,7 +96,14 @@ onMounted(() => {
         >
           统计
         </button>
-        <button class="tab" type="button" disabled title="记录流水页（票 08 交付）">记录</button>
+        <button
+          class="tab"
+          :class="{ active: page === 'logs' }"
+          type="button"
+          @click="page = 'logs'"
+        >
+          记录
+        </button>
       </nav>
       <div class="tools">
         <button class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
@@ -148,6 +156,9 @@ onMounted(() => {
     </main>
 
     <StatsPage v-if="page === 'stats'" />
+
+    <!-- 记录流水（票 08）：任何编辑/删除抛 changed → refresh，首页红绿态即时重算 -->
+    <LogListPage v-if="page === 'logs'" @changed="void refresh()" />
 
     <ColonyFormDialog
       v-if="showForm"
