@@ -19,6 +19,11 @@ dist-ssr
 # Tauri auto-generated
 src-tauri/gen/schemas/
 
+# minisign 更新签名私钥（票 07：私钥绝不入 git；推荐生成到 ~/.tauri/，仓库内误放也拦住）
+.tauri/
+*.key
+!*.key.pub
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
