@@ -10,6 +10,7 @@ mod system;
 mod updater;
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -410,6 +411,66 @@ async fn check_update_now(app: tauri::AppHandle) -> Result<updater::CheckOutcome
     updater::manual_check(app).await
 }
 
+// ── 确认升级与安装（票 05）──
+
+/// 确认安装防重入标志：确认流一跑几十秒（下载），双击/狂点会并发拉起两条流
+///（两个安装器、两份下载），用一个原子位把第二条挡在门外。
+static CONFIRM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Drop 兜底复位防重入标志（检查数据目录失败等早退路径也复位）。
+struct ConfirmInFlightGuard;
+impl Drop for ConfirmInFlightGuard {
+    fn drop(&mut self) {
+        CONFIRM_IN_FLIGHT.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 确认升级并安装（设置页按钮，票 06 接 UI）。编排（再次检查 → 写 pending 标记
+/// → 下载 → install）与失败路径在 updater::run_confirm_flow 纯函数层（FakeSteps
+/// 测试锚定）；本 command 只做三件事：
+/// - 防重入（CONFIRM_IN_FLIGHT）；
+/// - 解析数据目录（标记落盘点）；
+/// - 把编排丢进阻塞线程池：生产步骤内部用 block_on 桥接插件 async API，只允许
+///   在非运行时线程上做（spawn_blocking 线程不是 tokio worker，阻塞安全），
+///   下载是长网络任务也不占异步 worker。
+/// 返回：成功 `{"status":"install_started",..}`（Windows 下进程随即退出）；
+/// 下载/安装失败 `{"status":"install_failed",..}`（进程存活，禁写标志已被编排
+/// 复位——票 04 评审 M-1 契约）；检查失败/写标记失败折为 Err 一次性展示。
+#[tauri::command]
+async fn confirm_and_install(app: tauri::AppHandle) -> Result<updater::InstallOutcome, String> {
+    if CONFIRM_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return Err("已有安装流程正在进行，请稍候".into());
+    }
+    let _guard = ConfirmInFlightGuard;
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("解析数据目录失败: {e}"))?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let steps = updater::PluginConfirmSteps::new(app);
+        updater::run_confirm_flow(&data_dir, &steps)
+    })
+    .await
+    .map_or_else(
+        |e| {
+            // 编排线程 panic（理论外路径，如插件步骤 panics）：panic 点可能已在
+            // install 置位禁写之后——进程存活就必须复位（M-1 契约精神：失败后
+            // 应用不得卡在只读态）；标记保留，交启动判定兜底。
+            updater::set_write_blocked(false);
+            Err(format!("确认安装任务异常退出: {e}"))
+        },
+        Ok,
+    )?
+}
+
+/// 查询更新状态（票 05）：`idle` 无残留 / `last_install_succeeded` 上次升级成功
+///（可提示"已升级到 vX"）/ `last_install_incomplete` 上次升级未完成（含目标
+/// 版本，UI 据此给重试/手动下载引导）。状态由启动判定与确认流失败路径暂存。
+#[tauri::command]
+fn get_update_state() -> Result<updater::UpdateState, String> {
+    Ok(updater::current_update_state())
+}
+
 // ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──
 
 /// 打开数据文件夹（opener 打开 app data 目录；目录不存在先创建）。
@@ -513,6 +574,19 @@ pub fn run() {
             // 托盘常驻 + 提醒调度（启动即查一次，此后每 30 分钟；评审附录规则 1）。
             reminder::setup_tray(app)?;
             reminder::spawn_scheduler(app.handle().clone());
+            // 升级残留兜底（票 05）：上次"想升没升成"的启动判定——读 pending 标记
+            // 对比当前运行版本（与票 04 快照同源），三态结果暂存（get_update_state
+            // 可查），标记判定后即清。失败只影响提示，绝不挡启动。
+            let current_version = app.package_info().version.to_string();
+            match updater::startup_judgment(&data_dir, &current_version) {
+                updater::UpdateState::LastInstallIncomplete { version } => {
+                    eprintln!("[updater] 上次升级未完成（目标 v{version}）：可在设置页重试或手动下载安装包");
+                }
+                updater::UpdateState::LastInstallSucceeded { version } => {
+                    eprintln!("[updater] 升级成功，当前已是 v{version}");
+                }
+                updater::UpdateState::Idle => {}
+            }
             // 每日更新检查（票 02）：托盘常驻进程内跑，窗口关闭也查；
             // 内部按"上次检查日"决定真查还是跳过（重启不重查）。
             updater::spawn_daily_checker(app.handle().clone());
@@ -565,6 +639,8 @@ pub fn run() {
             set_settings,
             send_test_notification,
             check_update_now,
+            confirm_and_install,
+            get_update_state,
             reveal_data_folder,
             backup_to,
             export_data,
