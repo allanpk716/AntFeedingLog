@@ -67,7 +67,7 @@ async function submit() {
 <template>
   <div class="overlay" @click.self="$emit('close')">
     <div class="dialog feed-dialog">
-      <h3>记录喂食 · {{ colony.name }}</h3>
+      <h3>记录{{ action.name }} · {{ colony.name }}</h3>
 
       <div class="field-label">食物（可多选）</div>
       <div class="foods">

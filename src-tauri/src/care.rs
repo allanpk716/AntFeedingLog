@@ -33,6 +33,8 @@ pub struct ActionTile {
     pub name: String,
     pub icon: Option<String>,
     pub kind: String, // reminding | log_only
+    /// 是否喂食类操作（决定记账时是否带食物多选；schema 标记位，与名字无关）。
+    pub is_feeding: bool,
     pub suggested_interval_days: Option<i64>,
     /// 今天 − 最近一次发生日期（自然日）；从未记录为 None。
     pub days_since_last: Option<i64>,
@@ -128,11 +130,11 @@ pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i6
         return Err("窝不存在".into());
     }
 
-    let (action_name, enabled): (String, i64) = conn
+    let (action_name, enabled, is_feeding): (String, i64, i64) = conn
         .query_row(
-            "SELECT name, enabled FROM care_action WHERE id = ?1",
+            "SELECT name, enabled, is_feeding FROM care_action WHERE id = ?1",
             params![input.action_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => "操作不存在".to_string(),
@@ -144,6 +146,11 @@ pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i6
 
     let happened_at = normalize_happened_at(&input.happened_at)?;
     let note = input.note.as_deref().map(str::trim).unwrap_or("").to_string();
+
+    // 食物关联仅喂食类操作可带（is_feeding 标记位，与名字无关）
+    if is_feeding == 0 && !input.food_ids.is_empty() {
+        return Err(format!("操作「{action_name}」不是喂食，不能关联食物"));
+    }
 
     // 食物：去重（保序）+ 逐个校验存在且启用
     let mut seen = HashSet::new();
@@ -192,7 +199,7 @@ pub fn tiles_for_colony(
 ) -> Result<Vec<ActionTile>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, icon, kind, suggested_interval_days
+            "SELECT id, name, icon, kind, is_feeding, suggested_interval_days
              FROM care_action WHERE enabled = 1 ORDER BY sort, id",
         )
         .map_err(db_err)?;
@@ -203,7 +210,8 @@ pub fn tiles_for_colony(
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, String>(3)?,
-                row.get::<_, Option<i64>>(4)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<i64>>(5)?,
             ))
         })
         .map_err(db_err)?
@@ -211,7 +219,7 @@ pub fn tiles_for_colony(
         .map_err(db_err)?;
 
     let mut tiles = Vec::with_capacity(rows.len());
-    for (action_id, name, icon, kind, interval) in rows {
+    for (action_id, name, icon, kind, is_feeding, interval) in rows {
         let last: Option<String> = conn
             .query_row(
                 "SELECT MAX(occurred_at) FROM care_log WHERE colony_id = ?1 AND action_id = ?2",
@@ -226,6 +234,7 @@ pub fn tiles_for_colony(
             name,
             icon,
             kind,
+            is_feeding: is_feeding != 0,
             suggested_interval_days: interval,
             days_since_last: days,
             overdue,
@@ -516,6 +525,45 @@ mod tests {
     }
 
     #[test]
+    fn log_care_rejects_foods_for_non_feeding_action() {
+        // 食物关联仅喂食类操作可带（is_feeding 位，与名字无关）：
+        // 「活动区换水」不是喂食 → 带食物拒收
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let water = action_id(&conn, "活动区换水");
+        let seed = food_id(&conn, "种子");
+
+        let err = log_care(
+            &conn,
+            &CareLogInput {
+                colony_id: c,
+                action_id: water,
+                happened_at: "2026-09-18T20:00".into(),
+                note: None,
+                food_ids: vec![seed],
+            },
+            "2026-09-18 08:00:00",
+        )
+        .unwrap_err();
+        assert!(err.contains("食物"), "实际错误：{err}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 0, "被拒的记账不落库");
+
+        // 不带食物照常可记
+        assert!(log_care(
+            &conn,
+            &CareLogInput {
+                colony_id: c,
+                action_id: water,
+                happened_at: "2026-09-18T20:00".into(),
+                note: None,
+                food_ids: vec![],
+            },
+            "2026-09-18 08:00:00",
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn log_care_failure_rolls_back_the_log_row() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
@@ -560,10 +608,12 @@ mod tests {
         assert!(feed.overdue, "喂食 4 天 > 建议 3 应超期");
         assert_eq!(feed.kind, "reminding");
         assert_eq!(feed.suggested_interval_days, Some(3));
+        assert!(feed.is_feeding, "预置喂食操作的 is_feeding 标记位为真");
 
         let trash = tile(&tiles, "垃圾清理");
         assert_eq!(trash.days_since_last, Some(4));
         assert!(!trash.overdue, "垃圾清理 4 天 ≤ 建议 7 不超期");
+        assert!(!trash.is_feeding);
 
         let water = tile(&tiles, "活动区换水");
         assert_eq!(water.days_since_last, Some(100));

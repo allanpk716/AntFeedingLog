@@ -11,7 +11,8 @@ use std::path::Path;
 use rusqlite::Connection;
 
 /// 当前 schema 版本。schema 变更时 +1，并在 `migrate` 的 match 里加对应分支。
-pub const SCHEMA_VERSION: i64 = 1;
+/// v2：care_action 增加 is_feeding 标记位（R1 评审：喂食判定与名字解耦）。
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -88,6 +89,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
     while version < SCHEMA_VERSION {
         match version {
             0 => migrate_v0_to_v1(conn)?,
+            1 => migrate_v1_to_v2(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -105,6 +107,22 @@ fn migrate_v0_to_v1(conn: &Connection) -> Result<(), rusqlite::Error> {
     let tx = conn.unchecked_transaction()?;
     tx.execute_batch(V1_SCHEMA_SQL)?;
     seed_v1_presets(&tx)?;
+    tx.pragma_update(None, "user_version", 1)?;
+    tx.commit()
+}
+
+/// v1 → v2：care_action 增加 is_feeding 标记位（喂食判定与名字解耦，R1 评审方案 A），
+/// 回填预置「喂食」行 = 1。单事务原子完成；v1 时期用户自建的操作回填为 0。
+fn migrate_v1_to_v2(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        ALTER TABLE care_action
+            ADD COLUMN is_feeding INTEGER NOT NULL DEFAULT 0
+            CHECK (is_feeding IN (0, 1));
+        UPDATE care_action SET is_feeding = 1 WHERE name = '喂食';
+        "#,
+    )?;
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     tx.commit()
 }
@@ -300,7 +318,98 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 1);
+        assert_eq!(SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn v2_fresh_db_has_is_feeding_with_preset_backfilled() {
+        let (conn, _dir) = fresh_conn();
+        // 列存在且 NOT NULL DEFAULT 0
+        let cols: Vec<(String, i64, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, \"notnull\", dflt_value FROM pragma_table_info('care_action')
+                     WHERE name = 'is_feeding'",
+                )
+                .expect("prepare 失败");
+            stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .expect("query_map 失败")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("读取列信息失败")
+        };
+        assert_eq!(cols.len(), 1, "care_action 应有 is_feeding 列");
+        assert_eq!(cols[0].1, 1, "is_feeding 应为 NOT NULL");
+
+        // 回填：仅预置「喂食」=1，其余 =0
+        let flagged: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM care_action WHERE is_feeding = 1")
+                .expect("prepare 失败");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query_map 失败")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("读取失败")
+        };
+        assert_eq!(flagged, vec!["喂食"]);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM care_action WHERE is_feeding = 0"),
+            3
+        );
+    }
+
+    #[test]
+    fn v1_db_with_data_upgrades_to_v2_and_backfills() {
+        // 手工搭一个 v1 库（旧 schema + 预置数据 + 用户在 v1 时期自建的操作 + 历史记录），
+        // 版本停在 1，跑 migrate 应升到 v2 并正确回填 is_feeding。
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).expect("建 v1 schema 失败");
+        seed_v1_presets(&conn).expect("灌 v1 预置数据失败");
+        conn.execute(
+            "INSERT INTO care_action (name, kind, enabled, sort) VALUES ('降温', 'log_only', 1, 5)",
+            [],
+        )
+        .expect("自建操作失败");
+        conn.execute(
+            "INSERT INTO colony (name, start_date, status) VALUES ('大头一号', '2026-01-20', 'active')",
+            [],
+        )
+        .expect("建窝失败");
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (1, 1, '2026-09-01 08:00:00', '', '2026-09-01 08:00:00')",
+            [],
+        )
+        .expect("建历史记录失败");
+        conn.pragma_update(None, "user_version", 1).expect("置 v1 失败");
+
+        migrate(&conn).expect("v1 → v2 升级失败");
+
+        assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+        let flags: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT name, is_feeding FROM care_action ORDER BY sort, id")
+                .expect("prepare 失败");
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .expect("query_map 失败")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("读取失败")
+        };
+        assert_eq!(
+            flags,
+            vec![
+                ("喂食".into(), 1),
+                ("活动区换水".into(), 0),
+                ("巢穴保湿".into(), 0),
+                ("垃圾清理".into(), 0),
+                ("降温".into(), 0), // 用户自建操作不被误标
+            ]
+        );
+        // 历史数据原样保留
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_log"), 1);
+        // 升级后再 migrate 幂等
+        migrate(&conn).expect("对 v2 库再次 migrate 不应失败");
     }
 
     #[test]

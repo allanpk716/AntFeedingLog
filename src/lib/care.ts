@@ -7,9 +7,6 @@
 
 import type { ColonyAction, RecentLog } from "../types";
 
-/** 预置字典里的喂食操作名。schema 没有独立"喂食"标记位，凭名字决定弹食物多选（v1 约定）。 */
-export const FEEDING_ACTION_NAME = "喂食";
-
 /** 操作块展示态：ok=绿 / bad=红（超期）/ reg=中性灰（登记类）/ none=尚未记录 / mute=冬眠静音 */
 export type TileTone = "ok" | "bad" | "reg" | "none" | "mute";
 
@@ -38,9 +35,9 @@ export function actionTile(a: ColonyAction, hibernating: boolean): TileView {
   return { tone: "ok", text: baseText };
 }
 
-/** 是否喂食操作（点它弹食物多选，其余一点即记）。 */
+/** 是否喂食类操作（点它弹食物多选，其余一点即记）。按 schema 的 is_feeding 标记位，与名字无关。 */
 export function isFeeding(a: ColonyAction): boolean {
-  return a.name === FEEDING_ACTION_NAME;
+  return a.is_feeding;
 }
 
 /**

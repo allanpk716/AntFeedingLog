@@ -14,6 +14,8 @@ export interface ColonyAction {
   name: string;
   icon: string | null;
   kind: ActionKind;
+  /** 是否喂食类操作（schema 标记位，决定记账时是否带食物多选；与名字无关） */
+  is_feeding: boolean;
   suggested_interval_days: number | null;
   /** 今天 − 最近一次发生日期（自然日）；从未记录为 null */
   days_since_last: number | null;

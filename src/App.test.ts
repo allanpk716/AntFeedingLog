@@ -376,6 +376,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     name: "喂食",
     icon: null,
     kind: "reminding",
+    is_feeding: true,
     suggested_interval_days: 3,
     days_since_last: 4,
     overdue: true,
@@ -385,6 +386,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     name: "活动区换水",
     icon: null,
     kind: "log_only",
+    is_feeding: false,
     suggested_interval_days: null,
     days_since_last: 2,
     overdue: false,
@@ -394,6 +396,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     name: "巢穴保湿",
     icon: null,
     kind: "log_only",
+    is_feeding: false,
     suggested_interval_days: null,
     days_since_last: null,
     overdue: false,
@@ -403,9 +406,21 @@ describe("卡片操作块与一键记账（票 03）", () => {
     name: "垃圾清理",
     icon: null,
     kind: "reminding",
+    is_feeding: false,
     suggested_interval_days: 7,
     days_since_last: 0,
     overdue: false,
+  };
+  // 名字不含「喂食」的喂食类操作：弹窗触发与标题只认 is_feeding 位（R1 解耦）
+  const feedCustom: ColonyAction = {
+    action_id: 9,
+    name: "投喂",
+    icon: null,
+    kind: "reminding",
+    is_feeding: true,
+    suggested_interval_days: 3,
+    days_since_last: 9,
+    overdue: true,
   };
 
   const recent: RecentLog[] = [
@@ -478,15 +493,16 @@ describe("卡片操作块与一键记账（票 03）", () => {
     ).toBe("今天 · 已记录");
   });
 
-  it("点喂食弹食物多选弹窗：只列启用食物，勾两种 + 补录时间 + 备注，确认生成一条带两食物的记录", async () => {
-    colony1With([feedOverdue]);
+  it("点喂食类操作弹食物多选弹窗（只认 is_feeding 位）：只列启用食物，勾两种 + 补录时间 + 备注，确认生成一条带两食物的记录", async () => {
+    // 操作名「投喂」不含「喂食」：弹窗触发与标题跟随 is_feeding/名字，不受字典改名影响
+    colony1With([feedCustom]);
     const wrapper = await mountApp();
 
-    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="1"]').trigger("click");
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="9"]').trigger("click");
 
     const dialog = wrapper.find(".feed-dialog");
     expect(dialog.exists()).toBe(true);
-    expect(dialog.find("h3").text()).toBe("记录喂食 · 大头一号");
+    expect(dialog.find("h3").text()).toBe("记录投喂 · 大头一号");
     expect(invokeMock).toHaveBeenCalledWith("list_foods");
 
     // 停用食物不出现在新建记录入口（规则 10）
@@ -511,7 +527,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(logCall![1]).toEqual({
       input: {
         colony_id: 1,
-        action_id: 1,
+        action_id: 9,
         happened_at: "2026-09-17T21:00",
         note: "加餐",
         food_ids: [2, 3],

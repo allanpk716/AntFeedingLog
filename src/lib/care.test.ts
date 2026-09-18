@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { ColonyAction, RecentLog } from "../types";
-import { actionTile, FEEDING_ACTION_NAME, formatRecent, isFeeding, nowLocalDateTime } from "./care";
+import { actionTile, formatRecent, isFeeding, nowLocalDateTime } from "./care";
 
 function action(partial: Partial<ColonyAction> & { action_id: number }): ColonyAction {
   return {
     name: `操作${partial.action_id}`,
     icon: null,
     kind: "reminding",
+    is_feeding: false,
     suggested_interval_days: 3,
     days_since_last: null,
     overdue: false,
@@ -75,10 +76,13 @@ describe("操作块展示态", () => {
 });
 
 describe("喂食判定", () => {
-  it("只有名字为「喂食」的操作弹食物多选", () => {
-    expect(FEEDING_ACTION_NAME).toBe("喂食");
-    expect(isFeeding(action({ action_id: 1, name: "喂食" }))).toBe(true);
-    expect(isFeeding(action({ action_id: 2, name: "垃圾清理" }))).toBe(false);
+  it("按 is_feeding 标记位判定，与名字彻底解耦", () => {
+    expect(isFeeding(action({ action_id: 1, name: "喂食", is_feeding: true }))).toBe(true);
+    // 名字不叫「喂食」但标记位为真 → 仍弹食物多选
+    expect(isFeeding(action({ action_id: 5, name: "投喂", is_feeding: true }))).toBe(true);
+    // 名字叫「喂食」但标记位为假 → 不弹
+    expect(isFeeding(action({ action_id: 2, name: "喂食", is_feeding: false }))).toBe(false);
+    expect(isFeeding(action({ action_id: 3, name: "垃圾清理", is_feeding: false }))).toBe(false);
   });
 });
 
