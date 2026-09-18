@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { addDays, daysBetween, daysRaised, isValidIsoDate, todayIso } from "./dates";
+import { addDays, daysBetween, daysRaised, isValidIsoDate, todayIso, todayLabel } from "./dates";
 
 describe("饲养天数（前端同口径：今天 − 开始饲养日期的自然日数）", () => {
   it("同一天为 0", () => {
@@ -53,5 +53,18 @@ describe("日期加减与差值（票 05：冬眠默认出眠日 / 剩余天数�
     expect(daysBetween("2026-09-18", "2026-09-18")).toBe(0);
     expect(daysBetween("2026-11-01", "2027-01-08")).toBe(68);
     expect(daysBetween("2026-09-18", "2026-09-08")).toBe(-10);
+  });
+});
+
+describe("顶栏日期标签（票 09 停靠 F：YYYY-MM-DD 周X，对齐 mock-a-light .today）", () => {
+  it("格式 = 本机日期 + 星期，mock 基线当天为周五", () => {
+    expect(todayLabel(new Date(2026, 8, 18))).toBe("2026-09-18 周五");
+    expect(todayLabel(new Date(2026, 8, 20))).toBe("2026-09-20 周日");
+    expect(todayLabel(new Date(2026, 0, 1))).toBe("2026-01-01 周四");
+    expect(todayLabel(new Date(2027, 2, 6))).toBe("2027-03-06 周六");
+  });
+
+  it("个位月/日补零", () => {
+    expect(todayLabel(new Date(2026, 2, 5))).toBe("2026-03-05 周四");
   });
 });

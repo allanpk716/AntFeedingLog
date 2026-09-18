@@ -46,9 +46,9 @@ const busyActionId = ref<number | null>(null);
 const tileError = ref("");
 
 const showHibernation = ref(false);
-const hibernationMode = ref<"start" | "wake" | "past">("start");
+const hibernationMode = ref<"start" | "wake" | "past" | "edit">("start");
 
-function openHibernation(mode: "start" | "wake" | "past") {
+function openHibernation(mode: "start" | "wake" | "past" | "edit") {
   hibernationMode.value = mode;
   showHibernation.value = true;
 }
@@ -118,6 +118,14 @@ function onFeedSaved() {
     <div v-if="banner" class="banner" data-testid="hib-banner">
       {{ banner.line }}
       <span v-if="banner.nearWake" class="chip wake">临近出眠</span>
+      <button
+        class="resched-btn"
+        type="button"
+        title="修改预计出眠日：未发的临近/出眠提醒按新日期重算"
+        @click="openHibernation('edit')"
+      >
+        改期
+      </button>
     </div>
 
     <div class="tiles">
@@ -283,6 +291,25 @@ function onFeedSaved() {
   background: var(--accent-soft);
   color: var(--accent-deep);
   font-weight: 600;
+}
+
+/* 横幅上的「改期」入口（票 09 停靠 D） */
+.resched-btn {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--hib);
+  font: inherit;
+  font-size: 11px;
+  padding: 1px 10px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.resched-btn:hover {
+  border-color: var(--hib);
+  color: var(--text);
 }
 
 /* ── 操作块（视觉照 mock-a-light 的 .tiles/.tile/.t-tag/.pill）── */

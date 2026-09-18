@@ -335,6 +335,50 @@ pub fn add_past_hibernation(
     })
 }
 
+/// 修改开放段的预计出眠日（票 09 停靠 D，冬眠横幅「改期」入口）。
+/// 仅开放段可改；新日期 ≥ 段开始日（schema CHECK 同口径，应用层先给友好报错）。
+/// 台账身份语义自然重算（规则 2）：基准日跟着新出眠日走——未发的临近/出眠提醒
+/// 按新日期触发，已发的不追回；因此无需删台账行，也不碰窝状态。
+pub fn update_expected_end(
+    conn: &Connection,
+    colony_id: i64,
+    new_expected_end_date: &str,
+) -> Result<Hibernation, String> {
+    let (seg_id, start_date): (i64, String) = conn
+        .query_row(
+            "SELECT id, start_date FROM hibernation
+             WHERE colony_id = ?1 AND actual_end_date IS NULL
+             ORDER BY id DESC LIMIT 1",
+            params![colony_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "该窝没有进行中的冬眠段".to_string(),
+            other => db_err(other),
+        })?;
+    let new_end = parse_iso(new_expected_end_date)?;
+    let start = parse_iso(&start_date)?;
+    if new_end < start {
+        return Err(format!(
+            "预计结束日期（{}）不能早于开始日期（{start_date}）",
+            new_expected_end_date.trim()
+        ));
+    }
+    let new_end = new_end.format("%Y-%m-%d").to_string();
+    conn.execute(
+        "UPDATE hibernation SET expected_end_date = ?1 WHERE id = ?2",
+        params![new_end, seg_id],
+    )
+    .map_err(db_err)?;
+    Ok(Hibernation {
+        id: seg_id,
+        colony_id,
+        start_date,
+        expected_end_date: new_end,
+        actual_end_date: None,
+    })
+}
+
 /// 某窝全部冬眠段，按开始日期升序（同日按 id）。
 pub fn list_hibernations(conn: &Connection, colony_id: i64) -> Result<Vec<Hibernation>, String> {
     let exists: i64 = conn
@@ -742,6 +786,83 @@ mod tests {
         assert_eq!(latest_wake_date(&conn, c2), None);
         let c3 = colony(&conn, " Fresh 三号");
         assert_eq!(latest_wake_date(&conn, c3), None);
+    }
+
+    // ── 修改预计出眠日（票 09 停靠 D）──
+
+    #[test]
+    fn update_expected_end_updates_open_segment_with_validation() {
+        let conn = mem_conn();
+        let c = colony(&conn, "冬眠一号");
+        start_hibernation(&conn, c, "2026-02-15", "2026-03-01", "2026-02-15").unwrap();
+
+        let h = update_expected_end(&conn, c, " 2026-04-10 ").unwrap();
+        assert_eq!(h.id > 0, true);
+        assert_eq!(h.colony_id, c);
+        assert_eq!(h.start_date, "2026-02-15");
+        assert_eq!(h.expected_end_date, "2026-04-10", "首尾空白被 trim");
+        assert_eq!(h.actual_end_date, None, "仍是开放段");
+        // 落库生效
+        let seg = open_segment(&conn, c).unwrap().unwrap();
+        assert_eq!(seg.expected_end_date, "2026-04-10");
+
+        // = 开始日允许（与 schema CHECK 一致）
+        assert!(update_expected_end(&conn, c, "2026-02-15").is_ok());
+        // 早于开始日拒绝
+        let err = update_expected_end(&conn, c, "2026-02-14").unwrap_err();
+        assert!(err.contains("不能早于"), "实际错误：{err}");
+        assert!(err.contains("开始"), "实际错误：{err}");
+        // 坏格式拒绝
+        assert!(update_expected_end(&conn, c, "2026/04/10").is_err());
+    }
+
+    #[test]
+    fn update_expected_end_requires_open_segment() {
+        let conn = mem_conn();
+        let c = colony(&conn, "冬眠一号");
+
+        // 没有开放段 / 窝不存在 → 同一错误
+        for id in [c, 999] {
+            let err = update_expected_end(&conn, id, "2026-04-10").unwrap_err();
+            assert!(err.contains("没有进行中的冬眠段"), "实际错误：{err}");
+        }
+
+        // 确认出眠后再改 → 已无开放段，拒绝且不落库
+        start_hibernation(&conn, c, "2026-02-15", "2026-03-01", "2026-02-15").unwrap();
+        confirm_wake(&conn, c, "2026-02-20", "2026-02-20").unwrap();
+        let err = update_expected_end(&conn, c, "2026-04-10").unwrap_err();
+        assert!(err.contains("没有进行中的冬眠段"), "实际错误：{err}");
+        let closed: Option<String> = conn
+            .query_row(
+                "SELECT expected_end_date FROM hibernation WHERE colony_id = ?1",
+                params![c],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(closed.as_deref(), Some("2026-03-01"), "闭合段不被改到");
+    }
+
+    #[test]
+    fn update_expected_end_keeps_ledger_and_status_for_natural_recompute() {
+        // 规则 2 的兑现通道：改 base 后，未发的临近/出眠提醒按新出眠日自然重算
+        //（基准日跟着新日期走），已发的不追回——无需删台账行，也不碰窝状态。
+        let conn = mem_conn();
+        let c = colony(&conn, "冬眠一号");
+        start_hibernation(&conn, c, "2026-08-01", "2027-03-01", "2026-08-01").unwrap();
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
+             VALUES (?1, 'approaching_wake', NULL, '2027-03-01', '2026-09-18 08:00:00')",
+            params![c],
+        )
+        .unwrap();
+
+        update_expected_end(&conn, c, "2027-05-01").unwrap();
+
+        let ledger: i64 = conn
+            .query_row("SELECT COUNT(*) FROM reminder_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ledger, 1, "改期不删台账行（已发不追回）");
+        assert_eq!(status_of(&conn, c), "hibernating", "改期不改状态");
     }
 
     // ── 重叠天数纯函数（规则 6，供统计/间隔扣减复用）──

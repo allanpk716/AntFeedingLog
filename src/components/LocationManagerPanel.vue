@@ -18,8 +18,8 @@ interface Row {
   enabled: boolean;
 }
 
-const props = defineProps<{ locations: LocationItem[]; showCancel?: boolean }>();
-const emit = defineEmits<{ saved: []; changed: []; cancel: [] }>();
+const props = defineProps<{ locations: LocationItem[] }>();
+const emit = defineEmits<{ saved: []; changed: [] }>();
 
 function buildRows(locations: LocationItem[]): Row[] {
   return [...locations]
@@ -136,7 +136,6 @@ async function erase(row: Row) {
 
     <div class="dlg-btns">
       <span class="spacer"></span>
-      <button v-if="props.showCancel !== false" class="btn cancel-btn" type="button" @click="$emit('cancel')">取消</button>
       <button class="btn primary save-locations" type="button" :disabled="busy" @click="save">保存</button>
     </div>
   </div>

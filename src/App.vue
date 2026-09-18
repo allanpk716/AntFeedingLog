@@ -9,6 +9,7 @@ import { computed, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { Colony, LocationItem } from "./types";
 import { groupColonies, splitColonies } from "./lib/home";
+import { todayLabel } from "./lib/dates";
 import ColonyCard from "./components/ColonyCard.vue";
 import ColonyFormDialog from "./components/ColonyFormDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
@@ -105,6 +106,7 @@ onMounted(() => {
           记录
         </button>
       </nav>
+      <div class="today">{{ todayLabel() }}</div>
       <div class="tools">
         <button class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
           ⚙ 设置
@@ -250,6 +252,13 @@ onMounted(() => {
 .tab:disabled {
   cursor: not-allowed;
   opacity: 0.55;
+}
+
+/* 顶栏今天日期（视觉基线 mocks/mock-a-light.html 的 .today） */
+.today {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
 }
 
 .tools {

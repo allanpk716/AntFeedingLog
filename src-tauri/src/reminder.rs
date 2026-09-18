@@ -344,9 +344,17 @@ pub fn refresh_tray_tooltip(handle: &tauri::AppHandle) {
 
 /// 启动调度：启动即查一次，此后每 30 分钟一轮（评审附录规则 1）。
 /// 独立 std 线程 + sleep：锁竞争每半小时一次，不值得占 async 运行时。
+/// 每轮包 catch_unwind（票 09 停靠 A）：单轮 panic 打日志后继续下一轮，
+/// 调度线程不再无声死掉。
 pub fn spawn_scheduler(handle: tauri::AppHandle) {
     std::thread::spawn(move || loop {
-        check_and_notify(&handle);
+        let h = handle.clone();
+        let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            check_and_notify(&h);
+        }));
+        if let Err(panic) = round {
+            eprintln!("[reminder] 本轮提醒检查 panic（已跳过，下个 30 分钟周期重试）: {panic:?}");
+        }
         std::thread::sleep(std::time::Duration::from_secs(30 * 60));
     });
 }

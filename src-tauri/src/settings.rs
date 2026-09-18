@@ -99,11 +99,12 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings, String> {
 }
 
 /// 保存全部设置（整体覆盖式 upsert），返回收敛后的生效值。
-/// 提前天数负值收敛为 0（提前 0 天 = 出眠日当天才发临近提醒，与出眠日提醒
-/// 同日各一条——schema v3 的冬眠侧唯一键已按种类区分）。
+/// 提前天数收敛到 0–365（票 09 停靠 B：服务端兜底，前端已先行校验同区间）。
+/// 提前 0 天 = 出眠日当天才发临近提醒，与出眠日提醒同日各一条——schema v3 的
+/// 冬眠侧唯一键已按种类区分。
 pub fn set_settings(conn: &Connection, s: &AppSettings) -> Result<AppSettings, String> {
     let effective = AppSettings {
-        wake_remind_days_ahead: s.wake_remind_days_ahead.max(0),
+        wake_remind_days_ahead: s.wake_remind_days_ahead.clamp(0, 365),
         ..s.clone()
     };
     upsert(conn, K_MASTER, bool_str(effective.notify_master_enabled))?;
@@ -180,6 +181,22 @@ mod tests {
         let saved = set_settings(&conn, &AppSettings { wake_remind_days_ahead: -2, ..Default::default() }).unwrap();
         assert_eq!(saved.wake_remind_days_ahead, 0);
         assert_eq!(get_settings(&conn).unwrap().wake_remind_days_ahead, 0);
+    }
+
+    #[test]
+    fn days_ahead_clamped_into_0_365_range() {
+        // 票 09 停靠 B：服务端收敛 0–365（前端已校验，这里兜底绕过前端的直调）
+        let conn = mem_conn();
+        let saved = set_settings(&conn, &AppSettings { wake_remind_days_ahead: 999, ..Default::default() }).unwrap();
+        assert_eq!(saved.wake_remind_days_ahead, 365);
+        assert_eq!(get_settings(&conn).unwrap().wake_remind_days_ahead, 365);
+
+        let saved = set_settings(&conn, &AppSettings { wake_remind_days_ahead: -5, ..Default::default() }).unwrap();
+        assert_eq!(saved.wake_remind_days_ahead, 0);
+
+        // 边界值原样保留
+        let saved = set_settings(&conn, &AppSettings { wake_remind_days_ahead: 365, ..Default::default() }).unwrap();
+        assert_eq!(saved.wake_remind_days_ahead, 365);
     }
 
     #[test]

@@ -355,7 +355,7 @@ function eraseTitle(referenced: boolean): string {
 
       <!-- 地点 -->
       <div v-else-if="activeTab === 'locations'" class="tab-body">
-        <LocationManagerPanel :locations="locations" :show-cancel="false" @saved="onPanelSaved" @changed="onPanelChanged" />
+        <LocationManagerPanel :locations="locations" @saved="onPanelSaved" @changed="onPanelChanged" />
       </div>
 
       <!-- 通知（票 06） -->

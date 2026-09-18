@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "./App.vue";
 import type { AppSettings, CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
-import { addDays, todayIso } from "./lib/dates";
+import { addDays, todayIso, todayLabel } from "./lib/dates";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -541,6 +541,12 @@ describe("设置 · 字典管理（票 04）", () => {
 });
 
 describe("顶栏导航（票 07/08）", () => {
+  it("顶栏显示今天日期（YYYY-MM-DD 周X，票 09 停靠 F 对齐 mock）", async () => {
+    const wrapper = await mountApp();
+    expect(wrapper.find(".topbar .today").exists()).toBe(true);
+    expect(wrapper.find(".topbar .today").text()).toBe(todayLabel());
+  });
+
   it("三页 nav：首页/统计/记录可切换，记录页挂载后拉记录列表", async () => {
     const wrapper = await mountApp();
 
@@ -1029,6 +1035,35 @@ describe("冬眠管理（票 05）", () => {
       endDate: "2026-02-01",
     });
     expect(wrapper.find(".hibernation-dialog").exists()).toBe(false);
+  });
+
+  it("冬眠卡横幅「改期」：预填当前预计出眠日，提交 update_expected_end 并刷新（票 09 停靠 D）", async () => {
+    colony3With({ id: 9, start_date: "2026-08-20", expected_end_date: "2026-12-01" });
+    const wrapper = await mountApp();
+
+    const card = wrapper.find('.card[data-colony-id="3"]');
+    // 改期入口只在冬眠卡横幅上；活跃卡没有
+    expect(card.find(".banner .resched-btn").exists()).toBe(true);
+    expect(wrapper.find('.card[data-colony-id="1"] .resched-btn').exists()).toBe(false);
+
+    await card.find(".banner .resched-btn").trigger("click");
+
+    const dialog = wrapper.find(".hibernation-dialog");
+    expect(dialog.exists()).toBe(true);
+    expect(dialog.find("h3").text()).toContain("修改预计出眠");
+    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe("2026-12-01");
+
+    await dialog.find(".end-input").setValue("2027-01-15");
+    invokeMock.mockClear();
+    await dialog.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("update_expected_end", {
+      colonyId: 3,
+      newExpectedEndDate: "2027-01-15",
+    });
+    expect(wrapper.find(".hibernation-dialog").exists()).toBe(false);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(true);
   });
 
   it("冬眠卡仍可记账：静音块点击照常发 log_care（验收 5：灰化静音但可记账）", async () => {

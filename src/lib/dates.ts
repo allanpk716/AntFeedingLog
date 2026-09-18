@@ -65,3 +65,13 @@ export function todayIso(): string {
   const day = String(now.getDate()).padStart(2, "0");
   return `${now.getFullYear()}-${month}-${day}`;
 }
+
+const WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"] as const;
+
+/** 顶栏日期标签（票 09 停靠 F，对齐 mock-a-light 的 .today）：本机今天 "YYYY-MM-DD 周X"。 */
+export function todayLabel(now: Date = new Date()): string {
+  const pad = (v: number) => String(v).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${
+    WEEKDAY_LABELS[now.getDay()]
+  }`;
+}

@@ -46,9 +46,13 @@ fn health_check(state: tauri::State<DbState>) -> Result<SchemaInfo, String> {
 #[tauri::command]
 fn log_care(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     input: care::CareLogInput,
 ) -> Result<i64, String> {
-    with_conn(state, |conn| care::log_care(conn, &input, &care::now_local()))
+    let result = with_conn(state, |conn| care::log_care(conn, &input, &care::now_local()));
+    // 停靠 C：数据变了 → 托盘 tooltip 即时重算（在锁释放后调用，避免自锁）
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 #[tauri::command]
@@ -69,15 +73,24 @@ fn list_logs(
 #[tauri::command]
 fn update_log(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     id: i64,
     input: care::LogUpdateInput,
 ) -> Result<(), String> {
-    with_conn(state, |conn| care::update_log(conn, id, &input, &care::now_local()))
+    let result = with_conn(state, |conn| care::update_log(conn, id, &input, &care::now_local()));
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 #[tauri::command]
-fn delete_log(state: tauri::State<'_, DbState>, id: i64) -> Result<(), String> {
-    with_conn(state, |conn| care::delete_log(conn, id))
+fn delete_log(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    id: i64,
+) -> Result<(), String> {
+    let result = with_conn(state, |conn| care::delete_log(conn, id));
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 // ── 字典管理与操作性质设置（票 04）──
@@ -203,11 +216,6 @@ fn save_location(
 }
 
 #[tauri::command]
-fn deactivate_location(state: tauri::State<DbState>, id: i64) -> Result<(), String> {
-    with_conn(state, |conn| colony::deactivate_location(conn, id))
-}
-
-#[tauri::command]
 fn erase_location(state: tauri::State<DbState>, id: i64) -> Result<(), String> {
     with_conn(state, |conn| colony::erase_location(conn, id))
 }
@@ -263,6 +271,18 @@ fn list_hibernations(
     with_conn(state, |conn| hibernation::list_hibernations(conn, colony_id))
 }
 
+/// 修改预计出眠日（票 09 停靠 D）：改 base 即可，未发的提醒按新日期自然重算（规则 2）。
+#[tauri::command]
+fn update_expected_end(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+    new_expected_end_date: String,
+) -> Result<hibernation::Hibernation, String> {
+    with_conn(state, |conn| {
+        hibernation::update_expected_end(conn, colony_id, &new_expected_end_date)
+    })
+}
+
 // ── 统计页（票 07）──
 
 #[tauri::command]
@@ -291,9 +311,13 @@ fn get_settings(state: tauri::State<'_, DbState>) -> Result<settings::AppSetting
 #[tauri::command]
 fn set_settings(
     state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
     input: settings::AppSettings,
 ) -> Result<settings::AppSettings, String> {
-    with_conn(state, |conn| settings::set_settings(conn, &input))
+    let result = with_conn(state, |conn| settings::set_settings(conn, &input));
+    // 通知设置影响托盘超期摘要之外的展示口径有限，但提前天数等变化后顺手刷新一次
+    reminder::refresh_tray_tooltip(&app);
+    result
 }
 
 /// 发送测试通知（设置弹窗按钮；不经开关与台账，排障用）。
@@ -340,12 +364,12 @@ pub fn run() {
             delete_colony,
             list_locations,
             save_location,
-            deactivate_location,
             erase_location,
             start_hibernation,
             confirm_wake,
             add_past_hibernation,
             list_hibernations,
+            update_expected_end,
             get_settings,
             set_settings,
             send_test_notification,

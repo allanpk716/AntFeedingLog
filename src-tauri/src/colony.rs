@@ -360,17 +360,6 @@ pub fn save_location(conn: &Connection, input: &LocationInput) -> Result<Locatio
     }
 }
 
-/// 停用（规则 10：被引用的只能停用，不能物理删）。
-pub fn deactivate_location(conn: &Connection, id: i64) -> Result<(), String> {
-    let changed = conn
-        .execute("UPDATE location SET enabled = 0 WHERE id = ?1", params![id])
-        .map_err(db_err)?;
-    if changed == 0 {
-        return Err("地点不存在".into());
-    }
-    Ok(())
-}
-
 /// 启用/停用双向开关（票 04：补上停用后的恢复通道）。
 pub fn set_location_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(), String> {
     let changed = conn
@@ -775,11 +764,11 @@ mod tests {
     }
 
     #[test]
-    fn deactivate_location_disables_but_keeps_row() {
+    fn set_location_enabled_false_disables_but_keeps_row() {
         let conn = mem_conn();
         let locs = list_locations(&conn).unwrap();
         let home_id = locs[0].id;
-        deactivate_location(&conn, home_id).unwrap();
+        set_location_enabled(&conn, home_id, false).unwrap();
         let locs = list_locations(&conn).unwrap();
         let home = locs.iter().find(|l| l.id == home_id).unwrap();
         assert!(!home.enabled);
@@ -803,7 +792,7 @@ mod tests {
         assert!(err.contains("停用"), "实际错误：{err}");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM location WHERE id = ?1", home_id), 1);
 
-        deactivate_location(&conn, home_id).unwrap();
+        set_location_enabled(&conn, home_id, false).unwrap();
         assert!(!list_locations(&conn).unwrap().iter().any(|l| l.id == home_id && l.enabled));
     }
 
