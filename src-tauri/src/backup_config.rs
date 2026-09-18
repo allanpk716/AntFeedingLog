@@ -198,12 +198,22 @@ pub fn load(data_dir: &Path) -> BackupConfig {
 }
 
 /// 写配置（pretty JSON，人可直接看改）。数据目录缺失先建。
+/// 原子写（终局评审 Minor）：先写同目录临时文件再 `std::fs::rename` 覆盖——该
+/// 文件每次备份成功都写，直接 `fs::write` 撕裂（进程死在写入中途）会让下次
+/// load 按默认值重建、备份账目清零，自动备份形同静默失效；同卷 rename 是原子
+/// 替换，并发读者要么看到完整旧值要么完整新值。rename 失败顺手清掉临时文件。
 pub fn save(data_dir: &Path, config: &BackupConfig) -> Result<(), String> {
     std::fs::create_dir_all(data_dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
     let text =
         serde_json::to_string_pretty(config).map_err(|e| format!("序列化备份配置失败: {e}"))?;
-    std::fs::write(data_dir.join(BACKUP_CONFIG_FILE), text)
-        .map_err(|e| format!("写入备份配置失败: {e}"))
+    let path = data_dir.join(BACKUP_CONFIG_FILE);
+    let tmp = data_dir.join(format!("{BACKUP_CONFIG_FILE}.tmp"));
+    std::fs::write(&tmp, &text).map_err(|e| format!("写入备份配置临时文件失败: {e}"))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("替换备份配置失败: {e}"));
+    }
+    Ok(())
 }
 
 /// 读 → 合并校验 → 写（set_backup_config 编排）。校验失败时不落盘，原配置原样。
@@ -382,6 +392,40 @@ mod tests {
         let data_dir = dir.path().join("nested").join("data");
         save(&data_dir, &BackupConfig::default()).unwrap();
         assert!(data_dir.join(BACKUP_CONFIG_FILE).exists());
+    }
+
+    #[test]
+    fn save_replaces_atomically_without_temp_leftover() {
+        // 终局评审 Minor：save 改「临时文件 + rename」原子写——该文件每次备份
+        // 成功都写，撕裂 = 配置按默认值重建、自动备份静默失效。覆盖后必须整体
+        // 是新值，且目录内无临时文件残留（Windows 下 std::fs::rename 同卷覆盖
+        // 已存在文件）。写中途 kill 的撕裂无法在进程内模拟，本测试守住新实现
+        // 的可观察契约：覆盖完整 + 零残留。
+        let dir = temp_data_dir();
+        save(
+            dir.path(),
+            &BackupConfig {
+                enabled: false,
+                keep_count: 7,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let next = BackupConfig {
+            enabled: true,
+            keep_count: 365,
+            backup_dir: Some("D:/bk".into()),
+            ..Default::default()
+        };
+        save(dir.path(), &next).unwrap();
+        assert_eq!(load(dir.path()), next, "rename 后读到的是完整新配置");
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "无临时文件残留，实际：{leftovers:?}");
     }
 
     // ── D1 核心：库与配置零联动（验收 1 单测：动库不联动配置）──

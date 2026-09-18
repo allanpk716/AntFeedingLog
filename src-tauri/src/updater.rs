@@ -127,7 +127,8 @@ pub fn to_outcome(result: Result<Option<UpdateInfo>, String>) -> CheckOutcome {
 pub fn fold_daily(outcome: CheckOutcome) -> CheckOutcome {
     match outcome {
         CheckOutcome::CheckFailed { message } => {
-            eprintln!("[updater] 每日静默检查失败，按无更新处理: {message}");
+            // 终局评审 D7：失败细节落错误流水（窗口化应用 stderr 不可见）
+            crate::applog::log_error(&format!("每日更新检查失败（按无更新处理，跨天自动重查）: {message}"));
             CheckOutcome::UpToDate
         }
         other => other,
@@ -557,7 +558,7 @@ fn before_exit_snapshot(app: &tauri::AppHandle) {
     let data_dir = match app.path().app_data_dir() {
         Ok(dir) => dir,
         Err(e) => {
-            eprintln!("[updater] 升级前快照失败（不阻塞升级）：解析数据目录失败: {e}");
+            crate::applog::log_error(&format!("升级前快照失败（不阻塞升级）：解析数据目录失败: {e}"));
             return;
         }
     };
@@ -568,16 +569,19 @@ fn before_exit_snapshot(app: &tauri::AppHandle) {
     let guard = match state.0.lock() {
         Ok(guard) => guard,
         Err(e) => {
-            eprintln!("[updater] 升级前快照失败（不阻塞升级）：库锁不可用: {e}");
+            crate::applog::log_error(&format!("升级前快照失败（不阻塞升级）：库锁不可用: {e}"));
             return;
         }
     };
     match pre_update_snapshot(&state.1, &data_dir, &version, &now_stamp()) {
         Ok(path) => {
             set_write_blocked(true);
-            eprintln!("[updater] 升级前快照完成，进入禁写窗口: {}", path.display());
+            crate::applog::log_action(&format!(
+                "升级前快照完成，进入禁写窗口: {}",
+                path.display()
+            ));
         }
-        Err(e) => eprintln!("[updater] 升级前快照失败（不阻塞升级）: {e}"),
+        Err(e) => crate::applog::log_error(&format!("升级前快照失败（不阻塞升级）: {e}")),
     }
     drop(guard);
 }
@@ -673,6 +677,9 @@ impl ConfirmSteps for PluginConfirmSteps {
             .bytes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bytes);
+        // 终局评审 D7：下载结果一行流水（失败由 run_confirm_flow 失败臂 →
+        // confirm_and_install 的错误行覆盖，原因随 message 带出）
+        crate::applog::log_action("更新包下载完成");
         Ok(())
     }
 
@@ -763,7 +770,7 @@ fn daily_tick(handle: &tauri::AppHandle) {
     match should {
         Ok(false) => return,
         Err(e) => {
-            eprintln!("[updater] 每日更新检查读记账失败（本轮跳过）: {e}");
+            crate::applog::log_error(&format!("每日更新检查读记账失败（本轮跳过）: {e}"));
             return;
         }
         Ok(true) => {}
@@ -786,10 +793,18 @@ fn daily_tick(handle: &tauri::AppHandle) {
     };
     match outcome {
         Ok(DailyOutcome::UpdateAvailable { version, notes }) => {
+            // 终局评审 D7：每日检查结果一天一行（真查才走到这里，Skipped 已提前返回）
+            crate::applog::log_action(&format!("每日更新检查：发现新版本 v{version}，已发系统通知"));
             notify_update(handle, &version, notes.as_deref());
         }
-        Ok(_) => {}
-        Err(e) => eprintln!("[updater] 每日更新检查记账失败（下个 30 分钟周期重试当天这轮）: {e}"),
+        Ok(_) => {
+            crate::applog::log_action("每日更新检查：无更新");
+        }
+        Err(e) => {
+            crate::applog::log_error(&format!(
+                "每日更新检查记账失败（下个 30 分钟周期重试当天这轮）: {e}"
+            ));
+        }
     }
 }
 

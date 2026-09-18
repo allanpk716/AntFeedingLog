@@ -196,7 +196,10 @@ pub fn enforce_retention(backup_dir: &Path, keep: usize) -> Result<usize, String
     for name in stale_backup_names(&refs, keep) {
         match std::fs::remove_file(backup_dir.join(&name)) {
             Ok(()) => removed += 1,
-            Err(e) => eprintln!("[auto_backup] 删除超限备份 {name} 失败（忽略）: {e}"),
+            // 终局评审 Minor：删除失败升级为错误流水（eprintln 在窗口化应用不可见）
+            Err(e) => crate::applog::log_error(&format!(
+                "自动备份保留淘汰：删除超限备份 {name} 失败（忽略）: {e}"
+            )),
         }
     }
     Ok(removed)

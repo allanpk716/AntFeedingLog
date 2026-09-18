@@ -323,14 +323,21 @@ pub fn run_check(conn: &Connection, today: &str, now: &str) -> Result<CheckOutco
 }
 
 fn collect_retry_jobs(conn: &Connection, today: &str) -> Result<Vec<PushJob>, String> {
-    // 先了结超窗/无文案的历史行，再捞窗口内未了结的
-    conn.execute(
-        "UPDATE reminder_ledger SET pushover_done = 1
-         WHERE pushover_done = 0
-           AND date(sent_at) < date(?1, ?2)",
-        params![today, format!("-{PUSHOVER_RETRY_DAYS} day")],
-    )
-    .map_err(db_err)?;
+    // 先了结超窗/无文案的历史行，再捞窗口内未了结的；作废数量记动作流水
+    //（终局评审 D7：推送补发/作废留痕）
+    let abandoned = conn
+        .execute(
+            "UPDATE reminder_ledger SET pushover_done = 1
+             WHERE pushover_done = 0
+               AND date(sent_at) < date(?1, ?2)",
+            params![today, format!("-{PUSHOVER_RETRY_DAYS} day")],
+        )
+        .map_err(db_err)?;
+    if abandoned > 0 {
+        crate::applog::log_action(&format!(
+            "手机推送补发作废 {abandoned} 条（超过 {PUSHOVER_RETRY_DAYS} 天补发窗口）"
+        ));
+    }
     let mut stmt = conn
         .prepare(
             "SELECT id, push_title, push_body FROM reminder_ledger
@@ -409,10 +416,20 @@ use tauri_plugin_notification::NotificationExt;
 /// 主托盘 id（refresh_tray_tooltip 按它找回托盘句柄）。
 pub const TRAY_ID: &str = "ant-main-tray";
 
-/// 发一条系统通知。失败静默忽略：通知是副产物，不应打断调度循环。
+/// 发一条系统通知。发送失败记错误流水但不打断调度循环（通知是副产物，原样
+/// 静默忽略语义保留）；成功记一行动作流水（终局评审 D7：提醒发出）。
 pub fn send_notification(handle: &tauri::AppHandle, r: &Reminder) {
     let (title, body) = r.notification_text();
-    let _ = handle.notification().builder().title(title).body(body).show();
+    let result = handle
+        .notification()
+        .builder()
+        .title(title.as_str())
+        .body(body.as_str())
+        .show();
+    match result {
+        Ok(()) => crate::applog::log_action(&format!("桌面提醒已发出：{title}")),
+        Err(e) => crate::applog::log_error(&format!("桌面提醒发送失败（{title}）: {e}")),
+    }
 }
 
 /// 测试通知结果（分渠道回显；pushover=None 表示未配置）。
@@ -474,7 +491,11 @@ pub fn check_and_notify(handle: &tauri::AppHandle) {
         }
         match run_check(&conn, &today, &now) {
             Ok(outcome) => outcome,
-            Err(_) => return,
+            Err(e) => {
+                // 终局评审 D7：台账/设置读失败不再无声吞掉（窗口化应用 stderr 不可见）
+                crate::applog::log_error(&format!("提醒检查失败（本轮跳过，下个 30 分钟周期重试）: {e}"));
+                return;
+            }
         }
     };
     for r in &outcome.toasts {
@@ -486,8 +507,14 @@ pub fn check_and_notify(handle: &tauri::AppHandle) {
         for job in &outcome.push_jobs {
             if let Some(cfg) = &cfg {
                 match crate::pushover::send(cfg, &job.title, &job.body) {
-                    Ok(()) => settled.push(job.ledger_id),
-                    Err(e) => eprintln!("[pushover] 发送失败（下轮重试）: {e}"),
+                    Ok(()) => {
+                        // 终局评审 D7：补发成功一行流水
+                        crate::applog::log_action(&format!("手机推送已发：{}", job.title));
+                        settled.push(job.ledger_id);
+                    }
+                    Err(e) => {
+                        crate::applog::log_error(&format!("手机推送发送失败（下轮重试）: {e}"));
+                    }
                 }
             }
         }

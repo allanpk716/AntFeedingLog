@@ -477,16 +477,23 @@ fn set_settings(
     outcome
 }
 
-/// 设置保存的 command 层裁决（纯函数，测试用）：落库结果 + 自启同步结果 → 前端口径。
+/// 设置保存的 command 层裁决：落库结果 + 自启同步结果 → 前端口径。
 /// 落库失败恒报错；自启同步失败只记日志、不吞掉已保存的设置（设置是权威，
 /// 启动时按设置重新对齐插件——与启动路径同一宽宽策略）。
+/// 终局评审 D7：自启同步成败落日志（窗口化应用 stderr 丢失等于不可见）。
 fn settle_settings_save(
     saved: Result<settings::AppSettings, String>,
     autostart_sync: Result<(), String>,
 ) -> Result<settings::AppSettings, String> {
     let effective = saved?;
-    if let Err(e) = autostart_sync {
-        eprintln!("[autostart] 保存设置后同步开机自启失败（下次启动按设置重试）: {e}");
+    match autostart_sync {
+        Ok(()) => applog::log_action(&format!(
+            "开机自启已同步：{}",
+            if effective.autostart_enabled { "开" } else { "关" }
+        )),
+        Err(e) => applog::log_error(&format!(
+            "保存设置后同步开机自启失败（下次启动按设置重试）: {e}"
+        )),
     }
     Ok(effective)
 }
@@ -522,7 +529,12 @@ fn pushover_status() -> pushover::PushoverStatus {
 /// 一次性展示；成功返回 `{"status":"up_to_date"}` 或 `{"status":"update_available",..}`。
 #[tauri::command]
 async fn check_update_now(app: tauri::AppHandle) -> Result<updater::CheckOutcome, String> {
-    updater::manual_check(app).await
+    let outcome = updater::manual_check(app).await;
+    // 终局评审 D7：非库命令失败也落日志（不经 with_conn，统一入口覆盖不到）
+    if let Err(e) = &outcome {
+        applog::log_error(&format!("手动检查更新失败: {e}"));
+    }
+    outcome
 }
 
 // ── 确认升级与安装（票 05）──
@@ -556,11 +568,15 @@ async fn confirm_and_install(app: tauri::AppHandle) -> Result<updater::InstallOu
         return Err("已有安装流程正在进行，请稍候".into());
     }
     let _guard = ConfirmInFlightGuard;
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("解析数据目录失败: {e}"))?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let data_dir = match app.path().app_data_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            let msg = format!("解析数据目录失败: {e}");
+            applog::log_error(&format!("确认安装失败: {msg}"));
+            return Err(msg);
+        }
+    };
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
         let steps = updater::PluginConfirmSteps::new(app);
         updater::run_confirm_flow(&data_dir, &steps)
     })
@@ -571,10 +587,26 @@ async fn confirm_and_install(app: tauri::AppHandle) -> Result<updater::InstallOu
             // install 置位禁写之后——进程存活就必须复位（M-1 契约精神：失败后
             // 应用不得卡在只读态）；标记保留，交启动判定兜底。
             updater::set_write_blocked(false);
+            applog::log_error(&format!("确认安装任务异常退出: {e}"));
             Err(format!("确认安装任务异常退出: {e}"))
         },
         Ok,
-    )?
+    )?;
+    // 终局评审 D7：安装结果落流水（下载完成行在 PluginConfirmSteps::download；
+    // 失败原因随 message 带全，目标版本齐全，供日志侧对账"想升到哪、成没成"）
+    match &outcome {
+        Ok(updater::InstallOutcome::InstallStarted { version }) => {
+            applog::log_action(&format!("更新安装已启动（目标 v{version}），进程即将退出"));
+        }
+        Ok(updater::InstallOutcome::InstallFailed { version, message }) => {
+            applog::log_error(&format!("更新安装失败（目标 v{version}）: {message}"));
+        }
+        Err(e) => {
+            // 确认流在下载前中止（再次检查失败 / 写 pending 标记失败）
+            applog::log_error(&format!("确认安装流程中止: {e}"));
+        }
+    }
+    outcome
 }
 
 /// 查询更新状态（票 05）：`idle` 无残留 / `last_install_succeeded` 上次升级成功
@@ -600,9 +632,15 @@ fn get_app_version(app: tauri::AppHandle) -> String {
 #[tauri::command]
 fn open_releases_page(app: tauri::AppHandle) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    app.opener()
+    let result = app
+        .opener()
         .open_url(updater::RELEASES_PAGE_URL, None::<&str>)
-        .map_err(|e| format!("打开发布页失败: {e}"))
+        .map_err(|e| format!("打开发布页失败: {e}"));
+    // 终局评审 D7：非库命令失败也落日志（不经 with_conn，统一入口覆盖不到）
+    if let Err(e) = &result {
+        applog::log_error(&format!("打开发布页失败: {e}"));
+    }
+    result
 }
 
 // ── 日志与异常退出（数据安全二期票 01，D10 命令契约）──
@@ -611,16 +649,23 @@ fn open_releases_page(app: tauri::AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn open_logs_folder(app: tauri::AppHandle) -> Result<String, String> {
     use tauri_plugin_opener::OpenerExt;
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("解析数据目录失败: {e}"))?;
-    let logs_dir = data_dir.join(applog::LOG_DIR_NAME);
-    std::fs::create_dir_all(&logs_dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
-    app.opener()
-        .open_path(logs_dir.to_string_lossy(), None::<&str>)
-        .map_err(|e| format!("打开日志文件夹失败: {e}"))?;
-    Ok(logs_dir.to_string_lossy().to_string())
+    let result = (|| -> Result<String, String> {
+        let data_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("解析数据目录失败: {e}"))?;
+        let logs_dir = data_dir.join(applog::LOG_DIR_NAME);
+        std::fs::create_dir_all(&logs_dir).map_err(|e| format!("创建日志目录失败: {e}"))?;
+        app.opener()
+            .open_path(logs_dir.to_string_lossy(), None::<&str>)
+            .map_err(|e| format!("打开日志文件夹失败: {e}"))?;
+        Ok(logs_dir.to_string_lossy().to_string())
+    })();
+    // 终局评审 D7：非库命令失败也落日志（不经 with_conn，统一入口覆盖不到）
+    if let Err(e) = &result {
+        applog::log_error(&format!("打开日志文件夹失败: {e}"));
+    }
+    result
 }
 
 /// 最近错误摘要（[ERROR]/[PANIC] 行，新→旧，限量 [`applog::MAX_RECENT_ERRORS`]）。
@@ -769,7 +814,12 @@ fn restore_preview(
     path: String,
 ) -> Result<restore::RestoreSummary, String> {
     let data_dir = current_data_dir()?;
-    restore::run_preview(Path::new(&path), &state.1, &data_dir, &restore::stamp_now())
+    let result = restore::run_preview(Path::new(&path), &state.1, &data_dir, &restore::stamp_now());
+    // 终局评审 D7：预览被拒（选错文件/损坏/未来版本）也留痕，排查"为什么不让恢复"
+    if let Err(e) = &result {
+        applog::log_error(&format!("恢复预览未通过（来源 {path}）: {e}"));
+    }
+    result
 }
 
 /// 恢复执行（D10 契约）：重走完整校验（TOCTOU 安全——preview 与 apply 之间
@@ -833,15 +883,22 @@ fn restore_apply(
 #[tauri::command]
 fn reveal_data_folder(app: tauri::AppHandle) -> Result<String, String> {
     use tauri_plugin_opener::OpenerExt;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("解析数据目录失败: {e}"))?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
-    app.opener()
-        .open_path(dir.to_string_lossy(), None::<&str>)
-        .map_err(|e| format!("打开数据文件夹失败: {e}"))?;
-    Ok(dir.to_string_lossy().to_string())
+    let result = (|| -> Result<String, String> {
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("解析数据目录失败: {e}"))?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
+        app.opener()
+            .open_path(dir.to_string_lossy(), None::<&str>)
+            .map_err(|e| format!("打开数据文件夹失败: {e}"))?;
+        Ok(dir.to_string_lossy().to_string())
+    })();
+    // 终局评审 D7：非库命令失败也落日志（不经 with_conn，统一入口覆盖不到）
+    if let Err(e) = &result {
+        applog::log_error(&format!("打开数据文件夹失败: {e}"));
+    }
+    result
 }
 
 /// rfd 保存对话框选目标路径（取消返回 None）。同名文件覆盖确认由对话框承担。
@@ -865,6 +922,7 @@ fn date_stamp() -> String {
 
 /// 安全备份：rfd 选目标 → 短暂拿锁挡住并发写 → 拷贝库文件
 /// （journal_mode=DELETE，拷贝即完整，评审附录规则 11）。用户取消返回 None。
+/// 成败都落流水（终局评审 D7：备份成功/失败；本命令不经 with_conn）。
 #[tauri::command]
 async fn backup_to(state: tauri::State<'_, DbState>) -> Result<Option<String>, String> {
     let db_path = state.1.clone();
@@ -873,8 +931,18 @@ async fn backup_to(state: tauri::State<'_, DbState>) -> Result<Option<String>, S
         return Ok(None);
     };
     // 拷贝期间短暂持锁：保证没有并发写（对话框阶段不持锁，不卡其他命令）
-    let _guard = state.0.lock().map_err(|e| e.to_string())?;
-    system::backup_db_file(&db_path, &target)?;
+    let _guard = match state.0.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            applog::log_error(&format!("安全备份失败（库锁不可用）: {e}"));
+            return Err(e.to_string());
+        }
+    };
+    if let Err(e) = system::backup_db_file(&db_path, &target) {
+        applog::log_error(&format!("安全备份失败: {e}"));
+        return Err(e);
+    }
+    applog::log_action(&format!("安全备份成功: {}", target.display()));
     Ok(Some(target.to_string_lossy().to_string()))
 }
 
@@ -951,10 +1019,13 @@ pub fn run() {
             let current_version = app.package_info().version.to_string();
             match updater::startup_judgment(&data_dir, &current_version) {
                 updater::UpdateState::LastInstallIncomplete { version } => {
-                    eprintln!("[updater] 上次升级未完成（目标 v{version}）：可在设置页重试或手动下载安装包");
+                    // 终局评审 D7：安装结果三态判定落流水（未完成是错误态）
+                    applog::log_error(&format!(
+                        "上次升级未完成（目标 v{version}）：可在设置页重试或手动下载安装包"
+                    ));
                 }
                 updater::UpdateState::LastInstallSucceeded { version } => {
-                    eprintln!("[updater] 升级成功，当前已是 v{version}");
+                    applog::log_action(&format!("升级成功，当前已是 v{version}"));
                 }
                 updater::UpdateState::Idle => {}
             }
@@ -975,9 +1046,14 @@ pub fn run() {
                     }
                 });
             }
-            // 开机自启默认开（settings 预置行=1 即「首次启动写入」）；失败只打日志不拦启动。
-            if let Err(e) = apply_autostart(app.handle(), autostart_on) {
-                eprintln!("[autostart] 启动时同步开机自启失败: {e}");
+            // 开机自启默认开（settings 预置行=1 即「首次启动写入」）；成败都落
+            // 日志（终局评审 D7：窗口化应用 stderr 丢失等于不可见），失败不拦启动。
+            match apply_autostart(app.handle(), autostart_on) {
+                Ok(()) => applog::log_action(&format!(
+                    "开机自启已同步：{}",
+                    if autostart_on { "开" } else { "关" }
+                )),
+                Err(e) => applog::log_error(&format!("启动时同步开机自启失败: {e}")),
             }
             Ok(())
         })
