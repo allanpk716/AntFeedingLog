@@ -1,0 +1,560 @@
+<script setup lang="ts">
+/**
+ * 设置弹窗 · 字典管理部分（票 04）：操作 / 食物 / 地点 三个 tab。
+ * - 操作行可编辑：名字、性质（提醒/仅登记）、建议间隔（提醒类显示）、
+ *   「喂食」标记（带提示，允许编辑不强制唯一）、停用/启用、删除
+ *   （被历史记录/提醒台账引用时删除禁用，只能停用——规则 10）。
+ * - 食物行：名字、停用/启用、删除（被引用禁用）。
+ * - 地点 tab 复用 LocationManagerPanel。
+ *
+ * 行级 停用/启用/删除 即时落库并抛 changed（外层刷新首页，卡片红/灰随之变化）；
+ * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
+ * 成功后重拉字典并抛 changed。停用项整行置灰。
+ */
+import { onMounted, ref } from "vue";
+import { invoke } from "@tauri-apps/api/core";
+import type { CareActionItem, FoodItem, LocationItem } from "../types";
+import {
+  buildActionRows,
+  buildFoodRows,
+  moveRow,
+  toActionInputs,
+  toFoodInputs,
+  validateActionRows,
+  validateFoodRows,
+  type ActionRow,
+  type FoodRow,
+} from "../lib/dict";
+import LocationManagerPanel from "./LocationManagerPanel.vue";
+
+type Tab = "actions" | "foods" | "locations";
+
+const emit = defineEmits<{ close: []; changed: [] }>();
+
+const activeTab = ref<Tab>("actions");
+const actionRows = ref<ActionRow[]>([]);
+const foodRows = ref<FoodRow[]>([]);
+const locations = ref<LocationItem[]>([]);
+const addActionName = ref("");
+const addFoodName = ref("");
+const error = ref("");
+const busy = ref(false);
+
+async function load() {
+  const [actions, foods, locs] = await Promise.all([
+    invoke<CareActionItem[]>("list_actions"),
+    invoke<FoodItem[]>("list_foods"),
+    invoke<LocationItem[]>("list_locations"),
+  ]);
+  actionRows.value = buildActionRows(actions);
+  foodRows.value = buildFoodRows(foods);
+  locations.value = locs;
+}
+
+onMounted(async () => {
+  try {
+    await load();
+  } catch (e) {
+    error.value = String(e);
+  }
+});
+
+// ── 行级即时操作 ──
+
+async function addActionRow(kind: "actions" | "foods") {
+  const raw = (kind === "actions" ? addActionName : addFoodName).value.trim();
+  if (!raw) {
+    error.value = kind === "actions" ? "操作名字不能为空" : "食物名字不能为空";
+    return;
+  }
+  const target: Array<{ id: number | null; name: string }> =
+    kind === "actions" ? actionRows.value : foodRows.value;
+  if (target.some((r) => r.name.trim() === raw)) {
+    error.value = `名字「${raw}」已存在`;
+    return;
+  }
+  if (kind === "actions") {
+    actionRows.value.push({
+      id: null,
+      name: raw,
+      kind: "reminding",
+      isFeeding: false,
+      intervalText: "7",
+      enabled: true,
+      referenced: false,
+    });
+    addActionName.value = "";
+  } else {
+    foodRows.value.push({ id: null, name: raw, enabled: true, referenced: false });
+    addFoodName.value = "";
+  }
+  error.value = "";
+}
+
+async function setActionEnabled(row: ActionRow, enabled: boolean) {
+  if (row.id === null) return;
+  busy.value = true;
+  error.value = "";
+  try {
+    await invoke("set_action_enabled", { id: row.id, enabled });
+    row.enabled = enabled;
+    emit("changed");
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function eraseAction(row: ActionRow) {
+  if (row.id === null) {
+    actionRows.value = actionRows.value.filter((r) => r !== row);
+    return;
+  }
+  busy.value = true;
+  error.value = "";
+  try {
+    await invoke("erase_action", { id: row.id });
+    actionRows.value = actionRows.value.filter((r) => r !== row);
+    emit("changed");
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function setFoodEnabled(row: FoodRow, enabled: boolean) {
+  if (row.id === null) return;
+  busy.value = true;
+  error.value = "";
+  try {
+    await invoke("set_food_enabled", { id: row.id, enabled });
+    row.enabled = enabled;
+    emit("changed");
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function eraseFood(row: FoodRow) {
+  if (row.id === null) {
+    foodRows.value = foodRows.value.filter((r) => r !== row);
+    return;
+  }
+  busy.value = true;
+  error.value = "";
+  try {
+    await invoke("erase_food", { id: row.id });
+    foodRows.value = foodRows.value.filter((r) => r !== row);
+    emit("changed");
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+// ── 批量保存（名字/排序/性质/间隔/喂食标记） ──
+
+async function saveActions() {
+  const invalid = validateActionRows(actionRows.value);
+  if (invalid) {
+    error.value = invalid;
+    return;
+  }
+  busy.value = true;
+  error.value = "";
+  try {
+    for (const input of toActionInputs(actionRows.value)) {
+      await invoke("save_action", { input });
+    }
+    await load();
+    emit("changed");
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function saveFoods() {
+  const invalid = validateFoodRows(foodRows.value);
+  if (invalid) {
+    error.value = invalid;
+    return;
+  }
+  busy.value = true;
+  error.value = "";
+  try {
+    for (const input of toFoodInputs(foodRows.value)) {
+      await invoke("save_food", { input });
+    }
+    await load();
+    emit("changed");
+  } catch (e) {
+    error.value = String(e);
+  } finally {
+    busy.value = false;
+  }
+}
+
+function onPanelChanged() {
+  emit("changed");
+}
+
+function onPanelSaved() {
+  emit("changed");
+}
+
+function eraseTitle(referenced: boolean): string {
+  return referenced ? "被历史记录引用，只能停用，不能删除" : "";
+}
+</script>
+
+<template>
+  <div class="overlay" @click.self="$emit('close')">
+    <div class="dialog settings-dialog">
+      <h3>设置 · 字典管理</h3>
+
+      <div class="tabs">
+        <button class="tab tab-actions" :class="{ active: activeTab === 'actions' }" type="button" @click="activeTab = 'actions'">
+          操作
+        </button>
+        <button class="tab tab-foods" :class="{ active: activeTab === 'foods' }" type="button" @click="activeTab = 'foods'">
+          食物
+        </button>
+        <button class="tab tab-locations" :class="{ active: activeTab === 'locations' }" type="button" @click="activeTab = 'locations'">
+          地点
+        </button>
+      </div>
+
+      <!-- 操作 -->
+      <div v-if="activeTab === 'actions'" class="tab-body">
+        <div v-for="(row, index) in actionRows" :key="row.id ?? `new-${index}`" class="dict-row" :class="{ 'row-disabled': !row.enabled }">
+          <span class="movers">
+            <button type="button" :disabled="index === 0" @click="moveRow(actionRows, index, -1)">↑</button>
+            <button type="button" :disabled="index === actionRows.length - 1" @click="moveRow(actionRows, index, 1)">↓</button>
+          </span>
+          <input v-model="row.name" class="name-input" type="text" />
+          <select v-model="row.kind" class="kind-select" :title="row.kind === 'reminding' ? '提醒类：超期标红并通知' : '仅登记：只记录，永不催促'">
+            <option value="reminding">提醒</option>
+            <option value="log_only">仅登记</option>
+          </select>
+          <input
+            v-if="row.kind === 'reminding'"
+            v-model="row.intervalText"
+            class="interval-input"
+            type="number"
+            min="1"
+            title="建议间隔天数：距上次超过它就标红"
+          />
+          <label class="feeding-flag" title="勾选后记账时弹出食物多选；建议全局只勾一个（不强制）">
+            <input v-model="row.isFeeding" type="checkbox" />
+            喂食
+          </label>
+          <span v-if="!row.enabled" class="disabled-chip">已停用</span>
+          <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setActionEnabled(row, false)">停用</button>
+          <button v-else class="row-btn" type="button" @click="setActionEnabled(row, true)">启用</button>
+          <button class="row-btn erase-btn" type="button" :disabled="row.referenced" :title="eraseTitle(row.referenced)" @click="eraseAction(row)">
+            删除
+          </button>
+        </div>
+
+        <div class="add-row">
+          <input v-model="addActionName" class="add-input" type="text" placeholder="新操作，如：糖水" @keyup.enter="addActionRow('actions')" />
+          <button class="add-btn" type="button" @click="addActionRow('actions')">＋ 添加</button>
+        </div>
+
+        <p class="hint">「喂食」标记：勾选的操作记账时会弹出食物多选，建议全局只勾一个（不强制）。性质与间隔改完点「保存」，首页卡片红/灰随之变化。</p>
+        <div class="dlg-btns">
+          <span class="spacer"></span>
+          <button class="btn primary" type="button" :disabled="busy" @click="saveActions">保存</button>
+        </div>
+      </div>
+
+      <!-- 食物 -->
+      <div v-else-if="activeTab === 'foods'" class="tab-body">
+        <div v-for="(row, index) in foodRows" :key="row.id ?? `new-${index}`" class="dict-row" :class="{ 'row-disabled': !row.enabled }">
+          <span class="movers">
+            <button type="button" :disabled="index === 0" @click="moveRow(foodRows, index, -1)">↑</button>
+            <button type="button" :disabled="index === foodRows.length - 1" @click="moveRow(foodRows, index, 1)">↓</button>
+          </span>
+          <input v-model="row.name" class="name-input" type="text" />
+          <span v-if="!row.enabled" class="disabled-chip">已停用</span>
+          <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setFoodEnabled(row, false)">停用</button>
+          <button v-else class="row-btn" type="button" @click="setFoodEnabled(row, true)">启用</button>
+          <button class="row-btn erase-btn" type="button" :disabled="row.referenced" :title="eraseTitle(row.referenced)" @click="eraseFood(row)">
+            删除
+          </button>
+        </div>
+
+        <div class="add-row">
+          <input v-model="addFoodName" class="add-input" type="text" placeholder="新食物，如：糖水" @keyup.enter="addActionRow('foods')" />
+          <button class="add-btn" type="button" @click="addActionRow('foods')">＋ 添加</button>
+        </div>
+
+        <div class="dlg-btns">
+          <span class="spacer"></span>
+          <button class="btn primary" type="button" :disabled="busy" @click="saveFoods">保存</button>
+        </div>
+      </div>
+
+      <!-- 地点 -->
+      <div v-else class="tab-body">
+        <LocationManagerPanel :locations="locations" :show-cancel="false" @saved="onPanelSaved" @changed="onPanelChanged" />
+      </div>
+
+      <p v-if="error && activeTab !== 'locations'" class="form-error">{{ error }}</p>
+
+      <div class="dlg-btns close-row">
+        <span class="spacer"></span>
+        <button class="btn" type="button" @click="$emit('close')">关闭</button>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+}
+
+.settings-dialog {
+  width: 640px;
+  max-width: 94vw;
+  max-height: 86vh;
+  overflow-y: auto;
+  background: var(--card);
+  border-radius: 14px;
+  padding: 18px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+}
+
+.settings-dialog h3 {
+  font-size: 15px;
+  margin-bottom: 12px;
+}
+
+.tabs {
+  display: flex;
+  gap: 6px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 14px;
+}
+
+.tab {
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 14px;
+  padding: 6px 14px;
+  cursor: pointer;
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+}
+
+.tab.active {
+  color: var(--accent-deep);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+
+.tab-body {
+  min-height: 120px;
+}
+
+.dict-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.dict-row.row-disabled {
+  opacity: 0.55;
+}
+
+.movers {
+  display: flex;
+  gap: 2px;
+}
+
+.movers button {
+  border: 1px solid var(--border-strong);
+  background: var(--tile);
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  padding: 4px 8px;
+}
+
+.movers button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.name-input {
+  flex: 1;
+  min-width: 90px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font: inherit;
+  background: var(--card);
+  color: var(--text);
+}
+
+.kind-select {
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 13px;
+  background: var(--card);
+  color: var(--text);
+}
+
+.interval-input {
+  width: 64px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font: inherit;
+  background: var(--card);
+  color: var(--text);
+}
+
+.feeding-flag {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.disabled-chip {
+  font-size: 11px;
+  color: var(--hib);
+  background: var(--hib-soft);
+  border-radius: 999px;
+  padding: 1px 8px;
+  white-space: nowrap;
+}
+
+.row-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--card);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 12px;
+  padding: 5px 10px;
+  cursor: pointer;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.row-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent-deep);
+}
+
+.row-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.add-input {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font: inherit;
+  background: var(--card);
+  color: var(--text);
+}
+
+.add-btn {
+  border: 1px dashed var(--border-strong);
+  background: transparent;
+  border-radius: 8px;
+  font: inherit;
+  padding: 6px 14px;
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.add-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-deep);
+}
+
+.hint {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.form-error {
+  margin-top: 10px;
+  font-size: 13px;
+  color: var(--bad);
+}
+
+.dlg-btns {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.close-row {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+
+.spacer {
+  flex: 1;
+}
+
+.btn {
+  padding: 7px 18px;
+  border-radius: 9px;
+  border: 1px solid var(--border-strong);
+  background: var(--card);
+  cursor: pointer;
+  font: inherit;
+}
+
+.btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.btn.primary:hover {
+  background: var(--accent-deep);
+}
+
+.btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+</style>

@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
  * 首页：按地点分组渲染窝卡片（分组顺序 = 地点清单顺序，空地点「未分组」最后），
- * 已结束的窝收底部折叠区（默认折叠）。「+ 新建窝」与地点管理入口在本页。
+ * 已结束的窝收底部折叠区（默认折叠）。「+ 新建窝」与设置入口（字典管理等）在本页。
  * 卡片操作块/喂食弹窗在 ColonyCard 内（票 03）：记账成功抛 saved → refresh 数据驱动重算。
+ * 设置弹窗（票 04）：字典管理三 tab，任何变更抛 changed → refresh，卡片红/灰即时跟上。
  */
 import { computed, onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
@@ -10,7 +11,7 @@ import type { Colony, LocationItem } from "./types";
 import { groupColonies, splitColonies } from "./lib/home";
 import ColonyCard from "./components/ColonyCard.vue";
 import ColonyFormDialog from "./components/ColonyFormDialog.vue";
-import LocationManagerDialog from "./components/LocationManagerDialog.vue";
+import SettingsDialog from "./components/SettingsDialog.vue";
 
 const colonies = ref<Colony[]>([]);
 const locations = ref<LocationItem[]>([]);
@@ -18,7 +19,7 @@ const pageError = ref("");
 
 const showForm = ref(false);
 const editing = ref<Colony | null>(null);
-const showLocations = ref(false);
+const showSettings = ref(false);
 const endedOpen = ref(false);
 
 const activeColonies = computed(() => splitColonies(colonies.value).active);
@@ -54,8 +55,12 @@ function onSaved() {
   void refresh();
 }
 
-function onLocationsSaved() {
-  showLocations.value = false;
+function onSettingsChanged() {
+  void refresh();
+}
+
+function onSettingsClosed() {
+  showSettings.value = false;
   void refresh();
 }
 
@@ -69,8 +74,8 @@ onMounted(() => {
     <header class="topbar">
       <div class="brand">🐜 蚂蚁饲养日志</div>
       <div class="tools">
-        <button class="ghost-btn location-mgr-btn" type="button" @click="showLocations = true">
-          地点管理
+        <button class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
+          ⚙ 设置
         </button>
       </div>
     </header>
@@ -126,12 +131,10 @@ onMounted(() => {
       @close="showForm = false"
       @saved="onSaved"
     />
-    <LocationManagerDialog
-      v-if="showLocations"
-      :locations="locations"
-      @close="showLocations = false"
-      @saved="onLocationsSaved"
-      @changed="void refresh()"
+    <SettingsDialog
+      v-if="showSettings"
+      @close="onSettingsClosed"
+      @changed="onSettingsChanged"
     />
   </div>
 </template>

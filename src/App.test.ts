@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "./App.vue";
-import type { Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
+import type { CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -13,10 +13,17 @@ const locations: LocationItem[] = [
 ];
 
 const foods: FoodItem[] = [
-  { id: 1, name: "种子", enabled: true, sort: 1 },
-  { id: 2, name: "干虾仁", enabled: true, sort: 2 },
-  { id: 3, name: "面包虫", enabled: true, sort: 3 },
-  { id: 4, name: "蚕蛹", enabled: false, sort: 4 },
+  { id: 1, name: "种子", enabled: true, sort: 1, referenced: false },
+  { id: 2, name: "干虾仁", enabled: true, sort: 2, referenced: false },
+  { id: 3, name: "面包虫", enabled: true, sort: 3, referenced: false },
+  { id: 4, name: "蚕蛹", enabled: false, sort: 4, referenced: false },
+];
+
+const actions: CareActionItem[] = [
+  { id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: 3, enabled: true, sort: 1, referenced: false },
+  { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, referenced: true },
+  { id: 3, name: "巢穴保湿", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 3, referenced: false },
+  { id: 4, name: "垃圾清理", icon: null, kind: "reminding", is_feeding: false, suggested_interval_days: 7, enabled: true, sort: 4, referenced: false },
 ];
 
 const colonies: Colony[] = [
@@ -78,6 +85,8 @@ function baseMock() {
         return locations;
       case "list_foods":
         return foods;
+      case "list_actions":
+        return actions;
       default:
         return null;
     }
@@ -279,15 +288,20 @@ describe("编辑窝", () => {
   });
 });
 
-describe("地点管理", () => {
-  async function openManager(wrapper: Awaited<ReturnType<typeof mountApp>>) {
-    await wrapper.find(".location-mgr-btn").trigger("click");
-    return wrapper.find(".loc-dialog");
+describe("设置 · 字典管理（票 04）", () => {
+  /** 打开设置弹窗并等它拉完字典。 */
+  async function openSettings(wrapper: Awaited<ReturnType<typeof mountApp>>) {
+    await wrapper.find(".settings-btn").trigger("click");
+    await flushPromises();
+    return wrapper.find(".settings-dialog");
   }
 
-  it("列出全部地点，支持上下移调顺序，保存时按新顺序逐行 save_location", async () => {
+  // ── 地点 tab（复用 LocationManagerPanel）──
+
+  it("地点 tab：列出全部地点，支持上下移调顺序，保存时按新顺序逐行 save_location，弹窗不关", async () => {
     const wrapper = await mountApp();
-    const dlg = await openManager(wrapper);
+    const dlg = await openSettings(wrapper);
+    await dlg.find(".tab-locations").trigger("click");
 
     const rows = dlg.findAll(".loc-row");
     expect(rows.length).toBe(2);
@@ -305,12 +319,15 @@ describe("地点管理", () => {
       ["save_location", { input: { id: 2, name: "公司", sort: 0 } }],
       ["save_location", { input: { id: 1, name: "家", sort: 1 } }],
     ]);
-    expect(wrapper.find(".loc-dialog").exists()).toBe(false);
+    // 设置弹窗保存后保持打开（changed → 外层静默刷新首页）
+    expect(wrapper.find(".settings-dialog").exists()).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(true);
   });
 
-  it("可新增地点（新行 id 为空），保存时一并提交", async () => {
+  it("地点 tab：可新增地点（新行 id 为空），保存时一并提交", async () => {
     const wrapper = await mountApp();
-    const dlg = await openManager(wrapper);
+    const dlg = await openSettings(wrapper);
+    await dlg.find(".tab-locations").trigger("click");
 
     await dlg.find(".loc-add-input").setValue("阳台");
     await dlg.find(".loc-add-btn").trigger("click");
@@ -325,9 +342,10 @@ describe("地点管理", () => {
     });
   });
 
-  it("行级操作不关弹窗：删除被引用展示原因；停用成功后弹窗保持、未保存改名不丢、外层静默刷新", async () => {
+  it("地点 tab：行级操作不关弹窗，删除被引用展示原因，停用后可再启用", async () => {
     const wrapper = await mountApp();
-    const dlg = await openManager(wrapper);
+    const dlg = await openSettings(wrapper);
+    await dlg.find(".tab-locations").trigger("click");
 
     // 未保存的改名（行内编辑）
     await dlg.find(".loc-row .loc-name-input").setValue("老家");
@@ -340,6 +358,10 @@ describe("地点管理", () => {
           return colonies;
         case "list_locations":
           return locations;
+        case "list_foods":
+          return foods;
+        case "list_actions":
+          return actions;
         default:
           return null;
       }
@@ -351,22 +373,144 @@ describe("地点管理", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("erase_location", { id: 1 });
     expect(dlg.find(".loc-error").text()).toContain("停用");
-    expect(wrapper.find(".loc-dialog").exists()).toBe(true);
+    expect(wrapper.find(".settings-dialog").exists()).toBe(true);
     expect(dlg.findAll(".loc-row").length).toBe(2);
 
     await rows[0].find(".loc-deactivate-btn").trigger("click");
     await flushPromises();
 
-    expect(invokeMock).toHaveBeenCalledWith("deactivate_location", { id: 1 });
+    // 票 04：停用改走双向 set_location_enabled
+    expect(invokeMock).toHaveBeenCalledWith("set_location_enabled", { id: 1, enabled: false });
     // 弹窗仍开着；行内未保存的改名保留；停用态行内可见
-    expect(wrapper.find(".loc-dialog").exists()).toBe(true);
+    expect(wrapper.find(".settings-dialog").exists()).toBe(true);
     expect(
-      (wrapper.find(".loc-row .loc-name-input").element as HTMLInputElement).value,
+      (dlg.find(".loc-row .loc-name-input").element as HTMLInputElement).value,
     ).toBe("老家");
-    expect(wrapper.find(".loc-row .loc-disabled-chip").exists()).toBe(true);
-    // 行级操作触发外层静默刷新（changed → list_locations），但弹窗不关
-    const refreshCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_locations");
-    expect(refreshCalls.length).toBeGreaterThanOrEqual(1);
+    expect(dlg.find(".loc-row .loc-disabled-chip").exists()).toBe(true);
+
+    // 票 04 补的恢复通道：停用的地点可再启用
+    invokeMock.mockClear();
+    await dlg.find(".loc-row .loc-activate-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("set_location_enabled", { id: 1, enabled: true });
+  });
+
+  // ── 操作 tab ──
+
+  it("操作 tab：列出全部操作，被引用的行删除禁用并提示只能停用", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openSettings(wrapper);
+
+    const rows = dlg.findAll(".dict-row");
+    expect(
+      rows.map((r) => (r.find(".name-input").element as HTMLInputElement).value),
+    ).toEqual(["喂食", "活动区换水", "巢穴保湿", "垃圾清理"]);
+
+    // 活动区换水被历史记录引用 → 删除禁用（规则 10）
+    const water = rows[1];
+    expect(water.find(".erase-btn").attributes("disabled")).toBeDefined();
+    expect(water.find(".erase-btn").attributes("title")).toContain("只能停用");
+    // 未被引用的可删
+    expect(rows[2].find(".erase-btn").attributes("disabled")).toBeUndefined();
+  });
+
+  it("操作 tab：登记类切提醒 + 填建议间隔，保存发出 save_action 并刷新首页（验收 4 的链路）", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openSettings(wrapper);
+
+    const water = dlg.findAll(".dict-row")[1];
+    expect((water.find(".kind-select").element as HTMLSelectElement).value).toBe("log_only");
+    // 登记类不显示间隔输入
+    expect(water.find(".interval-input").exists()).toBe(false);
+
+    await water.find(".kind-select").setValue("reminding");
+    const interval = water.find(".interval-input");
+    expect(interval.exists()).toBe(true);
+    await interval.setValue("3");
+
+    invokeMock.mockClear();
+    await dlg.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("save_action", {
+      input: {
+        id: 2,
+        name: "活动区换水",
+        kind: "reminding",
+        is_feeding: false,
+        suggested_interval_days: 3,
+        sort: 1,
+      },
+    });
+    // changed → 外层刷新首页数据（卡片红/灰数据驱动重算，验收 4）
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(true);
+  });
+
+  it("操作 tab：停用即时生效（set_action_enabled + changed 刷新），弹窗不关", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openSettings(wrapper);
+
+    invokeMock.mockClear();
+    const hydrate = dlg.findAll(".dict-row")[2];
+    await hydrate.find(".row-btn").trigger("click"); // 启用行的第一个行级按钮是「停用」
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("set_action_enabled", { id: 3, enabled: false });
+    expect(wrapper.find(".settings-dialog").exists()).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_colonies")).toBe(true);
+  });
+
+  it("操作 tab：可新增操作（默认提醒类、建议间隔 7），保存一并提交", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openSettings(wrapper);
+
+    await dlg.find(".add-input").setValue("糖水");
+    await dlg.find(".add-btn").trigger("click");
+    expect(dlg.findAll(".dict-row").length).toBe(5);
+
+    invokeMock.mockClear();
+    await dlg.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("save_action", {
+      input: {
+        id: null,
+        name: "糖水",
+        kind: "reminding",
+        is_feeding: false,
+        suggested_interval_days: 7,
+        sort: 4,
+      },
+    });
+  });
+
+  // ── 食物 tab ──
+
+  it("食物 tab：改名保存走 save_food；停用即时生效（验收 1 的入口）；停用行置灰", async () => {
+    const wrapper = await mountApp();
+    const dlg = await openSettings(wrapper);
+    await dlg.find(".tab-foods").trigger("click");
+
+    const rows = dlg.findAll(".dict-row");
+    expect(
+      rows.map((r) => (r.find(".name-input").element as HTMLInputElement).value),
+    ).toEqual(["种子", "干虾仁", "面包虫", "蚕蛹"]);
+    // 停用的「蚕蛹」整行置灰 + 行级第一按钮是「启用」
+    expect(rows[3].classes()).toContain("row-disabled");
+    expect(rows[3].find(".row-btn").text()).toBe("启用");
+
+    await rows[0].find(".name-input").setValue("瓜子");
+    invokeMock.mockClear();
+    await dlg.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("save_food", {
+      input: { id: 1, name: "瓜子", sort: 0 },
+    });
+
+    invokeMock.mockClear();
+    await dlg.findAll(".dict-row")[1].find(".row-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("set_food_enabled", { id: 2, enabled: false });
   });
 });
 

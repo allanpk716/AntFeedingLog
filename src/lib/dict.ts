@@ -8,13 +8,14 @@ import type { ActionInput, ActionKind, CareActionItem, FoodInput, FoodItem } fro
 
 // ── 操作 ─────────────────────────────────────────────────────────────────
 
-/** 操作行本地编辑态：间隔用字符串承载输入框原文（空串=未设），保存时才解析 */
+/** 操作行本地编辑态：间隔用输入框原文承载（空串=未设），保存时才解析。
+ * type=number 的输入框经 v-model 可能给回数字，故 intervalText 放宽为 string | number。 */
 export interface ActionRow {
   id: number | null;
   name: string;
   kind: ActionKind;
   isFeeding: boolean;
-  intervalText: string;
+  intervalText: string | number;
   enabled: boolean;
   referenced: boolean;
 }
@@ -34,9 +35,10 @@ export function buildActionRows(actions: CareActionItem[]): ActionRow[] {
     }));
 }
 
-/** 间隔输入框原文 → 数字；空串=null（无建议间隔）；非数字=NaN（交给校验拦）。 */
-export function parseInterval(text: string): number | null {
-  const trimmed = text.trim();
+/** 间隔输入框原文 → 数字；空串=null（无建议间隔）；非数字=NaN（交给校验拦）。
+ * type=number 输入框经 v-model 可能给回数字，先统一转字符串再判。 */
+export function parseInterval(text: string | number): number | null {
+  const trimmed = String(text ?? "").trim();
   if (trimmed === "") {
     return null;
   }

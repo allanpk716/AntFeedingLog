@@ -68,6 +68,15 @@ describe("操作行：本地编辑态 → save 入参", () => {
     expect(parseInterval(" 7 ")).toBe(7);
     expect(parseInterval("abc")).toBeNaN();
   });
+
+  it("parseInterval 接受 type=number 输入框经 v-model 给回的数字（回归：数字不炸）", () => {
+    expect(parseInterval(3)).toBe(3);
+    expect(parseInterval(0)).toBe(0);
+    expect(validateActionRows([{
+      id: 1, name: "喂食", kind: "reminding", isFeeding: true,
+      intervalText: 3, enabled: true, referenced: false,
+    }])).toBe("");
+  });
 });
 
 describe("操作行：保存前本地预检", () => {

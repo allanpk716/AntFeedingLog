@@ -1,12 +1,12 @@
 <script setup lang="ts">
 /**
- * 地点清单管理：改名、上下移调排序、新增、停用、删除。
+ * 地点清单管理面板（票 04 从 LocationManagerDialog 抽出，供独立弹窗与设置页复用）：
+ * 改名、上下移调排序、新增、停用/启用、删除。
  * 删除校验在 Rust：被窝引用的地点只能停用、不能物理删（评审附录规则 10）。
  * 保存 = 按当前行序逐行 save_location（sort = 行下标）。
  *
- * 关弹窗的只有两条路：整体「保存」成功、点取消。
- * 停用/删除这类行级操作只抛 changed 让外层静默刷新数据，弹窗保持打开，
- * 行内未保存的改名/排序也不受影响（行状态在本地维护，不因外层刷新重建）。
+ * 行级操作（停用/启用/删除）只抛 changed 让外层静默刷新数据，面板保持打开，
+ * 行内未保存的改名/排序不受影响（行状态在本地维护，不因外层刷新重建）。
  */
 import { ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
@@ -18,8 +18,8 @@ interface Row {
   enabled: boolean;
 }
 
-const props = defineProps<{ locations: LocationItem[] }>();
-const emit = defineEmits<{ close: []; saved: []; changed: [] }>();
+const props = defineProps<{ locations: LocationItem[]; showCancel?: boolean }>();
+const emit = defineEmits<{ saved: []; changed: []; cancel: [] }>();
 
 function buildRows(locations: LocationItem[]): Row[] {
   return [...locations]
@@ -75,7 +75,6 @@ async function save() {
       await invoke("save_location", { input: { id: row.id, name: row.name, sort: i } });
     }
     emit("saved");
-    emit("close");
   } catch (e) {
     error.value = String(e);
   } finally {
@@ -83,13 +82,13 @@ async function save() {
   }
 }
 
-async function deactivate(row: Row) {
+async function setEnabled(row: Row, enabled: boolean) {
   if (row.id === null) return;
   busy.value = true;
   error.value = "";
   try {
-    await invoke("deactivate_location", { id: row.id });
-    row.enabled = false;
+    await invoke("set_location_enabled", { id: row.id, enabled });
+    row.enabled = enabled;
     emit("changed");
   } catch (e) {
     error.value = String(e);
@@ -115,67 +114,44 @@ async function erase(row: Row) {
 </script>
 
 <template>
-  <div class="overlay">
-    <div class="dialog loc-dialog">
-      <h3>地点管理</h3>
+  <div class="loc-panel">
+    <div v-for="(row, index) in rows" :key="row.id ?? `new-${index}`" class="loc-row" :class="{ 'row-disabled': !row.enabled }">
+      <span class="loc-movers">
+        <button class="move-up" type="button" :disabled="index === 0" @click="move(index, -1)">↑</button>
+        <button class="move-down" type="button" :disabled="index === rows.length - 1" @click="move(index, 1)">↓</button>
+      </span>
+      <input v-model="row.name" class="loc-name-input" type="text" />
+      <span v-if="!row.enabled" class="loc-disabled-chip">已停用</span>
+      <button v-if="row.enabled" class="loc-deactivate-btn" type="button" @click="setEnabled(row, false)">停用</button>
+      <button v-else class="loc-activate-btn" type="button" @click="setEnabled(row, true)">启用</button>
+      <button class="loc-erase-btn" type="button" @click="erase(row)">删除</button>
+    </div>
 
-      <div v-for="(row, index) in rows" :key="row.id ?? `new-${index}`" class="loc-row">
-        <span class="loc-movers">
-          <button class="move-up" type="button" :disabled="index === 0" @click="move(index, -1)">↑</button>
-          <button class="move-down" type="button" :disabled="index === rows.length - 1" @click="move(index, 1)">↓</button>
-        </span>
-        <input v-model="row.name" class="loc-name-input" type="text" />
-        <span v-if="!row.enabled" class="loc-disabled-chip">已停用</span>
-        <button class="loc-deactivate-btn" type="button" :disabled="!row.enabled" @click="deactivate(row)">停用</button>
-        <button class="loc-erase-btn" type="button" @click="erase(row)">删除</button>
-      </div>
+    <div class="loc-add">
+      <input v-model="addName" class="loc-add-input" type="text" placeholder="新地点，如：阳台" />
+      <button class="loc-add-btn" type="button" @click="addRow">＋ 添加</button>
+    </div>
 
-      <div class="loc-add">
-        <input v-model="addName" class="loc-add-input" type="text" placeholder="新地点，如：阳台" />
-        <button class="loc-add-btn" type="button" @click="addRow">＋ 添加</button>
-      </div>
+    <p v-if="error" class="loc-error">{{ error }}</p>
 
-      <p v-if="error" class="loc-error">{{ error }}</p>
-
-      <div class="dlg-btns">
-        <span class="spacer"></span>
-        <button class="btn cancel-btn" type="button" @click="$emit('close')">取消</button>
-        <button class="btn primary save-locations" type="button" :disabled="busy" @click="save">保存</button>
-      </div>
+    <div class="dlg-btns">
+      <span class="spacer"></span>
+      <button v-if="props.showCancel !== false" class="btn cancel-btn" type="button" @click="$emit('cancel')">取消</button>
+      <button class="btn primary save-locations" type="button" :disabled="busy" @click="save">保存</button>
     </div>
   </div>
 </template>
 
 <style scoped>
-.overlay {
-  position: fixed;
-  inset: 0;
-  background: var(--overlay);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 50;
-}
-
-.loc-dialog {
-  width: 480px;
-  max-width: 92vw;
-  background: var(--card);
-  border-radius: 14px;
-  padding: 18px;
-  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
-}
-
-.loc-dialog h3 {
-  font-size: 15px;
-  margin-bottom: 12px;
-}
-
 .loc-row {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-bottom: 8px;
+}
+
+.loc-row.row-disabled {
+  opacity: 0.55;
 }
 
 .loc-movers {
