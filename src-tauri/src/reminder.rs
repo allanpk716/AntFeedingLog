@@ -308,6 +308,11 @@ pub fn send_test_notification(handle: &tauri::AppHandle) -> Result<(), String> {
 /// 一轮「检查 → 发通知 → 刷新托盘概要」。启动首查与调度线程共用。
 /// 单轮失败不致命，静默等下一个 30 分钟周期。
 pub fn check_and_notify(handle: &tauri::AppHandle) {
+    if crate::updater::is_write_blocked() {
+        // 票 04 禁写窗口：本轮台账落库会被拒 → 静默跳过；窗口只到进程退出，
+        // 错过的提醒重开后按台账去重规则自然补算（超期锚定当天，不会丢）
+        return;
+    }
     let Some(state) = handle.try_state::<crate::DbState>() else {
         return;
     };

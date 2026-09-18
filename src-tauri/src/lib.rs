@@ -26,10 +26,14 @@ pub struct SchemaInfo {
 pub struct DbState(Mutex<Connection>, std::path::PathBuf);
 
 /// 借出连接的统一入口（锁被毒化时转成前端可见的错误串）。
+/// 票 04 禁写窗口：快照完成后到进程退出前，一切请求在此拒绝。取舍：挂在统一
+/// 入口把读也一并拦下——窗口只有安装器拉起前的一瞬（随后进程退出），读失败
+/// 只是前端一次报错；而逐个写命令去挂太散、未来新命令可能漏挂。
 fn with_conn<T>(
     state: tauri::State<'_, DbState>,
     f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
 ) -> Result<T, String> {
+    updater::ensure_writable()?;
     let conn = state.0.lock().map_err(|e| e.to_string())?;
     f(&conn)
 }

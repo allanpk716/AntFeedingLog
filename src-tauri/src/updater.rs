@@ -29,6 +29,17 @@
 //!
 //! 生产检查器、每日定时线程与通知发送是薄封装（lib.rs 调
 //! `spawn_daily_checker`，系统行为不进单测）。
+//!
+//! 升级前快照（票 04）：[`pre_update_snapshot`] 复用 system.rs 既有拷贝（评审附录
+//! 规则 11：journal_mode=DELETE 短暂拿锁+拷贝单 .db 即完整），文件名
+//! `backups/pre-update-v<版本>-<yyyymmdd-hhmmss>.db` 同版本并存不覆盖；禁写闸门
+//! [`gate_write`] + 进程级 AtomicBool 标志，快照落成后到进程退出前拒绝一切写请求
+//! （拦截点：lib.rs `with_conn` 统一入口 / [`daily_tick`] /
+//! reminder::check_and_notify，取舍记在各处注释）。挂点在 [`build_updater`] 的
+//! `on_before_exit`（插件 2.11.0 在 Windows 安装器启动前、进程退出前回调，闭包
+//! 签名 `Fn()` 无参）；快照失败只记日志，绝不阻塞安装流程。
+
+use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -116,6 +127,64 @@ pub fn manual_result(outcome: CheckOutcome) -> Result<CheckOutcome, String> {
     }
 }
 
+// ── 核心：升级前快照与禁写窗口（票 04）───────────────────────────────────
+
+/// 快照文件名：`pre-update-v<当前版本>-<yyyymmdd-hhmmss>.db`（票面命名）。
+/// 时间戳由调用方注入（可测），版本与 stamp 都按字符串拼接、不做格式裁剪。
+pub fn snapshot_file_name(version: &str, stamp: &str) -> String {
+    format!("pre-update-v{version}-{stamp}.db")
+}
+
+/// 升级前快照：拷贝库文件到 `<数据目录>/backups/`，返回快照完整路径。
+/// 复用 [`crate::system::backup_db_file`]（journal_mode=DELETE 下短暂拿锁挡住
+/// 并发写后拷贝单 .db 即完整，评审附录规则 11）——不另写拷贝逻辑；拿锁由调用方
+/// 负责（与 lib.rs backup_to 同一模式）。文件名带秒级时间戳 → 同版本重试/重装
+/// 两次快照并存不覆盖（同一秒内的第二次才会覆盖；挂点每进程至多一次、重装间隔
+/// 远大于 1s，不做尾缀去重——取舍记录）。失败返回 Err（源缺失/磁盘满等），
+/// 不 panic 不中断升级流程——调用方记日志继续安装。
+pub fn pre_update_snapshot(
+    db_path: &Path,
+    data_dir: &Path,
+    version: &str,
+    stamp: &str,
+) -> Result<std::path::PathBuf, String> {
+    let target = data_dir
+        .join("backups")
+        .join(snapshot_file_name(version, stamp));
+    crate::system::backup_db_file(db_path, &target)?;
+    Ok(target)
+}
+
+/// 禁写闸门（纯逻辑）：`blocked` = true（更新安装窗口）时写请求一律拒绝；
+/// false（日常运行）原样放行。
+pub fn gate_write(blocked: bool) -> Result<(), String> {
+    if blocked {
+        Err("应用正在安装更新，数据写入已暂停（升级前数据快照已保存）；若停留此状态请重启应用".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// 进程级禁写标志（票 04）：快照完成后置位，直到安装流程结束。
+static WRITE_BLOCKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 置位/复位进程级禁写标志。置位后 [`ensure_writable`] 拒绝一切写请求。
+/// 复位契约：安装成功 = 进程随即退出（标志随进程消亡）；安装失败（install 返回
+/// Err、进程存活）由票 05 的确认流复位，避免应用卡在只读态。
+pub fn set_write_blocked(blocked: bool) {
+    WRITE_BLOCKED.store(blocked, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 当前是否处于禁写窗口（快照已完成、等待进程退出）。
+pub fn is_write_blocked() -> bool {
+    WRITE_BLOCKED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 写请求统一入口的闸门：读进程级标志并放行/拒绝。
+pub fn ensure_writable() -> Result<(), String> {
+    gate_write(is_write_blocked())
+}
+
 fn db_err(e: rusqlite::Error) -> String {
     format!("数据库操作失败: {e}")
 }
@@ -177,12 +246,67 @@ use tauri::Manager;
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 带总超时的 updater 构造（endpoints / pubkey 来自 tauri.conf.json）。
+/// 票 04：升级前快照挂在本构造的 `on_before_exit` 上——插件 2.11.0 在 Windows
+/// 安装器启动前、`std::process::exit` 前回调（插件源码 install_inner），检查
+/// 路径不触发它；票 05 的安装流复用本构造即自动带上快照挂点。
 fn build_updater(app: &tauri::AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
     use tauri_plugin_updater::UpdaterExt;
+    let app_for_exit = app.clone();
     app.updater_builder()
         .timeout(CHECK_TIMEOUT)
+        // 闭包签名 Fn() 无参（updater 2.11.0 `OnBeforeExit`），AppHandle 靠捕获进来；
+        // 本调用会顶掉 UpdaterExt::updater_builder 预挂的 cleanup_before_exit，故在
+        // 闭包末尾补调一次（tauri 2.11.5 起 pub），保持插件退出清理行为不变。
+        .on_before_exit(move || {
+            before_exit_snapshot(&app_for_exit);
+            app_for_exit.cleanup_before_exit();
+        })
         .build()
         .map_err(|e| format!("初始化更新器失败: {e}"))
+}
+
+/// 快照时间戳（本地时间，yyyymmdd-hhmmss）。薄封装不进单测——防覆盖语义由
+/// snapshot_file_name / pre_update_snapshot 的注入式测试覆盖。
+fn now_stamp() -> String {
+    chrono::Local::now().format("%Y%m%d-%H%M%S").to_string()
+}
+
+/// on_before_exit 挂点本体（票 04，薄封装不进单测；核心 pre_update_snapshot /
+/// set_write_blocked 全测）：拿锁挡并发写 → 拷贝快照 → 锁内先置禁写标志 → 放锁。
+/// 标志在持锁期间置位：放锁后任何写闸门（with_conn / daily_tick /
+/// check_and_notify）都进不来，快照与实际库之间不存在漂移窗口。
+/// 任何失败只记日志、绝不阻塞安装（票面：失败不阻塞升级，状态即本函数日志）；
+/// 快照失败也不置禁写——没有快照可保护，且安装失败残留时应用需保持可用。
+fn before_exit_snapshot(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<crate::DbState>() else {
+        return;
+    };
+    let data_dir = match app.path().app_data_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("[updater] 升级前快照失败（不阻塞升级）：解析数据目录失败: {e}");
+            return;
+        }
+    };
+    // 版本号与插件同源：updater 2.11.0 的 UpdaterBuilder 也取 package_info().version
+    // 作 current_version，保证快照名里的版本 = 更新流认为的当前版本（三处版本号
+    // 一致性由票 03 校验脚本兜底）。
+    let version = app.package_info().version.to_string();
+    let guard = match state.0.lock() {
+        Ok(guard) => guard,
+        Err(e) => {
+            eprintln!("[updater] 升级前快照失败（不阻塞升级）：库锁不可用: {e}");
+            return;
+        }
+    };
+    match pre_update_snapshot(&state.1, &data_dir, &version, &now_stamp()) {
+        Ok(path) => {
+            set_write_blocked(true);
+            eprintln!("[updater] 升级前快照完成，进入禁写窗口: {}", path.display());
+        }
+        Err(e) => eprintln!("[updater] 升级前快照失败（不阻塞升级）: {e}"),
+    }
+    drop(guard);
 }
 
 /// 插件 Update → 最小信息（每日/手动两条路径共用）。
@@ -250,6 +374,11 @@ fn notify_update(handle: &tauri::AppHandle, version: &str, notes: Option<&str>) 
 /// 任何失败都止于日志，绝不弹错误通知（spec 错误路径约定；
 /// 评审 R1-4：DB 侧 Err 也记日志，不静默丢弃）。
 fn daily_tick(handle: &tauri::AppHandle) {
+    if is_write_blocked() {
+        // 票 04 禁写窗口：本轮检查与记账都会写库 → 整轮跳过（窗口只到进程退出，
+        // 一瞬即逝；错过的一轮重开后按"上次检查日"自然补查）
+        return;
+    }
     let Some(state) = handle.try_state::<crate::DbState>() else {
         return;
     };
@@ -628,5 +757,124 @@ mod tests {
         // 每日照常可查
         let out = run_daily_flow(&conn, &checker, D1).unwrap();
         assert_eq!(out, DailyOutcome::NoUpdate);
+    }
+
+    // ── 升级前快照与禁写窗口（票 04）──
+
+    use tempfile::TempDir;
+
+    /// 建文件库（tempdir）并迁移到最新 schema（沿 system.rs 测试先例）。
+    fn file_conn() -> (Connection, std::path::PathBuf, TempDir) {
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let db_path = dir.path().join("data").join(crate::db::DB_FILE_NAME);
+        let conn = crate::db::open_and_migrate(&db_path).expect("建库失败");
+        (conn, db_path, dir)
+    }
+
+    #[test]
+    fn snapshot_file_name_embeds_version_and_stamp() {
+        // 票面命名：pre-update-v<当前版本>-<yyyymmdd-hhmmss>.db
+        assert_eq!(
+            snapshot_file_name("0.2.0", "20260918-181223"),
+            "pre-update-v0.2.0-20260918-181223.db"
+        );
+    }
+
+    #[test]
+    fn same_version_snapshots_coexist_without_overwrite() {
+        // 同版本重试/重装：不同时间戳两次快照并存，旧快照不被覆盖
+        let (_conn, db_path, dir) = file_conn();
+        let data_dir = dir.path();
+
+        let first = pre_update_snapshot(&db_path, data_dir, "0.2.0", "20260918-120000").unwrap();
+        let second = pre_update_snapshot(&db_path, data_dir, "0.2.0", "20260918-120001").unwrap();
+
+        assert_ne!(first, second, "两次快照路径不同");
+        assert!(first.exists() && second.exists(), "两份快照并存");
+        assert_eq!(
+            first.parent(),
+            Some(data_dir.join("backups").as_path()),
+            "落在数据目录 backups/ 下"
+        );
+        assert!(
+            first
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("pre-update-v0.2.0-"),
+            "文件名含源版本，实际：{}",
+            first.display()
+        );
+
+        // 两份都是完整库（可被应用正式打开通道重开，迁移幂等通过）
+        for path in [&first, &second] {
+            let reopened = crate::db::open_and_migrate(path).expect("快照产物可重开");
+            assert_eq!(
+                crate::db::schema_version_of(&reopened).unwrap(),
+                crate::db::SCHEMA_VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_product_reopenable_with_data_complete() {
+        // 带数据的快照 → 应用正式打开通道重开 → 数据齐（沿 system.rs 备份测试先例）
+        let (conn, db_path, dir) = file_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+
+        let snap = pre_update_snapshot(&db_path, dir.path(), "0.1.0", "20260918-181223").unwrap();
+        let reopened = crate::db::open_and_migrate(&snap).expect("快照产物可被应用重开");
+        let colonies: i64 = reopened
+            .query_row("SELECT COUNT(*) FROM colony", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(colonies, 1, "快照数据完整");
+    }
+
+    #[test]
+    fn snapshot_failure_returns_error_without_panicking() {
+        // 快照失败（源缺失等）→ Err 交给调用方记日志后继续安装，不 panic 不中断
+        let dir = TempDir::new().expect("创建临时目录失败");
+        let outcome = pre_update_snapshot(
+            &dir.path().join("no-such.db"),
+            dir.path(),
+            "0.2.0",
+            "20260918-181223",
+        );
+        assert!(outcome.is_err(), "源不存在应报错而不是静默产出空快照");
+    }
+
+    #[test]
+    fn gate_write_rejects_only_during_window() {
+        // 禁写闸门：窗口外（快照前/日常运行）正常写放行；窗口内写请求一律拒绝
+        assert!(gate_write(false).is_ok(), "未禁写不受影响");
+
+        let err = gate_write(true).unwrap_err();
+        assert!(err.contains("安装更新"), "拒绝文案要点明原因，实际：{err}");
+    }
+
+    #[test]
+    fn write_block_flag_roundtrip() {
+        // 进程级标志：置位后写请求被拒、复位后恢复（Drop 兜底复位，不污染其他测试）
+        struct ResetFlag;
+        impl Drop for ResetFlag {
+            fn drop(&mut self) {
+                set_write_blocked(false);
+            }
+        }
+        let _reset = ResetFlag;
+
+        assert!(!is_write_blocked(), "初始未禁写");
+        assert!(ensure_writable().is_ok());
+
+        set_write_blocked(true);
+        assert!(is_write_blocked());
+        assert!(ensure_writable().is_err(), "置位后写请求被拒");
+
+        set_write_blocked(false);
+        assert!(ensure_writable().is_ok(), "复位后恢复放行");
     }
 }
