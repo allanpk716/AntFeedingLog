@@ -12,7 +12,6 @@ import {
   upToDateText,
   updateAvailableTitle,
   type CheckOutcome,
-  type DownloadProgress,
   type InstallOutcome,
   type ProgressView,
   type UpdateState,

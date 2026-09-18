@@ -471,6 +471,26 @@ fn get_update_state() -> Result<updater::UpdateState, String> {
     Ok(updater::current_update_state())
 }
 
+// ── 更新 UI 的轻量出口（release-update 票 06 设置页「更新」节）──
+
+/// 当前应用版本（设置页展示）。与更新流同源（package_info，即 tauri.conf.json
+/// 的 version），快照/启动判定/页面展示三方口径一致。
+#[tauri::command]
+fn get_app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+/// 打开发布页（升级未完成引导 / 安装失败的手动下载出口）。走 Rust 侧 opener
+/// 插件（与 reveal_data_folder 同款），前端不需要 opener JS 权限；
+/// capabilities 保持不加任何 updater/opener 权限。
+#[tauri::command]
+fn open_releases_page(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(updater::RELEASES_PAGE_URL, None::<&str>)
+        .map_err(|e| format!("打开发布页失败: {e}"))
+}
+
 // ── 系统级数据出口（票 09）：打开数据文件夹 / 安全备份 / 导出 ──
 
 /// 打开数据文件夹（opener 打开 app data 目录；目录不存在先创建）。
@@ -641,6 +661,8 @@ pub fn run() {
             check_update_now,
             confirm_and_install,
             get_update_state,
+            get_app_version,
+            open_releases_page,
             reveal_data_folder,
             backup_to,
             export_data,

@@ -57,6 +57,11 @@ use serde::Serialize;
 /// settings 表键名：每日更新检查最近一次执行的日期（ISO 日期串）。
 pub const K_LAST_CHECK_DAY: &str = "update_last_check_day";
 
+/// 发布页地址（票 06 手动下载出口：升级未完成引导 / 安装失败的兜底）。
+/// 与 tauri.conf.json endpoints 同仓库；`releases/latest` 恒指最新发布，
+/// 不随版本号变，无需在发版时改这里。
+pub const RELEASES_PAGE_URL: &str = "https://github.com/allanpk716/AntFeedingLog/releases/latest";
+
 /// 远端有新版时的最小信息：版本号 + release 说明。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpdateInfo {

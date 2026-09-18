@@ -1,6 +1,7 @@
 <script setup lang="ts">
 /**
- * 设置弹窗（票 04 字典管理 + 票 06 通知 + 票 09 数据收口）：操作 / 食物 / 地点 / 通知 / 数据 五个 tab。
+ * 设置弹窗（票 04 字典管理 + 票 06 通知 + 票 09 数据收口 + release-update 票 06 更新）：
+ * 操作 / 食物 / 地点 / 通知 / 数据 / 更新 六个 tab。
  * - 操作行可编辑：名字、性质（提醒/仅登记）、建议间隔（提醒类显示）、
  *   「喂食」标记（带提示，允许编辑不强制唯一）、停用/启用、删除
  *   （被历史记录/提醒台账引用时删除禁用，只能停用——规则 10）。
@@ -11,6 +12,8 @@
  *   Rust 侧 set_settings 同步自启插件状态。
  * - 数据 tab（票 09）：打开数据文件夹 / 安全备份（Rust 拷贝库文件，无需退出）/
  *   导出 CSV / JSON（归档带走）；帮助文案写明手动拷贝需先从托盘真实退出。
+ * - 更新 tab（release-update 票 06）：当前版本 / 立即检查更新 / 确认下载安装，
+ *   全部走 Tauri command；升级未完成残留的引导也挂在本节顶（UpdatePanel）。
  *
  * 行级 停用/启用/删除 即时落库并抛 changed（外层刷新首页，卡片红/灰随之变化）；
  * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
@@ -32,8 +35,9 @@ import {
 } from "../lib/dict";
 import { DAYS_AHEAD_ERROR, toForm, toSettings, type NotifySettingsForm } from "../lib/notifySettings";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
+import UpdatePanel from "./UpdatePanel.vue";
 
-type Tab = "actions" | "foods" | "locations" | "notify" | "data";
+type Tab = "actions" | "foods" | "locations" | "notify" | "data" | "update";
 
 const emit = defineEmits<{ close: []; changed: [] }>();
 
@@ -328,6 +332,9 @@ function eraseTitle(referenced: boolean): string {
         <button class="tab tab-data" :class="{ active: activeTab === 'data' }" type="button" @click="activeTab = 'data'">
           数据
         </button>
+        <button class="tab tab-update" :class="{ active: activeTab === 'update' }" type="button" @click="activeTab = 'update'">
+          更新
+        </button>
       </div>
 
       <!-- 操作 -->
@@ -450,8 +457,13 @@ function eraseTitle(referenced: boolean): string {
         </div>
       </div>
 
+      <!-- 更新（release-update 票 06）：检查更新 / 确认安装 / 升级残留引导 -->
+      <div v-else-if="activeTab === 'update'" class="tab-body">
+        <UpdatePanel />
+      </div>
+
       <!-- 数据（票 09）：打开数据文件夹 / 安全备份 / 导出归档 -->
-      <div v-else class="tab-body">
+      <div v-else-if="activeTab === 'data'" class="tab-body">
         <div class="data-actions">
           <button class="btn data-btn reveal-btn" type="button" title="在资源管理器中打开库文件所在目录" @click="revealFolder">
             打开数据文件夹
