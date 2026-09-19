@@ -988,12 +988,6 @@ mod tests {
         buf
     }
 
-    fn read_zip_names(pkg: &Path) -> Vec<String> {
-        let f = std::fs::File::open(pkg).unwrap();
-        let mut z = zip::ZipArchive::new(f).unwrap();
-        (0..z.len()).map(|i| z.by_index(i).unwrap().name().to_string()).collect()
-    }
-
     const STAMP: &str = "20260919-120000";
 
     fn live_lock(db_path: &Path) -> Mutex<Connection> {

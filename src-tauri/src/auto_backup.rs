@@ -1197,7 +1197,7 @@ mod tests {
     fn run_triggered_without_dir_still_persists_clamp_and_stays_silent() {
         // 目录未设：不产生任何备份动作（验收 8），但钳制在判定入口收敛并持久化
         let _flow = flow_guard();
-        let (dir, data_dir, _backup_dir, db_path) = io_fixture();
+        let (_dir, data_dir, _backup_dir, db_path) = io_fixture();
         let today = chrono::Local::now().date_naive();
         backup_config::save(
             &data_dir,
