@@ -7,6 +7,7 @@
  */
 import { computed, onMounted, ref } from "vue";
 import { getWebUiWizardDone, listColonies, listLocations, subscribe } from "./lib/ipc";
+import { watchDataVersion } from "./lib/versionSync";
 import type { Colony, LocationItem } from "./types";
 import { groupColonies, splitColonies } from "./lib/home";
 import { todayLabel } from "./lib/dates";
@@ -76,9 +77,18 @@ function onSettingsClosed() {
 
 onMounted(() => {
   void refresh();
-  // 恢复完成广播（数据安全二期票 04）：整库被替换，各页数据全部重拉——
-  // 首页在此刷新；统计/记录页离开再进时按 v-if 重挂载自然重拉
+  // 恢复完成广播（数据安全二期票 04，语义=无条件刷新，票 06 不改）：整库被
+  // 替换，各页数据全部重拉——首页在此刷新；统计/记录页离开再进时按 v-if
+  // 重挂载自然重拉
   void subscribe("db-restored", () => {
+    void refresh();
+  });
+  // 数据版本广播（webui-checkin 票 06）：任一端记录、开着的一端自动刷新——
+  // 同 epoch 版本落后重拉当前页；epoch 变（电脑重启过）无条件重拉。桌面走
+  // data-version 事件、浏览器走 SSE（versionSync 对账）；恢复完成在浏览器侧
+  // 也经恢复后的版本帧到达（服务端已做跨恢复单调抬升）。本组件是根，常驻
+  // 不卸载，与 db-restored 同款不退订。
+  void watchDataVersion(() => {
     void refresh();
   });
   // 网页端首启向导（webui-checkin 票 03）：只在明确查到「未做」（false）时弹；

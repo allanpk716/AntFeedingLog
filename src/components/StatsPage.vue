@@ -8,6 +8,7 @@
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { earliestLogDate, getStats, listColonies } from "../lib/ipc";
+import { watchDataVersion } from "../lib/versionSync";
 import * as echarts from "echarts";
 import type { Colony, StatsDayDetail, StatsPayload } from "../types";
 import { todayIso } from "../lib/dates";
@@ -38,6 +39,8 @@ const range = ref<StatsRange>("6m");
 const payload = ref<StatsPayload | null>(null);
 const pageError = ref("");
 const loading = ref(false);
+/** 版本广播退订柄（票 06；页签卸载时调用）。 */
+let unwatchVersion: (() => void) | null = null;
 
 const totalLogs = computed(() => payload.value?.daily.reduce((s, d) => s + d.count, 0) ?? 0);
 const foodSlices = computed(() => normalizeFoodShare(payload.value?.food_share ?? []));
@@ -207,9 +210,15 @@ function renderWeekly() {
 
 onMounted(() => {
   void refresh();
+  // 数据版本广播（webui-checkin 票 06）：别端记录后本页开着就重拉（复用
+  // refresh；筛选条件原样保留，数据驱动重算）。页签卸载即退订。
+  unwatchVersion = watchDataVersion(() => void refresh());
 });
 watch(payload, () => void nextTick(renderCharts));
-onBeforeUnmount(disposeCharts);
+onBeforeUnmount(() => {
+  disposeCharts();
+  unwatchVersion?.();
+});
 </script>
 
 <template>

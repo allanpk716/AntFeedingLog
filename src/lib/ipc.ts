@@ -7,8 +7,9 @@
  * - 浏览器（网页端）：对内嵌 HTTP 服务的约定端点 `POST /api/cmd` 发 JSON
  *   （体 `{ cmd, args }`），凭证以 `Authorization: Bearer <token>` 携带（读
  *   localStorage，键见 WEBUI_TOKEN_KEY；票 04 起由页面写入）。HTTP 服务的
- *   白名单端点随票 05 落地后本路径自然生效；事件订阅的浏览器侧（SSE）同样随
- *   票 05 接线，当前返回立即退订的空实现。
+ *   白名单端点随票 05 落地后本路径自然生效；事件订阅的浏览器侧（SSE）随
+ *   票 06 接线——data-version 事件走一次性票据 + EventSource，见本文件
+ *   「浏览器 SSE」段。
  *
  * 约定：
  * - 每个前端在用的 Tauri 命令一个类型化包装（cmdFn 构造，入参对象沿用各调用点
@@ -59,6 +60,13 @@ export const WEBUI_TOKEN_KEY = "antfeedinglog.webui.token";
 
 /** 退订函数（与 Tauri listen 返回的 unlisten 同形）。 */
 export type UnlistenFn = () => void;
+
+/** SSE 版本帧（票 06：`/api/sse` 的 data 行 JSON；hello/version 两类）。 */
+export interface SseVersionFrame {
+  type: "hello" | "version";
+  epoch: string;
+  version: number;
+}
 
 /** 桌面 Tauri 环境判定：WebView 里由 Tauri 注入 `__TAURI_INTERNALS__`；纯浏览器没有。 */
 export function isTauri(): boolean {
@@ -115,16 +123,172 @@ async function httpInvoke<R>(command: string, args?: Record<string, unknown>): P
   return body as R;
 }
 
+// ── 浏览器 SSE：data-version 事件源（票 06，规格 B「SSE 短时票据」）─────────
+//
+// EventSource 建连带不了 Authorization 头，流程：先 POST /api/sse-ticket（主
+// 凭证换 60 秒一次性票据）→ 连 `/api/sse?ticket=`。**票据建连即消费（一次性）
+// ——所以必须在 onerror 里 close() 关掉 EventSource 原生自动重连**（原生重连
+// 带着旧票只会 401 死循环），然后重取票据重建连，带 1s/3s/10s 封顶退避。
+// 同一页面多个订阅者共享一条 SSE 连接（按 handler 计数管理生命周期）。
+// 对账（hello/version 帧 → 是否重拉）在 versionSync.ts，本层只管连接与派发。
+
+/** 重连退避序列（毫秒），越挫越狠、10 秒封顶。 */
+const SSE_BACKOFF_MS = [1_000, 3_000, 10_000] as const;
+
+interface BrowserSseState {
+  es: EventSource | null;
+  /** 取票进行中（防并发重复建连）。 */
+  connecting: boolean;
+  /** 连续失败计数（退避档位；onopen 成功即归零）。 */
+  attempt: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  handlers: Set<(payload: unknown) => void>;
+}
+
+let browserSse: BrowserSseState | null = null;
+
+/** 把一帧派发给所有 data-version 订阅者（handler 异常互不牵连）。 */
+function sseDispatch(frame: SseVersionFrame): void {
+  const state = browserSse;
+  if (!state) return;
+  for (const handler of [...state.handlers]) {
+    try {
+      handler(frame);
+    } catch (e) {
+      console.error("[ipc] data-version 处理器异常", e);
+    }
+  }
+}
+
+/** 全部退订：断连接、撤销挂起的重连。 */
+function sseTeardown(): void {
+  const state = browserSse;
+  browserSse = null;
+  if (!state) return;
+  if (state.timer !== null) clearTimeout(state.timer);
+  state.es?.close();
+}
+
+/** 测试专用：复位浏览器 SSE 单例（模块级连接状态不跨测试泄漏）。 */
+export function resetBrowserSseForTests(): void {
+  sseTeardown();
+}
+
+/** 主凭证换一次性票据（失败 throw，调用方按退避重试）。 */
+async function fetchSseTicket(): Promise<string> {
+  const headers: Record<string, string> = {};
+  const token = localStorage.getItem(WEBUI_TOKEN_KEY);
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  const res = await fetch("/api/sse-ticket", { method: "POST", headers });
+  if (!res.ok) {
+    throw `HTTP ${res.status}`;
+  }
+  const body: unknown = await res.json();
+  const ticket =
+    typeof body === "object" && body !== null
+      ? (body as { ticket?: unknown }).ticket
+      : undefined;
+  if (typeof ticket !== "string" || ticket === "") {
+    throw "票据响应缺 ticket";
+  }
+  return ticket;
+}
+
+function scheduleSseReconnect(): void {
+  const state = browserSse;
+  if (!state || state.timer !== null || state.handlers.size === 0) return;
+  const delay = SSE_BACKOFF_MS[Math.min(state.attempt, SSE_BACKOFF_MS.length - 1)];
+  state.attempt += 1;
+  state.timer = setTimeout(() => {
+    if (browserSse) {
+      browserSse.timer = null;
+      sseConnect();
+    }
+  }, delay);
+}
+
+function sseConnect(): void {
+  const state = browserSse;
+  if (!state || state.es || state.connecting) return;
+  state.connecting = true;
+  fetchSseTicket()
+    .then((ticket) => {
+      const cur = browserSse;
+      if (!cur) return; // 取票期间已全部退订
+      cur.connecting = false;
+      const es = new EventSource(`/api/sse?ticket=${encodeURIComponent(ticket)}`);
+      cur.es = es;
+      es.onopen = () => {
+        cur.attempt = 0; // 连上过：退避归零
+      };
+      es.onmessage = (ev) => {
+        try {
+          const frame = JSON.parse(String(ev.data)) as SseVersionFrame;
+          if (
+            frame !== null &&
+            typeof frame === "object" &&
+            (frame.type === "hello" || frame.type === "version") &&
+            typeof frame.epoch === "string" &&
+            typeof frame.version === "number"
+          ) {
+            sseDispatch(frame);
+          }
+          // 形状不对的帧：忽略，等下一帧
+        } catch {
+          // 半行/非 JSON：忽略
+        }
+      };
+      es.onerror = () => {
+        // 票据一次性：原生自动重连只会拿旧票撞 401 —— close 关掉它，重取票据再来
+        es.close();
+        if (browserSse === cur) {
+          cur.es = null;
+          scheduleSseReconnect();
+        }
+      };
+    })
+    .catch(() => {
+      const cur = browserSse;
+      if (!cur) return;
+      cur.connecting = false;
+      scheduleSseReconnect();
+    });
+}
+
 /**
  * 事件订阅包装（组件不得直接 import listen）。桌面 = Tauri 事件，事件对象
  * 拆包为 payload 再交处理器（与原各监听点取 `event.payload` 等价）；浏览器 =
- * SSE，随票 05 接线，当前返回立即退订的空实现（订阅不报错也不泄漏）。
+ * SSE（票 06）：仅 `data-version` 有源——首帧 hello、此后每次版本 bump 一帧
+ * version，负载 `{type, epoch, version}` 原样透传。恢复完成没有独立事件：服务
+ * 端恢复后把版本抬到已广播最大值+1 再广播 version 帧，订阅方（versionSync）
+ * 对账必判落后 → 刷新。其余事件桌面专属，返回立即退订的空实现。
  */
 export function subscribe<T>(event: string, handler: (payload: T) => void): Promise<UnlistenFn> {
   if (isTauri()) {
     return tauriListen<T>(event, (e) => handler(e.payload));
   }
-  return Promise.resolve(() => {});
+  if (event !== "data-version") {
+    return Promise.resolve(() => {});
+  }
+  const state = (browserSse ??= {
+    es: null,
+    connecting: false,
+    attempt: 0,
+    timer: null,
+    handlers: new Set(),
+  });
+  state.handlers.add(handler as (payload: unknown) => void);
+  if (!state.es && state.timer === null) {
+    sseConnect();
+  }
+  return Promise.resolve(() => {
+    state.handlers.delete(handler as (payload: unknown) => void);
+    if (state.handlers.size === 0) {
+      sseTeardown();
+    }
+  });
 }
 
 /** 命令包装函数：入参对象类型 A、返回类型 R、命令名挂 cmdName。 */

@@ -7,8 +7,9 @@
  * 新挂停用项前后端双重拒绝。任何编辑/删除成功抛 changed → 外层 refresh，
  * 首页「距上次」与超期态即时重算（数据驱动）。
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { deleteLog, listActions, listColonies, listFoods, listLogs, updateLog } from "../lib/ipc";
+import { watchDataVersion } from "../lib/versionSync";
 import type { CareActionItem, Colony, FoodItem, LogPage, LogRow } from "../types";
 import {
   buildLogFilter,
@@ -177,7 +178,9 @@ async function requestDelete(row: LogRow) {
   }
 }
 
-onMounted(async () => {
+/** 全量重拉：字典三件套 + 首页流水（筛选表单原样保留）。挂载与版本广播
+ * （webui-checkin 票 06，别端记录后本页开着就刷新）共用这一个入口。 */
+async function reloadAll() {
   try {
     const [cols, acts, fds] = await Promise.all([
       listColonies(),
@@ -191,6 +194,18 @@ onMounted(async () => {
     pageError.value = String(e);
   }
   await load(0);
+}
+
+/** 版本广播退订柄（票 06；页签卸载时调用）。 */
+let unwatchVersion: (() => void) | null = null;
+
+onMounted(() => {
+  void reloadAll();
+  unwatchVersion = watchDataVersion(() => void reloadAll());
+});
+
+onBeforeUnmount(() => {
+  unwatchVersion?.();
 });
 </script>
 
