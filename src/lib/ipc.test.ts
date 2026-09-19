@@ -59,7 +59,7 @@ describe("桌面路由（透传 Tauri invoke，命令名/参数/返回逐字等�
   it("无参命令：invoke(命令名)，返回值原样透传", async () => {
     asTauri();
     const cols: Colony[] = [
-      { id: 1, name: "大头一号", species: null, location_id: null, start_date: "2026-01-20", status: "active", days_raised: 1, actions: [], recent: [], hibernation: null },
+      { id: 1, name: "大头一号", species: null, location_id: null, start_date: "2026-01-20", status: "active", days_raised: 1, actions: [], recent: [], hibernation: null, checkin: { latest: null, baseline_date: null, days_since_last: null } },
     ];
     invokeMock.mockResolvedValue(cols);
 

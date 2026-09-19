@@ -72,6 +72,8 @@ export interface Colony {
   actions: ColonyAction[];
   recent: RecentLog[];
   hibernation: HibernationPreview | null;
+  /** 巢况摘要（webui-checkin 票 02）：最新一组数 + 基线 + 距上次登记天数 */
+  checkin: CheckinDigest;
 }
 
 /** 新建/编辑窝入参 */
@@ -351,3 +353,59 @@ export interface RestoreSummary {
 /** restore_apply 返回体：done = 界面当场刷新；done_needs_restart = 新库文件已
  * 就位但重开连接失败，提示「请重启应用」 */
 export type RestoreApplyOutcome = "done" | "done_needs_restart";
+
+// ── 巢况登记（webui-checkin 票 02，Rust nest_checkin.rs）──
+
+/** 照片元数据一行（本票恒空数组：写入随票 07 照片管线接线） */
+export interface NestPhotoMeta {
+  id: number;
+  checkin_id: number;
+  /** photos/ 下相对路径 `<colonyId>/<uuid>.jpg` */
+  rel_path: string;
+  /** 客户端原始文件名，仅备注 */
+  original_name: string | null;
+  note: string;
+}
+
+/** 巢况登记一行（时间线按日期倒序返回） */
+export interface NestCheckin {
+  id: number;
+  colony_id: number;
+  /** 登记日期 YYYY-MM-DD（可补录过去） */
+  date: string;
+  /** null = 未数 */
+  queen_count: number | null;
+  worker_count: number | null;
+  moved_nest: boolean;
+  note: string;
+  created_at: string;
+  photos: NestPhotoMeta[];
+}
+
+/** 新增巢况入参（至少一项非空才可提交，后端兜底校验） */
+export interface CheckinInput {
+  colony_id: number;
+  date: string;
+  queen_count: number | null;
+  worker_count: number | null;
+  moved_nest: boolean;
+  note: string | null;
+}
+
+/** 编辑巢况入参：全量覆盖（数可清回 null，日期必填） */
+export interface CheckinUpdateInput {
+  date: string;
+  queen_count: number | null;
+  worker_count: number | null;
+  moved_nest: boolean;
+  note: string | null;
+}
+
+/** 窝卡片/详情的巢况摘要（Rust 算好；从未登记三者皆 null） */
+export interface CheckinDigest {
+  latest: NestCheckin | null;
+  /** 基线 = 最早一条登记的日期字段 */
+  baseline_date: string | null;
+  /** 距上次登记 = 今天 − 最新登记日期（自然日，当天 0） */
+  days_since_last: number | null;
+}

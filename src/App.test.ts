@@ -62,6 +62,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
   {
     id: 2,
@@ -74,6 +75,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
   {
     id: 3,
@@ -86,6 +88,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
   {
     id: 4,
@@ -98,6 +101,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
 ];
 
@@ -163,6 +167,53 @@ describe("首页卡片墙", () => {
   it("冬眠中的窝显示冬眠状态徽章", async () => {
     const wrapper = await mountApp();
     expect(wrapper.find('.card[data-colony-id="3"] .chip.st').text()).toContain("冬眠");
+  });
+
+  it("卡片显示最新巢况数与距上次登记天数（webui-checkin 票 02）；「巢况」按钮打开时间线", async () => {
+    currentColonies = colonies.map((c) =>
+      c.id === 1
+        ? {
+            ...c,
+            checkin: {
+              latest: {
+                id: 3,
+                colony_id: 1,
+                date: "2026-09-15",
+                queen_count: 2,
+                worker_count: 3000,
+                moved_nest: false,
+                note: "",
+                created_at: "2026-09-15 21:00:00",
+                photos: [],
+              },
+              baseline_date: "2026-09-01",
+              days_since_last: 3,
+            },
+          }
+        : c,
+    );
+    const wrapper = await mountApp();
+    const card = wrapper.find('.card[data-colony-id="1"]');
+    expect(card.find(".checkin-line").text()).toBe("巢况：蚁后 2 · 工蚁 3000 · 距上次登记 3 天");
+
+    // 打开巢况时间线弹窗：按窝拉时间线
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return currentColonies;
+        case "list_locations":
+          return locations;
+        case "list_checkins":
+          return [];
+        default:
+          return null;
+      }
+    });
+    await card.find(".checkin-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".checkin-dialog").exists()).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("list_checkins", { colonyId: 1 });
+    expect(wrapper.find(".checkin-dialog .checkin-empty").text()).toContain("还没有巢况登记");
   });
 
   it("已结束的窝默认折叠，展开后可见，且不占分组", async () => {

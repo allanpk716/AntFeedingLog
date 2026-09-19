@@ -16,7 +16,7 @@
  *   不得直接 import invoke/listen（验收标准）。
  * - 包装函数挂 `cmdName`（命令名）：排障可用，也是组件测试统一 mock 工厂
  *   （src/testing/ipcMock.ts）按命令名路由到唯一 invokeMock 的依据。
- * - Rust 侧 53 个命令中前端未调用的 4 个（health_check / set_action_policy /
+ * - Rust 侧 58 个命令中前端未调用的 4 个（health_check / set_action_policy /
  *   list_hibernations / get_backup_status）不在此预置包装，随用随加。
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
@@ -29,6 +29,9 @@ import type {
   BackupConfigInput,
   CareActionItem,
   CareLogInput,
+  CheckinDigest,
+  CheckinInput,
+  CheckinUpdateInput,
   Colony,
   ColonyInput,
   FoodInput,
@@ -38,6 +41,7 @@ import type {
   LogFilter,
   LogPage,
   LogUpdateInput,
+  NestCheckin,
   PushoverStatus,
   RestoreApplyOutcome,
   RestoreSummary,
@@ -142,6 +146,17 @@ export const deleteColony = cmdFn<{ id: number }, void>("delete_colony");
 
 export const listFoods = cmdFn<void, FoodItem[]>("list_foods");
 export const logCare = cmdFn<{ input: CareLogInput }, void>("log_care");
+
+// ── 巢况登记（webui-checkin 票 02；时间线弹窗 NestCheckinDialog）──
+
+export const saveCheckin = cmdFn<{ input: CheckinInput }, NestCheckin>("save_checkin");
+export const listCheckins = cmdFn<{ colonyId: number }, NestCheckin[]>("list_checkins");
+export const updateCheckin = cmdFn<
+  { id: number; input: CheckinUpdateInput },
+  NestCheckin
+>("update_checkin");
+export const deleteCheckin = cmdFn<{ id: number }, void>("delete_checkin");
+export const getCheckinDigest = cmdFn<{ colonyId: number }, CheckinDigest>("get_checkin_digest");
 
 // ── 冬眠（HibernationDialog；入参键沿用现状 camelCase，Tauri 侧自行映射）──
 

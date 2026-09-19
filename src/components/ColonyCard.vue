@@ -10,10 +10,12 @@
 import { computed, ref } from "vue";
 import type { Colony, ColonyAction } from "../types";
 import { actionTile, feedingTooltip, formatRecent, isFeeding, type TileView } from "../lib/care";
+import { checkinCardLine } from "../lib/checkin";
 import { hibernationBanner } from "../lib/hibernation";
 import { todayIso } from "../lib/dates";
 import FeedDialog from "./FeedDialog.vue";
 import HibernationDialog from "./HibernationDialog.vue";
+import NestCheckinDialog from "./NestCheckinDialog.vue";
 import QuickLogDialog from "./QuickLogDialog.vue";
 
 const props = defineProps<{ colony: Colony }>();
@@ -40,6 +42,9 @@ const tiles = computed(() =>
 
 const recentLine = computed(() => formatRecent(props.colony.recent));
 
+/** 巢况摘要行（webui-checkin 票 02）：最新一组数 + 距上次登记天数；从未登记为空串（隐藏）。 */
+const checkinLine = computed(() => checkinCardLine(props.colony.checkin));
+
 const showFeed = ref(false);
 const feedAction = ref<ColonyAction | null>(null);
 
@@ -48,6 +53,8 @@ const quickAction = ref<ColonyAction | null>(null);
 
 const showHibernation = ref(false);
 const hibernationMode = ref<"start" | "wake" | "past" | "edit">("start");
+
+const showCheckin = ref(false);
 
 function openHibernation(mode: "start" | "wake" | "past" | "edit") {
   hibernationMode.value = mode;
@@ -78,6 +85,11 @@ function onQuickSaved() {
 function onFeedSaved() {
   showFeed.value = false;
   feedAction.value = null;
+  emit("saved");
+}
+
+function onCheckinSaved() {
+  showCheckin.value = false;
   emit("saved");
 }
 </script>
@@ -135,7 +147,12 @@ function onFeedSaved() {
 
     <div v-if="recentLine" class="recent">{{ recentLine }}</div>
 
+    <div v-if="checkinLine" class="checkin-line" data-testid="checkin-line">{{ checkinLine }}</div>
+
     <div class="card-actions">
+      <button class="checkin-btn" type="button" title="蚁口 / 换巢 / 备注的时间线" @click="showCheckin = true">
+        巢况
+      </button>
       <button
         v-if="colony.status === 'active'"
         class="hib-btn"
@@ -185,6 +202,12 @@ function onFeedSaved() {
       :mode="hibernationMode"
       @close="showHibernation = false"
       @saved="onHibernationSaved"
+    />
+    <NestCheckinDialog
+      v-if="showCheckin"
+      :colony="colony"
+      @close="showCheckin = false"
+      @saved="onCheckinSaved"
     />
   </article>
 </template>
@@ -416,6 +439,13 @@ function onFeedSaved() {
   padding-top: 9px;
 }
 
+/* 巢况摘要行（webui-checkin 票 02）：与最近记录行同字号，紧随其后 */
+.checkin-line {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .card-actions {
   margin-top: 10px;
   display: flex;
@@ -427,7 +457,8 @@ function onFeedSaved() {
 .edit-btn,
 .hib-btn,
 .wake-btn,
-.past-btn {
+.past-btn,
+.checkin-btn {
   border: 1px solid var(--border-strong);
   background: var(--card);
   color: var(--muted);
@@ -441,7 +472,8 @@ function onFeedSaved() {
 .edit-btn:hover,
 .hib-btn:hover,
 .wake-btn:hover,
-.past-btn:hover {
+.past-btn:hover,
+.checkin-btn:hover {
   border-color: var(--accent);
   color: var(--accent-deep);
 }
