@@ -239,5 +239,17 @@ describe("photos 网页端（webui-checkin 票 08）", () => {
         "HTTP 响应不是照片清单",
       );
     });
+
+    it("网络层错误（断网/超时中断，fetch 直接 reject）换人话：提示先核对已保存的照片，避免重复上传（终局评审）", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          throw new TypeError("Failed to fetch");
+        }),
+      );
+      await expect(uploadPhotosHttp(7, [new File(["x"], "a.jpg")])).rejects.toBe(
+        "上传中断（网络断开或超时）。请刷新查看已保存的照片，避免重复上传后再试",
+      );
+    });
   });
 });

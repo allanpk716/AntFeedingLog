@@ -68,6 +68,11 @@ async function httpErrorMessage(res: Response): Promise<string> {
   return `HTTP ${res.status}`;
 }
 
+/** 上传网络层错误（断网/Wi-Fi 切换/超时半路断连，fetch 直接 reject）的人话
+ * （终局评审）：提示先刷新核对已落库的照片，避免盲目整批重传造成重复。 */
+export const UPLOAD_INTERRUPTED_MSG =
+  "上传中断（网络断开或超时）。请刷新查看已保存的照片，避免重复上传后再试";
+
 /**
  * 浏览器取图（票 08）：fetch 带 Bearer 拿 blob → objectURL。失败 throw 人话
  * （缺图 404 的「照片文件缺失…」），调用方标占位符。
@@ -110,11 +115,17 @@ export async function uploadPhotosHttp(
   for (const f of files) {
     form.append("photos", f, f.name);
   }
-  const res = await fetch("/api/photos", {
-    method: "POST",
-    headers: authHeaders(),
-    body: form,
-  });
+  let res: Response;
+  try {
+    res = await fetch("/api/photos", {
+      method: "POST",
+      headers: authHeaders(),
+      body: form,
+    });
+  } catch {
+    // 网络层错误（TypeError: Failed to fetch 等）：不透出浏览器原文，换人话
+    throw UPLOAD_INTERRUPTED_MSG;
+  }
   if (!res.ok) {
     throw await httpErrorMessage(res);
   }

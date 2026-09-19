@@ -41,7 +41,8 @@
 //! 请求限制（规格 A）：请求体 ≤1MB（照片上传端点票 08 自行放宽到 15MB/张，
 //! 框架层预留按路径 `DefaultBodyLimit::max` 的口子）、普通并发 ≤8、SSE 连接单独计量
 //! ≤4（计数器本票落地，票 06 挂到 SSE 路由）、读超时 30 秒（hyper 连接层
-//! header 读超时 + 请求处理超时中间件）、header 条数/单条长度/总体积上限。
+//! header 读超时 + 请求处理超时中间件；照片上传的处理超时按路径放宽到 300
+//! 秒——慢 Wi-Fi 大批量，终局评审）、header 条数/单条长度/总体积上限。
 //!
 //! 照片端点（票 08，规格 E「桌面/网页同一套」）：**独立 HTTP 端点，不进 /api/cmd
 //! 白名单**（二进制体不进 JSON 派发层，也不新增命令名）：
@@ -96,6 +97,21 @@ pub const MAX_CONCURRENT_SSE: usize = 4;
 
 /// 读超时（30 秒）：连接层 header 读超时（慢速请求防挂）+ 请求处理超时。
 pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 照片上传端点的请求处理超时（300 秒；终局评审）：慢 Wi-Fi 一批传 9 张大图
+/// （服务端还要逐张解码重编码），30 秒普通读超时太紧——与体上限同款「按路径
+/// 放宽」的口子（[`PHOTO_UPLOAD_PATH`] 专用，其余路径维持 [`READ_TIMEOUT`]）。
+pub const PHOTO_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 请求处理超时按（方法, 路径）取值：仅 `POST /api/photos` 放宽（照片上传，
+/// 慢 Wi-Fi 大批量），其余一律 [`READ_TIMEOUT`]。纯核独立可测。
+fn request_timeout_for(method: &axum::http::Method, path: &str) -> Duration {
+    if method == axum::http::Method::POST && path == PHOTO_UPLOAD_PATH {
+        PHOTO_UPLOAD_TIMEOUT
+    } else {
+        READ_TIMEOUT
+    }
+}
 
 /// header 条数上限。
 pub const MAX_HEADER_COUNT: usize = 64;
@@ -856,17 +872,20 @@ async fn limits_mw(
     resp
 }
 
-/// 请求处理超时（读超时的 handler 侧：慢请求最多占 30 秒）。
+/// 请求处理超时（读超时的 handler 侧：慢请求最多占 [`READ_TIMEOUT`] 30 秒；
+/// `POST /api/photos` 按路径放宽到 [`PHOTO_UPLOAD_TIMEOUT`] 300 秒——慢 Wi-Fi
+/// 大批量照片，终局评审）。
 /// 注意：SSE 长连接（票 06）的建连响应立即可返回，不受此层牵连。
 async fn timeout_mw(
     req: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
-    match tokio::time::timeout(READ_TIMEOUT, next.run(req)).await {
+    let limit = request_timeout_for(req.method(), req.uri().path());
+    match tokio::time::timeout(limit, next.run(req)).await {
         Ok(resp) => resp,
         Err(_) => json_error(
             axum::http::StatusCode::REQUEST_TIMEOUT,
-            &format!("请求处理超时（{} 秒内未完成）", READ_TIMEOUT.as_secs()),
+            &format!("请求处理超时（{} 秒内未完成）", limit.as_secs()),
         ),
     }
 }
@@ -919,7 +938,7 @@ fn respond_dispatch(outcome: Option<CmdOutcome>) -> axum::response::Response {
         Some(CmdOutcome::Rejected(msg)) => json_error(StatusCode::BAD_REQUEST, &msg),
         // 执行失败：桌面 invoke 同款人话错误串（业务拒绝/库错误）
         Some(CmdOutcome::Failed(e)) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
-        None => json_error(StatusCode::NOT_FOUND, "unknown command"),
+        None => json_error(StatusCode::NOT_FOUND, "未知命令或桌面端专属功能"),
     }
 }
 
@@ -957,8 +976,9 @@ async fn cmd_handler(
         .unwrap_or_else(|| serde_json::json!({}));
     if !WEBUI_COMMANDS.contains(&cmd) {
         // deny-by-default 的常态 404，不刷日志（网段外根本进不来，段内探测
-        // 不构成安全事件；真正的准入拒绝在闸一/闸二层记流水）
-        return json_error(StatusCode::NOT_FOUND, "unknown command");
+        // 不构成安全事件；真正的准入拒绝在闸一/闸二层记流水）。错误串点明
+        // 「也可能是桌面端专属命令」——网页端撞上的多半是这种情况。
+        return json_error(StatusCode::NOT_FOUND, "未知命令或桌面端专属功能");
     }
     respond_dispatch(dispatch_command(&deps, cmd, &args))
 }
@@ -1442,9 +1462,10 @@ async fn static_handler(
 /// 计量 ≤4，handler 内 try_acquire_sse）；header 上限与建连超时照挂（超时只
 /// 覆盖建连——流式响应体在中间件链返回后才被消费，见 sse_handler 注释）。
 /// `/api/data-version`（票 06）走闸二与全部限额（普通短请求）。照片端点
-///（票 08）同在 api 组：`POST /api/photos` 闸二/限额/超时照挂，体上限经路由层
-/// DefaultBodyLimit 放宽到 9×15MB+框架开销（其余路径全局 1MB 不动）；`GET
-/// /api/photo/...` 是普通短请求。其余一切路径 404（axum 无路由默认）。
+///（票 08）同在 api 组：`POST /api/photos` 闸二/限额照挂、处理超时按路径放宽
+/// 到 300 秒（终局评审），体上限经路由层 DefaultBodyLimit 放宽到 9×15MB+框架
+/// 开销（其余路径全局 1MB 不动）；`GET /api/photo/...` 是普通短请求。其余一切
+/// 路径 404（axum 无路由默认）。
 fn build_router(deps: Shared) -> axum::Router {
     use axum::extract::DefaultBodyLimit;
     use axum::middleware as mw;
@@ -1895,6 +1916,39 @@ mod tests {
         drop((slots, sse));
     }
 
+    // ── 超时按路径放宽（终局评审）──
+
+    #[test]
+    fn photo_upload_timeout_relaxed_by_path_others_keep_read_timeout() {
+        // 仅 POST /api/photos 放宽（慢 Wi-Fi 一批传 9 张大图，服务端还要逐张
+        // 解码重编码，30 秒普通读超时太紧）；其余路径一律 READ_TIMEOUT 不动
+        assert_eq!(
+            request_timeout_for(&axum::http::Method::POST, PHOTO_UPLOAD_PATH),
+            PHOTO_UPLOAD_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&axum::http::Method::POST, "/api/cmd"),
+            READ_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&axum::http::Method::GET, PHOTO_UPLOAD_PATH),
+            READ_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&axum::http::Method::GET, "/api/data-version"),
+            READ_TIMEOUT
+        );
+        // 前后缀相近路径不误放宽
+        assert_eq!(
+            request_timeout_for(&axum::http::Method::POST, "/api/photosX"),
+            READ_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&axum::http::Method::POST, "/api/photos/1/a.jpg"),
+            READ_TIMEOUT
+        );
+    }
+
     // ── header 上限 ──
 
     fn header_map(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
@@ -2195,8 +2249,8 @@ mod tests {
         );
         assert_eq!(status, 401);
 
-        // 未登记命令 → 404 {"error":"unknown command"}（deny-by-default；
-        // get_settings 是桌面专属设置命令，规格 H 永不入表）
+        // 未登记命令 → 404 人话（deny-by-default；get_settings 是桌面专属设置
+        // 命令，规格 H 永不入表——错误串点明「可能是桌面端专属」）
         let (status, body) = http(
             &a,
             "POST",
@@ -2205,7 +2259,7 @@ mod tests {
             r#"{"cmd":"get_settings","args":{}}"#,
         );
         assert_eq!(status, 404);
-        assert_eq!(body["error"], "unknown command");
+        assert_eq!(body["error"], "未知命令或桌面端专属功能");
 
         // 未登记路径 → 404（axum 无路由默认，不泄漏存在性）
         let (status, _) = http(&a, "GET", &format!("{base}/api/nothing"), Some(&token), "");
