@@ -608,6 +608,9 @@ pub fn delete_log(conn: &Connection, id: i64) -> Result<(), String> {
 pub struct RetrievalDue {
     /// 基准 = 该窝最近一次含「易腐且已设间隔」食物的喂食发生时刻。
     pub fed_at: String,
+    /// 该次喂食的录入时刻（票 05 通知三分类用：vs baseline 判存量、
+    /// vs fed_at+间隔 判录入时是否已逾期）。
+    pub created_at: String,
     /// 到期 = fed_at + min(该次所选易腐食物的撤食间隔)（同喂取最短，F2）。
     pub due_at: String,
 }
@@ -621,9 +624,9 @@ pub fn retrieval_due_for_colony(
     colony_id: i64,
 ) -> Result<Option<RetrievalDue>, String> {
     // 最近一次含有效易腐食物的喂食 + 该次所选易腐的最短间隔
-    let feed: Option<(String, i64)> = conn
+    let feed: Option<(String, String, i64)> = conn
         .query_row(
-            "SELECT l.occurred_at, MIN(f.retrieval_hours)
+            "SELECT l.occurred_at, l.created_at, MIN(f.retrieval_hours)
              FROM care_log l
              JOIN log_food lf ON lf.log_id = l.id
              JOIN food f ON f.id = lf.food_id
@@ -633,11 +636,17 @@ pub fn retrieval_due_for_colony(
              ORDER BY l.occurred_at DESC, l.id DESC
              LIMIT 1",
             params![colony_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
         )
         .optional()
         .map_err(db_err)?;
-    let Some((fed_at, min_hours)) = feed else {
+    let Some((fed_at, created_at, min_hours)) = feed else {
         return Ok(None);
     };
 
@@ -664,7 +673,7 @@ pub fn retrieval_due_for_colony(
     let due_at = (fed + chrono::Duration::hours(min_hours))
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
-    Ok(Some(RetrievalDue { fed_at, due_at }))
+    Ok(Some(RetrievalDue { fed_at, created_at, due_at }))
 }
 
 /// 某窝每个「启用中」操作一块，按 sort、id 排序（字典新增操作自动出现）。
