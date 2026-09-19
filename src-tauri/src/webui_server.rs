@@ -38,10 +38,22 @@
 //! 先加载才能执行 `#token=` 入库的入口 JS，带不了 Authorization 头；产物是
 //! 公开构建物、无敏感内容），闸一照拦；并保留限额与超时。
 //!
-//! 请求限制（规格 A）：请求体 ≤1MB（照片上传端点票 08 自行放宽到 15MB，框架层
-//! 预留按路径 `DefaultBodyLimit::max` 的口子）、普通并发 ≤8、SSE 连接单独计量
+//! 请求限制（规格 A）：请求体 ≤1MB（照片上传端点票 08 自行放宽到 15MB/张，
+//! 框架层预留按路径 `DefaultBodyLimit::max` 的口子）、普通并发 ≤8、SSE 连接单独计量
 //! ≤4（计数器本票落地，票 06 挂到 SSE 路由）、读超时 30 秒（hyper 连接层
 //! header 读超时 + 请求处理超时中间件）、header 条数/单条长度/总体积上限。
+//!
+//! 照片端点（票 08，规格 E「桌面/网页同一套」）：**独立 HTTP 端点，不进 /api/cmd
+//! 白名单**（二进制体不进 JSON 派发层，也不新增命令名）：
+//! - `POST /api/photos`——multipart 表单（`checkinId` 文本段 + `photos` 文件段
+//!   ≤9 张），单张流式体积闸 ≤15MB；字节过 [`crate::photo::process_uploads`]
+//!   同一套校验链（魔数白名单/头部尺寸/解码炸弹/重编码 JPEG 清 EXIF），落盘名
+//!   一律服务端 UUID（[`crate::photo::attach_photos`] 写入协议），成功触发写后
+//!   钩子（版本 bump + 自动备份；巢况不刷托盘）。体上限按路径放宽到
+//!   9×15MB+框架开销（[`MAX_PHOTOS_BODY_BYTES`]），并发计入普通 8 槽。
+//! - `GET /api/photo/{colonyId}/{file}`——Bearer 照挂；严格路径 grammar + 查库
+//!   确认引用（防枚举未引用文件）；库引用在而文件缺 → 404 占位；响应头三件套
+//!   `image/jpeg` + `nosniff` + `inline`（只以图片身份渲染）。
 //!
 //! 日志（D7）：起/停/端口占用/准入与凭证拒绝（来源 IP + 原因，绝不带 token 值）
 //! 落 applog 流水。
@@ -67,6 +79,14 @@ use crate::webui_config;
 /// 普通请求体上限（1MB）。照片上传端点（票 08）在自己的路由上用
 /// `DefaultBodyLimit::max(15MB)` 放宽，不动全局值。
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
+/// 照片上传端点路径（票 08；limits_mw 的体上限按路径放宽以此判定）。
+pub const PHOTO_UPLOAD_PATH: &str = "/api/photos";
+
+/// 照片上传端点请求体上限：单张 ≤15MB × 单次 ≤9 张 + multipart 框架开销
+/// （票 04 预留的按路径 `DefaultBodyLimit` 口子；全局 1MB 对其余路径不动）。
+pub const MAX_PHOTOS_BODY_BYTES: usize =
+    crate::photo::MAX_INPUT_BYTES * crate::photo::MAX_PHOTOS_PER_SUBMIT + 64 * 1024;
 
 /// 普通并发上限（8）。SSE 长连接单独计量（[`ConnLimiter`] 双计数器）。
 pub const MAX_CONCURRENT_REQUESTS: usize = 8;
@@ -806,16 +826,22 @@ async fn limits_mw(
         crate::applog::log_error(&format!("网页端拒绝来源 {peer}（{reason}）"));
         return json_error(axum::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE, reason);
     }
+    // 体上限按路径放宽（票 08）：照片上传端点放宽到 9×15MB+multipart 框架开销，
+    // 其余路径维持全局 1MB。这是 Content-Length 有值时的前置预检；分块编码等
+    // 残余路径由路由层 DefaultBodyLimit 与端点自身的流式闸兜底。
+    let max_body = if req.uri().path() == PHOTO_UPLOAD_PATH {
+        MAX_PHOTOS_BODY_BYTES
+    } else {
+        MAX_BODY_BYTES
+    };
     if let Some(len) = req
         .headers()
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
     {
-        if len > MAX_BODY_BYTES {
-            // 照片上传端点（票 08）不经过本层或自带放宽——上传路由自行挂
-            // DefaultBodyLimit::max(15MB) 的按路径覆盖层
-            let reason = format!("请求体超过 {}MB 上限", MAX_BODY_BYTES / 1024 / 1024);
+        if len > max_body {
+            let reason = format!("请求体超过 {}MB 上限", max_body / 1024 / 1024);
             crate::applog::log_error(&format!("网页端拒绝来源 {peer}（{reason}）"));
             return json_error(axum::http::StatusCode::PAYLOAD_TOO_LARGE, &reason);
         }
@@ -1090,6 +1116,250 @@ async fn sse_handler(
         .into_response()
 }
 
+// ── HTTP 层：照片端点（票 08，规格 E）────────────────────────────────────────
+
+/// `GET /api/photo/{colonyId}/{file}` 路径 grammar（严格）：窝段纯数字（≤19 位，
+/// i64 rowid 形态）；文件段 = 36 位 `[A-Za-z0-9-]` + `.jpg`（服务端 UUID 落盘
+/// 口径，36 位由 photo::random_uuid 的产物钉住）。axum Path 已做百分号解码，
+/// 本 grammar 是最后一道闸：`..`/反斜杠/冒号/绝对路径/多余段全过不了段数与
+/// 字符集检查，`..%2F` 之类编码花样解码后同样被字符集拒；只从 photos/ 根内
+/// 按段拼接，无任何穿越面。
+fn photo_url_parts_valid(colony_id: &str, file_name: &str) -> bool {
+    if colony_id.is_empty() || colony_id.len() > 19 || !colony_id.bytes().all(|b| b.is_ascii_digit())
+    {
+        return false;
+    }
+    let Some(base) = file_name.strip_suffix(".jpg") else {
+        return false;
+    };
+    base.len() == 36 && base.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// 照片响应头三件套（规格 E）：类型钉死 JPEG + `nosniff` 禁 MIME 嗅探 +
+/// `inline` 只以图片身份渲染（禁下载/禁当文档内嵌）。
+fn photo_response_headers() -> [(&'static str, &'static str); 3] {
+    [
+        ("Content-Type", "image/jpeg"),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Content-Disposition", "inline"),
+    ]
+}
+
+/// multipart 里收到的一段原始文件（未过校验链）。
+struct RawPhoto {
+    original_name: Option<String>,
+    bytes: Vec<u8>,
+}
+
+/// 单个 multipart 字段的流式读取：逐 chunk 累积，超 `cap` 即停（任意大文件
+/// 不会整段进内存）。错误信息由调用方按字段类型给（人话）。
+async fn read_field_capped(
+    field: &mut axum::extract::multipart::Field<'_>,
+    cap: usize,
+    over_cap_message: &str,
+) -> Result<Vec<u8>, String> {
+    let mut buf = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|e| format!("上传数据读取失败: {e}"))?
+    {
+        if buf.len() + chunk.len() > cap {
+            return Err(over_cap_message.to_string());
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+/// 把当前字段剩余字节耗尽（chunk 级丢弃，不累计内存）——出错后继续解析流的
+/// 排干手段，让客户端稳定拿到 400 人话而不是半路被掐断的连接。
+async fn drain_field(field: &mut axum::extract::multipart::Field<'_>) {
+    while field.chunk().await.ok().flatten().is_some() {}
+}
+
+/// multipart 解析：`checkinId` 文本段 + `photos` 文件段（≤9 张，逐张流式体积
+/// 闸 ≤15MB）。任何坏形状（缺 checkinId/超张数/超单张/未知字段）返回人话
+/// Err，由调用方统一回 400——先把剩余体排干再回，413 半路断连的形态只留给
+/// limits_mw 的 Content-Length 预检。
+async fn read_multipart_photos(
+    mut multipart: axum::extract::Multipart,
+) -> Result<(i64, Vec<RawPhoto>), String> {
+    let mut checkin_id: Option<i64> = None;
+    let mut photos: Vec<RawPhoto> = Vec::new();
+    let mut error: Option<String> = None;
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| format!("上传数据不是合法的 multipart 表单: {e}"))?
+    {
+        if error.is_some() {
+            drain_field(&mut field).await; // 已有错在身：耗尽字节即走，不再解析
+            continue;
+        }
+        match field.name() {
+            Some("checkinId") => {
+                let read = read_field_capped(&mut field, 64, "checkinId 字段超长").await;
+                match read {
+                    Ok(bytes) => {
+                        let text = String::from_utf8_lossy(&bytes).trim().to_string();
+                        match text.parse::<i64>() {
+                            Ok(v) if v >= 1 => checkin_id = Some(v),
+                            _ => error = Some(format!("checkinId 必须是正整数（收到 {text}）")),
+                        }
+                    }
+                    Err(e) => error = Some(e),
+                }
+            }
+            Some("photos") => {
+                if photos.len() >= crate::photo::MAX_PHOTOS_PER_SUBMIT {
+                    error = Some(format!(
+                        "一次最多上传 {} 张照片",
+                        crate::photo::MAX_PHOTOS_PER_SUBMIT
+                    ));
+                    drain_field(&mut field).await;
+                    continue;
+                }
+                let original_name = field.file_name().map(str::to_string);
+                let message = format!(
+                    "单张照片压缩前不能超过 {}MB",
+                    crate::photo::MAX_INPUT_BYTES / 1024 / 1024
+                );
+                match read_field_capped(&mut field, crate::photo::MAX_INPUT_BYTES, &message).await
+                {
+                    Ok(bytes) => photos.push(RawPhoto {
+                        original_name,
+                        bytes,
+                    }),
+                    Err(e) => error = Some(e),
+                }
+            }
+            _ => {
+                error = Some("表单包含不认识的字段（只收 checkinId 与 photos）".to_string());
+                drain_field(&mut field).await;
+            }
+        }
+    }
+    if let Some(e) = error {
+        return Err(e);
+    }
+    match checkin_id {
+        Some(id) => Ok((id, photos)),
+        None => Err("缺少 checkinId 表单字段".to_string()),
+    }
+}
+
+/// 上传失败的两态（票 08 验收口径）：**内容坏**（票 07 校验链拒——格式/尺寸/
+/// 解码失败，客户端给的垃圾 → 400 人话）与**服务端失败**（库/盘/任务异常，
+/// 与 /api/cmd 的业务错误同口径 → 500 人话）。
+enum UploadRejection {
+    BadRequest(String),
+    Failed(String),
+}
+
+/// `POST /api/photos`（票 08，规格 E「桌面/网页同一套校验链」）：multipart
+/// `checkinId` + ≤9 张照片，字节过 [`crate::photo::process_uploads`] 纯核
+///（魔数白名单/头部尺寸/解码炸弹/重编码 JPEG 清 EXIF），落盘名一律服务端
+/// UUID（[`crate::photo::attach_photos`] 写入协议：tmp+fsync+原子 rename+插库，
+/// 失败不留半截），成功触发写后钩子（版本 bump + 自动备份；巢况不刷托盘）。
+///
+/// 取舍：**整段在内存处理，不经临时文件**——单张 ≤15MB、单次 ≤9 张，批量内存
+/// 峰值 ≤135MB 与桌面 read_photo_files（整读文件进内存）同包络；超限在
+/// multipart 流式读取时前置拦截，不会先囤满再拒。解码/重编码是 CPU 重活，
+/// 放 spawn_blocking 且库锁外（锁内只留写入协议的小 IO 与插行），与桌面
+/// attach_photos 命令同款。并发计入普通 8 槽（limits_mw 照挂）。
+async fn photo_upload_handler(
+    State(deps): State<Shared>,
+    multipart: axum::extract::Multipart,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    let (checkin_id, raws) = match read_multipart_photos(multipart).await {
+        Ok(v) => v,
+        Err(msg) => return json_error(StatusCode::BAD_REQUEST, &msg),
+    };
+    if raws.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "没有收到照片（photos 字段为空）");
+    }
+    let photos_root = deps.data_dir.join(crate::photo::PHOTOS_DIR_NAME);
+    let conn = deps.conn.clone();
+    let uploads: Vec<crate::photo::PhotoUpload> = raws
+        .into_iter()
+        .map(|r| crate::photo::PhotoUpload {
+            original_name: r.original_name,
+            bytes: r.bytes,
+        })
+        .collect();
+    let joined = tauri::async_runtime::spawn_blocking(
+        move || -> Result<Vec<crate::nest_checkin::NestPhotoMeta>, UploadRejection> {
+            // 快速失败：登记不存在就不烧解码重编码的 CPU（业务错误 → 500）
+            let exists =
+                crate::run_with_conn(&conn, |c| crate::nest_checkin::checkin_exists(c, checkin_id))
+                    .map_err(UploadRejection::Failed)?;
+            if !exists {
+                return Err(UploadRejection::Failed("登记不存在".to_string()));
+            }
+            // 校验链拒 = 客户端内容坏 → 400
+            let processed = crate::photo::process_uploads(uploads)
+                .map_err(UploadRejection::BadRequest)?;
+            crate::run_with_conn(&conn, |c| {
+                crate::photo::attach_photos(c, &photos_root, checkin_id, &processed)
+            })
+            .map_err(UploadRejection::Failed)
+        },
+    )
+    .await
+    .map_err(|e| UploadRejection::Failed(format!("照片上传任务异常退出: {e}")));
+    match joined {
+        Ok(Ok(saved)) => {
+            // 巢况写后语义：不刷托盘，自动备份记账/版本广播走同一钩子
+            (deps.after_write)(false);
+            json_response(
+                StatusCode::OK,
+                &serde_json::to_value(&saved).unwrap_or(serde_json::Value::Null),
+            )
+        }
+        Ok(Err(UploadRejection::BadRequest(msg))) => json_error(StatusCode::BAD_REQUEST, &msg),
+        Ok(Err(UploadRejection::Failed(msg))) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+        // join 层只产 Failed；此臂为穷尽性要求
+        Err(UploadRejection::BadRequest(msg)) => json_error(StatusCode::BAD_REQUEST, &msg),
+        Err(UploadRejection::Failed(msg)) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+    }
+}
+
+/// `GET /api/photo/{colonyId}/{file}`（票 08）：Bearer 照挂（api 组闸二）；严格
+/// 路径 grammar + 查库确认引用（防枚举库未引用的文件名）；库引用在而文件缺
+/// → 404 占位（规格 E「缺图展示」的服务端半边，前端渲染占位符不崩溃）。
+/// 响应头三件套见 [`photo_response_headers`]。
+async fn photo_read_handler(
+    State(deps): State<Shared>,
+    axum::extract::Path((colony_id, file_name)): axum::extract::Path<(String, String)>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    if !photo_url_parts_valid(&colony_id, &file_name) {
+        return json_error(StatusCode::NOT_FOUND, "资源不存在");
+    }
+    let rel_path = format!("{colony_id}/{file_name}");
+    let referenced = crate::run_with_conn(&deps.conn, |conn| {
+        crate::photo::rel_path_referenced(conn, &rel_path)
+    });
+    let referenced = match referenced {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+    };
+    if !referenced {
+        return json_error(StatusCode::NOT_FOUND, "资源不存在");
+    }
+    let path = deps
+        .data_dir
+        .join(crate::photo::PHOTOS_DIR_NAME)
+        .join(&colony_id)
+        .join(&file_name);
+    match std::fs::read(&path) {
+        Ok(bytes) => (StatusCode::OK, photo_response_headers(), bytes).into_response(),
+        Err(_) => json_error(StatusCode::NOT_FOUND, "照片文件缺失（可能恢复过旧备份）"),
+    }
+}
+
 // ── HTTP 层：前端静态资源（票 05，规格「浏览器打开即完整前端」）────────────
 
 /// 静态资源响应的附加头：nosniff 防 MIME 嗅探（规格 E 精神，照片路由票 08 同款）。
@@ -1171,8 +1441,10 @@ async fn static_handler(
 /// 凭证换一次性票据在 handler 内消费）；**不占普通并发槽**（SSE 长连接单独
 /// 计量 ≤4，handler 内 try_acquire_sse）；header 上限与建连超时照挂（超时只
 /// 覆盖建连——流式响应体在中间件链返回后才被消费，见 sse_handler 注释）。
-/// `/api/data-version`（票 06）走闸二与全部限额（普通短请求）。其余一切路径
-/// 404（axum 无路由默认）。
+/// `/api/data-version`（票 06）走闸二与全部限额（普通短请求）。照片端点
+///（票 08）同在 api 组：`POST /api/photos` 闸二/限额/超时照挂，体上限经路由层
+/// DefaultBodyLimit 放宽到 9×15MB+框架开销（其余路径全局 1MB 不动）；`GET
+/// /api/photo/...` 是普通短请求。其余一切路径 404（axum 无路由默认）。
 fn build_router(deps: Shared) -> axum::Router {
     use axum::extract::DefaultBodyLimit;
     use axum::middleware as mw;
@@ -1182,6 +1454,16 @@ fn build_router(deps: Shared) -> axum::Router {
         .route("/api/cmd", post(cmd_handler))
         .route("/api/sse-ticket", post(sse_ticket_handler))
         .route("/api/data-version", get(data_version_handler))
+        // 照片端点（票 08）：闸二/限额/超时照组层挂；上传路由用路由层
+        // DefaultBodyLimit 按路径放宽（路由层比全局层更贴 handler，覆盖生效）
+        .route(
+            "/api/photos",
+            post(photo_upload_handler).layer(DefaultBodyLimit::max(MAX_PHOTOS_BODY_BYTES)),
+        )
+        .route(
+            "/api/photo/{colony_id}/{file_name}",
+            get(photo_read_handler),
+        )
         .layer(mw::from_fn_with_state(deps.clone(), auth_mw))
         .layer(mw::from_fn(timeout_mw))
         .layer(mw::from_fn_with_state(deps.clone(), limits_mw))
@@ -3152,5 +3434,411 @@ mod tests {
             desktop_of(crate::nest_checkin::get_checkin(&conn, http_row["id"].as_i64().unwrap()))
         };
         assert_eq!(http_row, desktop);
+    }
+
+    // ── 票 08：照片上传 / 照片读取端点 ─────────────────────────────────────
+
+    /// multipart 请求体构造（ureq 无 multipart 支持，手拼——字段顺序与浏览器
+    /// FormData 同形：checkinId 文本段在前，photos 文件段若干）。
+    const MULTIPART_BOUNDARY: &str = "----antfeedinglog-test-boundary";
+
+    fn multipart_body(checkin_id: Option<i64>, photos: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut b = Vec::new();
+        if let Some(id) = checkin_id {
+            b.extend_from_slice(
+                format!(
+                    "--{MULTIPART_BOUNDARY}\r\n\
+                     Content-Disposition: form-data; name=\"checkinId\"\r\n\r\n{id}\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        for (name, bytes) in photos {
+            b.extend_from_slice(
+                format!(
+                    "--{MULTIPART_BOUNDARY}\r\n\
+                     Content-Disposition: form-data; name=\"photos\"; filename=\"{name}\"\r\n\
+                     Content-Type: application/octet-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            b.extend_from_slice(bytes);
+            b.extend_from_slice(b"\r\n");
+        }
+        b.extend_from_slice(format!("--{MULTIPART_BOUNDARY}--\r\n").as_bytes());
+        b
+    }
+
+    /// 测试夹具：一张 64×48 的真 JPEG（走 image crate 编码，重编码链可完整过）。
+    fn tiny_jpeg() -> Vec<u8> {
+        use std::io::Cursor;
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            64,
+            48,
+            image::Rgb([120, 90, 60]),
+        ));
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+        buf.into_inner()
+    }
+
+    /// POST /api/photos（multipart），返回 (状态码, JSON 体)。
+    fn post_photos(
+        a: &ureq::Agent,
+        base: &str,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> (u16, serde_json::Value) {
+        let mut call = a
+            .post(&format!("{base}/api/photos"))
+            .set(
+                "Content-Type",
+                &format!("multipart/form-data; boundary={MULTIPART_BOUNDARY}"),
+            );
+        if let Some(t) = token {
+            call = call.set("Authorization", &format!("Bearer {t}"));
+        }
+        let to_json = |resp: ureq::Response| -> serde_json::Value {
+            serde_json::from_str(&resp.into_string().unwrap_or_default())
+                .unwrap_or(serde_json::Value::Null)
+        };
+        match call.send_bytes(&body) {
+            Ok(resp) => (resp.status(), to_json(resp)),
+            Err(ureq::Error::Status(code, resp)) => (code, to_json(resp)),
+            Err(e) => panic!("POST /api/photos 失败: {e}"),
+        }
+    }
+
+    /// 种子一窝一条登记，返回 checkin_id（内部自取库锁，调用方不得持锁）。
+    fn seed_checkin(deps: &Arc<SharedDeps>, name: &str) -> i64 {
+        let colony_id = seed_colony(&deps.conn, name);
+        let conn = deps.conn.lock().unwrap();
+        crate::nest_checkin::save_checkin(
+            &conn,
+            &crate::nest_checkin::CheckinInput {
+                colony_id,
+                date: "2026-09-18".into(),
+                queen_count: None,
+                worker_count: None,
+                moved_nest: false,
+                note: Some("带照片".into()),
+            },
+            "2026-09-18",
+            "2026-09-18 21:00:00",
+        )
+        .unwrap()
+        .id
+    }
+
+    #[test]
+    fn photo_upload_saves_file_and_metadata_pair_and_fires_after_write() {
+        // 验收「浏览器上传→库+文件成对」：multipart 过校验链重编码，落盘名
+        // 服务端 UUID，original_name 只进备注；写后钩子按巢况语义（不刷托盘）
+        // 触发——生产钩子里是 trigger_after_write（版本 bump + 自动备份）。
+        let token = "a".repeat(32);
+        let fired = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let fired2 = fired.clone();
+        let after_write: AfterWriteHook = Arc::new(move |with_tray| {
+            fired2.lock().unwrap().push(with_tray);
+        });
+        let (deps, _dir) = test_deps_with(&["127.0.0.0/8"], &token, after_write, Arc::new(|_| None));
+        let checkin_id = seed_checkin(&deps, "照片窝");
+        let handle = block(start(deps.clone(), 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+
+        let (status, body) = post_photos(
+            &agent(),
+            &base,
+            Some(&token),
+            multipart_body(Some(checkin_id), &[("IMG_001.jpg", tiny_jpeg())]),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        let arr = body.as_array().expect("返回照片数组");
+        assert_eq!(arr.len(), 1);
+        let rel = arr[0]["rel_path"].as_str().expect("rel_path");
+        assert_eq!(arr[0]["original_name"], "IMG_001.jpg", "客户端文件名只进备注");
+        let (dir_seg, file_seg) = rel.split_once('/').unwrap();
+        assert_eq!(dir_seg, "1", "目录段 = 窝 id（服务端归属反查）");
+        assert_eq!(file_seg.len(), 36 + 4, "落盘名 = 服务端 UUID + .jpg，与客户端名无关");
+
+        // 文件+库行成对存在（写入协议收尾状态），盘上是重编码后的 JPEG
+        let photos_root = deps.data_dir.join(crate::photo::PHOTOS_DIR_NAME);
+        let on_disk = std::fs::read(photos_root.join(rel)).expect("照片文件应已落盘");
+        assert_eq!(&on_disk[..3], b"\xFF\xD8\xFF", "落盘的是 JPEG");
+        let count: i64 = deps
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM nest_photo WHERE rel_path = ?1",
+                [rel],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "元数据行已插");
+
+        assert_eq!(fired.lock().unwrap().as_slice(), &[false], "巢况写不刷托盘");
+        block(handle.stop());
+    }
+
+    #[test]
+    fn photo_upload_rejects_oversize_batch_bad_format_and_bad_checkin_id() {
+        // 超张数（10>9）/ 坏格式（GIF）/ 缺 checkinId / 零张 / 单张超 15MB：
+        // 一律 400 人话且不碰库不落盘；未知 checkinId 是业务错误走 500。
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let checkin_id = seed_checkin(&deps, "拒绝窝");
+        let handle = block(start(deps.clone(), 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+
+        // 超张数
+        let photos: Vec<(String, Vec<u8>)> = (0..10)
+            .map(|i| (format!("{i}.jpg"), tiny_jpeg()))
+            .collect();
+        let refs: Vec<(&str, Vec<u8>)> =
+            photos.iter().map(|(n, b)| (n.as_str(), b.clone())).collect();
+        let (status, body) = post_photos(&a, &base, Some(&token), multipart_body(Some(checkin_id), &refs));
+        assert_eq!(status, 400, "实际：{body}");
+        assert!(body["error"].as_str().unwrap_or("").contains('9'), "实际：{body}");
+        assert!(
+            !deps.data_dir.join(crate::photo::PHOTOS_DIR_NAME).exists(),
+            "超批拒绝不落盘"
+        );
+
+        // 坏格式（GIF 魔数，改扩展名没用——白名单按魔数）
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0u8; 32]);
+        let (status, body) =
+            post_photos(&a, &base, Some(&token), multipart_body(Some(checkin_id), &[("evil.gif", gif)]));
+        assert_eq!(status, 400, "实际：{body}");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("JPEG / PNG / WebP"),
+            "实际：{body}"
+        );
+
+        // 缺 checkinId
+        let (status, body) =
+            post_photos(&a, &base, Some(&token), multipart_body(None, &[("a.jpg", tiny_jpeg())]));
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("checkinId"),
+            "实际：{body}"
+        );
+
+        // 零张照片
+        let (status, body) =
+            post_photos(&a, &base, Some(&token), multipart_body(Some(checkin_id), &[]));
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("照片"),
+            "实际：{body}"
+        );
+
+        // 单张压缩前超 15MB：流式闸 400（不整段囤进内存再拒）
+        let big = vec![0u8; crate::photo::MAX_INPUT_BYTES + 1];
+        let (status, body) =
+            post_photos(&a, &base, Some(&token), multipart_body(Some(checkin_id), &[("big.jpg", big)]));
+        assert_eq!(status, 400, "实际：{}", body["error"].as_str().unwrap_or_default());
+        assert!(body["error"].as_str().unwrap_or("").contains("15"), "实际：{body}");
+
+        // 未登记的 checkinId：业务错误 500（与 /api/cmd 的业务拒绝同口径）
+        let (status, body) =
+            post_photos(&a, &base, Some(&token), multipart_body(Some(999), &[("a.jpg", tiny_jpeg())]));
+        assert_eq!(status, 500);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("登记不存在"),
+            "实际：{body}"
+        );
+
+        // 一轮拒绝之后登记照常可用（无半截状态）
+        let (status, _) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body(Some(checkin_id), &[("ok.jpg", tiny_jpeg())]),
+        );
+        assert_eq!(status, 200, "拒绝轮不污染后续上传");
+        block(handle.stop());
+    }
+
+    #[test]
+    fn photo_upload_requires_bearer_token() {
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let handle = block(start(deps, 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let (status, body) = post_photos(&agent(), &base, None, multipart_body(Some(1), &[]));
+        assert_eq!(status, 401, "无凭证上传必须 401");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("凭证"),
+            "实际：{body}"
+        );
+        block(handle.stop());
+    }
+
+    #[test]
+    fn photo_read_serves_referenced_file_with_triple_headers() {
+        // 验收「响应头三件套 + 带凭证取图 200」：走写入协议种一张真照片，
+        // GET /api/photo/<rel_path> 回 JPEG 字节 + 三件套。
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let checkin_id = seed_checkin(&deps, "读图窝");
+        let rel_path = {
+            let conn = deps.conn.lock().unwrap();
+            let photos_root = deps.data_dir.join(crate::photo::PHOTOS_DIR_NAME);
+            let saved = crate::photo::attach_photos(
+                &conn,
+                &photos_root,
+                checkin_id,
+                &[crate::photo::PhotoUpload {
+                    original_name: Some("a.jpg".into()),
+                    bytes: tiny_jpeg(),
+                }],
+            )
+            .unwrap();
+            saved[0].rel_path.clone()
+        };
+        let handle = block(start(deps.clone(), 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+
+        let resp = agent()
+            .get(&format!("{base}/api/photo/{rel_path}"))
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .expect("库引用照片应可达");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.header("content-type"), Some("image/jpeg"), "类型钉死 JPEG");
+        assert_eq!(resp.header("x-content-type-options"), Some("nosniff"));
+        assert_eq!(resp.header("content-disposition"), Some("inline"));
+        use std::io::Read;
+        let mut buf = Vec::new();
+        resp.into_reader().read_to_end(&mut buf).unwrap();
+        let on_disk = std::fs::read(
+            deps.data_dir
+                .join(crate::photo::PHOTOS_DIR_NAME)
+                .join(&rel_path),
+        )
+        .unwrap();
+        assert_eq!(buf, on_disk, "回包字节与盘上文件一致");
+        block(handle.stop());
+    }
+
+    #[test]
+    fn photo_read_requires_bearer_rejects_bad_grammar_and_unreferenced() {
+        let token = "a".repeat(32);
+        let (deps, dir) = test_deps(&["127.0.0.0/8"], &token);
+        let handle = block(start(deps, 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+        let uuid_jpg = "6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg";
+
+        // 无凭证 → 401
+        let (status, _) = http(&a, "GET", &format!("{base}/api/photo/1/{uuid_jpg}"), None, "");
+        assert_eq!(status, 401, "取图同样要过闸二");
+
+        // 路径 grammar 拒绝表（404 人话；不泄漏形状原因给探测者）
+        let cases = [
+            format!("api/photo/abc/{uuid_jpg}"),           // 窝段非数字
+            format!("api/photo/1x/{uuid_jpg}"),            // 窝段混字母
+            format!("api/photo/-1/{uuid_jpg}"),            // 窝段负号
+            format!("api/photo/1/{uuid_jpg}.jpg"),         // 双尾缀（base 形态破）
+            "api/photo/1/short.jpg".to_string(),           // 非 UUID 长度
+            "api/photo/1/x!@$.jpg".to_string(),            // 字符集外
+            format!("api/photo/1/{}.png", &uuid_jpg[..36]), // 非 .jpg
+        ];
+        for path in cases {
+            let (status, body) = http(&a, "GET", &format!("{base}/{path}"), Some(&token), "");
+            assert_eq!(status, 404, "{path} 应 404，实际：{}", body["error"].as_str().unwrap_or_default());
+        }
+
+        // `..` 点段与反斜杠：URL 客户端会规整/转义，用原始 socket 打
+        use std::io::{Read as _, Write as _};
+        let raw_get = |target: &str| {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", handle.port())).unwrap();
+            write!(
+                s,
+                "GET {target} HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut raw = String::new();
+            s.read_to_string(&mut raw).unwrap();
+            raw.lines().next().unwrap_or_default().to_string()
+        };
+        assert_eq!(raw_get("/api/photo/1/../x.jpg"), "HTTP/1.1 404 Not Found", "点段应 404");
+        assert_eq!(raw_get("/api/photo/1/a\\b.jpg"), "HTTP/1.1 404 Not Found", "反斜杠应 404");
+
+        // 未引用文件（磁盘有、库无行）→ 404 防枚举
+        let photos_root = dir.path().join(crate::photo::PHOTOS_DIR_NAME);
+        std::fs::create_dir_all(photos_root.join("1")).unwrap();
+        std::fs::write(photos_root.join("1").join(uuid_jpg), b"orphan").unwrap();
+        let (status, body) = http(
+            &a,
+            "GET",
+            &format!("{base}/api/photo/1/{uuid_jpg}"),
+            Some(&token),
+            "",
+        );
+        assert_eq!(status, 404, "库无引用的文件不得经端点读出");
+        assert!(body["error"].as_str().unwrap_or("").contains("不存在"));
+        block(handle.stop());
+    }
+
+    #[test]
+    fn photo_read_referenced_but_file_missing_returns_404_placeholder() {
+        // 库引用在、文件缺（恢复裸库遗留）→ 404 人话占位；前端渲染「文件缺失」
+        // 占位符，不崩溃（规格 E「缺图展示」的服务端半边）。
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let checkin_id = seed_checkin(&deps, "缺图窝");
+        {
+            let conn = deps.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+                 VALUES (?1, '1/6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg', NULL, '')",
+                [checkin_id],
+            )
+            .unwrap();
+        }
+        let handle = block(start(deps, 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let (status, body) = http(
+            &agent(),
+            "GET",
+            &format!("{base}/api/photo/1/6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg"),
+            Some(&token),
+            "",
+        );
+        assert_eq!(status, 404);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("缺失"),
+            "实际：{body}"
+        );
+        block(handle.stop());
+    }
+
+    #[test]
+    fn photo_url_grammar_accepts_only_digits_and_uuid_jpg_form() {
+        // 表驱动 grammar 纯核：只放行 <纯数字>/<36位[A-Za-z0-9-]>.jpg
+        let ok = |c: &str, f: &str| photo_url_parts_valid(c, f);
+        let uuid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        let file = format!("{uuid}.jpg");
+        assert!(ok("1", &file));
+        assert!(ok("123456789", &file), "多位窝 id 合法");
+        assert!(ok("1", &format!("{}.jpg", uuid.to_uppercase())), "大写十六进制在字符集内");
+        // 窝段
+        assert!(!ok("", &file));
+        assert!(!ok("01a", &file), "混字母拒");
+        assert!(!ok("-1", &file), "负号拒");
+        assert!(!ok("1.5", &file));
+        assert!(!ok(&"9".repeat(20), &file), "20 位超 i64 形态拒");
+        // 文件段
+        assert!(!ok("1", ".."));
+        assert!(!ok("1", "../x.jpg"), "点段过不了字符集（'.' 不在集内）");
+        assert!(!ok("1", "a\\b.jpg"), "反斜杠拒");
+        assert!(!ok("1", "a:b.jpg"), "冒号拒");
+        assert!(!ok("1", "x.jpg"), "长度不足");
+        assert!(!ok("1", &format!("{uuid}.png")), "非 .jpg 后缀拒");
+        assert!(!ok("1", &format!("{uuid}.jpg.jpg")), "双尾缀拒");
     }
 }

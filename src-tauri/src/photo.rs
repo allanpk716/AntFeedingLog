@@ -21,7 +21,7 @@ use std::collections::HashSet;
 use std::io::Cursor;
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::nest_checkin::NestPhotoMeta;
@@ -401,6 +401,20 @@ pub fn collect_colony_photo_paths(conn: &Connection, colony_id: i64) -> Result<V
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
     Ok(rows)
+}
+
+/// 库内是否引用该相对路径（webui-checkin 票 08 照片读取端点的存在性闸：
+/// 路径 grammar 之外再查库，防枚举库未引用的文件名）。
+pub fn rel_path_referenced(conn: &Connection, rel_path: &str) -> Result<bool, String> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM nest_photo WHERE rel_path = ?1 LIMIT 1",
+            params![rel_path],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    Ok(found.is_some())
 }
 
 /// 库行删除已提交后删文件。逐张尽力删，失败的记为孤儿（调用方落 applog），
@@ -1128,6 +1142,22 @@ mod tests {
     }
 
     // ── 删除顺序 ──
+
+    #[test]
+    fn rel_path_referenced_reflects_rows() {
+        // 票 08 读取端点的存在性闸：库有该行 → true；无行（含没插入过）→ false
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let id = checkin(&conn, c);
+        assert!(!rel_path_referenced(&conn, "1/a.jpg").unwrap());
+        conn.execute(
+            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note) VALUES (?1, '1/a.jpg', NULL, '')",
+            params![id],
+        )
+        .unwrap();
+        assert!(rel_path_referenced(&conn, "1/a.jpg").unwrap());
+        assert!(!rel_path_referenced(&conn, "1/b.jpg").unwrap(), "别的文件名不牵连");
+    }
 
     #[test]
     fn delete_checkin_then_files_removes_rows_first_and_its_files_only() {

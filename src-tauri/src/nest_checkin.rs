@@ -233,6 +233,20 @@ fn row_to_checkin(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, String
     ))
 }
 
+/// 登记是否存在（webui-checkin 票 08 照片上传端点的快速失败预检——不存在的
+/// 登记不烧解码重编码的 CPU；权威归属查询仍是 photo::attach_photos 的反查）。
+pub fn checkin_exists(conn: &Connection, id: i64) -> Result<bool, String> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM nest_checkin WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| format!("数据库操作失败: {e}"))?;
+    Ok(found.is_some())
+}
+
 /// 单条登记（保存/编辑后回读用）。
 pub fn get_checkin(conn: &Connection, id: i64) -> Result<NestCheckin, String> {
     let (id, colony_id, date, queen_count, worker_count, moved_nest, note, created_at) = conn

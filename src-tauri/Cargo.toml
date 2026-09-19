@@ -41,7 +41,9 @@ getrandom = "0.3"
 # 与其版本对齐，实际新增编译面只有 axum 自身。hyper / hyper-util 直接依赖只为
 # 两样 axum::serve 摸不到的东西：http1 构建器上的读超时（header_read_timeout，
 # 慢速请求防挂）与 TowerToHyperService（自管 accept 循环里做闸一 TCP 层准入）。
-axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+# multipart feature（webui-checkin 票 08）：照片上传端点 POST /api/photos 的
+# Multipart 提取器按需开启（multer 随之进编译面，仅此端点消费）。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "multipart"] }
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
 # SSE 帧流（票 06）：axum 的 Sse 响应体要 futures_core::Stream——自写 VersionStream
