@@ -33,6 +33,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ureq = "2"
 # 网页端访问凭证随机源（webui-checkin 票 03）：OS 级随机 ≥128bit，只程序生成
 getrandom = "0.3"
+# 网页端内嵌 HTTP 服务（webui-checkin 票 04）。选型 axum：票 06 的 SSE 长连接有
+# 内置支持（axum::response::sse），中间件分层天然承载闸一/闸二；Tauri 2 本就跑在
+# tokio 上（updater 等在用），hyper 1.x / tower 0.5 已是 Tauri 传递依赖，axum 0.8
+# 与其版本对齐，实际新增编译面只有 axum 自身。hyper / hyper-util 直接依赖只为
+# 两样 axum::serve 摸不到的东西：http1 构建器上的读超时（header_read_timeout，
+# 慢速请求防挂）与 TowerToHyperService（自管 accept 循环里做闸一 TCP 层准入）。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
+# tokio 直依赖（票 04）：服务生命周期要 TcpListener/watch/JoinSet/timeout——
+# Tauri 本就带着 tokio（同版本共享），这里只是把已在树里的 crate 显式点名
+tokio = { version = "1", default-features = false, features = ["net", "rt", "sync", "time", "io-util"] }
 
 [dev-dependencies]
 tempfile = "3"

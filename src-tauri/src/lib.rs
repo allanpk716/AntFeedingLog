@@ -18,6 +18,7 @@ mod stats;
 mod system;
 mod updater;
 mod webui_config;
+mod webui_server;
 
 /// 全链冒烟（数据安全二期票 05）：造数据 → 自动备份 → 改数据 → 恢复 的端到端
 /// 断言。只在测试构建编译。
@@ -25,7 +26,7 @@ mod webui_config;
 mod full_chain;
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::Connection;
@@ -39,20 +40,31 @@ pub struct SchemaInfo {
 }
 
 /// 数据库连接托管在应用状态里：Rust 是数据层唯一属主，前端只经 command 读写。
-/// `.1` 是库文件路径（安全备份直接拷这个文件，journal_mode=DELETE 拷贝即完整）。
-pub struct DbState(Mutex<Connection>, std::path::PathBuf);
+/// 锁包一层 Arc（票 04）：网页端 HTTP 服务（webui_server）要拿同一把库锁派发
+/// 命令——单连接不变，只是让 tokio 任务能持有克隆的锁柄。`.1` 是库文件路径
+/// （安全备份直接拷这个文件，journal_mode=DELETE 拷贝即完整）。
+pub struct DbState(Arc<Mutex<Connection>>, std::path::PathBuf);
 
-/// 借出连接的统一入口（锁被毒化时转成前端可见的错误串）。
+impl DbState {
+    /// 库锁的共享柄（HTTP 服务与桌面 IPC 同锁串行的接缝）。
+    pub(crate) fn conn_handle(&self) -> Arc<Mutex<Connection>> {
+        self.0.clone()
+    }
+}
+
+/// 借出连接的统一入口（锁被毒化时转成前端可见的错误串）。`with_conn`（桌面
+/// Tauri command）与网页端 HTTP 派发（webui_server::dispatch_command）共用本
+/// 函数：同一把锁、同一禁写窗口、同一失败日志，两条通路一个口径。
 /// 票 04 禁写窗口：快照完成后到进程退出前，一切请求在此拒绝。取舍：挂在统一
 /// 入口把读也一并拦下——窗口只有安装器拉起前的一瞬（随后进程退出），读失败
 /// 只是前端一次报错；而逐个写命令去挂太散、未来新命令可能漏挂。
 /// 复查必须在锁内（评审 R1 TOCTOU）：置位发生在快照的持锁段，若在拿锁前检查，
 /// 置位前已通过检查、正阻塞在 lock 上的在途写会在快照放锁后落库。
-fn with_conn<T>(
-    state: tauri::State<'_, DbState>,
+pub(crate) fn run_with_conn<T>(
+    conn_mutex: &Mutex<Connection>,
     f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
 ) -> Result<T, String> {
-    let conn = match state.0.lock() {
+    let conn = match conn_mutex.lock() {
         Ok(conn) => conn,
         Err(e) => {
             // 票 01：命令失败落日志（库锁不可用）
@@ -71,6 +83,14 @@ fn with_conn<T>(
         applog::log_error(&format!("命令执行失败: {e}"));
     }
     result
+}
+
+/// 桌面命令入口：State 里借出锁交给 [`run_with_conn`]。
+fn with_conn<T>(
+    state: tauri::State<'_, DbState>,
+    f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    run_with_conn(&state.0, f)
 }
 
 /// IPC 通路健康检查：返回 schema 版本（迁移正常时应为 1）。
@@ -716,7 +736,8 @@ fn open_releases_page(app: tauri::AppHandle) -> Result<(), String> {
 
 // ── 网页端设置（webui-checkin 票 03）：网段枚举 / 配置与凭证 / 防火墙联动 ──
 // 配置存数据目录 webui-config.json（库外，恢复不触碰，同 backup-config.json 取舍）。
-// 本票不含 HTTP 服务（票 04）——save 后不启动监听，防火墙联动与凭证/URL 即刻生效。
+// 票 04 起：保存成功后按新配置对齐内嵌 HTTP 服务（起/停/改端口即重启）；
+// 凭证与网段由服务每请求现读，重生成/改网段即刻生效，无须动服务。
 
 /// 枚举本机网段（虚拟化噪音已滤、NetBird 段置顶标名）。async：PowerShell 枚举
 /// 不能占主线程（评审 R1-2 同款，与 pick_backup_dir 同理）。
@@ -729,9 +750,10 @@ async fn list_network_segments() -> Result<Vec<netseg::NetworkSegment>, String> 
 
 /// 读网页端配置；凭证为空顺路补生成并落盘（首次打开设置页即有凭证可用）。
 ///
-/// ⚠ **严禁注册进网页端 HTTP 白名单**（票 05）：本命令响应含**访问凭证明文**，
-/// 只允许桌面 Tauri IPC 调用。票 05 实现白名单注册表时须对本命令加显式禁入
-/// 断言——网页端 API 一旦暴露它，凭证即泄漏给页面侧脚本。
+/// ⚠ **严禁注册进网页端 HTTP 白名单**：本命令响应含**访问凭证明文**，只允许
+/// 桌面 Tauri IPC 调用——webui_server::WEBUI_COMMANDS 的
+/// `registry_excludes_forbidden_commands` 测试钉死本命令不得入表（票 03 评审
+/// Important 的落点），一旦暴露，凭证即泄漏给页面侧脚本。
 #[tauri::command]
 fn get_webui_config() -> Result<webui_config::WebUiConfig, String> {
     let data_dir = current_data_dir()?;
@@ -740,24 +762,34 @@ fn get_webui_config() -> Result<webui_config::WebUiConfig, String> {
 
 /// save_webui_config 返回体（半成功语义，同 settle_settings_save 取舍）：配置
 /// 落盘是事实，防火墙失败不吞掉它——结构化回传错误 + 现成手动命令，前端分开展示。
+/// 服务起停结果同理（票 04）：端口被占用 → 配置已保存但 server_error 给人话
+/// 提示（设置页回显），绝不把已保存的配置标成失败。
 #[derive(Serialize)]
 pub struct WebUiSaveOutcome {
     pub config: webui_config::WebUiConfig,
     pub firewall_ok: bool,
     pub firewall_error: Option<String>,
     pub firewall_manual_cmd: Option<String>,
+    /// 网页端服务按新配置对齐成功（含「停用即关停」）。
+    pub server_ok: bool,
+    /// 服务起停失败的人话原因（端口占用等）；None = 正常。
+    pub server_error: Option<String>,
 }
 
 /// 保存网页端配置（enabled/segments/port；CIDR 与端口校验在 webui_config 纯核，
-/// 绕过前端的直调在此兜底拦下）。成功后同步防火墙规则：开 = 先删后建（幂等），
-/// 关 = 删规则；提权 UAC 弹窗等待用户响应，丢阻塞线程池跑、不冻 UI（async command）。
-/// 防火墙成败都落流水（D7）。
+/// 绕过前端的直调在此兜底拦下）。成功后两件联动，都走阻塞线程池/异步不冻 UI：
+/// 防火墙规则（开 = 先删后建幂等，关 = 删规则，UAC 弹窗）+ 内嵌 HTTP 服务按新
+/// 配置对齐（票 04：起/停/改端口重启；端口被占用不崩溃，人话错误回设置页）。
+/// 防火墙与服务成败都落流水（D7），且都不吞掉已保存的配置（半成功语义）。
 ///
-/// ⚠ **严禁注册进网页端 HTTP 白名单**（票 05）：本命令可改受信网段/端口/开关
-/// （闸一安全配置），只能由桌面设置页发起；网页端的功能面不含任何设置操作
-///（规格 H），票 05 白名单注册表须对本命令加显式禁入断言。
+/// ⚠ **严禁注册进网页端 HTTP 白名单**：本命令可改受信网段/端口/开关（闸一
+/// 安全配置），只能由桌面设置页发起；网页端的功能面不含任何设置操作（规格 H），
+/// webui_server::WEBUI_COMMANDS 的禁入断言测试钉死本命令不得入表。
 #[tauri::command]
-async fn save_webui_config(input: webui_config::WebUiSaveInput) -> Result<WebUiSaveOutcome, String> {
+async fn save_webui_config(
+    app: tauri::AppHandle,
+    input: webui_config::WebUiSaveInput,
+) -> Result<WebUiSaveOutcome, String> {
     let data_dir = current_data_dir()?;
     let saved = webui_config::save_webui(&data_dir, &input)?;
     let segments_text = if saved.segments.is_empty() {
@@ -789,19 +821,41 @@ async fn save_webui_config(input: webui_config::WebUiSaveInput) -> Result<WebUiS
             (false, Some(e.message), Some(e.manual_cmd))
         }
     };
+    // 服务对齐（票 04）：失败不回滚已落盘的配置，人话错误随回传体给设置页
+    let server_outcome = sync_webui_server(&app, &saved).await;
+    let (server_ok, server_error) = match server_outcome {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
     Ok(WebUiSaveOutcome {
         config: saved,
         firewall_ok,
         firewall_error,
         firewall_manual_cmd,
+        server_ok,
+        server_error,
     })
+}
+
+/// 按配置对齐网页端服务（启动序列与 save_webui_config 共用入口）。
+/// 从 Tauri 状态拿运行时槽位与共享依赖；状态未就绪（极端早退路径）报人话错误。
+async fn sync_webui_server(app: &tauri::AppHandle, cfg: &webui_config::WebUiConfig) -> Result<(), String> {
+    let runtime = app
+        .try_state::<webui_server::WebUiRuntime>()
+        .ok_or_else(|| "网页端服务运行时未就绪".to_string())?;
+    let deps = app
+        .try_state::<Arc<webui_server::SharedDeps>>()
+        .ok_or_else(|| "网页端服务依赖未就绪".to_string())?;
+    runtime.sync(deps.inner().clone(), cfg).await
 }
 
 /// 重生成访问凭证（旧地址即刻作废 = 覆盖写）。成功记一条动作流水（D7）。
 ///
-/// ⚠ **严禁注册进网页端 HTTP 白名单**（票 05）：本命令返回**新凭证明文**且可
-/// 直接作废全部旧地址（安全管理操作），只允许桌面设置页调用；票 05 白名单注册表
-/// 须对本命令加显式禁入断言。
+/// ⚠ **严禁注册进网页端 HTTP 白名单**：本命令返回**新凭证明文**且可直接作废
+/// 全部旧地址（安全管理操作），只允许桌面设置页调用——webui_server 的
+/// `registry_excludes_forbidden_commands` 测试钉死本命令不得入表。
+/// 凭证重生成后旧地址即刻失效的机制：HTTP 服务每请求现读配置文件（webui_server
+/// auth_mw 取舍注释），无需通知服务。
 #[tauri::command]
 fn regenerate_token() -> Result<webui_config::WebUiConfig, String> {
     let data_dir = current_data_dir()?;
@@ -814,9 +868,9 @@ fn regenerate_token() -> Result<webui_config::WebUiConfig, String> {
 /// 本机 IP 拼（多段取第一个）。网段当前不在线报错（如拔掉 NetBird 后）。
 /// async：网卡枚举不能占主线程。
 ///
-/// ⚠ **严禁注册进网页端 HTTP 白名单**（票 05）：本命令响应就是**含凭证的完整
-/// 访问地址**，只允许桌面设置页/向导调用；票 05 白名单注册表须对本命令加显式
-/// 禁入断言——经网页端 API 取到它等于把进门凭证递给页面侧。
+/// ⚠ **严禁注册进网页端 HTTP 白名单**：本命令响应就是**含凭证的完整访问地址**，
+/// 只允许桌面设置页/向导调用——webui_server 的 `registry_excludes_forbidden_commands`
+/// 测试钉死本命令不得入表，经网页端 API 取到它等于把进门凭证递给页面侧。
 #[tauri::command]
 async fn get_access_url() -> Result<String, String> {
     let data_dir = current_data_dir()?;
@@ -1212,7 +1266,17 @@ pub fn run() {
             let autostart_on = settings::get_settings(&conn)
                 .map(|s| s.autostart_enabled)
                 .unwrap_or(true);
-            app.manage(DbState(Mutex::new(conn), db_path));
+            let db_state = DbState(Arc::new(Mutex::new(conn)), db_path);
+            // 网页端服务（票 04）：共享依赖（与桌面 IPC 同一把库锁的柄）+ 运行时
+            // 槽位先就位；配置 enabled 即拉起。启动失败只落日志不挡启动（不弹窗
+            // 不崩溃；设置页保存时会对齐并回显错误，用户可当场看到原因）。
+            let webui_deps = Arc::new(webui_server::SharedDeps::new(
+                db_state.conn_handle(),
+                data_dir.clone(),
+            ));
+            app.manage(webui_deps);
+            app.manage(webui_server::WebUiRuntime::new());
+            app.manage(db_state);
             // 托盘常驻 + 提醒调度（启动即查一次，此后每 30 分钟；评审附录规则 1）。
             reminder::setup_tray(app)?;
             reminder::spawn_scheduler(app.handle().clone());
@@ -1257,6 +1321,18 @@ pub fn run() {
                     if autostart_on { "开" } else { "关" }
                 )),
                 Err(e) => applog::log_error(&format!("启动时同步开机自启失败: {e}")),
+            }
+            // 网页端服务自启（票 04）：上次会话启用过即拉起（绑定失败时 start()
+            // 已落日志——端口占用等细节在流水里，设置页重新保存可回显）。disabled
+            // 静默（每次启动都记「未启用」是刷屏）。
+            let webui_cfg = webui_config::load(&data_dir);
+            if webui_cfg.enabled {
+                let app_handle = app.handle().clone();
+                let outcome =
+                    tauri::async_runtime::block_on(sync_webui_server(&app_handle, &webui_cfg));
+                if let Err(e) = outcome {
+                    applog::log_error(&format!("启动时拉起网页端服务失败: {e}"));
+                }
             }
             Ok(())
         })

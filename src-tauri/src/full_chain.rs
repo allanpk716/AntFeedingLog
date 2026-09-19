@@ -86,9 +86,11 @@ fn full_chain_backup_then_restore_roundtrip() {
         colony_id
     };
 
-    // 运行态：DbState（Mutex<Connection> + 库路径），同应用 setup 的形状
+    // 运行态：DbState（Arc<Mutex<Connection>> + 库路径），同应用 setup 的形状
     let state = crate::DbState(
-        Mutex::new(crate::db::open_and_migrate(&db_path).expect("重开库失败")),
+        std::sync::Arc::new(Mutex::new(
+            crate::db::open_and_migrate(&db_path).expect("重开库失败"),
+        )),
         db_path.clone(),
     );
 

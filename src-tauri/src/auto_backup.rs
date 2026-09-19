@@ -427,7 +427,9 @@ mod tests {
     /// 用库路径拼一个 DbState（重开一份连接，模拟应用运行态）。
     fn db_state(db_path: &std::path::Path) -> crate::DbState {
         crate::DbState(
-            std::sync::Mutex::new(crate::db::open_and_migrate(db_path).expect("重开库失败")),
+            std::sync::Arc::new(std::sync::Mutex::new(
+                crate::db::open_and_migrate(db_path).expect("重开库失败"),
+            )),
             db_path.to_path_buf(),
         )
     }
