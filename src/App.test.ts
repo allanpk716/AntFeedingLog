@@ -4,6 +4,7 @@ import App from "./App.vue";
 import type { AppSettings, CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
 import { addDays, todayIso, todayLabel } from "./lib/dates";
 import DateTimeField from "./components/DateTimeField.vue";
+import DatePickerPop from "./components/DatePickerPop.vue";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
 const { invokeMock, listenStub } = vi.hoisted(() => ({
@@ -224,7 +225,7 @@ describe("新建窝", () => {
     await dialog.find(".name-input").setValue("  新窝一号  ");
     await dialog.find(".species-input").setValue("针毛收获蚁");
     await dialog.find(".location-select").setValue("1");
-    await dialog.find(".date-input").setValue("2026-09-18");
+    await dialog.findComponent(DatePickerPop).vm.$emit("update:modelValue", "2026-09-18");
 
     invokeMock.mockClear();
     await dialog.find(".submit-btn").trigger("click");
@@ -268,7 +269,7 @@ describe("编辑窝", () => {
     expect((dialog.find(".name-input").element as HTMLInputElement).value).toBe("大头一号");
     expect((dialog.find(".species-input").element as HTMLInputElement).value).toBe("大头收获蚁");
     expect((dialog.find(".location-select").element as HTMLSelectElement).value).toBe("1");
-    expect((dialog.find(".date-input").element as HTMLInputElement).value).toBe("2026-01-20");
+    expect(dialog.findComponent(DatePickerPop).props("modelValue")).toBe("2026-01-20");
 
     await dialog.find(".name-input").setValue("大头一号B");
     await dialog.find(".status-select").setValue("ended");
@@ -1167,13 +1168,13 @@ describe("冬眠管理（票 05）", () => {
 
     const dialog = wrapper.find(".hibernation-dialog");
     expect(dialog.exists()).toBe(true);
-    const start = (dialog.find(".start-input").element as HTMLInputElement).value;
+    const start = dialog.findAllComponents(DatePickerPop)[0].props("modelValue") as string;
     expect(start).toBe(todayIso());
-    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe(addDays(start, 120));
+    expect(dialog.findAllComponents(DatePickerPop)[1].props("modelValue")).toBe(addDays(start, 120));
 
-    await dialog.find(".start-input").setValue("2026-12-01");
+    await dialog.findAllComponents(DatePickerPop)[0].vm.$emit("update:modelValue", "2026-12-01");
     // 手动改预计结束（选完开始日自动预填、但用户可改）
-    await dialog.find(".end-input").setValue("2027-04-15");
+    await dialog.findAllComponents(DatePickerPop)[1].vm.$emit("update:modelValue", "2027-04-15");
 
     invokeMock.mockClear();
     await dialog.find(".submit-btn").trigger("click");
@@ -1193,13 +1194,13 @@ describe("冬眠管理（票 05）", () => {
     await wrapper.find('.card[data-colony-id="1"] .hib-btn').trigger("click");
 
     const dialog = wrapper.find(".hibernation-dialog");
-    await dialog.find(".start-input").setValue("2026-12-01");
-    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe("2027-03-31");
+    await dialog.findAllComponents(DatePickerPop)[0].vm.$emit("update:modelValue", "2026-12-01");
+    expect(dialog.findAllComponents(DatePickerPop)[1].props("modelValue")).toBe("2027-03-31");
 
     // 手动改过之后不再自动覆盖
-    await dialog.find(".end-input").setValue("2027-05-01");
-    await dialog.find(".start-input").setValue("2026-12-10");
-    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe("2027-05-01");
+    await dialog.findAllComponents(DatePickerPop)[1].vm.$emit("update:modelValue", "2027-05-01");
+    await dialog.findAllComponents(DatePickerPop)[0].vm.$emit("update:modelValue", "2026-12-10");
+    expect(dialog.findAllComponents(DatePickerPop)[1].props("modelValue")).toBe("2027-05-01");
   });
 
   it("开始冬眠被后端拒绝（如重叠）时弹窗内展示原因且弹窗保持", async () => {
@@ -1229,8 +1230,8 @@ describe("冬眠管理（票 05）", () => {
 
     const dialog = wrapper.find(".hibernation-dialog");
     expect(dialog.find("h3").text()).toContain("确认出眠");
-    expect((dialog.find(".actual-input").element as HTMLInputElement).value).toBe(todayIso());
-    await dialog.find(".actual-input").setValue("2026-09-12");
+    expect(dialog.findComponent(DatePickerPop).props("modelValue")).toBe(todayIso());
+    await dialog.findComponent(DatePickerPop).vm.$emit("update:modelValue", "2026-09-12");
 
     invokeMock.mockClear();
     await dialog.find(".submit-btn").trigger("click");
@@ -1258,8 +1259,8 @@ describe("冬眠管理（票 05）", () => {
     expect(dialog.find(".form-error").text()).toContain("日期");
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "add_past_hibernation")).toBe(false);
 
-    await dialog.find(".past-start-input").setValue("2025-12-01");
-    await dialog.find(".past-end-input").setValue("2026-02-01");
+    await dialog.findAllComponents(DatePickerPop)[0].vm.$emit("update:modelValue", "2025-12-01");
+    await dialog.findAllComponents(DatePickerPop)[1].vm.$emit("update:modelValue", "2026-02-01");
     await dialog.find(".submit-btn").trigger("click");
     await flushPromises();
 
@@ -1285,9 +1286,9 @@ describe("冬眠管理（票 05）", () => {
     const dialog = wrapper.find(".hibernation-dialog");
     expect(dialog.exists()).toBe(true);
     expect(dialog.find("h3").text()).toContain("修改预计出眠");
-    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe("2026-12-01");
+    expect(dialog.findComponent(DatePickerPop).props("modelValue")).toBe("2026-12-01");
 
-    await dialog.find(".end-input").setValue("2027-01-15");
+    await dialog.findComponent(DatePickerPop).vm.$emit("update:modelValue", "2027-01-15");
     invokeMock.mockClear();
     await dialog.find(".submit-btn").trigger("click");
     await flushPromises();
