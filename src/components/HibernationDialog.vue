@@ -15,6 +15,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Colony } from "../types";
 import { defaultExpectedEnd } from "../lib/hibernation";
 import { todayIso } from "../lib/dates";
+import DatePickerPop from "./DatePickerPop.vue";
 
 const props = defineProps<{
   colony: Colony;
@@ -109,32 +110,32 @@ function submit() {
 
       <template v-if="mode === 'start'">
         <div class="field-label">开始日期（默认今天）</div>
-        <input v-model="startDate" class="start-input" type="date" />
+        <DatePickerPop v-model="startDate" placeholder="开始日期" />
 
         <div class="field-label">预计结束日期（默认开始日 + 120 天，可改）</div>
-        <input
+        <!-- 手动改过预计结束的标记：触发源从原生 input 事件换为日历的 update:modelValue -->
+        <DatePickerPop
           v-model="expectedEnd"
-          class="end-input"
-          type="date"
-          @input="endTouched = true"
+          placeholder="预计结束日期"
+          @update:model-value="endTouched = true"
         />
       </template>
 
       <template v-else-if="mode === 'edit'">
         <div class="field-label">新的预计出眠日（未发的提醒按新日期重算）</div>
-        <input v-model="expectedEnd" class="end-input" type="date" />
+        <DatePickerPop v-model="expectedEnd" placeholder="预计出眠日" />
       </template>
 
       <template v-else-if="mode === 'wake'">
         <div class="field-label">实际结束日期（默认今天，可与预计不同）</div>
-        <input v-model="actualEnd" class="actual-input" type="date" />
+        <DatePickerPop v-model="actualEnd" placeholder="实际结束日期" />
       </template>
 
       <template v-else>
         <div class="field-label">历史段开始日期</div>
-        <input v-model="pastStart" class="past-start-input" type="date" />
+        <DatePickerPop v-model="pastStart" placeholder="开始日期" />
         <div class="field-label">历史段结束日期</div>
-        <input v-model="pastEnd" class="past-end-input" type="date" />
+        <DatePickerPop v-model="pastEnd" placeholder="结束日期" />
       </template>
 
       <p v-if="formError" class="form-error">{{ formError }}</p>
@@ -181,14 +182,15 @@ function submit() {
   margin: 12px 0 6px;
 }
 
-.dialog input[type="date"] {
+/* DatePickerPop 拉满行宽（对齐原 date 输入）：.dp 是 inline-block 收缩包围，
+   button 的百分比宽拉不开父级——包壳改 block 才有效；触发器自身再占满 .dp */
+.dialog :deep(.dp) {
+  display: block;
   width: 100%;
-  padding: 7px 10px;
-  border: 1px solid var(--border-strong);
-  border-radius: 8px;
-  font: inherit;
-  background: var(--card);
-  color: var(--text);
+}
+
+.dialog :deep(.dp-trigger) {
+  width: 100%;
 }
 
 .form-error {

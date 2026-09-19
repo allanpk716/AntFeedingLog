@@ -8,5 +8,6 @@
 - [ ] `pnpm build`（vue-tsc + vite build）通过
 - [ ] README 增补交互第三轮 8 项、测试数刷新
 - [ ] 存疑项目检：弹层在滚动容器内的表现（评审附录③，撞上停下反馈）
+- [x] 存疑项目检：dp-pop 在 .page-body 滚动容器内只滚动不裁剪、弹窗 fixed overlay 无裁剪祖先——终局评审代码复核 + 票11实跑目检双确认，无阻塞
 
 **Blocked by**: 08, 09, 10

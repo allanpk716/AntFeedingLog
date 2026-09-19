@@ -110,6 +110,21 @@ fn list_logs(
     with_conn(state, |conn| care::list_logs(conn, &filter))
 }
 
+/// 按窝按月的记录摘要（交互第三轮票 05）：日历标记 + 重复黄条数据源。
+/// `excludeLogId`：编辑场景传当前记录 id——正在编辑的这条不计入，防自计数误报。
+#[tauri::command]
+fn colony_month_records(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+    year: i64,
+    month: i64,
+    exclude_log_id: Option<i64>,
+) -> Result<Vec<care::MonthDayRecords>, String> {
+    with_conn(state, |conn| {
+        care::colony_month_records(conn, colony_id, year, month, exclude_log_id)
+    })
+}
+
 #[tauri::command]
 fn update_log(
     state: tauri::State<'_, DbState>,
@@ -1062,6 +1077,7 @@ pub fn run() {
             log_care,
             list_foods,
             list_logs,
+            colony_month_records,
             update_log,
             delete_log,
             list_actions,

@@ -231,6 +231,8 @@ pub struct LogRow {
     pub id: i64,
     pub colony_id: i64,
     pub colony_name: String,
+    /// 窝所属地点名（交互第三轮 #5）；未分组 = None
+    pub location_name: Option<String>,
     pub action_id: i64,
     pub action_name: String,
     pub occurred_at: String,
@@ -252,6 +254,9 @@ pub struct LogPage {
 /// 备注子串匹配（LIKE 通配符转义）；limit 缺省 50、上限 500，offset 缺省 0。
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct LogFilter {
+    /// 地点筛选（交互第三轮 #1）：窝的所属地点；与 colony_id 组合生效
+    #[serde(default)]
+    pub location_id: Option<i64>,
     #[serde(default)]
     pub colony_id: Option<i64>,
     #[serde(default)]
@@ -293,6 +298,10 @@ fn parse_filter_date(s: &str) -> Result<String, String> {
 pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, String> {
     let mut wheres: Vec<String> = Vec::new();
     let mut args: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(location_id) = filter.location_id {
+        args.push(location_id.into());
+        wheres.push(format!("c.location_id = ?{}", args.len()));
+    }
     if let Some(colony_id) = filter.colony_id {
         args.push(colony_id.into());
         wheres.push(format!("l.colony_id = ?{}", args.len()));
@@ -324,7 +333,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
 
     let total: i64 = conn
         .query_row(
-            &format!("SELECT COUNT(*) FROM care_log l {where_sql}"),
+            &format!("SELECT COUNT(*) FROM care_log l JOIN colony c ON c.id = l.colony_id {where_sql}"),
             rusqlite::params_from_iter(args.iter()),
             |row| row.get(0),
         )
@@ -332,9 +341,10 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
 
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT l.id, l.colony_id, c.name, l.action_id, a.name, l.occurred_at, l.note, l.created_at
+            "SELECT l.id, l.colony_id, c.name, lo.name, l.action_id, a.name, l.occurred_at, l.note, l.created_at
              FROM care_log l
              JOIN colony c ON c.id = l.colony_id
+             LEFT JOIN location lo ON lo.id = c.location_id
              JOIN care_action a ON a.id = l.action_id
              {where_sql}
              ORDER BY l.occurred_at DESC, l.id DESC
@@ -347,11 +357,12 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })
         .map_err(db_err)?
@@ -359,7 +370,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
         .map_err(db_err)?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (id, colony_id, colony_name, action_id, action_name, occurred_at, note, created_at) in rows {
+    for (id, colony_id, colony_name, location_name, action_id, action_name, occurred_at, note, created_at) in rows {
         let mut stmt_food = conn
             .prepare(
                 "SELECT lf.food_id, f.name FROM log_food lf JOIN food f ON f.id = lf.food_id
@@ -377,6 +388,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
             id,
             colony_id,
             colony_name,
+            location_name,
             action_id,
             action_name,
             occurred_at,
@@ -387,6 +399,71 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
         });
     }
     Ok(LogPage { total, rows: out })
+}
+
+/// 按窝按月的记录摘要行（交互第三轮 #8）：日历标记与重复提醒的数据源。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MonthDayRecords {
+    pub day: i64,
+    pub action_id: i64,
+    pub count: i64,
+    /// 该 (日, 操作) 最近一条的发生时刻（"YYYY-MM-DD HH:MM:SS"）
+    pub last_time: String,
+}
+
+/// 某窝某月每天的逐操作计数（日历橙点/灰点、黄条「已有 N 条（HH:MM）」用）。
+/// month 取 1–12；occurred_at 落在 [当月1日, 次月1日) 字典序区间内（库内格式定长，字典序即时间序）。
+/// `exclude_log_id`：编辑场景传当前记录 id——正在编辑的这条不计入，防「只改备注也误报重复」。
+pub fn colony_month_records(
+    conn: &Connection,
+    colony_id: i64,
+    year: i64,
+    month: i64,
+    exclude_log_id: Option<i64>,
+) -> Result<Vec<MonthDayRecords>, String> {
+    if !(1..=12).contains(&month) {
+        return Err(format!("月份应在 1–12：{year}-{month}"));
+    }
+    let (next_y, next_m) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let range_start = format!("{year:04}-{month:02}-01 00:00:00");
+    let range_end = format!("{next_y:04}-{next_m:02}-01 00:00:00");
+
+    // 动态 WHERE 照抄 list_logs 的 wheres/args 模式：固定三段 + 可选「排除自身」
+    let mut wheres: Vec<String> = vec![
+        "l.colony_id = ?1".into(),
+        "l.occurred_at >= ?2".into(),
+        "l.occurred_at < ?3".into(),
+    ];
+    let mut args: Vec<rusqlite::types::Value> =
+        vec![colony_id.into(), range_start.into(), range_end.into()];
+    if let Some(exclude) = exclude_log_id {
+        args.push(exclude.into());
+        wheres.push(format!("l.id != ?{}", args.len()));
+    }
+
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT CAST(substr(l.occurred_at, 9, 2) AS INTEGER), l.action_id, COUNT(*), MAX(l.occurred_at)
+             FROM care_log l
+             WHERE {}
+             GROUP BY substr(l.occurred_at, 9, 2), l.action_id
+             ORDER BY substr(l.occurred_at, 9, 2), l.action_id",
+            wheres.join(" AND ")
+        ))
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            Ok(MonthDayRecords {
+                day: row.get(0)?,
+                action_id: row.get(1)?,
+                count: row.get(2)?,
+                last_time: row.get(3)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
 }
 
 /// 编辑一条记录（spec API 契约 updateLog）：走完整校验——时间规整 + 不许未来
@@ -1563,6 +1640,59 @@ mod tests {
         assert_eq!(page.rows[0].food_names, vec!["种子"]);
     }
 
+    // ── 地点筛选 + 行带地点名（交互第三轮 #1/#5）──
+    // （种子依据：db.rs seeds 预置 '家'/'公司'，loc_id 按名取不会踩空）
+
+    fn colony_in_loc(conn: &Connection, name: &str, loc: Option<i64>) -> i64 {
+        conn.execute(
+            "INSERT INTO colony (name, location_id, start_date, status) VALUES (?1, ?2, '2026-01-01', 'active')",
+            params![name, loc],
+        ).expect("建窝失败");
+        conn.last_insert_rowid()
+    }
+    fn loc_id(conn: &Connection, name: &str) -> i64 {
+        conn.query_row("SELECT id FROM location WHERE name = ?1", params![name], |r| r.get(0)).expect("查地点失败")
+    }
+
+    #[test]
+    fn list_logs_filters_by_location_and_joins_location_name() {
+        let conn = mem_conn();
+        let home = loc_id(&conn, "家");
+        let c1 = colony_in_loc(&conn, "大头一号", Some(home));
+        let c2 = colony_in_loc(&conn, "游民", None);
+        log(&conn, c1, "喂食", "2026-09-17 20:00:00");
+        log(&conn, c2, "喂食", "2026-09-16 20:00:00");
+
+        let page = list_logs(&conn, &LogFilter { location_id: Some(home), ..Default::default() }).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].colony_name, "大头一号");
+        assert_eq!(page.rows[0].location_name.as_deref(), Some("家"));
+
+        // 未分组的窝：location_name = None；按「全部」查两行都在
+        let all = list_logs(&conn, &LogFilter::default()).unwrap();
+        assert_eq!(all.total, 2);
+        let nomad = all.rows.iter().find(|r| r.colony_name == "游民").unwrap();
+        assert_eq!(nomad.location_name, None);
+    }
+
+    #[test]
+    fn list_logs_location_and_colony_filters_compose() {
+        let conn = mem_conn();
+        let home = loc_id(&conn, "家");
+        let c1 = colony_in_loc(&conn, "家A", Some(home));
+        let c2 = colony_in_loc(&conn, "家B", Some(home));
+        log(&conn, c1, "喂食", "2026-09-17 20:00:00");
+        log(&conn, c2, "喂食", "2026-09-16 20:00:00");
+
+        let page = list_logs(&conn, &LogFilter {
+            location_id: Some(home),
+            colony_id: Some(c1),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].colony_name, "家A");
+    }
+
     #[test]
     fn update_log_swaps_foods_and_edits_fields_in_place() {
         // 验收 2：编辑喂食记录更换食物生效（log_food 关联同事务重写）
@@ -1899,5 +2029,93 @@ mod tests {
         // 再删同一 id → 记录不存在
         let err = delete_log(&conn, id).unwrap_err();
         assert!(err.contains("不存在"), "实际错误：{err}");
+    }
+
+    // ── 按窝按月记录摘要（交互第三轮 #8：日历标记 + 重复黄条数据源）──
+
+    fn month_rows(
+        conn: &Connection,
+        colony_id: i64,
+        year: i64,
+        month: i64,
+        exclude_log_id: Option<i64>,
+    ) -> Vec<MonthDayRecords> {
+        colony_month_records(conn, colony_id, year, month, exclude_log_id).expect("按月查询失败")
+    }
+
+    #[test]
+    fn colony_month_records_groups_by_day_and_action_with_last_time() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        log(&conn, c, "垃圾清理", "2026-09-12 19:40:00");
+        log(&conn, c, "垃圾清理", "2026-09-12 08:30:00"); // 同日同操作第二条
+        log(&conn, c, "巢穴保湿", "2026-09-12 21:00:00");
+        log(&conn, c, "喂食", "2026-09-17 20:00:00");
+
+        let rows = month_rows(&conn, c, 2026, 9, None);
+        assert_eq!(rows.len(), 3, "3 个 (day, action) 组");
+        let trash = rows.iter().find(|r| r.action_id == action_id(&conn, "垃圾清理")).unwrap();
+        assert_eq!(trash.day, 12);
+        assert_eq!(trash.count, 2);
+        assert_eq!(trash.last_time, "2026-09-12 19:40:00"); // 最近一条的时刻
+    }
+
+    #[test]
+    fn colony_month_records_excludes_other_months_and_colonies() {
+        let conn = mem_conn();
+        let c1 = colony(&conn, "大头一号");
+        let c2 = colony(&conn, "大头二号");
+        log(&conn, c1, "喂食", "2026-09-17 20:00:00");
+        log(&conn, c1, "喂食", "2026-08-31 23:59:59"); // 上月
+        // 次月：票 04 起写入层拒未来时间，log_care 写不进——查询边界直接落库验证
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (?1, ?2, '2026-10-01 00:00:00', '', '2026-09-18 08:00:00')",
+            params![c1, action_id(&conn, "喂食")],
+        )
+        .unwrap();
+        log(&conn, c2, "喂食", "2026-09-18 07:00:00"); // 别窝
+
+        let rows = month_rows(&conn, c1, 2026, 9, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].day, 17);
+    }
+
+    #[test]
+    fn colony_month_records_exclude_log_id_drops_only_that_record() {
+        // 编辑场景防自计数：正在编辑的这条不计入，其余照常聚合
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let early = log(&conn, c, "喂食", "2026-09-12 08:30:00");
+        let editing = log(&conn, c, "喂食", "2026-09-12 19:40:00");
+
+        // 不排除：同日同操作 2 条，last_time 取最近
+        let rows = month_rows(&conn, c, 2026, 9, None);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].count, 2);
+        assert_eq!(rows[0].last_time, "2026-09-12 19:40:00");
+
+        // 排除正在编辑的这条：剩 1 条，last_time 回退到早的那条
+        let rows = month_rows(&conn, c, 2026, 9, Some(editing));
+        assert_eq!(rows.len(), 1, "仍有另一条记录在");
+        assert_eq!(rows[0].count, 1);
+        assert_eq!(rows[0].last_time, "2026-09-12 08:30:00");
+
+        // 排除另一条同理（对称校验）
+        let rows = month_rows(&conn, c, 2026, 9, Some(early));
+        assert_eq!(rows[0].count, 1);
+        assert_eq!(rows[0].last_time, "2026-09-12 19:40:00");
+
+        // 排除不存在的 id：不影响结果（WHERE 不命中任何行）
+        let rows = month_rows(&conn, c, 2026, 9, Some(999_999));
+        assert_eq!(rows[0].count, 2);
+    }
+
+    #[test]
+    fn colony_month_records_rejects_bad_month() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        assert!(colony_month_records(&conn, c, 2026, 0, None).is_err());
+        assert!(colony_month_records(&conn, c, 2026, 13, None).is_err());
     }
 }

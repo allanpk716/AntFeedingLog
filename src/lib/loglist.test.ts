@@ -5,6 +5,7 @@ import {
   buildUpdateInput,
   canPickAction,
   canPickFood,
+  colonyOptionsFor,
   dictLabel,
   emptyFilterForm,
   filterFormError,
@@ -12,7 +13,7 @@ import {
   nextOffset,
   type LogFilterForm,
 } from "./loglist";
-import type { CareActionItem, FoodItem } from "../types";
+import type { CareActionItem, Colony, FoodItem } from "../types";
 
 function action(overrides: Partial<CareActionItem>): CareActionItem {
   return {
@@ -46,6 +47,7 @@ function food(overrides: Partial<FoodItem>): FoodItem {
 describe("筛选拼装（验收 1：组合筛选 + 备注搜索的 IPC 入参）", () => {
   it("空表单 → 全 null 筛选（后端即全量），页大小取默认", () => {
     expect(buildLogFilter(emptyFilterForm())).toEqual({
+      location_id: null,
       colony_id: null,
       action_id: null,
       start: null,
@@ -58,6 +60,7 @@ describe("筛选拼装（验收 1：组合筛选 + 备注搜索的 IPC 入参）
 
   it("各维度组合进一个入参；关键词 trim、空串收敛 null", () => {
     const form: LogFilterForm = {
+      locationId: 1,
       colonyId: 2,
       actionId: 3,
       start: "2026-09-01",
@@ -65,6 +68,7 @@ describe("筛选拼装（验收 1：组合筛选 + 备注搜索的 IPC 入参）
       keyword: "  面包虫  ",
     };
     expect(buildLogFilter(form, 50)).toEqual({
+      location_id: 1,
       colony_id: 2,
       action_id: 3,
       start: "2026-09-01",
@@ -146,5 +150,15 @@ describe("编辑载荷与展示", () => {
     expect(nextOffset(50, 120)).toBe(50);
     expect(nextOffset(120, 120)).toBeNull();
     expect(nextOffset(0, 0)).toBeNull();
+  });
+
+  it("colonyOptionsFor：级联过滤（交互第三轮 #1）", () => {
+    const cols = [
+      { id: 1, location_id: 1 } as Colony,
+      { id: 2, location_id: 2 } as Colony,
+      { id: 3, location_id: null } as Colony,
+    ];
+    expect(colonyOptionsFor(cols, 1).map((c) => c.id)).toEqual([1]);
+    expect(colonyOptionsFor(cols, null).map((c) => c.id)).toEqual([1, 2, 3]);
   });
 });

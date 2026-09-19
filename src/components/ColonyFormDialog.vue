@@ -17,6 +17,7 @@ import {
   validateColonyForm,
 } from "../lib/colonyForm";
 import { todayIso } from "../lib/dates";
+import DatePickerPop from "./DatePickerPop.vue";
 
 const props = defineProps<{
   editing: Colony | null;
@@ -151,7 +152,7 @@ async function remove() {
       </select>
 
       <div class="field-label">开始饲养日期 *</div>
-      <input v-model="form.startDate" class="date-input" type="date" />
+      <DatePickerPop v-model="form.startDate" placeholder="开始日期" />
 
       <div class="field-label">状态</div>
       <select v-model="form.status" class="status-select">
@@ -216,7 +217,6 @@ async function remove() {
 }
 
 .dialog input[type="text"],
-.dialog input[type="date"],
 .dialog select {
   width: 100%;
   padding: 7px 10px;
@@ -225,6 +225,17 @@ async function remove() {
   font: inherit;
   background: var(--card);
   color: var(--text);
+}
+
+/* DatePickerPop 拉满行宽（对齐原 date 输入）：.dp 是 inline-block 收缩包围，
+   button 的百分比宽拉不开父级——包壳改 block 才有效；触发器自身再占满 .dp */
+.dialog :deep(.dp) {
+  display: block;
+  width: 100%;
+}
+
+.dialog :deep(.dp-trigger) {
+  width: 100%;
 }
 
 .form-error {
