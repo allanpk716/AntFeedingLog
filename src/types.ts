@@ -348,6 +348,9 @@ export interface RestoreSummary {
   /** 备份内的备份目录设置值（settings 表旧布局才有；null = 备份内无此设置，
    * 备份设置存库外不随恢复回滚——D1） */
   backup_dir_in_backup: string | null;
+  /** 备份内照片张数（webui-checkin 票 10）：数据包 = 包内清单张数；
+   * 0 = 裸库或包内零照片，界面标注「不含照片」 */
+  photo_count: number;
 }
 
 /** restore_apply 返回体：done = 界面当场刷新；done_needs_restart = 新库文件已

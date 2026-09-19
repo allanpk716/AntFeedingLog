@@ -15,6 +15,7 @@ function summary(overrides: Partial<RestoreSummary> = {}): RestoreSummary {
     colony_count: 2,
     log_count: 5,
     backup_dir_in_backup: null,
+    photo_count: 0,
     ...overrides,
   };
 }
@@ -27,18 +28,25 @@ describe("恢复摘要展示（数据安全二期票 04）", () => {
     expect(RESTORE_CONFIRM_TEXT).toContain("恢复期间新产生的记录不会保留");
   });
 
-  it("摘要行按固定顺序展示四项（验收 1 的数据面）", () => {
-    const rows = summaryRows(summary({ backup_dir_in_backup: "D:/old-bk" }));
+  it("摘要行按固定顺序展示五项（票 10 增照片行）", () => {
+    const rows = summaryRows(summary({ backup_dir_in_backup: "D:/old-bk", photo_count: 7 }));
     expect(rows.map(([label]) => label)).toEqual([
       "备份日期",
       "窝数",
       "记录数",
+      "照片",
       "备份内备份目录设置",
     ]);
     expect(rows[0][1]).toBe("2026-09-10");
     expect(rows[1][1]).toBe("2");
     expect(rows[2][1]).toBe("5");
-    expect(rows[3][1]).toContain("D:/old-bk");
+    expect(rows[3][1]).toBe("7 张");
+    expect(rows[4][1]).toContain("D:/old-bk");
+  });
+
+  it("照片行两态：包内带照片报张数 / 裸库与零照片包标注不含照片（票 10）", () => {
+    expect(summaryRows(summary({ photo_count: 3 }))[3][1]).toBe("3 张");
+    expect(summaryRows(summary({ photo_count: 0 }))[3][1]).toContain("不含照片");
   });
 
   it("备份内无目录设置（D1 后的正常备份）→ 点明存库外不随恢复回滚", () => {

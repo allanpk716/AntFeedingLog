@@ -421,6 +421,7 @@ function restoreSummaryFixture(overrides: Partial<RestoreSummary> = {}): Restore
     colony_count: 2,
     log_count: 5,
     backup_dir_in_backup: null,
+    photo_count: 0,
     ...overrides,
   };
 }
@@ -497,7 +498,7 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
     expect(manualPos).toBeGreaterThan(restorePos);
   });
 
-  it("选完文件调 restore_preview，摘要展示备份日期/窝数/记录数/备份内目录值 + 固定文案（验收 1）", async () => {
+  it("选完文件调 restore_preview，摘要展示备份日期/窝数/记录数/照片/备份内目录值 + 固定文案（验收 1）", async () => {
     const wrapper = await openDataTabForRestore({
       pickResult: "D:\\ant-bk\\ant-feeding-log-backup-20260910-080000.db",
       preview: restoreSummaryFixture({ backup_dir_in_backup: "D:\\old-bk" }),
@@ -519,6 +520,8 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
     expect(text).toContain("2");
     expect(text).toContain("5");
     expect(text).toContain("D:\\old-bk");
+    // 票 10：裸库恢复摘要标注不含照片
+    expect(text).toContain("不含照片");
     expect(text).toContain("恢复将整体替换当前全部数据");
     expect(text).toContain("备份设置保持当前值，不随恢复回滚");
   });
