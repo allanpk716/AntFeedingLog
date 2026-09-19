@@ -227,7 +227,13 @@ async function remove() {
   color: var(--text);
 }
 
-/* DatePickerPop 触发器与原 date 输入同占满行宽（自身配色/圆角见 DatePickerPop.vue） */
+/* DatePickerPop 拉满行宽（对齐原 date 输入）：.dp 是 inline-block 收缩包围，
+   button 的百分比宽拉不开父级——包壳改 block 才有效；触发器自身再占满 .dp */
+.dialog :deep(.dp) {
+  display: block;
+  width: 100%;
+}
+
 .dialog :deep(.dp-trigger) {
   width: 100%;
 }
