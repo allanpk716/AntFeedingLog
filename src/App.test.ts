@@ -3,6 +3,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import App from "./App.vue";
 import type { AppSettings, CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
 import { addDays, todayIso, todayLabel } from "./lib/dates";
+import DateTimeField from "./components/DateTimeField.vue";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
 const { invokeMock, listenStub } = vi.hoisted(() => ({
@@ -119,6 +120,8 @@ function baseMock() {
         return { total: 0, rows: [] };
       case "get_settings":
         return currentSettings;
+      case "colony_month_records":
+        return []; // 打卡/喂食弹窗挂载即拉当月标记；默认空月（黄条/标记用例各自覆写）
       default:
         return null;
     }
@@ -959,7 +962,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(dialog.exists()).toBe(true);
     expect(dialog.find("h3").text()).toBe("记录活动区换水 · 大头一号");
 
-    await dialog.find(".time-input").setValue("2026-09-17T21:00");
+    await dialog.findComponent(DateTimeField).vm.$emit("update:modelValue", "2026-09-17T21:00");
     colony1With([{ ...waterReg, days_since_last: 0 }]);
     invokeMock.mockClear();
     await dialog.find(".record-btn").trigger("click");
@@ -1008,7 +1011,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(chips[0].classes()).not.toContain("selected");
 
     // 补录昨天时间（验收 3：距上次按发生时间算，Rust 侧覆盖计算）
-    await dialog.find(".time-input").setValue("2026-09-17T21:00");
+    await dialog.findComponent(DateTimeField).vm.$emit("update:modelValue", "2026-09-17T21:00");
     await dialog.find(".note-input").setValue("  加餐  ");
 
     invokeMock.mockClear();
@@ -1058,6 +1061,29 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "log_care")).toBe(false);
   });
 
+  it("喂食弹窗：今天已有喂食记录 → 黄条提醒但不拦提交（交互第三轮 #8）", async () => {
+    colony1With([feedCustom]);
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "colony_month_records") {
+        return [{ day: +todayIso().slice(8, 10), action_id: 9, count: 1, last_time: `${todayIso()} 08:00:00` }];
+      }
+      if (cmd === "log_care") return 5;
+      if (cmd === "list_colonies") return currentColonies;
+      if (cmd === "list_locations") return locations;
+      if (cmd === "list_foods") return foods;
+      return null;
+    });
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="9"]').trigger("click");
+    await flushPromises();
+    const dlg = wrapper.find(".feed-dialog");
+    expect(dlg.find(".dup-warn").text()).toContain("已有 1 条");
+    await dlg.findAll(".food")[0].trigger("click");
+    await dlg.find(".record-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "log_care")).toBe(true);
+  });
+
   it("冬眠窝的操作块全部静音态：不红、文案带（静音）", async () => {
     currentColonies = colonies.map((c) =>
       c.id === 3 ? { ...c, actions: [feedOverdue] } : c,
@@ -1078,6 +1104,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
         case "log_care": throw "操作「活动区换水」已停用，不能新记";
         case "list_colonies": return currentColonies;
         case "list_locations": return locations;
+        case "colony_month_records": return []; // 弹窗挂载拉当月标记，给空月
         default: return null;
       }
     });
