@@ -207,11 +207,39 @@ pub fn process_uploads(uploads: Vec<PhotoUpload>) -> Result<Vec<PhotoUpload>, St
     Ok(out)
 }
 
-/// 从磁盘读所选照片文件：数量 ≤9、单张压缩前 ≤15MB（重活前置，库锁外做）。
+/// 单文件路径预检上限：超过按异常路径拒（正常文件选择器产不出这种长度）。
+pub const MAX_PATH_LEN: usize = 4096;
+
+/// 读盘前的单文件预检（评审 R1）：metadata 先行——读不到拒、不是常规文件
+/// （目录等）拒、路径超长拒、**压缩前 >15MB 拒且不发起读**（堵"任意大文件
+/// 路径先整读进 RAM"的内存尖峰面）。体积真闸仍以读后 [`ensure_input_size`]
+/// 兜底（metadata 与实际读之间文件可能被换大），魔数白名单在解码链上不动。
+fn precheck_photo_path(p: &str) -> Result<(), String> {
+    if p.chars().count() > MAX_PATH_LEN {
+        return Err(format!("照片路径过长（超过 {MAX_PATH_LEN} 字符）"));
+    }
+    let meta = std::fs::metadata(p).map_err(|e| format!("读取照片失败（{p}）: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{p}: 不是常规文件（目录等不收）"));
+    }
+    if meta.len() > MAX_INPUT_BYTES as u64 {
+        return Err(format!(
+            "{p}: 单张照片压缩前不能超过 {}MB（实际约 {}MB），已跳过读入",
+            MAX_INPUT_BYTES / 1024 / 1024,
+            meta.len() / 1024 / 1024
+        ));
+    }
+    Ok(())
+}
+
+/// 从磁盘读所选照片文件：数量 ≤9；单文件先走 [`precheck_photo_path`] 预检
+/// （体积闸在读内存之前），读后 [`ensure_input_size`] 兜底；解码链校验随
+/// [`process_uploads`]。重活前置，库锁外做。
 pub fn read_photo_files(paths: &[String]) -> Result<Vec<PhotoUpload>, String> {
     ensure_batch_size(paths.len())?;
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
+        precheck_photo_path(p)?;
         let bytes = std::fs::read(p).map_err(|e| format!("读取照片失败（{p}）: {e}"))?;
         ensure_input_size(bytes.len()).map_err(|e| format!("{p}: {e}"))?;
         let original_name = Path::new(p)
@@ -854,6 +882,47 @@ mod tests {
         let big = vec![0u8; MAX_INPUT_BYTES + 1];
         let err = process_photo_bytes(&big).unwrap_err();
         assert!(err.contains("15"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn read_photo_files_rejects_oversize_file_before_reading() {
+        // 评审 R1：体积闸前置到 metadata 预检——超限文件**不发起读**，
+        // 错误信息带「跳过读入」标记（只有 metadata 路径产出，即证明未整读进 RAM）
+        let tmp = TempDir::new().unwrap();
+        let big_path = tmp.path().join("big.jpg");
+        std::fs::write(&big_path, vec![0u8; MAX_INPUT_BYTES + 1]).unwrap();
+
+        let err = read_photo_files(&[big_path.to_string_lossy().to_string()]).unwrap_err();
+        assert!(err.contains("跳过读入"), "错误应来自 metadata 预检：{err}");
+        assert!(err.contains("15"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn read_photo_files_rejects_directory_missing_and_overlong_paths() {
+        let tmp = TempDir::new().unwrap();
+        // 目录：metadata 拿得到但不是常规文件 → 拒
+        let err = read_photo_files(&[tmp.path().to_string_lossy().to_string()]).unwrap_err();
+        assert!(err.contains("不是常规文件"), "实际错误：{err}");
+        // 不存在的路径：metadata 失败 → 拒
+        let missing = tmp.path().join("nope.jpg");
+        let err = read_photo_files(&[missing.to_string_lossy().to_string()]).unwrap_err();
+        assert!(err.contains("读取照片失败"), "实际错误：{err}");
+        // 超长路径：预检直接拒（先于 metadata）
+        let long = format!("C:\\{}", "a".repeat(MAX_PATH_LEN + 1));
+        let err = read_photo_files(&[long]).unwrap_err();
+        assert!(err.contains("路径过长"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn read_photo_files_reads_small_file_with_original_name() {
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("IMG_007.jpg");
+        std::fs::write(&p, b"\xFF\xD8\xFF-tiny").unwrap();
+
+        let ups = read_photo_files(&[p.to_string_lossy().to_string()]).unwrap();
+        assert_eq!(ups.len(), 1);
+        assert_eq!(ups[0].bytes, b"\xFF\xD8\xFF-tiny");
+        assert_eq!(ups[0].original_name.as_deref(), Some("IMG_007.jpg"));
     }
 
     #[test]
