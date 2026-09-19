@@ -96,6 +96,12 @@ async function httpInvoke<R>(command: string, args?: Record<string, unknown>): P
     try {
       body = JSON.parse(text) as unknown;
     } catch {
+      // 非 2xx：交给下面的统一错误路径（HTTP <status>）；
+      // 2xx 且非空体却解析不了（网关劫持/代理注页）：明确报错，绝不静默归
+      // null 让上层把「响应丢了」当「查询结果为空」用（票 05 评审 Minor）。
+      if (res.ok) {
+        throw `HTTP ${res.status} 不可解析响应`;
+      }
       body = null;
     }
   }

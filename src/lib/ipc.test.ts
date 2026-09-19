@@ -189,6 +189,12 @@ describe("浏览器路由（POST /api/cmd，Bearer 凭证）", () => {
     await expect(listColonies()).rejects.toBe("HTTP 500");
   });
 
+  it("2xx 且响应体非空但 JSON 不可解析：以 HTTP <status> 不可解析响应 reject（票 05 评审 Minor：不静默归 null）", async () => {
+    stubFetch(200, "<html>proxy injected</html>");
+
+    await expect(listColonies()).rejects.toBe("HTTP 200 不可解析响应");
+  });
+
   it("网络失败（fetch 抛错）原样上抛", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => {
       throw new TypeError("Failed to fetch");
