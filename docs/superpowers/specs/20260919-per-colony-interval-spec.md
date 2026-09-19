@@ -32,7 +32,7 @@
 
 **术语**:本规格全部沿用 CONTEXT.md 词汇表——窝(Colony)、维护操作(Care Action)、每窝周期(Per-colony Interval)、建议间隔、距上次、统一周期、食物周期、待撤食、冬眠。
 
-1. **schema v8**:新表 `colony_action_interval(colony_id INTEGER NOT NULL REFERENCES colony(id), action_id INTEGER NOT NULL REFERENCES care_action(id), interval_days INTEGER NOT NULL, PRIMARY KEY(colony_id, action_id))`,CHECK 约束 `interval_days BETWEEN 1 AND 365`。删行=未设;不预置任何行。迁移沿 data_version 既有链(v7→v8),旧库升级与全新建库两路都要。
+1. **schema v9**:新表 `colony_action_interval(colony_id INTEGER NOT NULL REFERENCES colony(id), action_id INTEGER NOT NULL REFERENCES care_action(id), interval_days INTEGER NOT NULL, PRIMARY KEY(colony_id, action_id))`,CHECK 约束 `interval_days BETWEEN 1 AND 365`。删行=未设;不预置任何行。迁移沿既有迁移链(基线 SCHEMA_VERSION=8,本链 v8→v9;规格原文写 v8 系核实基线前的笔误——v8 已被已发布链占用,复用会毁已发布库),旧库升级与全新建库两路都要。
 2. **有效周期解析(钉死评审 F3 判定式)**:某窝某操作的有效周期 = 该窝每窝周期(若有)否则操作层建议间隔。喂食超期判定:`[days_since_last > 有效周期] OR [任一食物:days_since_last(该食物) > 该食物周期]`——设了每窝周期的窝**不参与**统一周期判定(操作层 OR 项二取一:每窝周期或统一周期);未设的窝照旧 `[days > 统一周期] OR [食物层]`。撤食(follow)永不参与。
 3. **超期口径(钉死评审 F1)**:严格大于——`days > interval` 才标红/通知,恰好等于周期当天不提醒、次日起提醒;统一适用于每窝周期、操作层周期、食物周期三层,与既有 `is_overdue` 同构。
 4. **展示口径(钉死评审 F2)**:卡片 tile 的"周期 M 天"取该窝有效周期(设了即每窝周期);"⚠ 超期 X 天"的 X = days − 有效周期,与判定同源;食物行照旧独立标各自超期;没设周期且操作为登记类的 tile 与现状逐字节一致(只显示距上次、永不红)。
