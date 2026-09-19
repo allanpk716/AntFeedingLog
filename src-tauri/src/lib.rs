@@ -539,6 +539,31 @@ fn delete_colony(
     result
 }
 
+// ── 每窝周期（每窝周期票 01）──
+// 桌面管理入口专用：不入网页端 HTTP 命令白名单（webui_server.rs 保持不动），
+// 读侧数据经 tiles/窝列表对网页端可见属票 02 的接线范围。改周期会动超期态 →
+// 与其他窝命令同一锁外模式刷托盘 tooltip；写成功走 trigger_after_write。
+
+/// 设置/清除某窝某操作的每窝周期：`interval_days = Some(1..=365)` 设/改，
+/// `None` 清除。非整数入参在 IPC 反序列化处即被拒绝（入参类型即契约）。
+#[tauri::command]
+fn set_colony_action_interval(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    colony_id: i64,
+    action_id: i64,
+    interval_days: Option<i64>,
+) -> Result<(), String> {
+    let result = with_conn(state, |conn| {
+        colony::set_colony_action_interval(conn, colony_id, action_id, interval_days)
+    });
+    reminder::refresh_tray_tooltip(&app);
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
 // ── 地点（票 02）──
 
 #[tauri::command]
@@ -1703,6 +1728,7 @@ pub fn run() {
             update_colony,
             archive_colony,
             delete_colony,
+            set_colony_action_interval,
             list_locations,
             save_location,
             erase_location,

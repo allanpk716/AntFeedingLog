@@ -7,7 +7,9 @@
 //! - 发生时间（occurred_at）与录入时间（created_at）分开存，补录合法；
 //! - 「距上次」= 今天 − max(该窝该操作最近一次发生日期, 最近出眠日期)（自然日，
 //!   评审附录规则 5：出眠当天 0 天、不全红；无出眠史即纯记录基线，票 05）；
-//! - 超期判定仅提醒类且 > 建议间隔；登记类永不红；
+//! - 超期判定按有效周期（票 02）：每窝周期(若有)取代操作层建议间隔，设了即
+//!   提醒（登记类也开始催，CONTEXT 词汇表）；撤食（follow）永不参与；
+//!   未设的窝沿用操作层性质——提醒类且 > 建议间隔，登记类永不红；
 //! - 喂食可一条记录挂多种食物（log_food 多选关联），与记录同事务写入。
 
 use std::collections::HashSet;
@@ -60,10 +62,17 @@ pub struct ActionTile {
     /// 是否喂食类操作（决定记账时是否带食物多选；schema 标记位，与名字无关）。
     pub is_feeding: bool,
     pub suggested_interval_days: Option<i64>,
+    /// 有效周期（票 02）：该窝每窝周期(若有)否则操作层建议间隔——设了即取代。
+    /// 与 `suggested_interval_days` 同构；撤食（follow）不适用周期，判定侧恒不参与。
+    pub effective_interval_days: Option<i64>,
+    /// 有效周期是否来自该窝的每窝周期：true = 设了（`effective_interval_days`
+    /// 即原始每窝周期值，编辑小节可据此还原）；false = 沿用操作层建议间隔。
+    pub interval_from_colony: bool,
     /// 今天 − max(最近一次发生日期, 最近出眠日期)（自然日，规则 5）；从未记录且无出眠史为 None。
     pub days_since_last: Option<i64>,
-    /// 仅提醒类且 > 建议间隔；喂食类任一设周期食物超期也算（F3，Q2 决议）；
-    /// 登记类/从未记录恒 false。
+    /// 操作层按有效周期判定（每窝周期设了即提醒、follow 除外；未设 = 提醒类且 >
+    /// 建议间隔，登记类永不红）；喂食类任一设周期食物超期也算（F3，Q2 决议，
+    /// 不因每窝周期而废）；登记类(未设)/从未记录恒 false。
     pub overdue: bool,
     /// 逐食物「距上次」明细（F3）；仅喂食类非空，其余操作恒空数组。
     pub foods: Vec<FoodTileStatus>,
@@ -71,6 +80,22 @@ pub struct ActionTile {
     /// （正常可点）/ `overdue`=已超到期时刻（前端红）。仅 kind=follow（撤食）块
     /// 非 "none"；不占用 days_since/overdue 通道（follow 的 overdue 恒 false）。
     pub retrieval_state: String,
+}
+
+impl ActionTile {
+    /// 操作层超期（不含食物层 OR 项）——卡片聚合与提醒引擎共用的单一判定源。
+    /// 提醒引擎不能用 `overdue`（已含食物层），否则食物层顶红时会把操作层
+    /// 不超期的窝也当超期发出去。
+    pub fn operation_overdue(&self) -> bool {
+        let per_colony =
+            if self.interval_from_colony { self.effective_interval_days } else { None };
+        is_overdue_effective(
+            &self.kind,
+            self.days_since_last,
+            per_colony,
+            self.suggested_interval_days,
+        )
+    }
 }
 
 /// 最近记录摘要的一行（前端拼成「最近：09-17 喂食（种子）· …」）。
@@ -147,6 +172,26 @@ pub fn is_overdue(kind: &str, days: Option<i64>, suggested_interval_days: Option
     match (kind, days, suggested_interval_days) {
         ("reminding", Some(d), Some(interval)) => d > interval,
         _ => false,
+    }
+}
+
+/// 有效周期解析 + 操作层超期判定（票 02，spec 钉死 F1/F3）：有效周期 = 该窝
+/// 每窝周期(若有)否则操作层建议间隔。设了每窝周期即提醒——按它严格大于判定，
+/// 登记类也一样（CONTEXT 词汇表：单窝需要周期就设每窝周期，不动全局性质）；
+/// 撤食（follow）永不参与。未设沿用操作层性质 = [`is_overdue`] 原语义
+/// （登记类即使字典里保留着间隔值——切登记类不清空——也永不催）。
+pub fn is_overdue_effective(
+    kind: &str,
+    days: Option<i64>,
+    per_colony_interval: Option<i64>,
+    suggested_interval_days: Option<i64>,
+) -> bool {
+    if kind == "follow" {
+        return false;
+    }
+    match per_colony_interval {
+        Some(interval) => days.is_some_and(|d| d > interval),
+        None => is_overdue(kind, days, suggested_interval_days),
     }
 }
 
@@ -681,6 +726,8 @@ pub fn retrieval_due_for_colony(
 /// 出眠当天全窝 0 天、不会一睁眼全红；登记类显示同样基准（只影响文案，永不红的性质不变）。
 /// 喂食块（F3）另带逐食物明细：基线同口径（max(该食物最近喂食, 出眠日)），
 /// 任一设周期食物超期整块红（Q2）。
+/// 票 02：操作层判定与展示换用有效周期（每窝周期(若有)否则操作层建议间隔，
+/// 设了即提醒、follow 除外）；未设每窝周期的窝与此前行为一致。
 pub fn tiles_for_colony(
     conn: &Connection,
     colony_id: i64,
@@ -698,6 +745,8 @@ fn tiles_for_colony_at(
     now: &str,
 ) -> Result<Vec<ActionTile>, String> {
     let wake = crate::hibernation::latest_wake_date(conn, colony_id);
+    // 票 02：该窝的每窝周期整窝取一次，逐操作覆盖操作层建议间隔（有效周期）
+    let per_colony = crate::colony::intervals_for_colony(conn, colony_id)?;
     let mut stmt = conn
         .prepare(
             "SELECT id, name, icon, kind, is_feeding, suggested_interval_days
@@ -750,6 +799,9 @@ fn tiles_for_colony_at(
 
     let mut tiles = Vec::with_capacity(rows.len());
     for (action_id, name, icon, kind, is_feeding, interval) in rows {
+        // 票 02：有效周期 = 每窝周期(若有)否则操作层建议间隔（spec 钉死 F3）
+        let colony_interval = per_colony.get(&action_id).copied();
+        let effective = colony_interval.or(interval);
         // 逐行取 occurred_at、跳过解析失败的单条（票 04 停靠①：一条脏行不得毒死整页），
         // 取剩余行里的最近日期；无可用行视同从未记录。
         let occurred_rows: Vec<String> = {
@@ -828,7 +880,9 @@ fn tiles_for_colony_at(
             }
         }
         let food_any = foods.iter().any(|f| f.overdue);
-        let overdue = is_overdue(&kind, days, interval) || food_any;
+        // 票 02：操作层 OR 项 = 有效周期（设了每窝周期即取代统一/建议间隔并开始
+        // 提醒，follow 除外；严格大于）；食物层照旧独立叠加
+        let overdue = is_overdue_effective(&kind, days, colony_interval, interval) || food_any;
         // 撤食三态（票 02）：none=无待撤 / pending=待撤未到期 / overdue=已超到期时刻
         //（恰在到期时刻即逾期）；只落在 follow 块，不占用 days_since/overdue 通道
         let retrieval_state = if kind == "follow" {
@@ -847,6 +901,8 @@ fn tiles_for_colony_at(
             kind,
             is_feeding: is_feeding != 0,
             suggested_interval_days: interval,
+            effective_interval_days: effective,
+            interval_from_colony: colony_interval.is_some(),
             days_since_last: days,
             overdue,
             foods,
@@ -1105,6 +1161,25 @@ mod tests {
         assert!(!is_overdue("log_only", Some(100), None));
         // 从未记录不超期
         assert!(!is_overdue("reminding", None, Some(3)));
+    }
+
+    #[test]
+    fn is_overdue_effective_set_unset_and_boundaries() {
+        // 设了即提醒：登记类也按每窝周期判（严格大于两侧边界）
+        assert!(is_overdue_effective("log_only", Some(4), Some(3), None));
+        assert!(!is_overdue_effective("log_only", Some(3), Some(3), None), "days==周期 不红");
+        assert!(!is_overdue_effective("log_only", None, Some(3), None), "从未做过不红");
+        // 提醒类设了每窝周期即取代操作层建议间隔（4>3 但 4≤5 → 不红）
+        assert!(is_overdue_effective("reminding", Some(6), Some(5), Some(3)));
+        assert!(!is_overdue_effective("reminding", Some(4), Some(5), Some(3)));
+        // 撤食（follow）永不参与——设了周期行也不判
+        assert!(!is_overdue_effective("follow", Some(100), Some(1), None));
+        // 未设沿用操作层性质：登记类即使字典里保留着建议间隔值也永不催（现状一致）
+        assert!(!is_overdue_effective("log_only", Some(100), None, Some(3)));
+        // 未设提醒类 = 既有 is_overdue 语义
+        assert!(is_overdue_effective("reminding", Some(4), None, Some(3)));
+        assert!(!is_overdue_effective("reminding", Some(3), None, Some(3)));
+        assert!(!is_overdue_effective("reminding", None, None, Some(3)));
     }
 
     // ── 记账 ──
@@ -2125,6 +2200,157 @@ mod tests {
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         let worm = tile(&tiles, "喂食").foods.iter().find(|f| f.name == "面包虫").unwrap();
         assert_eq!(worm.days_since_last, Some(0), "从未喂过的食物从出眠日起算");
+    }
+
+    // ── 每窝周期：有效周期接入判定（票 02）──
+
+    /// 走票 01 的写侧命令设/清每窝周期（行为入口，不直插表）。
+    fn set_interval(conn: &Connection, colony_id: i64, action: &str, days: Option<i64>) {
+        crate::colony::set_colony_action_interval(conn, colony_id, action_id(conn, action), days)
+            .expect("设每窝周期失败");
+    }
+
+    #[test]
+    fn tiles_per_colony_interval_replaces_suggested_in_operation_layer() {
+        // 设了每窝 5 的窝：4 天没喂不红（4 ≤ 5）——若仍按操作层建议 3 会误红
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        set_interval(&conn, c, "喂食", Some(5));
+        log(&conn, c, "喂食", "2026-09-14 20:00:00"); // 4 天前
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert!(!tile(&tiles, "喂食").overdue, "4 ≤ 每窝周期 5 → 不红（取代建议 3）");
+    }
+
+    #[test]
+    fn tiles_log_only_with_per_colony_interval_starts_reminding() {
+        // 「设了即提醒」（CONTEXT 词汇表）：登记类（巢穴保湿）设了每窝周期
+        // 同样按它标红——单窝需要周期就设每窝周期，不动全局性质
+        let conn = mem_conn();
+        let c = colony(&conn, "石膏一号");
+        set_interval(&conn, c, "巢穴保湿", Some(3));
+        log(&conn, c, "巢穴保湿", "2026-09-14 09:00:00"); // 4 天前 > 3
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert!(tile(&tiles, "巢穴保湿").overdue, "登记类设了每窝周期即提醒");
+    }
+
+    #[test]
+    fn tiles_carry_effective_interval_and_source_flag() {
+        // 票 03 前端消费的读侧数据：设/未设两窝对照，操作层建议间隔字段原样保留
+        let conn = mem_conn();
+        let gypsum = colony(&conn, "石膏一号");
+        let tower = colony(&conn, "水塔一号");
+        set_interval(&conn, gypsum, "喂食", Some(5));
+        log(&conn, gypsum, "喂食", "2026-09-14 20:00:00"); // 4 天前
+        log(&conn, tower, "喂食", "2026-09-14 20:00:00");
+
+        let tiles = tiles_for_colony(&conn, gypsum, TODAY).unwrap();
+        let feed = tile(&tiles, "喂食");
+        assert_eq!(feed.suggested_interval_days, Some(3), "操作层建议间隔字段不动");
+        assert_eq!(feed.effective_interval_days, Some(5), "有效周期 = 每窝周期");
+        assert!(feed.interval_from_colony, "设了每窝周期 → 标记来自每窝");
+        assert_eq!(feed.days_since_last, Some(4));
+
+        let tiles = tiles_for_colony(&conn, tower, TODAY).unwrap();
+        let feed = tile(&tiles, "喂食");
+        assert_eq!(feed.effective_interval_days, Some(3), "未设 → 沿用操作层建议间隔");
+        assert!(!feed.interval_from_colony);
+        assert!(feed.overdue, "4 > 3 → 照旧红（未设窝行为与现状一致）");
+
+        // 登记类未设：有效周期随建议间隔为 None，距上次照带
+        let hydrate = tile(&tiles, "巢穴保湿");
+        assert_eq!(hydrate.effective_interval_days, None);
+        assert!(!hydrate.interval_from_colony);
+        assert_eq!(hydrate.days_since_last, None);
+        assert!(!hydrate.overdue);
+    }
+
+    #[test]
+    fn tiles_per_colony_strict_greater_boundary_both_sides() {
+        // 严格大于（spec 钉死 F1）：days==有效周期当天不红；==有效周期+1 红
+        let conn = mem_conn();
+        let c = colony(&conn, "石膏一号");
+        set_interval(&conn, c, "巢穴保湿", Some(3));
+        log(&conn, c, "巢穴保湿", "2026-09-15 09:00:00"); // 恰 3 天
+
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        assert_eq!(tile(&tiles, "巢穴保湿").days_since_last, Some(3));
+        assert!(!tile(&tiles, "巢穴保湿").overdue, "days==周期 → 不红");
+
+        let tiles = tiles_for_colony(&conn, c, "2026-09-19").unwrap();
+        assert_eq!(tile(&tiles, "巢穴保湿").days_since_last, Some(4));
+        assert!(tile(&tiles, "巢穴保湿").overdue, "days==周期+1 → 红");
+    }
+
+    #[test]
+    fn tiles_feeding_per_colony_replaces_unified_but_food_layer_stacks() {
+        // 设了每窝 7（取代统一 3）：操作层 2 ≤ 7 自身不红；面包虫 8 > 7 食物层
+        // 照旧叠加 → 整块红（食物周期不因每窝周期而废）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        set_interval(&conn, c, "喂食", Some(7));
+        feed_log(&conn, c, "2026-09-16 20:00:00", None, &["种子"]);
+        feed_log(&conn, c, "2026-09-10 20:00:00", None, &["面包虫"]);
+
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        let feed = tile(&tiles, "喂食");
+        assert_eq!(feed.effective_interval_days, Some(7));
+        assert!(feed.interval_from_colony);
+        assert!(!feed.operation_overdue(), "操作层 OR 项 = 每窝周期 7，2 ≤ 7 不红");
+        assert!(feed.overdue, "面包虫食物层超期 → 整块红（OR 叠加照旧）");
+        let worm = feed.foods.iter().find(|f| f.name == "面包虫").unwrap();
+        assert_eq!(worm.suggested_interval_days, Some(7), "食物行仍带自己的周期");
+        assert!(worm.overdue);
+
+        // 对照：只喂种子（2 ≤ 3）→ 每窝 7 下整块安静（若仍看统一 3 会整块红）
+        let quiet = colony(&conn, "安静二号");
+        set_interval(&conn, quiet, "喂食", Some(7));
+        feed_log(&conn, quiet, "2026-09-16 20:00:00", None, &["种子"]);
+        let tiles = tiles_for_colony(&conn, quiet, TODAY).unwrap();
+        assert!(!tile(&tiles, "喂食").overdue, "统一层不参与、食物层不超 → 不红");
+    }
+
+    #[test]
+    fn tiles_unset_log_only_with_retained_interval_stays_quiet() {
+        // dict.set_action_policy 切登记类不清空间隔值——未设每窝周期的窝必须
+        // 仍按性质判定（登记类永不红），不能因为间隔值还在就误用
+        let conn = mem_conn();
+        let c = colony(&conn, "水塔一号");
+        conn.execute("UPDATE care_action SET kind = 'log_only' WHERE name = '垃圾清理'", [])
+            .unwrap();
+        log(&conn, c, "垃圾清理", "2026-06-01 08:00:00"); // 100+ 天前，建议 7 仍在库
+
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        let trash = tile(&tiles, "垃圾清理");
+        assert_eq!(trash.suggested_interval_days, Some(7), "间隔值仍在字典");
+        assert!(!trash.overdue, "未设每窝周期 → 登记类永不红（现状一致）");
+    }
+
+    #[test]
+    fn tiles_per_colony_never_done_stays_quiet() {
+        // 从未做过该操作：设了每窝周期也不催（第一次做了才开始算）
+        let conn = mem_conn();
+        let c = colony(&conn, "石膏一号");
+        set_interval(&conn, c, "巢穴保湿", Some(3));
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        let hydrate = tile(&tiles, "巢穴保湿");
+        assert_eq!(hydrate.effective_interval_days, Some(3));
+        assert_eq!(hydrate.days_since_last, None);
+        assert!(!hydrate.overdue);
+    }
+
+    #[test]
+    fn tiles_per_colony_interval_never_applies_to_follow() {
+        // 撤食（follow）永不参与周期判定——即使周期行存在（脏数据边界），
+        // days_since/overdue 通道照旧，三态派生不动
+        let conn = mem_conn();
+        let c = colony(&conn, "跟班一号");
+        set_interval(&conn, c, "撤食", Some(1));
+        log(&conn, c, "撤食", "2026-06-01 08:00:00"); // 109 天前
+
+        let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
+        let follow = tiles.iter().find(|t| t.kind == "follow").unwrap();
+        assert_eq!(follow.days_since_last, Some(109), "days_since 通道照旧");
+        assert!(!follow.overdue, "follow 永不因周期超期");
     }
 
     #[test]

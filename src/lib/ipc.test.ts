@@ -6,6 +6,7 @@ import {
   getStats,
   isTauri,
   listColonies,
+  setColonyActionInterval,
   subscribe,
   type SseVersionFrame,
 } from "./ipc";
@@ -97,6 +98,25 @@ describe("桌面路由（透传 Tauri invoke，命令名/参数/返回逐字等�
       colonyId: 3,
       startDate: "2026-03-23",
       endDate: "2026-09-19",
+    });
+  });
+
+  it("set_colony_action_interval：入参 camelCase 原样透传，数字=设/改，null=清除（每窝周期票 04）", async () => {
+    asTauri();
+    invokeMock.mockResolvedValue(null);
+
+    await setColonyActionInterval({ colonyId: 1, actionId: 2, intervalDays: 7 });
+    expect(invokeMock).toHaveBeenCalledWith("set_colony_action_interval", {
+      colonyId: 1,
+      actionId: 2,
+      intervalDays: 7,
+    });
+
+    await setColonyActionInterval({ colonyId: 1, actionId: 2, intervalDays: null });
+    expect(invokeMock).toHaveBeenCalledWith("set_colony_action_interval", {
+      colonyId: 1,
+      actionId: 2,
+      intervalDays: null,
     });
   });
 
@@ -449,5 +469,6 @@ describe("命令包装的导出面（测试 mock 工厂的路由依据）", () =
     expect(listColonies.cmdName).toBe("list_colonies");
     expect(createColony.cmdName).toBe("create_colony");
     expect(getStats.cmdName).toBe("get_stats");
+    expect(setColonyActionInterval.cmdName).toBe("set_colony_action_interval");
   });
 });

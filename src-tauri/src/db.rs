@@ -30,7 +30,10 @@ use rusqlite::{params, Connection};
 ///     'follow'（跟随喂食）加进 kind CHECK 并插入预置「撤食」（撞名则原位升格，
 ///     F1/F7）；升级库写 retrieval_baseline_at 存量基线（全新安装不写，F4）；
 ///     reminder_ledger 加 retrieval_due 每窝每日唯一索引。
-pub const SCHEMA_VERSION: i64 = 8;
+/// v9：每窝周期（每窝周期票 01，spec D1）——只加一张 colony_action_interval
+///     （窝 × 操作 → 周期天数，CHECK 1..365，复合主键），不预置任何行；
+///     外键沿库内惯例裸 REFERENCES、应用层守卫。读写命令见 colony.rs，本版只建表。
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -123,6 +126,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             6 => migrate_v6_to_v7(conn)?,
             // 存量基线只属于"升级库"：全新安装从 v0 起步，不写 retrieval_baseline_at（F4）
             7 => migrate_v7_to_v8(conn, start == 0)?,
+            8 => migrate_v8_to_v9(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -427,6 +431,28 @@ fn migrate_v6_to_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
     tx.commit()
 }
 
+/// v9（每窝周期票 01，spec D1）：新增 `colony_action_interval`——"窝 × 操作"的
+/// 每窝周期表。只建表、不预置行（删行 = 未设）；interval_days 由 CHECK 限
+/// 1..365（应用层校验见 colony.rs，schema 兜底）；复合主键保证同窝同操作至多
+/// 一行（upsert 由应用层 ON CONFLICT 完成）。外键沿库内惯例裸 REFERENCES、
+/// 应用层守卫（删操作/删窝的清理见各删除命令），不用 ON DELETE CASCADE。
+/// 单事务原子完成，旧表结构零改动。
+fn migrate_v8_to_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE colony_action_interval (
+            colony_id     INTEGER NOT NULL REFERENCES colony(id),
+            action_id     INTEGER NOT NULL REFERENCES care_action(id),
+            interval_days INTEGER NOT NULL CHECK (interval_days BETWEEN 1 AND 365),
+            PRIMARY KEY (colony_id, action_id)
+        );
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 9)?;
+    tx.commit()
+}
+
 /// v1 预置数据：四操作（喂食/活动区换水/巢穴保湿/垃圾清理）、三食物、两地点、五项设置默认值。
 /// pub(crate)：restore.rs 的旧 schema 备份测试要搭真实 v1 库（票 04 验收 3）。
 pub(crate) fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -605,6 +631,7 @@ mod tests {
                 "care_action",
                 "care_log",
                 "colony",
+                "colony_action_interval",
                 "data_meta",
                 "food",
                 "hibernation",
@@ -622,7 +649,7 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 8);
+        assert_eq!(SCHEMA_VERSION, 9);
     }
 
     /// 按真实迁移函数链手工搭到 v7 的库（票 01 v8 迁移测试地基；含 webui-checkin
@@ -1304,6 +1331,177 @@ mod tests {
             .is_err());
     }
 
+    /// 每窝周期票 01：真实 v8 库（完整链 v0→v8）+ 用户数据，migrate() 升 v9——
+    /// 只新增 colony_action_interval 空表；旧对象 DDL 与旧数据零改动。
+    #[test]
+    fn v8_db_upgrades_to_v9_with_empty_per_colony_interval_table() {
+        let conn = v7_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        migrate_v7_to_v8(&conn, false).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), 8);
+        let before: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, sql FROM sqlite_master
+                     WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+
+        // 旧对象 DDL 逐条零改动（只加不改）
+        let after: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, sql FROM sqlite_master
+                     WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for (name, sql) in &before {
+            let found = after
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("升级后旧对象 {name} 消失"));
+            assert_eq!(found.1, *sql, "旧对象 {name} 的 DDL 被改动");
+        }
+        let new_names: Vec<&str> = after
+            .iter()
+            .filter(|(n, _)| !before.iter().any(|(b, _)| b == n))
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(new_names, vec!["colony_action_interval"], "v9 恰好新增一张表");
+
+        // 表为空、旧数据原样（不预置任何行，spec D1）
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"), 0);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony"), 1);
+
+        // 结构四要素（验收 1）：裸外键 ×2、CHECK 1..365、复合主键
+        let ddl: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'colony_action_interval'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for piece in [
+            "REFERENCES colony(id)",
+            "REFERENCES care_action(id)",
+            "CHECK (interval_days BETWEEN 1 AND 365)",
+            "PRIMARY KEY (colony_id, action_id)",
+        ] {
+            assert!(ddl.contains(piece), "DDL 缺 {piece}，实际：{ddl}");
+        }
+
+        // 幂等：已是 v9 再 migrate 不重跑（版本门卫），表仍空
+        migrate(&conn).unwrap();
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"), 0);
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+    }
+
+    /// 每窝周期票 01 验收 1（v7 旧库路径）：真实 v7 库直接 migrate() 走完整链，
+    /// 终态含空周期表、版本到最新、用户数据原样。
+    #[test]
+    fn v7_db_upgrades_to_latest_with_empty_per_colony_interval_table() {
+        let conn = v7_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), 7);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"), 0);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony"), 1);
+    }
+
+    /// 每窝周期票 01：新表约束行为——CHECK 拦 0/负/366、放行 1 与 365；
+    /// 复合主键拦同窝同操作重复；两向外键拦幽灵引用（fresh_conn 连接开了
+    /// PRAGMA foreign_keys，v7_conn 系内存库没开、拦不了）。
+    #[test]
+    fn interval_table_check_and_keys_enforced() {
+        let (conn, _dir) = fresh_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        let insert = |days: i64| {
+            conn.execute(
+                "INSERT INTO colony_action_interval (colony_id, action_id, interval_days)
+                 VALUES (1, 1, ?1)",
+                params![days],
+            )
+        };
+
+        // 边界内合法：1 与 365 都放行（先删再插绕开主键）
+        assert_eq!(insert(1).unwrap(), 1);
+        conn.execute("DELETE FROM colony_action_interval", []).unwrap();
+        assert_eq!(insert(365).unwrap(), 1);
+        conn.execute("DELETE FROM colony_action_interval", []).unwrap();
+
+        // CHECK 拦越界：0、负数、366
+        for bad in [0, -1, 366, 10000] {
+            assert!(insert(bad).is_err(), "interval_days={bad} 应被 CHECK 拒绝");
+        }
+
+        // 复合主键：同窝同操作至多一行
+        assert_eq!(insert(3).unwrap(), 1);
+        assert!(insert(3).is_err(), "同窝同操作重复应被主键拒绝");
+        // 同窝不同操作、同操作不同窝各行其是
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('针毛一号', '2026-02-01')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony_action_interval (colony_id, action_id, interval_days) VALUES (1, 4, 9)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony_action_interval (colony_id, action_id, interval_days) VALUES (2, 1, 5)",
+            [],
+        )
+        .unwrap();
+
+        // 外键：幽灵窝/幽灵操作都被拦（裸 REFERENCES + 连接级 foreign_keys=ON）
+        assert!(conn
+            .execute(
+                "INSERT INTO colony_action_interval (colony_id, action_id, interval_days)
+                 VALUES (999, 1, 3)",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO colony_action_interval (colony_id, action_id, interval_days)
+                 VALUES (1, 999, 3)",
+                [],
+            )
+            .is_err());
+    }
+
+
     #[test]
     fn journal_mode_is_delete() {
         let (conn, _dir) = fresh_conn();
@@ -1418,6 +1616,8 @@ mod tests {
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_action"), 5);
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM food"), 3);
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM location"), 2);
+        // 每窝周期表不预置任何行（每窝周期票 01，spec D1）
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"), 0);
         // 全新安装不写存量基线键（F4）
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM settings"), 5);
         assert!(conn

@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
-import type { Colony } from "../types";
-import { emptyForm, formFromColony, formToInput, validateColonyForm } from "./colonyForm";
+import type { Colony, ColonyAction } from "../types";
+import {
+  emptyForm,
+  formFromColony,
+  formToInput,
+  intervalRowsFromColony,
+  parseIntervalDays,
+  planIntervalSaves,
+  validateColonyForm,
+} from "./colonyForm";
 
 const existing: Colony[] = [
   {
@@ -87,5 +95,117 @@ describe("表单 ↔ IPC 入参映射", () => {
       start_date: "2026-09-18",
       status: "hibernating",
     });
+  });
+});
+
+/** 造一个操作 tile（只给小节关心的字段，其余按真实 IPC 形状补齐）。 */
+function tile(overrides: Partial<ColonyAction> & { action_id: number; name: string }): ColonyAction {
+  return {
+    icon: null,
+    kind: "log_only",
+    is_feeding: false,
+    suggested_interval_days: null,
+    days_since_last: null,
+    overdue: false,
+    foods: [],
+    ...overrides,
+  };
+}
+
+const colonyWithActions: Colony = {
+  ...existing[0],
+  actions: [
+    tile({ action_id: 11, name: "喂食", kind: "reminding", is_feeding: true }),
+    tile({
+      action_id: 12,
+      name: "加水",
+      interval_from_colony: true,
+      effective_interval_days: 7,
+    }),
+    tile({ action_id: 13, name: "撤食", kind: "follow" }),
+    tile({ action_id: 14, name: "打扫" }),
+  ],
+};
+
+describe("「周期提醒」小节纯逻辑（每窝周期票 04）", () => {
+  it("intervalRowsFromColony：启用操作各一行，撤食(follow)不出现；已设行回显原始每窝值，未设为空串", () => {
+    expect(intervalRowsFromColony(colonyWithActions)).toEqual([
+      { actionId: 11, actionName: "喂食", raw: "" },
+      { actionId: 12, actionName: "加水", raw: "7" },
+      { actionId: 14, actionName: "打扫", raw: "" },
+    ]);
+  });
+
+  it("intervalRowsFromColony：无操作窝得空表；interval_from_colony 缺省（未设）不误回显有效周期", () => {
+    expect(intervalRowsFromColony(existing[0])).toEqual([]);
+    const residue: Colony = {
+      ...existing[0],
+      actions: [
+        // 登记类切性质不清空间隔值：effective 有残留但 interval_from_colony=false → 未设
+        tile({ action_id: 21, name: "称重", effective_interval_days: 3 }),
+      ],
+    };
+    expect(intervalRowsFromColony(residue)).toEqual([
+      { actionId: 21, actionName: "称重", raw: "" },
+    ]);
+  });
+
+  it("parseIntervalDays：空串=未设(null)，1..365 整数合法", () => {
+    expect(parseIntervalDays("")).toBeNull();
+    expect(parseIntervalDays("   ")).toBeNull();
+    expect(parseIntervalDays("7")).toBe(7);
+    expect(parseIntervalDays(" 7 ")).toBe(7);
+    expect(parseIntervalDays("007")).toBe(7);
+    expect(parseIntervalDays("1")).toBe(1);
+    expect(parseIntervalDays("365")).toBe(365);
+  });
+
+  it("parseIntervalDays：0/负数/366/小数/非数字都被人话报错拦下", () => {
+    for (const bad of ["0", "-3", "366", "7.5", "abc", "1e2", "+7", "７"]) {
+      const err = parseIntervalDays(bad);
+      expect(typeof err, `输入 ${bad} 应被拒`).toBe("string");
+      expect(err as string).toContain("1–365");
+    }
+    expect(parseIntervalDays("366")).toContain("366");
+  });
+
+  it("planIntervalSaves：只挑相对回显值有变化的行，null=清除", () => {
+    const rows = [
+      { actionId: 11, actionName: "喂食", raw: "" },
+      { actionId: 12, actionName: "加水", raw: "9" },
+      { actionId: 14, actionName: "打扫", raw: "" },
+    ];
+    const original = [
+      { actionId: 11, actionName: "喂食", raw: "" },
+      { actionId: 12, actionName: "加水", raw: "7" },
+      { actionId: 14, actionName: "打扫", raw: "30" },
+    ];
+    expect(planIntervalSaves(rows, original)).toEqual({
+      saves: [
+        { actionId: 12, intervalDays: 9 },
+        { actionId: 14, intervalDays: null },
+      ],
+      error: null,
+    });
+  });
+
+  it("planIntervalSaves：任一行非法即整体报错不落库，报错带上操作名", () => {
+    const rows = [
+      { actionId: 11, actionName: "喂食", raw: "5" },
+      { actionId: 12, actionName: "加水", raw: "400" },
+    ];
+    const original = [
+      { actionId: 11, actionName: "喂食", raw: "" },
+      { actionId: 12, actionName: "加水", raw: "" },
+    ];
+    const plan = planIntervalSaves(rows, original);
+    expect(plan.error).toContain("加水");
+    expect(plan.error).toContain("1–365");
+    expect(plan.saves).toEqual([]);
+  });
+
+  it("planIntervalSaves：全部未动一行都不发", () => {
+    const rows = [{ actionId: 12, actionName: "加水", raw: "7" }];
+    expect(planIntervalSaves(rows, rows)).toEqual({ saves: [], error: null });
   });
 });

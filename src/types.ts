@@ -31,9 +31,16 @@ export interface ColonyAction {
   /** 是否喂食类操作（schema 标记位，决定记账时是否带食物多选；与名字无关） */
   is_feeding: boolean;
   suggested_interval_days: number | null;
+  /** 有效周期（票 02，Rust ActionTile 同名字段）：该窝每窝周期(若有)否则操作层建议间隔。
+   *  可选仅为旧测试载荷兜底——真实 IPC 恒有值。不能拿 != null 判「该窝设了周期」：
+   *  登记类切性质不清空间隔值，未设周期也可能是操作层残留旧值；判「设了」只认 interval_from_colony。 */
+  effective_interval_days?: number | null;
+  /** true = 该窝设了每窝周期（此时 effective_interval_days 即原始每窝周期值）；缺省 = 未设 */
+  interval_from_colony?: boolean;
   /** 今天 − 最近一次发生日期（自然日）；从未记录为 null */
   days_since_last: number | null;
-  /** 仅提醒类且 > 建议间隔；喂食类任一设周期食物超期也算（F3，Q2） */
+  /** 操作层超期（Rust is_overdue_effective）：设了每窝周期 = 严格大于有效周期（设了即提醒，
+   *  登记类也一样，follow 永不）；未设 = 提醒类且 > 建议间隔；喂食类任一设周期食物超期也算（F3，Q2） */
   overdue: boolean;
   /** 逐食物「距上次」明细（F3）；仅喂食类非空，其余操作恒空数组 */
   foods: FoodTileInfo[];
