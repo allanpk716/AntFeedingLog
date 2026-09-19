@@ -63,6 +63,16 @@ tokio-stream = { version = "0.1", default-features = false, features = ["sync"] 
 #（max_image_width/height/max_alloc）解码双保险；重编码 JPEG 天然不携带 APP1
 #（EXIF/GPS 所在段），输出即干净图。只开三个编解码 feature，不拖其余格式。
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# 数据包备份（webui-checkin 票 09，规格 F）：备份产物升级为单文件 zip 数据包
+#（库+照片+manifest.json）。选型 zip（zip-rs/zip2）：纯 Rust 事实标准，本应用
+# 只需要「写 deflate 包」（打包）与「按名读条目」（测试抽取；恢复侧票 10 复用）。
+# 注意不选 `deflate` feature：它 = zopfli（压缩比极高但极慢）+ zlib-rs，备份是
+# 常规操作要快；用 `deflate-flate2`（flate2 默认 miniz_oxide 后端，纯 Rust 快速
+# deflate）。aes-crypto/bzip2/zstd/lzma 等其余一概不进编译面。
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+# 数据包 manifest 的库/照片 SHA256（规格 F：清单自洽可校验）。sha2 已在依赖树
+#（Tauri 传递依赖，Cargo.lock 同版本 0.10），显式点名零新增编译面。
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

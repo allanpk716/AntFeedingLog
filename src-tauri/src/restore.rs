@@ -11,9 +11,12 @@
 //!   比当前程序新 → 「请先升级应用」；通过即产出 [`RestoreSummary`] 摘要
 //!   （备份日期、窝数、记录数、库内备份目录设置值）——摘要预览是选错文件的
 //!   最后防线（D6）；
-//! - 步骤 3 pre-restore 快照：[`snapshot_current`] 拷当前库到数据目录
-//!   `pre-restore-<时间戳>.db`，最多保留 [`SNAPSHOT_KEEP`] 份超出删最旧
-//!   （[`parse_snapshot_file_name`] 只认自家命名，绝不碰其他文件）；
+//! - 步骤 3 pre-restore 快照（票 09 起为数据包形态）：两段式——[`snapshot_stage_db`]
+//!   锁内拷当前库到数据目录临时文件（毫秒级），[`snapshot_publish`] 锁外打包
+//!   （临时库 + photos/ → `pre-restore-<时间戳>.zip`，`backup_pkg::build_package`；
+//!   照片文件 immutable 文件名，锁外读字节稳定）并保留 [`SNAPSHOT_KEEP`] 份超出
+//!   删最旧（[`parse_snapshot_file_name`] 只认自家命名，新 `.zip` 与旧 `.db`
+//!   兼容识别，绝不碰其他文件）；
 //! - 步骤 4 替换与重载：[`replace_and_reload`] 锁内先把旧连接降为内存占位
 //!   连接（Windows 下不释放文件句柄 rename 覆盖会失败）→ 写 `<库>.new` +
 //!   原子改名覆盖 → 重开新连接放回锁内；重开失败重试 3 次（短退避）→ 仍失败
@@ -34,8 +37,12 @@ use crate::auto_backup;
 /// 数据目录里恢复 staging 临时文件前缀（`restore-staging-<时间戳>.db`）。
 pub const STAGING_PREFIX: &str = "restore-staging-";
 
-/// pre-restore 快照文件前缀（数据目录下 `pre-restore-<时间戳>.db`）。
+/// pre-restore 快照文件前缀（数据目录下 `pre-restore-<时间戳>.zip`，票 09 起
+/// 数据包形态；旧 `.db` 命名只为兼容淘汰保留解析，不再产出）。
 pub const SNAPSHOT_PREFIX: &str = "pre-restore-";
+
+/// 快照打包的临时库文件前缀（`pre-restore-staging-<时间戳>.db`）。
+pub const SNAPSHOT_STAGING_PREFIX: &str = "pre-restore-staging-";
 
 /// 快照保留份数（spec D5：最多保留 3 份，超出删最旧）。
 pub const SNAPSHOT_KEEP: usize = 3;
@@ -82,15 +89,17 @@ pub fn staging_file_name(stamp: &str) -> String {
     format!("{STAGING_PREFIX}{stamp}.db")
 }
 
-/// pre-restore 快照文件名：`pre-restore-<时间戳>.db`。
+/// pre-restore 快照文件名：`pre-restore-<时间戳>.zip`（数据包，票 09）。
 pub fn snapshot_file_name(stamp: &str) -> String {
-    format!("{SNAPSHOT_PREFIX}{stamp}.db")
+    format!("{SNAPSHOT_PREFIX}{stamp}.zip")
 }
 
 /// 反向解析自家快照命名；不匹配/位数不对/非数字/日历不合法一律 None——
 /// 快照保留淘汰只对解析成功的文件动手，数据目录其他文件绝不触碰。
+/// 新 `.zip` 与旧 `.db`（票 09 前的快照产物）两种后缀都认：老快照照旧淘汰。
 pub fn parse_snapshot_file_name(name: &str) -> Option<chrono::NaiveDateTime> {
-    let stem = name.strip_prefix(SNAPSHOT_PREFIX)?.strip_suffix(".db")?;
+    let stem = name.strip_prefix(SNAPSHOT_PREFIX)?;
+    let stem = stem.strip_suffix(".zip").or_else(|| stem.strip_suffix(".db"))?;
     let (date_part, time_part) = stem.split_once('-')?;
     if date_part.len() != 8 || time_part.len() != 6 {
         return None;
@@ -323,21 +332,45 @@ pub fn retain_snapshots(data_dir: &Path, keep: usize) -> Result<usize, String> {
     Ok(removed)
 }
 
-/// 步骤 3：当前库拷为 `pre-restore-<时间戳>.db`（反悔通道），并保留最近
-/// [`SNAPSHOT_KEEP`] 份。拷贝失败清掉半截产物。
-pub fn snapshot_current(current_db: &Path, data_dir: &Path, stamp: &str) -> Result<PathBuf, String> {
+/// 步骤 3·阶段一（调用方持库锁时）：当前库 → 数据目录临时库文件（毫秒级拷贝）。
+/// 拷贝失败清掉半截临时文件。锁纪律与一致性论证见 `backup_pkg.rs` 模块头。
+pub fn snapshot_stage_db(current_db: &Path, data_dir: &Path, stamp: &str) -> Result<PathBuf, String> {
+    let temp = data_dir.join(format!("{SNAPSHOT_STAGING_PREFIX}{stamp}.db"));
+    match crate::system::backup_db_file(current_db, &temp) {
+        Ok(()) => Ok(temp),
+        Err(e) => {
+            let _ = std::fs::remove_file(&temp);
+            Err(format!("恢复前快照失败: {e}"))
+        }
+    }
+}
+
+/// 步骤 3·阶段二（锁外）：临时库 + `photos/` → `pre-restore-<时间戳>.zip`
+/// 数据包（照片文件 immutable 文件名，锁外读字节稳定；缺照片文件降级：跳过 +
+/// 错误流水，包照常产出），并保留最近 [`SNAPSHOT_KEEP`] 份。临时库无论成败都清；
+/// 失败时半截包由 build_package 自清。
+pub fn snapshot_publish(temp_db: &Path, data_dir: &Path, stamp: &str) -> Result<PathBuf, String> {
     let snap = data_dir.join(snapshot_file_name(stamp));
-    match crate::system::backup_db_file(current_db, &snap) {
-        Ok(()) => {
+    let photos_root = data_dir.join(crate::photo::PHOTOS_DIR_NAME);
+    let mut on_skip = |msg: &str| {
+        crate::applog::log_error(&format!("恢复前快照照片跳过（包内不含该张）: {msg}"))
+    };
+    let result = crate::backup_pkg::build_package(
+        temp_db,
+        &photos_root,
+        &crate::applog::now_local(),
+        &snap,
+        &mut on_skip,
+    );
+    let _ = std::fs::remove_file(temp_db);
+    match result {
+        Ok(_) => {
             if let Err(e) = retain_snapshots(data_dir, SNAPSHOT_KEEP) {
                 eprintln!("[restore] 快照保留淘汰失败（忽略）: {e}");
             }
             Ok(snap)
         }
-        Err(e) => {
-            let _ = std::fs::remove_file(&snap);
-            Err(format!("恢复前快照失败: {e}"))
-        }
+        Err(e) => Err(format!("恢复前快照失败: {e}")),
     }
 }
 
@@ -431,8 +464,10 @@ pub fn run_preview(
 
 /// 恢复执行（restore_apply 主体）：重走完整校验（步骤 1+2，TOCTOU 安全——
 /// preview 与 apply 之间源文件可能被换）→ 快照（步骤 3）→ 替换重载（步骤 4）。
-/// 库锁窗口覆盖快照与替换两段（都是本地毫秒级拷贝，与自动备份阶段一同理）；
-/// staging 无论成败一律清理。
+/// 锁窗口拆两段（票 09）：快照阶段一（锁内拷库，毫秒级）与替换共用锁纪律，
+/// 快照阶段二的照片打包在锁外（照片文件 immutable 文件名，读字节稳定；两锁
+/// 之间的业务写入随后被整库替换覆盖，无损）。每段拿锁都走同一 `take_lock`
+/// 闭包——锁内禁写复查（评审 R1 TOCTOU）在两段都生效。staging 无论成败一律清理。
 pub fn run_apply<G, L, O>(
     source: &Path,
     current_db: &Path,
@@ -442,7 +477,7 @@ pub fn run_apply<G, L, O>(
     open_conn: O,
 ) -> Result<ApplyOutcome, String>
 where
-    L: FnOnce() -> Result<G, String>,
+    L: Fn() -> Result<G, String>,
     G: std::ops::DerefMut<Target = Connection>,
     O: Fn(&Path) -> Result<Connection, String>,
 {
@@ -451,9 +486,17 @@ where
     drop(conn);
 
     let outcome = (|| -> Result<ApplyOutcome, String> {
+        // 快照阶段一：锁内拷库到临时（毫秒级；锁内禁写复查随闭包跑第一遍）
+        let snap_temp = {
+            let _guard = take_lock()?;
+            snapshot_stage_db(current_db, data_dir, stamp)?
+        }; // 守卫在此放锁：照片打包绝不占库锁
+        // 快照阶段二（锁外）：打包照片 → pre-restore 数据包 + 保留淘汰。
+        // 两锁之间或本步之后被拦（禁写窗口置位），已产出的快照是当前库的合法
+        // 备份，留在数据目录随保留淘汰收敛，不算残留垃圾。
+        snapshot_publish(&snap_temp, data_dir, stamp)?;
+        // 步骤 4：重新拿锁替换重载（锁内禁写复查随闭包再跑一遍）
         let guard = take_lock()?;
-        // 快照 + 替换共用同一锁窗口（本地毫秒级；锁内拷贝不受并发写干扰）
-        snapshot_current(current_db, data_dir, stamp)?;
         replace_and_reload(guard, current_db, &staging, &open_conn)
     })();
 
@@ -512,7 +555,27 @@ mod tests {
     }
 
     fn no_staging_left(data_dir: &Path) -> bool {
-        list_names(data_dir).iter().all(|n| !n.starts_with(STAGING_PREFIX))
+        list_names(data_dir).iter().all(|n| {
+            !n.starts_with(STAGING_PREFIX) && !n.starts_with(SNAPSHOT_STAGING_PREFIX)
+        })
+    }
+
+    /// 从数据包里抽出库条目到临时路径（zip 产物可验证的通道：解包 → 重开）。
+    fn extract_db_from_package(pkg: &Path, dest_dir: &Path) -> PathBuf {
+        use std::io::Read;
+        let f = std::fs::File::open(pkg).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        let mut out = dest_dir.join("extracted-snap.db");
+        let mut n = 1;
+        while out.exists() {
+            out = dest_dir.join(format!("extracted-snap-{n}.db"));
+            n += 1;
+        }
+        let mut entry = z.by_name(crate::backup_pkg::DB_ENTRY).unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        std::fs::write(&out, bytes).unwrap();
+        out
     }
 
     /// 双库夹具：tempdir 里 data_dir + 当前库（现窝 + 1 记录）。返回
@@ -543,19 +606,25 @@ mod tests {
     #[test]
     fn file_names_use_own_prefixes_and_strict_parse() {
         assert_eq!(staging_file_name(STAMP), "restore-staging-20260918-120000.db");
-        assert_eq!(snapshot_file_name(STAMP), "pre-restore-20260918-120000.db");
+        // 票 09：快照产出数据包 zip
+        assert_eq!(snapshot_file_name(STAMP), "pre-restore-20260918-120000.zip");
 
-        let ok = parse_snapshot_file_name("pre-restore-20260918-120000.db").unwrap();
+        let ok = parse_snapshot_file_name("pre-restore-20260918-120000.zip").unwrap();
         assert_eq!(ok, chrono::NaiveDate::from_ymd_opt(2026, 9, 18).unwrap().and_hms_opt(12, 0, 0).unwrap());
+        // 旧 .db 快照（票 09 前产物）：兼容识别——保留淘汰照旧淘汰
+        let legacy = parse_snapshot_file_name("pre-restore-20260918-120000.db").unwrap();
+        assert_eq!(legacy, ok);
         // 自动备份命名 / 手动命名 / staging 命名：绝不认（保留淘汰不得触碰）
-        assert_eq!(parse_snapshot_file_name("ant-feeding-log-backup-20260918-120000.db"), None);
+        assert_eq!(parse_snapshot_file_name("ant-feeding-log-backup-20260918-120000.zip"), None);
+        assert_eq!(parse_snapshot_file_name("pre-restore-20260918.zip"), None);
         assert_eq!(parse_snapshot_file_name("pre-restore-20260918.db"), None);
         assert_eq!(parse_snapshot_file_name("restore-staging-20260918-120000.db"), None);
+        assert_eq!(parse_snapshot_file_name("pre-restore-staging-20260918-120000.db"), None);
         // 位数不对 / 非数字 / 日历不合法 / 别的后缀
-        assert_eq!(parse_snapshot_file_name("pre-restore-2026091-120000.db"), None);
-        assert_eq!(parse_snapshot_file_name("pre-restore-2026ab18-120000.db"), None);
-        assert_eq!(parse_snapshot_file_name("pre-restore-20261332-120000.db"), None);
-        assert_eq!(parse_snapshot_file_name("pre-restore-20260918-120000.db.bak"), None);
+        assert_eq!(parse_snapshot_file_name("pre-restore-2026091-120000.zip"), None);
+        assert_eq!(parse_snapshot_file_name("pre-restore-2026ab18-120000.zip"), None);
+        assert_eq!(parse_snapshot_file_name("pre-restore-20261332-120000.zip"), None);
+        assert_eq!(parse_snapshot_file_name("pre-restore-20260918-120000.zip.bak"), None);
     }
 
     #[test]
@@ -838,16 +907,19 @@ mod tests {
             .query_row("SELECT name FROM colony", [], |r| r.get(0))
             .unwrap();
         assert_eq!(name, "备份窝", "运行态连接已重开到新库");
-        // 快照产出且可重开（含恢复前的现窝）
+        // 快照产出且是数据包：解出的库可重开（含恢复前的现窝）
         let snaps: Vec<String> = list_names(&data_dir)
             .into_iter()
             .filter(|n| n.starts_with(SNAPSHOT_PREFIX))
             .collect();
         assert_eq!(snaps.len(), 1, "实际：{snaps:?}");
-        let snap_conn = crate::db::open_and_migrate(&data_dir.join(&snaps[0])).unwrap();
+        assert!(snaps[0].ends_with(".zip"), "快照为数据包形态，实际：{snaps:?}");
+        let snap_db = extract_db_from_package(&data_dir.join(&snaps[0]), &data_dir);
+        let snap_conn = crate::db::open_and_migrate(&snap_db).unwrap();
         let name: String = snap_conn.query_row("SELECT name FROM colony", [], |r| r.get(0)).unwrap();
         assert_eq!(name, "现窝", "快照保存的是恢复前的当前库");
         drop(snap_conn);
+        let _ = std::fs::remove_file(&snap_db);
         // staging 与侧车清理干净（侧车 = `<库文件>.new`，不是扩展名替换）
         assert!(no_staging_left(&data_dir));
         let sidecar = PathBuf::from(format!("{}.new", db_path.display()));

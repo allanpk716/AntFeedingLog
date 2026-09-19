@@ -17,6 +17,7 @@
 //! 整个测试套件只有本测试调用 `applog::init` 把它指进临时数据目录，备份引擎
 //! 内部写的动作流水才会落进可断言的位置。
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -158,7 +159,9 @@ fn full_chain_backup_then_restore_roundtrip() {
     }
     crate::auto_backup::record_data_write(&data_dir, today).expect("写入记账失败");
 
-    // 备份产物在当前库分叉后仍是备份点内容（2 条）
+    // 备份产物在当前库分叉后仍是备份点内容（2 条）。票 09：产物是数据包 zip，
+    // 解出库条目验证内容；恢复通路本票仍吃裸库（数据包恢复随票 10），故恢复
+    // 段以解出的库为源——数据完整走过一遍包。
     let source: PathBuf = {
         let mut paths: Vec<PathBuf> = std::fs::read_dir(&backup_dir)
             .expect("备份目录应存在")
@@ -167,9 +170,24 @@ fn full_chain_backup_then_restore_roundtrip() {
             .collect();
         assert_eq!(paths.len(), 1, "实际：{paths:?}");
         let path = paths.pop().unwrap();
-        let backup_conn = crate::db::open_and_migrate(&path).expect("备份产物可重开");
+        assert!(
+            path.extension().map(|e| e == "zip").unwrap_or(false),
+            "备份产物应为数据包 zip，实际：{path:?}"
+        );
+        let f = std::fs::File::open(&path).expect("打开数据包失败");
+        let mut z = zip::ZipArchive::new(f).expect("数据包可解");
+        assert!(z.by_name(crate::backup_pkg::MANIFEST_ENTRY).is_ok(), "包内有根级清单");
+        let mut db_bytes = Vec::new();
+        z.by_name(crate::backup_pkg::DB_ENTRY)
+            .expect("包内有库条目")
+            .read_to_end(&mut db_bytes)
+            .expect("读库条目失败");
+        let extracted = dir.path().join("extracted-from-package.db");
+        std::fs::write(&extracted, &db_bytes).expect("落解出的库失败");
+        let backup_conn = crate::db::open_and_migrate(&extracted).expect("包内库可重开");
         assert_eq!(count_logs(&backup_conn), 2, "备份文件停在备份点");
-        path
+        drop(backup_conn);
+        extracted
     };
 
     // 恢复前基线：配置文件字节（D1：恢复不得动它）

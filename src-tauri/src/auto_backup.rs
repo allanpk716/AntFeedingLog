@@ -1,4 +1,5 @@
-//! 自动备份引擎（数据安全二期票 03）：触发 · 执行 · 保留淘汰。
+//! 自动备份引擎（数据安全二期票 03；产物格式升级见 backup_pkg.rs，票 09）：
+//! 触发 · 执行 · 保留淘汰。
 //!
 //! spec D2/D3/D4 的完整落地，纯函数核心与 IO/Tauri 解耦（沿 system.rs/applog.rs 惯例）：
 //! - 触发（D2）：统一谓词 [`needs_backup`]——`last_data_write_date > last_backup_date`，
@@ -6,11 +7,16 @@
 //!   （`last_backup_date` 晚于今日清空、`last_data_write_date` 钳到今日），单测注入
 //!   未来日期验证备份不停摆；
 //! - 执行（D3）：两段式 [`copy_and_publish`]——库锁只覆盖「库文件 → 数据目录临时
-//!   文件」的本地毫秒级段，锁外把临时文件拷到备份目录（网络盘/慢速盘不占库锁、
-//!   不阻塞业务命令返回）；临时文件成功失败都清理，失败待下个触发点重试；
+//!   文件」的本地毫秒级段；锁外做三件事：**打包**（临时库 + photos/ → 本地 staging
+//!   zip，`backup_pkg::build_package`，照片读取不占库锁）→ 发布（staging zip 拷到
+//!   备份目录，网络盘/慢速盘不阻塞业务命令返回）→ 清临时（临时库/staging zip 成功
+//!   失败都清，失败待下个触发点重试）。触发语义不变：仍以「元数据提交成功」记当日
+//!   新数据（照片写库即算，票 07）；缺照片文件按 backup_pkg 降级（跳过+错误流水），
+//!   包照常产出；
 //! - 保留淘汰（D4）：[`stale_backup_names`] 只匹配自家命名
-//!   `ant-feeding-log-backup-<8位日期>-<6位时间>.db` 且时间戳可解析的文件，按
-//!   **文件名内时间戳**（非 mtime）排序超 N 删最旧；手动备份/无关 .db/文档绝不触碰；
+//!   `ant-feeding-log-backup-<8位日期>-<6位时间>.zip`（旧版 `.db` 同名时间戳兼容
+//!   识别、照旧淘汰）且时间戳可解析的文件，按**文件名内时间戳**（非 mtime）排序
+//!   超 N 删最旧；手动备份/无关文件绝不触碰；
 //! - 触发点线程体 [`run_triggered`]：钳制持久化 → 谓词判定 → 两段式执行 →
 //!   记账/动作流水/保留淘汰。备份失败静默（记账 + 日志），绝不影响业务命令。
 //!
@@ -29,8 +35,12 @@ use crate::backup_config;
 /// 自动备份文件名前缀（D4 保留淘汰只对「前缀 + 8位日期-6位时间 + 后缀」动手）。
 pub const BACKUP_NAME_PREFIX: &str = "ant-feeding-log-backup-";
 
-/// 自动备份文件名后缀。
-pub const BACKUP_NAME_SUFFIX: &str = ".db";
+/// 自动备份文件名后缀（票 09 起产出数据包 zip）。
+pub const BACKUP_NAME_SUFFIX: &str = ".zip";
+
+/// 旧版纯库备份的后缀（票 09 前的产物）：不再产出，但保留淘汰仍识别——
+/// 老自动备份文件超限时照旧淘汰，不永久占位。
+const LEGACY_BACKUP_NAME_SUFFIX: &str = ".db";
 
 /// 数据目录里两段式中转的临时文件名前缀（`auto-backup-staging-<时间戳>.db`）。
 pub const STAGING_PREFIX: &str = "auto-backup-staging-";
@@ -42,7 +52,7 @@ pub fn stamp_format(now: NaiveDateTime) -> String {
     now.format("%Y%m%d-%H%M%S").to_string()
 }
 
-/// 备份文件名：`ant-feeding-log-backup-YYYYMMDD-HHMMSS.db`。
+/// 备份文件名：`ant-feeding-log-backup-YYYYMMDD-HHMMSS.zip`（数据包，票 09）。
 pub fn backup_file_name(stamp: &str) -> String {
     format!("{BACKUP_NAME_PREFIX}{stamp}{BACKUP_NAME_SUFFIX}")
 }
@@ -54,10 +64,12 @@ pub fn stamp_now() -> String {
 
 /// 反向解析自家备份命名；不匹配/位数不对/非数字/时间戳不合法（如 13 月、25 点）
 /// 一律 None——保留淘汰只对解析成功的文件动手，同目录其他文件绝不触碰（D4）。
+/// 新 `.zip` 与旧 `.db`（票 09 前的自动备份产物）两种后缀都认：老文件超限照旧淘汰。
 pub fn parse_backup_file_name(name: &str) -> Option<NaiveDateTime> {
-    let stem = name
-        .strip_prefix(BACKUP_NAME_PREFIX)?
-        .strip_suffix(BACKUP_NAME_SUFFIX)?;
+    let stem = name.strip_prefix(BACKUP_NAME_PREFIX)?;
+    let stem = stem
+        .strip_suffix(BACKUP_NAME_SUFFIX)
+        .or_else(|| stem.strip_suffix(LEGACY_BACKUP_NAME_SUFFIX))?;
     let (date_part, time_part) = stem.split_once('-')?;
     if date_part.len() != 8 || time_part.len() != 6 {
         return None;
@@ -221,10 +233,24 @@ pub fn copy_db_to_temp(db_path: &Path, data_dir: &Path, stamp: &str) -> Result<P
     }
 }
 
-/// 阶段二（锁外调用）：临时文件 → 备份目录正式名。父目录缺失先建
-/// （与手动备份同一行为）。
-pub fn publish_temp(temp_path: &Path, target: &Path) -> Result<(), String> {
-    crate::system::backup_db_file(temp_path, target).map(|_| ())
+/// 阶段二·打包（锁外调用）：临时库 + `photos/` → 数据目录本地 staging zip。
+/// 照片清单以临时库（锁内快照）为准，照片文件读取不占库锁（一致性论证见
+/// `backup_pkg.rs` 模块头）；缺照片文件降级（跳过 + 错误流水，包照常产出）。
+/// 半截 staging zip 由 build_package 自清。
+fn package_to_staging(temp_db: &Path, data_dir: &Path, stamp: &str) -> Result<PathBuf, String> {
+    let staging_zip = data_dir.join(format!("{STAGING_PREFIX}{stamp}.zip"));
+    let photos_root = data_dir.join(crate::photo::PHOTOS_DIR_NAME);
+    let mut on_skip = |msg: &str| {
+        crate::applog::log_error(&format!("自动备份照片跳过（包内不含该张）: {msg}"))
+    };
+    crate::backup_pkg::build_package(
+        temp_db,
+        &photos_root,
+        &crate::applog::now_local(),
+        &staging_zip,
+        &mut on_skip,
+    )
+    .map(|_| staging_zip)
 }
 
 /// 清理临时文件（成功/失败路径都调；NotFound 视为已清理）。
@@ -236,10 +262,11 @@ fn cleanup_temp(temp_path: &Path) {
     }
 }
 
-/// 两段式备份执行（D3）：`take_lock` 注入库锁获取（生产传 `DbState` 的
-/// `Mutex<Connection>::lock`；测试传任意守卫）。锁窗口只覆盖阶段一的本地临时
-/// 拷贝；阶段二（临时 → 备份目录，可能落在网络盘/慢速盘）在锁释放后执行，不
-/// 阻塞业务命令。临时文件成功失败都清理。返回备份产物完整路径。
+/// 两段式备份执行（D3；产物为数据包 zip，票 09）：`take_lock` 注入库锁获取
+/// （生产传 `DbState` 的 `Mutex<Connection>::lock`；测试传任意守卫）。锁窗口
+/// 只覆盖阶段一的本地临时库拷贝；阶段二（打包 + 发布到备份目录，可能落在网络
+/// 盘/慢速盘）在锁释放后执行，不阻塞业务命令。临时库与本地 staging zip 成功
+/// 失败都清理。返回备份产物完整路径。
 pub fn copy_and_publish<G, Guard>(
     db_path: &Path,
     data_dir: &Path,
@@ -251,12 +278,20 @@ where
     G: FnOnce() -> Result<Guard, String>,
 {
     let _guard = take_lock()?;
-    let temp_path = copy_db_to_temp(db_path, data_dir, stamp)?;
-    drop(_guard); // 锁窗口到此为止——备份目录拷贝绝不占库锁
-    let target = backup_dir.join(backup_file_name(stamp));
-    let result = publish_temp(&temp_path, &target);
-    cleanup_temp(&temp_path);
-    result.map(|_| target)
+    let temp_db = copy_db_to_temp(db_path, data_dir, stamp)?;
+    drop(_guard); // 锁窗口到此为止——打包与发布绝不占库锁
+
+    let publish = || -> Result<PathBuf, String> {
+        let staging_zip = package_to_staging(&temp_db, data_dir, stamp)?;
+        let target = backup_dir.join(backup_file_name(stamp));
+        let published = crate::system::backup_db_file(&staging_zip, &target);
+        // 发布成败都清本地 staging zip（失败时避免半截包占数据目录）
+        let _ = std::fs::remove_file(&staging_zip);
+        published.map(|_| target)
+    };
+    let result = publish();
+    cleanup_temp(&temp_db);
+    result
 }
 
 // ── 防重入 ───────────────────────────────────────────────────────────────
@@ -450,6 +485,37 @@ mod tests {
             .all(|n| !n.starts_with(STAGING_PREFIX))
     }
 
+    /// 从数据包里抽出库条目到临时路径（zip 产物可验证的通道：解包 → 重开）。
+    fn extract_db_from_package(pkg: &std::path::Path, dest_dir: &std::path::Path) -> std::path::PathBuf {
+        use std::io::Read;
+        let f = std::fs::File::open(pkg).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        let mut out = dest_dir.join("extracted.db");
+        let mut n = 1;
+        while out.exists() {
+            out = dest_dir.join(format!("extracted-{n}.db"));
+            n += 1;
+        }
+        let mut entry = z.by_name(crate::backup_pkg::DB_ENTRY).unwrap();
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).unwrap();
+        std::fs::write(&out, bytes).unwrap();
+        out
+    }
+
+    /// 读包内 manifest（解包验证清单用）。
+    fn read_manifest(pkg: &std::path::Path) -> serde_json::Value {
+        use std::io::Read;
+        let f = std::fs::File::open(pkg).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        let mut text = String::new();
+        z.by_name(crate::backup_pkg::MANIFEST_ENTRY)
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
     /// 轮询等待条件成立（线程调度不用固定睡眠硬等）。
     fn wait_until(pred: impl Fn() -> bool, timeout: Duration) -> bool {
         let start = std::time::Instant::now();
@@ -466,34 +532,42 @@ mod tests {
 
     #[test]
     fn backup_file_name_has_second_resolution_stamp() {
-        // 验收 5：命名含 YYYYMMDD-HHMMSS；同日两次（补跑场景）不互相覆盖
+        // 验收 5：命名含 YYYYMMDD-HHMMSS；同日两次（补跑场景）不互相覆盖。
+        // 票 09：产物为数据包 zip。
         let now = date(2026, 9, 18).and_hms_opt(9, 5, 3).unwrap();
         let stamp = stamp_format(now);
         assert_eq!(stamp, "20260918-090503");
         let name = backup_file_name(&stamp);
-        assert_eq!(name, "ant-feeding-log-backup-20260918-090503.db");
+        assert_eq!(name, "ant-feeding-log-backup-20260918-090503.zip");
         let one_second_later = backup_file_name(&stamp_format(now + chrono::Duration::seconds(1)));
         assert_ne!(name, one_second_later, "同秒只差 1 秒的两份备份不得同名");
     }
 
     #[test]
     fn parse_backup_file_name_accepts_only_own_complete_pattern() {
-        let ok = parse_backup_file_name("ant-feeding-log-backup-20260918-090503.db").unwrap();
+        // 新命名（数据包 zip）
+        let ok = parse_backup_file_name("ant-feeding-log-backup-20260918-090503.zip").unwrap();
         assert_eq!(ok, date(2026, 9, 18).and_hms_opt(9, 5, 3).unwrap());
+        // 旧命名（纯库 .db，票 09 前的自动备份产物）：兼容识别——保留淘汰照旧淘汰
+        let legacy = parse_backup_file_name("ant-feeding-log-backup-20260918-090503.db").unwrap();
+        assert_eq!(legacy, ok);
         // 手动备份默认命名（只有日期没时分秒）：绝不认——保留淘汰不得触碰
+        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918.zip"), None);
         assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918.db"), None);
         // 位数不对
-        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-2026091-090503.db"), None);
-        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-09050.db"), None);
+        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-2026091-090503.zip"), None);
+        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-09050.zip"), None);
         // 非数字
-        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-2026ab918-090503.db"), None);
+        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-2026ab918-090503.zip"), None);
         // 日历上不合法的时间戳（解析兜底，不能只靠位数）
-        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20261332-090503.db"), None);
-        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-250503.db"), None);
+        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20261332-090503.zip"), None);
+        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-250503.zip"), None);
         // 别的前缀 / 别的后缀 / 无后缀
-        assert_eq!(parse_backup_file_name("backup-20260918-090503.db"), None);
-        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-090503.db.bak"), None);
+        assert_eq!(parse_backup_file_name("backup-20260918-090503.zip"), None);
+        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-090503.zip.bak"), None);
         assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-090503"), None);
+        // 双后缀（异常构造）：时间部分带尾巴 → 位数不对 → 不认
+        assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-090503.db.zip"), None);
     }
 
     // ── 触发谓词与钳制（D2 纯核心）───────────────────────────────────────
@@ -603,12 +677,13 @@ mod tests {
 
     #[test]
     fn stale_backup_names_keeps_newest_and_never_touches_foreign() {
-        // 验收 6：按文件名内时间戳排序（刻意打乱入参顺序），超 N 删最旧
+        // 验收 6：按文件名内时间戳排序（刻意打乱入参顺序），超 N 删最旧。
+        // 新 .zip 与旧 .db 同时间戳池混排（兼容淘汰），手动/无关绝不返回。
         let names = [
-            "ant-feeding-log-backup-20250101-000000.db", // 最旧 → 删
-            "ant-feeding-log-backup-20250104-000000.db", // 最新 → 留
-            "ant-feeding-log-backup-20250102-000000.db", // 次旧 → 删
-            "ant-feeding-log-backup-20250103-000000.db", // 留
+            "ant-feeding-log-backup-20250101-000000.db", // 最旧（旧版产物）→ 删
+            "ant-feeding-log-backup-20250104-000000.zip", // 最新 → 留
+            "ant-feeding-log-backup-20250102-000000.zip", // 次旧 → 删
+            "ant-feeding-log-backup-20250103-000000.db", // 留（旧版产物）
             "ant-feeding-log-backup-20250105.db",        // 手动命名（无时分秒）：绝不返回
             "other.db",                                  // 无关 .db：绝不返回
             "notes.txt",                                 // 文档：绝不返回
@@ -617,7 +692,7 @@ mod tests {
             stale_backup_names(&names, 2),
             vec![
                 "ant-feeding-log-backup-20250101-000000.db".to_string(),
-                "ant-feeding-log-backup-20250102-000000.db".to_string(),
+                "ant-feeding-log-backup-20250102-000000.zip".to_string(),
             ]
         );
         // 数量未超：全留
@@ -638,13 +713,103 @@ mod tests {
         .unwrap();
         assert_eq!(target, backup_dir.join(backup_file_name(stamp)));
         assert!(target.exists(), "备份目录缺失时自动创建并落产物");
-        // 产物可被应用正式通道重开且数据完整
-        let reopened = crate::db::open_and_migrate(&target).unwrap();
+
+        // 产物是数据包：根级清单格式版本对，解出的库可被应用正式通道重开且数据完整
+        let manifest = read_manifest(&target);
+        assert_eq!(manifest["format_version"], crate::backup_pkg::FORMAT_VERSION);
+        assert_eq!(manifest["photo_count"], 0, "无照片库：零照片包");
+        let extracted = extract_db_from_package(&target, &data_dir);
+        let reopened = crate::db::open_and_migrate(&extracted).unwrap();
         let n: i64 = reopened
             .query_row("SELECT COUNT(*) FROM colony", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 1);
+        drop(reopened);
+        let _ = std::fs::remove_file(&extracted);
         assert!(no_staging_left(&data_dir), "临时文件已清理");
+    }
+
+    #[test]
+    fn copy_and_publish_package_includes_referenced_photos_with_manifest() {
+        // 引擎级端到端：库内引用的照片进包，清单对账（张数/路径/字节）
+        let (_dir, data_dir, backup_dir, db_path) = io_fixture();
+        {
+            let conn = crate::db::open_and_migrate(&db_path).unwrap();
+            let checkin_id = crate::nest_checkin::save_checkin(
+                &conn,
+                &crate::nest_checkin::CheckinInput {
+                    colony_id: 1,
+                    date: "2026-09-18".into(),
+                    queen_count: None,
+                    worker_count: None,
+                    moved_nest: false,
+                    note: Some("带照片".into()),
+                },
+                "2026-09-18",
+                "2026-09-18 21:00:00",
+            )
+            .unwrap()
+            .id;
+            let photos_root = data_dir.join(crate::photo::PHOTOS_DIR_NAME);
+            std::fs::create_dir_all(photos_root.join("1")).unwrap();
+            let bytes = vec![0xFF, 0xD8, 0xFF, 1, 2, 3];
+            std::fs::write(photos_root.join("1").join("uuid-1.jpg"), &bytes).unwrap();
+            conn.execute(
+                "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+                 VALUES (?1, '1/uuid-1.jpg', '', '')",
+                rusqlite::params![checkin_id],
+            )
+            .unwrap();
+        }
+        let target = copy_and_publish(&db_path, &data_dir, &backup_dir, "20260918-130000", || {
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        assert!(target.extension().map(|e| e == "zip").unwrap_or(false), "产物是 zip 数据包");
+        let manifest = read_manifest(&target);
+        assert_eq!(manifest["photo_count"], 1);
+        assert_eq!(manifest["photos"][0]["path"], "1/uuid-1.jpg");
+        assert_eq!(manifest["photos"][0]["bytes"], 6);
+        assert_eq!(manifest["total_bytes"], 6);
+    }
+
+    #[test]
+    fn copy_and_publish_missing_photo_still_produces_consistent_package() {
+        // 缺文件降级（引擎级）：引用的照片文件没了 → 包照常产出、manifest 只列
+        // 实际收入（自洽），不整包失败
+        let (_dir, data_dir, backup_dir, db_path) = io_fixture();
+        {
+            let conn = crate::db::open_and_migrate(&db_path).unwrap();
+            let checkin_id = crate::nest_checkin::save_checkin(
+                &conn,
+                &crate::nest_checkin::CheckinInput {
+                    colony_id: 1,
+                    date: "2026-09-18".into(),
+                    queen_count: None,
+                    worker_count: None,
+                    moved_nest: false,
+                    note: Some("照片引用在、文件缺失".into()),
+                },
+                "2026-09-18",
+                "2026-09-18 21:00:00",
+            )
+            .unwrap()
+            .id;
+            conn.execute(
+                "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+                 VALUES (?1, '1/gone.jpg', '', '')",
+                rusqlite::params![checkin_id],
+            )
+            .unwrap();
+            // 文件从不落位（或被外部清走）：photos/ 下没有 1/gone.jpg
+        }
+        let target = copy_and_publish(&db_path, &data_dir, &backup_dir, "20260918-140000", || {
+            Ok::<_, String>(())
+        })
+        .expect("缺照片不整包失败");
+        let manifest = read_manifest(&target);
+        assert_eq!(manifest["photo_count"], 0);
+        assert_eq!(manifest["photos"].as_array().unwrap().len(), 0);
     }
 
     #[test]
@@ -744,10 +909,12 @@ mod tests {
         let (_dir, _data_dir, backup_dir, _db_path) = io_fixture();
         std::fs::create_dir_all(&backup_dir).unwrap();
         for name in [
-            backup_file_name("20250101-000000"), // 最旧 → 删
-            backup_file_name("20250102-120000"), // 次旧 → 删
+            backup_file_name("20250101-000000"), // 最旧（zip）→ 删
+            backup_file_name("20250102-120000"), // 次旧（zip）→ 删
             backup_file_name("20250103-000000"), // 留
             backup_file_name("20250104-235959"), // 留
+            // 旧版纯库产物（票 09 前）：兼容识别，混池照旧淘汰
+            "ant-feeding-log-backup-20241231-000000.db".to_string(), // 更旧 → 删
             "ant-feeding-log-backup-20250105.db".to_string(), // 手动备份命名：绝不碰
             "my-manual-copy.db".to_string(),      // 无关 .db：绝不碰
             "说明文档.txt".to_string(),            // 文档：绝不碰
@@ -755,9 +922,10 @@ mod tests {
             std::fs::write(backup_dir.join(&name), "x").unwrap();
         }
         let removed = enforce_retention(&backup_dir, 2).unwrap();
-        assert_eq!(removed, 2, "只删超限的最旧自动备份");
+        assert_eq!(removed, 3, "只删超限的最旧自动备份（含旧版 .db 产物）");
         assert!(backup_dir.join(backup_file_name("20250103-000000")).exists());
         assert!(backup_dir.join(backup_file_name("20250104-235959")).exists());
+        assert!(backup_dir.join("ant-feeding-log-backup-20241231-000000.db").exists() == false, "旧版 .db 超限照旧淘汰");
         assert!(backup_dir.join("ant-feeding-log-backup-20250105.db").exists(), "手动备份幸存");
         assert!(backup_dir.join("my-manual-copy.db").exists(), "无关 .db 幸存");
         assert!(backup_dir.join("说明文档.txt").exists(), "文档幸存");
@@ -844,12 +1012,15 @@ mod tests {
         let r = c.last_result.expect("有结果");
         assert!(r.ok);
         assert!(r.reason.is_none());
-        // 产物可重开、临时文件已清
-        let reopened = crate::db::open_and_migrate(&backup_dir.join(&names[0])).unwrap();
+        // 产物可解包重开（数据包 zip：抽出库条目）、临时文件已清
+        let extracted = extract_db_from_package(&backup_dir.join(&names[0]), &data_dir);
+        let reopened = crate::db::open_and_migrate(&extracted).unwrap();
         let n: i64 = reopened
             .query_row("SELECT COUNT(*) FROM colony", [], |row| row.get(0))
             .unwrap();
         assert_eq!(n, 1);
+        drop(reopened);
+        let _ = std::fs::remove_file(&extracted);
         assert!(no_staging_left(&data_dir));
     }
 

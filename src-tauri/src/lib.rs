@@ -1,6 +1,7 @@
 mod applog;
 mod auto_backup;
 mod backup_config;
+mod backup_pkg;
 mod care;
 mod colony;
 mod data_meta;
@@ -1376,30 +1377,62 @@ fn date_stamp() -> String {
     chrono::Local::now().format("%Y%m%d").to_string()
 }
 
-/// 安全备份：rfd 选目标 → 短暂拿锁挡住并发写 → 拷贝库文件
-/// （journal_mode=DELETE，拷贝即完整，评审附录规则 11）。用户取消返回 None。
-/// 成败都落流水（终局评审 D7：备份成功/失败；本命令不经 with_conn）。
+/// 安全备份（票 09 起产出数据包）：rfd 选目标 → 锁内拷库到临时（挡并发写，
+/// 毫秒级本地拷贝，journal_mode=DELETE 拷贝即完整）→ 锁外打包（读 photos/ +
+/// 流式写 zip；照片文件 immutable 文件名、清单以锁内库快照为准，一致性论证见
+/// backup_pkg.rs 模块头）→ 清临时。缺照片文件降级（跳过+错误流水），包照常
+/// 产出。用户取消返回 None。成败都落流水（终局评审 D7：备份成功/失败；本命令
+/// 不经 with_conn）。
 #[tauri::command]
 async fn backup_to(state: tauri::State<'_, DbState>) -> Result<Option<String>, String> {
     let db_path = state.1.clone();
-    let default_name = format!("ant-feeding-log-backup-{}.db", date_stamp());
-    let Some(target) = pick_save_path(&default_name, "SQLite 数据库", &["db"]).await else {
+    let stamp = auto_backup::stamp_now();
+    let default_name = auto_backup::backup_file_name(&stamp);
+    let Some(target) = pick_save_path(&default_name, "蚂蚁饲养记录数据包（zip）", &["zip"]).await
+    else {
         return Ok(None);
     };
-    // 拷贝期间短暂持锁：保证没有并发写（对话框阶段不持锁，不卡其他命令）
-    let _guard = match state.0.lock() {
-        Ok(guard) => guard,
-        Err(e) => {
-            applog::log_error(&format!("安全备份失败（库锁不可用）: {e}"));
-            return Err(e.to_string());
-        }
+    let data_dir = current_data_dir()?;
+    // 锁内拷库（对话框阶段不持锁，不卡其他命令）
+    let temp_db = {
+        let guard = match state.0.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                applog::log_error(&format!("安全备份失败（库锁不可用）: {e}"));
+                return Err(e.to_string());
+            }
+        };
+        let copied = auto_backup::copy_db_to_temp(&db_path, &data_dir, &stamp);
+        drop(guard); // 照片打包在锁外，不阻塞业务命令
+        copied?
     };
-    if let Err(e) = system::backup_db_file(&db_path, &target) {
-        applog::log_error(&format!("安全备份失败: {e}"));
-        return Err(e);
+    let photos_root = data_dir.join(photo::PHOTOS_DIR_NAME);
+    let mut on_skip = |msg: &str| {
+        applog::log_error(&format!("安全备份照片跳过（包内不含该张）: {msg}"))
+    };
+    let result = backup_pkg::build_package(
+        &temp_db,
+        &photos_root,
+        &applog::now_local(),
+        &target,
+        &mut on_skip,
+    );
+    let _ = std::fs::remove_file(&temp_db);
+    match result {
+        Ok(outcome) => {
+            applog::log_action(&format!(
+                "安全备份成功: {}（照片 {} 张，包 {} 字节）",
+                target.display(),
+                outcome.photo_count,
+                std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0),
+            ));
+            Ok(Some(target.to_string_lossy().to_string()))
+        }
+        Err(e) => {
+            applog::log_error(&format!("安全备份失败: {e}"));
+            Err(e)
+        }
     }
-    applog::log_action(&format!("安全备份成功: {}", target.display()));
-    Ok(Some(target.to_string_lossy().to_string()))
 }
 
 /// 导出归档（评审附录规则 11：定位为归档带走；恢复走应用内恢复通道 restore.rs）：csv=记录流水一行一条
