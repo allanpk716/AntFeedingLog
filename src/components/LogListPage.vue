@@ -8,7 +8,7 @@
  * 首页「距上次」与超期态即时重算（数据驱动）。
  */
 import { computed, onMounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { deleteLog, listActions, listColonies, listFoods, listLogs, updateLog } from "../lib/ipc";
 import type { CareActionItem, Colony, FoodItem, LogPage, LogRow } from "../types";
 import {
   buildLogFilter,
@@ -45,7 +45,7 @@ const enabledActions = computed(() => actions.value.filter((a) => a.enabled));
 async function load(offset: number) {
   loading.value = true;
   try {
-    const res = await invoke<LogPage>("list_logs", {
+    const res = await listLogs({
       filter: buildLogFilter(form.value, offset),
     });
     page.value =
@@ -139,7 +139,7 @@ async function saveEdit() {
   editBusy.value = true;
   editError.value = "";
   try {
-    await invoke("update_log", {
+    await updateLog({
       id: editing.value.id,
       input: buildUpdateInput({
         happenedAt: editTime.value,
@@ -169,7 +169,7 @@ async function requestDelete(row: LogRow) {
   }
   confirmDeleteId.value = null;
   try {
-    await invoke("delete_log", { id: row.id });
+    await deleteLog({ id: row.id });
     emit("changed");
     await load(0);
   } catch (e) {
@@ -180,9 +180,9 @@ async function requestDelete(row: LogRow) {
 onMounted(async () => {
   try {
     const [cols, acts, fds] = await Promise.all([
-      invoke<Colony[]>("list_colonies"),
-      invoke<CareActionItem[]>("list_actions"),
-      invoke<FoodItem[]>("list_foods"),
+      listColonies(),
+      listActions(),
+      listFoods(),
     ]);
     colonies.value = cols;
     actions.value = acts;

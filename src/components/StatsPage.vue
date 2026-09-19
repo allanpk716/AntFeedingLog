@@ -7,7 +7,7 @@
  * 视觉基线 mocks/mock-b-stats.html；占比归一化/周取数/间隔条布局在 lib/stats.ts。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { earliestLogDate, getStats, listColonies } from "../lib/ipc";
 import * as echarts from "echarts";
 import type { Colony, StatsDayDetail, StatsPayload } from "../types";
 import { todayIso } from "../lib/dates";
@@ -51,12 +51,12 @@ async function refresh() {
   loading.value = true;
   try {
     if (colonies.value.length === 0) {
-      colonies.value = await invoke<Colony[]>("list_colonies");
+      colonies.value = await listColonies();
     }
     // 「全部」下界 = min(最早开始饲养日, 最早记录日)（票 07 停靠①）；分母口径
     // （规则 7）由 range_days 随 payload 带回
-    const earliest = await invoke<string | null>("earliest_log_date");
-    payload.value = await invoke<StatsPayload>("get_stats", {
+    const earliest = await earliestLogDate();
+    payload.value = await getStats({
       colonyId: colonyId.value,
       startDate: rangeStartFor(range.value, today, colonies.value, earliest),
       endDate: today,

@@ -11,7 +11,7 @@
  * 约束（重叠/日期先后/已结束不可入眠等）权威校验在 Rust，错误串直接展示。
  */
 import { computed, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { addPastHibernation, confirmWake, startHibernation, updateExpectedEnd } from "../lib/ipc";
 import type { Colony } from "../types";
 import { defaultExpectedEnd } from "../lib/hibernation";
 import { todayIso } from "../lib/dates";
@@ -69,7 +69,7 @@ function submit() {
     busy.value = false;
   };
   if (props.mode === "start") {
-    invoke("start_hibernation", {
+    startHibernation({
       colonyId: props.colony.id,
       startDate: startDate.value,
       expectedEndDate: expectedEnd.value,
@@ -77,21 +77,21 @@ function submit() {
       .then(done, fail)
       .finally(finish);
   } else if (props.mode === "wake") {
-    invoke("confirm_wake", {
+    confirmWake({
       colonyId: props.colony.id,
       actualEndDate: actualEnd.value,
     })
       .then(done, fail)
       .finally(finish);
   } else if (props.mode === "edit") {
-    invoke("update_expected_end", {
+    updateExpectedEnd({
       colonyId: props.colony.id,
       newExpectedEndDate: expectedEnd.value,
     })
       .then(done, fail)
       .finally(finish);
   } else {
-    invoke("add_past_hibernation", {
+    addPastHibernation({
       colonyId: props.colony.id,
       startDate: pastStart.value,
       endDate: pastEnd.value,

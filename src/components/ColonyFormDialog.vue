@@ -7,7 +7,7 @@
  * 本组件自己发 IPC（create/update/archive/delete_colony），成功后抛 saved 让外层刷新。
  */
 import { computed, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { archiveColony, createColony, deleteColony, updateColony } from "../lib/ipc";
 import type { Colony, ColonyStatus, LocationItem } from "../types";
 import { COLONY_STATUS_LABELS } from "../types";
 import {
@@ -79,9 +79,9 @@ async function submit() {
   formError.value = "";
   try {
     if (editingId === null) {
-      await invoke("create_colony", { input });
+      await createColony({ input });
     } else {
-      await invoke("update_colony", { id: editingId, input });
+      await updateColony({ id: editingId, input });
     }
     emit("saved");
   } catch (e) {
@@ -96,7 +96,7 @@ async function archive() {
   busy.value = true;
   formError.value = "";
   try {
-    await invoke("archive_colony", { id: props.editing.id });
+    await archiveColony({ id: props.editing.id });
     emit("saved");
   } catch (e) {
     formError.value = String(e);
@@ -110,7 +110,7 @@ async function remove() {
   busy.value = true;
   formError.value = "";
   try {
-    await invoke("delete_colony", { id: props.editing.id });
+    await deleteColony({ id: props.editing.id });
     emit("saved");
     emit("close");
   } catch (e) {

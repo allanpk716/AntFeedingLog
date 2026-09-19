@@ -3,13 +3,13 @@ import { flushPromises, mount } from "@vue/test-utils";
 import SettingsDialog from "./SettingsDialog.vue";
 import type { BackupConfigInfo, RestoreSummary } from "../types";
 
-// 不依赖 Tauri 运行时：mock 掉 IPC 与事件监听（沿 LogListPage.test.ts 先例）
-const { invokeMock, listenStub } = vi.hoisted(() => ({
-  invokeMock: vi.fn(),
-  listenStub: vi.fn(async () => () => {}),
-}));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: listenStub }));
+// 不依赖 Tauri 运行时：统一 mock 调用层（命令包装按 cmdName 透传给唯一的
+// invokeMock；事件订阅走 mock 工厂内置的立即退订空桩）
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+vi.mock("../lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("../testing/ipcMock");
+  return ipcModuleMock(invokeMock)(importOriginal);
+});
 
 function baseMock(updateState: object = { status: "idle" }) {
   invokeMock.mockImplementation(async (cmd: string) => {
@@ -47,7 +47,6 @@ async function openUpdateTab(updateState?: object) {
 
 beforeEach(() => {
   invokeMock.mockReset();
-  listenStub.mockClear();
 });
 
 describe("设置弹窗「更新」节（票 06）", () => {

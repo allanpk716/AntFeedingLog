@@ -4,9 +4,12 @@ import StatsPage from "./StatsPage.vue";
 import type { Colony, StatsPayload } from "../types";
 import { addDays, todayIso } from "../lib/dates";
 
-// 不依赖 Tauri 运行时：mock 掉 IPC
+// 不依赖 Tauri 运行时：统一 mock 调用层（沿 LogListPage.test.ts 先例）
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("../lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("../testing/ipcMock");
+  return ipcModuleMock(invokeMock)(importOriginal);
+});
 
 // happy-dom 无 canvas：mock 掉 echarts，只断言 setOption 收到配置
 const { echartsSetOption, echartsDispose } = vi.hoisted(() => ({

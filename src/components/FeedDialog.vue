@@ -5,7 +5,7 @@
  * 停用食物不进新建入口（规则 10）。
  */
 import { computed, onMounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { listFoods, logCare } from "../lib/ipc";
 import type { Colony, ColonyAction, FoodItem } from "../types";
 import { nowLocalDateTime } from "../lib/care";
 
@@ -26,7 +26,7 @@ const enabledFoods = computed(() => foods.value.filter((f) => f.enabled));
 
 onMounted(async () => {
   try {
-    foods.value = await invoke<FoodItem[]>("list_foods");
+    foods.value = await listFoods();
   } catch (e) {
     formError.value = String(e);
   }
@@ -46,7 +46,7 @@ async function submit() {
   busy.value = true;
   formError.value = "";
   try {
-    await invoke("log_care", {
+    await logCare({
       input: {
         colony_id: props.colony.id,
         action_id: props.action.action_id,

@@ -4,14 +4,14 @@ import App from "./App.vue";
 import type { AppSettings, CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
 import { addDays, todayIso, todayLabel } from "./lib/dates";
 
-// 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
-const { invokeMock, listenStub } = vi.hoisted(() => ({
-  invokeMock: vi.fn(),
-  listenStub: vi.fn(async () => () => {}),
-}));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
-// 票 04：App.vue 监听 db-restored 事件（恢复后各页刷新），测试里同样 mock 掉
-vi.mock("@tauri-apps/api/event", () => ({ listen: listenStub }));
+// 不依赖 Tauri 运行时：统一 mock 调用层（命令包装按 cmdName 透传给唯一的
+// invokeMock，调用形状 (命令名, 入参) 与旧式 vi.mock("@tauri-apps/api/core") 一致）；
+// 事件订阅（db-restored 等）走 mock 工厂内置的立即退订空桩
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+vi.mock("./lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("./testing/ipcMock");
+  return ipcModuleMock(invokeMock)(importOriginal);
+});
 
 // 票 07：统计页图表在 happy-dom 无 canvas，mock 掉 echarts（导航测试只验接线）
 const { echartsSetOption } = vi.hoisted(() => ({ echartsSetOption: vi.fn() }));

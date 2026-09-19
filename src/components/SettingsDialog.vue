@@ -29,19 +29,39 @@
  * 成功后重拉字典并抛 changed。停用项整行置灰。
  */
 import { onMounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import {
+  backupTo,
+  eraseAction as eraseActionCmd,
+  eraseFood as eraseFoodCmd,
+  exportData as exportDataCmd,
+  getBackupConfig,
+  getLastAbnormalExit,
+  getRecentErrors,
+  getSettings,
+  listActions,
+  listFoods,
+  listLocations,
+  openLogsFolder,
+  pickBackupDir as pickBackupDirCmd,
+  pickRestoreFile,
+  pushoverStatus as getPushoverStatus,
+  restoreApply,
+  restorePreview,
+  revealDataFolder,
+  saveAction,
+  saveFood,
+  sendTestNotification,
+  setActionEnabled as setActionEnabledCmd,
+  setBackupConfig,
+  setFoodEnabled as setFoodEnabledCmd,
+  setSettings,
+} from "../lib/ipc";
 import type {
-  AppSettings,
   BackupConfigInput,
   BackupConfigInfo,
-  CareActionItem,
-  FoodItem,
   LocationItem,
   PushoverStatus,
-  RestoreApplyOutcome,
   RestoreSummary,
-  TestNotifyOutcome,
-  AbnormalExitInfo,
 } from "../types";
 import {
   buildActionRows,
@@ -94,11 +114,11 @@ const pushoverStatus = ref<PushoverStatus | null>(null);
 
 async function load() {
   const [actions, foods, locs, s, pushStatus] = await Promise.all([
-    invoke<CareActionItem[]>("list_actions"),
-    invoke<FoodItem[]>("list_foods"),
-    invoke<LocationItem[]>("list_locations"),
-    invoke<AppSettings>("get_settings"),
-    invoke<PushoverStatus>("pushover_status"),
+    listActions(),
+    listFoods(),
+    listLocations(),
+    getSettings(),
+    getPushoverStatus(),
   ]);
   actionRows.value = buildActionRows(actions);
   foodRows.value = buildFoodRows(foods);
@@ -158,7 +178,7 @@ async function setActionEnabled(row: ActionRow, enabled: boolean) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("set_action_enabled", { id: row.id, enabled });
+    await setActionEnabledCmd({ id: row.id, enabled });
     row.enabled = enabled;
     emit("changed");
   } catch (e) {
@@ -176,7 +196,7 @@ async function eraseAction(row: ActionRow) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("erase_action", { id: row.id });
+    await eraseActionCmd({ id: row.id });
     actionRows.value = actionRows.value.filter((r) => r !== row);
     emit("changed");
   } catch (e) {
@@ -191,7 +211,7 @@ async function setFoodEnabled(row: FoodRow, enabled: boolean) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("set_food_enabled", { id: row.id, enabled });
+    await setFoodEnabledCmd({ id: row.id, enabled });
     row.enabled = enabled;
     emit("changed");
   } catch (e) {
@@ -209,7 +229,7 @@ async function eraseFood(row: FoodRow) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("erase_food", { id: row.id });
+    await eraseFoodCmd({ id: row.id });
     foodRows.value = foodRows.value.filter((r) => r !== row);
     emit("changed");
   } catch (e) {
@@ -231,7 +251,7 @@ async function saveActions() {
   error.value = "";
   try {
     for (const input of toActionInputs(actionRows.value)) {
-      await invoke("save_action", { input });
+      await saveAction({ input });
     }
     await load();
     emit("changed");
@@ -252,7 +272,7 @@ async function saveFoods() {
   error.value = "";
   try {
     for (const input of toFoodInputs(foodRows.value)) {
-      await invoke("save_food", { input });
+      await saveFood({ input });
     }
     await load();
     emit("changed");
@@ -275,7 +295,7 @@ async function saveNotify() {
   notifyError.value = "";
   notifySaved.value = "";
   try {
-    const saved = await invoke<AppSettings>("set_settings", { input });
+    const saved = await setSettings({ input });
     notifyForm.value = toForm(saved);
     autostart.value = saved.autostart_enabled;
     notifySaved.value = "已保存";
@@ -291,7 +311,7 @@ async function testNotify() {
   notifyError.value = "";
   notifySaved.value = "";
   try {
-    const r = await invoke<TestNotifyOutcome>("send_test_notification");
+    const r = await sendTestNotification();
     const parts = [
       r.desktop_ok ? "桌面 ✓" : `桌面 ✗（${r.desktop_error ?? "未知错误"}）`,
       r.pushover === null ? "手机：未配置" : r.pushover.ok ? "手机 ✓" : `手机 ✗（${r.pushover.error}）`,
@@ -318,7 +338,7 @@ const dataBusy = ref(false);
 async function revealFolder() {
   dataError.value = "";
   try {
-    await invoke<string>("reveal_data_folder");
+    await revealDataFolder();
   } catch (e) {
     dataError.value = String(e);
   }
@@ -329,7 +349,7 @@ async function runBackup() {
   dataError.value = "";
   dataResult.value = "";
   try {
-    const path = await invoke<string | null>("backup_to");
+    const path = await backupTo();
     dataResult.value = path ? `已备份到：${path}` : "";
   } catch (e) {
     dataError.value = String(e);
@@ -343,7 +363,7 @@ async function exportData(format: "csv" | "json") {
   dataError.value = "";
   dataResult.value = "";
   try {
-    const path = await invoke<string | null>("export_data", { format });
+    const path = await exportDataCmd({ format });
     dataResult.value = path ? `已导出到：${path}` : "";
   } catch (e) {
     dataError.value = String(e);
@@ -359,8 +379,8 @@ const abnormalExitText = ref<string | null>(null);
 async function loadLogSection() {
   try {
     const [errs, abnormal] = await Promise.all([
-      invoke<string[]>("get_recent_errors"),
-      invoke<AbnormalExitInfo | null>("get_last_abnormal_exit"),
+      getRecentErrors(),
+      getLastAbnormalExit(),
     ]);
     recentErrors.value = errs ?? [];
     abnormalExitText.value = formatAbnormalExit(abnormal);
@@ -372,7 +392,7 @@ async function loadLogSection() {
 async function openLogs() {
   dataError.value = "";
   try {
-    await invoke<string>("open_logs_folder");
+    await openLogsFolder();
   } catch (e) {
     dataError.value = String(e);
   }
@@ -404,7 +424,7 @@ function applyBackupConfig(c: BackupConfigInfo | null) {
 
 async function loadBackupSection() {
   try {
-    applyBackupConfig(await invoke<BackupConfigInfo>("get_backup_config"));
+    applyBackupConfig(await getBackupConfig());
   } catch {
     // 静默：配置读不出（理论外路径，Rust 侧缺失/损坏都回默认值）不挡其他功能区
   }
@@ -414,7 +434,7 @@ async function pickBackupDir() {
   backupError.value = "";
   backupSaved.value = "";
   try {
-    const dir = await invoke<string | null>("pick_backup_dir");
+    const dir = await pickBackupDirCmd();
     if (dir) autoForm.value.backupDir = dir;
   } catch (e) {
     backupError.value = String(e);
@@ -438,7 +458,7 @@ async function saveBackupConfig() {
       keep_count: keep,
     };
     // 返回收敛后的生效值（Rust 侧已规整目录/校验份数），回显以它为准
-    applyBackupConfig(await invoke<BackupConfigInfo>("set_backup_config", { input }));
+    applyBackupConfig(await setBackupConfig({ input }));
     backupSaved.value = "已保存";
   } catch (e) {
     backupError.value = String(e);
@@ -466,17 +486,17 @@ async function startRestore() {
   // 对话框默认定位备份目录（已设置时；读取失败不挡选文件）
   let defaultDir: string | null = null;
   try {
-    defaultDir = (await invoke<BackupConfigInfo>("get_backup_config")).backup_dir;
+    defaultDir = (await getBackupConfig()).backup_dir;
   } catch {
     // 静默：默认定位是锦上添花
   }
   try {
-    const picked = await invoke<string | null>("pick_restore_file", { defaultDir });
+    const picked = await pickRestoreFile({ defaultDir });
     if (!picked) return; // 用户取消选文件
     restorePath.value = picked;
     restoreBusy.value = true;
     // 校验链 + 摘要（Rust staging 临时库，当前库零改动）；拒绝原因直接展示
-    restoreSummary.value = await invoke<RestoreSummary>("restore_preview", { path: picked });
+    restoreSummary.value = await restorePreview({ path: picked });
     restoreConfirming.value = false; // 每份新摘要都重新走二段确认
   } catch (e) {
     restoreError.value = String(e);
@@ -496,7 +516,7 @@ async function confirmRestoreApply() {
   restoreBusy.value = true;
   restoreError.value = "";
   try {
-    const outcome = await invoke<RestoreApplyOutcome>("restore_apply", { path: restorePath.value });
+    const outcome = await restoreApply({ path: restorePath.value });
     restoreResult.value = formatRestoreOutcome(outcome);
     restoreSummary.value = null;
     restoreConfirming.value = false;

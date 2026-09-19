@@ -5,7 +5,7 @@
  * 喂食不弹这里（FeedDialog 自带食物多选）。后端 log_care 已拒未来时间。
  */
 import { ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { logCare } from "../lib/ipc";
 import type { Colony, ColonyAction } from "../types";
 import { nowLocalDateTime } from "../lib/care";
 
@@ -21,7 +21,7 @@ async function submit() {
   busy.value = true;
   formError.value = "";
   try {
-    await invoke("log_care", {
+    await logCare({
       input: {
         colony_id: props.colony.id,
         action_id: props.action.action_id,

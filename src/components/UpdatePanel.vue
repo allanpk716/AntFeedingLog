@@ -13,8 +13,14 @@
  * - 前端不经 updater JS API，全部走 Tauri command（capabilities 无 updater 权限）。
  */
 import { computed, onMounted, onUnmounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import {
+  checkUpdateNow,
+  confirmAndInstall,
+  getAppVersion,
+  getUpdateState,
+  openReleasesPage,
+  subscribe,
+} from "../lib/ipc";
 import {
   checkViewForOutcome,
   installViewForOutcome,
@@ -23,14 +29,11 @@ import {
   stateBannerFor,
   toProgressView,
   updateAvailableTitle,
-  type CheckOutcome,
   type CheckView,
-  type InstallOutcome,
   type InstallView,
   type ProgressView,
   type ShownProgress,
   type StateBannerView,
-  type UpdateState,
 } from "../lib/updaterUi";
 
 const currentVersion = ref("");
@@ -64,8 +67,8 @@ const progressIndeterminate = computed(
 async function loadVersionAndState() {
   try {
     const [version, state] = await Promise.all([
-      invoke<string>("get_app_version"),
-      invoke<UpdateState>("get_update_state"),
+      getAppVersion(),
+      getUpdateState(),
     ]);
     currentVersion.value = version;
     banner.value = stateBannerFor(state);
@@ -84,9 +87,9 @@ function onProgressEvent(payload: unknown) {
 }
 
 onMounted(async () => {
-  const unlisten = await listen<{ downloaded: number; total: number | null }>(
+  const unlisten = await subscribe<{ downloaded: number; total: number | null }>(
     "update-download-progress",
-    (event) => onProgressEvent(event.payload),
+    (payload) => onProgressEvent(payload),
   );
   if (disposed) {
     // 挂载即卸载（listen 未 resolve 前组件已销毁）：立即退订，监听器不泄漏
@@ -107,7 +110,7 @@ async function checkNow() {
   checking.value = true;
   declined.value = false;
   try {
-    const outcome = await invoke<CheckOutcome>("check_update_now").catch((e) => String(e));
+    const outcome = await checkUpdateNow().catch((e) => String(e));
     checkView.value = checkViewForOutcome(outcome);
   } finally {
     checking.value = false;
@@ -138,7 +141,7 @@ async function installNow() {
     // Err（防重入拒绝/再次检查失败/写标记失败）折为字符串进映射层：
     // 防重入拒绝 = 安装健康进行中，映射为平静「进行中」态，不走失败引导
     //（评审 R2 Important：切 tab 回来重复确认时不得误报失败）
-    const outcome = await invoke<InstallOutcome>("confirm_and_install").catch((e) => String(e));
+    const outcome = await confirmAndInstall().catch((e) => String(e));
     install.value = installViewForOutcome(outcome, fallbackVersion);
   } finally {
     installing.value = false;
@@ -148,7 +151,7 @@ async function installNow() {
 async function openReleases() {
   releasesError.value = "";
   try {
-    await invoke("open_releases_page");
+    await openReleasesPage();
   } catch (e) {
     releasesError.value = String(e);
   }

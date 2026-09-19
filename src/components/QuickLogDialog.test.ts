@@ -3,8 +3,12 @@ import { flushPromises, mount } from "@vue/test-utils";
 import QuickLogDialog from "./QuickLogDialog.vue";
 import type { Colony, ColonyAction } from "../types";
 
+// 不依赖 Tauri 运行时：统一 mock 调用层（沿 LogListPage.test.ts 先例）
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("../lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("../testing/ipcMock");
+  return ipcModuleMock(invokeMock)(importOriginal);
+});
 
 const colony: Colony = {
   id: 1, name: "大头一号", species: null, location_id: null, start_date: "2026-01-20",
