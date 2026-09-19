@@ -1095,6 +1095,7 @@ mod tests {
             days_since_last: days,
             overdue,
             foods: vec![],
+            retrieval_state: "none".into(), // 票 02 新字段；托盘概要测试用不到三态
         }
     }
 
