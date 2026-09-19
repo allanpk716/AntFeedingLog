@@ -8,6 +8,8 @@
 //! - 饲养天数 = 今天 − 开始饲养日期的自然日天数（含冬眠，评审附录规则 9）；
 //! - deleteColony 仅无记录窝（无 care_log 行）；有记录只能置「已结束」（规则 10 精神）。
 
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
@@ -269,10 +271,10 @@ pub fn archive_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony,
     get_colony(conn, id, today)
 }
 
-/// 仅无记录窝可删；有 care_log 行则拒绝。顺带清掉该窝的提醒台账、冬眠段与巢况
-/// 登记（webui-checkin 票 02，用户故事 11：删窝连带清巢况与照片元数据；照片文件
-/// 清理随票 07 照片管线接管）。全部 DELETE 包在同一事务里，任一失败整体回滚，
-/// 不留中间态。
+/// 仅无记录窝可删；有 care_log 行则拒绝。顺带清掉该窝的提醒台账、冬眠段、每窝
+/// 周期行与巢况登记（webui-checkin 票 02，用户故事 11：删窝连带清巢况与照片元
+/// 数据；照片文件清理随票 07 照片管线接管）。全部 DELETE 包在同一事务里，任一
+/// 失败整体回滚，不留中间态。
 pub fn delete_colony(conn: &Connection, id: i64) -> Result<(), String> {
     let logs: i64 = conn
         .query_row(
@@ -292,6 +294,11 @@ pub fn delete_colony(conn: &Connection, id: i64) -> Result<(), String> {
     tx.execute("DELETE FROM hibernation WHERE colony_id = ?1", params![id])
         .map_err(db_err)?;
     tx.execute(
+        "DELETE FROM colony_action_interval WHERE colony_id = ?1",
+        params![id],
+    )
+    .map_err(db_err)?;
+    tx.execute(
         "DELETE FROM nest_photo WHERE checkin_id IN
              (SELECT id FROM nest_checkin WHERE colony_id = ?1)",
         params![id],
@@ -307,6 +314,101 @@ pub fn delete_colony(conn: &Connection, id: i64) -> Result<(), String> {
         return Err("窝不存在".into());
     }
     tx.commit().map_err(db_err)
+}
+
+// ── 每窝周期（每窝周期票 01）─────────────────────────────────────────────
+// 术语见 CONTEXT.md「每窝周期」：挂在窝上、按操作设的周期（天）。设了即提醒并
+// 取代该操作层建议间隔，没设沿用操作层性质。本节只做存取与校验（存得进、读得
+// 出、校验得住）；超期判定接线在票 02，前端在票 03/04。
+
+/// 周期合法域（spec F4）：整数 1..=365；schema CHECK 同款兜底。
+const INTERVAL_DAYS_RANGE: std::ops::RangeInclusive<i64> = 1..=365;
+
+/// 窝与操作的存在性预检（外键裸 REFERENCES，应用层给人话报错）。
+fn ensure_interval_targets(
+    conn: &Connection,
+    colony_id: i64,
+    action_id: i64,
+) -> Result<(), String> {
+    let colony: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM colony WHERE id = ?1",
+            params![colony_id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if colony == 0 {
+        return Err(format!("窝不存在（id={colony_id}）"));
+    }
+    let action: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM care_action WHERE id = ?1",
+            params![action_id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if action == 0 {
+        return Err(format!("操作不存在（id={action_id}）"));
+    }
+    Ok(())
+}
+
+/// 设置/清除某窝某操作的每窝周期：`Some(天数)` upsert 一行（已设即改，立即
+/// 生效）；`None` 删行 = 未设（未设时清除也成功，幂等）。天数须为 1..=365 的
+/// 整数，窝或操作须存在，否则人话报错。与 Tauri 解耦，lib.rs 薄包装成桌面命令。
+pub fn set_colony_action_interval(
+    conn: &Connection,
+    colony_id: i64,
+    action_id: i64,
+    interval_days: Option<i64>,
+) -> Result<(), String> {
+    if let Some(days) = interval_days {
+        if !INTERVAL_DAYS_RANGE.contains(&days) {
+            return Err(format!("每窝周期应是 1–365 的整数天（收到 {days}）"));
+        }
+    }
+    ensure_interval_targets(conn, colony_id, action_id)?;
+    match interval_days {
+        Some(days) => conn
+            .execute(
+                "INSERT INTO colony_action_interval (colony_id, action_id, interval_days)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(colony_id, action_id)
+                 DO UPDATE SET interval_days = excluded.interval_days",
+                params![colony_id, action_id, days],
+            )
+            .map_err(db_err)?,
+        None => conn
+            .execute(
+                "DELETE FROM colony_action_interval
+                 WHERE colony_id = ?1 AND action_id = ?2",
+                params![colony_id, action_id],
+            )
+            .map_err(db_err)?,
+    };
+    Ok(())
+}
+
+/// 某窝已设的全部每窝周期：`action_id → interval_days`。读侧内部函数，供票 02
+/// 的 tiles/提醒接线取"窝 × 操作"覆盖值（本票不改 tiles_for_colony 行为）；
+/// 未设任何周期的窝返回空表。
+#[allow(dead_code)] // 每窝周期票 02（tiles/提醒接线）消费；本票先落读侧
+pub fn intervals_for_colony(
+    conn: &Connection,
+    colony_id: i64,
+) -> Result<HashMap<i64, i64>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT action_id, interval_days FROM colony_action_interval
+             WHERE colony_id = ?1",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![colony_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(db_err)?
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
 }
 
 // ── 地点 ─────────────────────────────────────────────────────────────────
@@ -692,11 +794,18 @@ mod tests {
             params![c.id],
         )
         .unwrap();
+        // 造一条每窝周期行（每窝周期票 01）：删窝顺带清理，不留悬挂引用
+        set_colony_action_interval(&conn, c.id, 1, Some(3)).unwrap();
 
         delete_colony(&conn, c.id).unwrap();
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM colony WHERE id = ?1", c.id), 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM hibernation WHERE colony_id = ?1", c.id), 0);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM reminder_ledger WHERE colony_id = ?1", c.id), 0);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM colony_action_interval WHERE colony_id = ?1", c.id),
+            0,
+            "删窝应连带清掉该窝全部周期行"
+        );
     }
 
     #[test]
@@ -745,6 +854,146 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM reminder_ledger WHERE colony_id = ?1", c.id), 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM hibernation WHERE colony_id = ?1", c.id), 1);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM colony WHERE id = ?1", c.id), 1);
+    }
+
+    // ── 每窝周期（每窝周期票 01）──
+
+    /// 查某窝某操作当前周期（未设 = None）。
+    fn interval_days(conn: &Connection, colony_id: i64, action_id: i64) -> Option<i64> {
+        conn.query_row(
+            "SELECT interval_days FROM colony_action_interval
+             WHERE colony_id = ?1 AND action_id = ?2",
+            params![colony_id, action_id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
+    fn action_id_by_name(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT id FROM care_action WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .expect("查预置操作失败")
+    }
+
+    #[test]
+    fn set_interval_upserts_then_updates_single_row() {
+        let conn = mem_conn();
+        let c = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+
+        set_colony_action_interval(&conn, c.id, hydrate, Some(2)).unwrap();
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(2));
+
+        // 改周期 = 原行更新，不新增
+        set_colony_action_interval(&conn, c.id, hydrate, Some(7)).unwrap();
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(7));
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM colony_action_interval WHERE colony_id = ?1",
+                c.id
+            ),
+            1
+        );
+
+        // 边界值 1 与 365 都合法
+        set_colony_action_interval(&conn, c.id, hydrate, Some(1)).unwrap();
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(1));
+        set_colony_action_interval(&conn, c.id, hydrate, Some(365)).unwrap();
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(365));
+    }
+
+    #[test]
+    fn clear_interval_removes_row_and_unset_clear_is_ok() {
+        let conn = mem_conn();
+        let c = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+
+        set_colony_action_interval(&conn, c.id, hydrate, Some(3)).unwrap();
+        // 清除 = 删行（未设）
+        set_colony_action_interval(&conn, c.id, hydrate, None).unwrap();
+        assert_eq!(interval_days(&conn, c.id, hydrate), None);
+
+        // 未设时再清除也成功（幂等）
+        set_colony_action_interval(&conn, c.id, hydrate, None).unwrap();
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM colony_action_interval WHERE colony_id = ?1",
+                c.id
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn set_interval_rejects_out_of_range_days() {
+        let conn = mem_conn();
+        let c = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+
+        for bad in [0, -1, -365, 366, 10000] {
+            let err = set_colony_action_interval(&conn, c.id, hydrate, Some(bad)).unwrap_err();
+            assert!(err.contains("1–365"), "interval_days={bad} 实际错误：{err}");
+            assert!(err.contains(&bad.to_string()), "报错应带实际值 {bad}：{err}");
+        }
+        // 越界值一个都没落库
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM colony_action_interval WHERE colony_id = ?1",
+                c.id
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn set_interval_rejects_missing_colony_or_action() {
+        let conn = mem_conn();
+        let c = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        let feed = action_id_by_name(&conn, "喂食");
+
+        // 幽灵窝：设与清都拒绝
+        let err = set_colony_action_interval(&conn, 999, feed, Some(3)).unwrap_err();
+        assert!(err.contains("窝不存在"), "实际错误：{err}");
+        let err = set_colony_action_interval(&conn, 999, feed, None).unwrap_err();
+        assert!(err.contains("窝不存在"), "实际错误：{err}");
+
+        // 幽灵操作：设与清都拒绝
+        let err = set_colony_action_interval(&conn, c.id, 999, Some(3)).unwrap_err();
+        assert!(err.contains("操作不存在"), "实际错误：{err}");
+        let err = set_colony_action_interval(&conn, c.id, 999, None).unwrap_err();
+        assert!(err.contains("操作不存在"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn intervals_for_colony_maps_actions_to_days() {
+        let conn = mem_conn();
+        let a = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        let b = create_colony(&conn, &input("针毛一号", Some(1)), TODAY).unwrap();
+        let feed = action_id_by_name(&conn, "喂食");
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+
+        // 未设任何周期的窝 → 空表
+        assert!(intervals_for_colony(&conn, a.id).unwrap().is_empty());
+
+        set_colony_action_interval(&conn, a.id, feed, Some(5)).unwrap();
+        set_colony_action_interval(&conn, a.id, hydrate, Some(2)).unwrap();
+        set_colony_action_interval(&conn, b.id, hydrate, Some(9)).unwrap();
+
+        let map = intervals_for_colony(&conn, a.id).unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&feed), Some(&5));
+        assert_eq!(map.get(&hydrate), Some(&2));
+
+        // 窝之间互不串
+        let map_b = intervals_for_colony(&conn, b.id).unwrap();
+        assert_eq!(map_b.len(), 1);
+        assert_eq!(map_b.get(&hydrate), Some(&9));
     }
 
     // ── 地点 ──
