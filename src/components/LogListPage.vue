@@ -122,19 +122,30 @@ function onEndDatePick(iso: string) {
 }
 
 /** 关键词防抖 300ms（#4，复审修正）：输入即时同步 form.keyword、只防抖查询动作——
- * 若同步也挂到回调里，重置后 form.keyword 仍是空串，Vue 不 patch 输入框，旧词残留界面 */
+ * 若同步也挂到回调里，重置后 form.keyword 仍是空串，Vue 不 patch 输入框，旧词残留界面。
+ * IME 两段式（vModelText 同款：守卫 + compositionend 补发）：组词期不同步不防抖；
+ * 携带最终上屏文本的那次 input 在 compositionend 之前发出（isComposing 仍 true），
+ * 只挡不补会吞掉确认上屏——所以 compositionend 时复位标志并补同步 */
 let kwTimer: ReturnType<typeof setTimeout> | undefined;
-function onKeywordInput(e: Event) {
-  // IME 组词期（拼音组词中）不同步不防抖（v-model/vModelText 同款守卫）：
-  // isComposing 在 InputEvent 上（评审原稿 cast 到 HTMLInputElement 类型错且运行时恒 undefined）；
-  // happy-dom 的 input 事件 isComposing 为 undefined，=== true 判定不影响测试
-  if ((e as InputEvent).isComposing === true) return;
-  form.value.keyword = (e.target as HTMLInputElement).value;
+const composing = ref(false);
+function syncKeyword(value: string) {
+  form.value.keyword = value;
   clearTimeout(kwTimer);
   kwTimer = setTimeout(() => {
     kwTimer = undefined;
     applyFilters();
   }, 300);
+}
+function onKeywordInput(e: Event) {
+  if (composing.value) return; // 组词中：拼音片段不进表单、不挂防抖
+  syncKeyword((e.target as HTMLInputElement).value);
+}
+function onCompositionStart() {
+  composing.value = true;
+}
+function onCompositionEnd(e: Event) {
+  composing.value = false;
+  syncKeyword((e.target as HTMLInputElement).value); // 补上屏同步（vModelText 同款语义）
 }
 
 onBeforeUnmount(() => clearTimeout(kwTimer));
@@ -378,6 +389,8 @@ onMounted(async () => {
           type="search"
           placeholder="搜备注 · 输入即查"
           @input="onKeywordInput"
+          @compositionstart="onCompositionStart"
+          @compositionend="onCompositionEnd"
         />
         <button class="reset-btn" type="button" @click="resetFilters">重置</button>
         <span class="auto-note">⚡ 条件变更即查询</span>
