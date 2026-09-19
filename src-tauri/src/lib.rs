@@ -16,6 +16,7 @@ mod photo;
 mod pushover;
 mod reminder;
 mod restore;
+mod restore_pkg;
 mod settings;
 mod stats;
 mod system;
@@ -1200,10 +1201,60 @@ fn run_orphan_scan(app: &tauri::AppHandle) {
     }
 }
 
-/// 启动巡检放后台线程：照片多时扫盘不挡启动。
+/// 数据包恢复中断续跑（webui-checkin 票 10）：库替换后进程被杀 → 暂存目录
+/// 留存，启动时把「当前库引用而 photos/ 缺失」且暂存区有的照片继续落位，然后
+/// 清暂存目录。必须在孤儿巡检之前跑（巡检会把换库前的旧照片按孤儿隔离，顺序
+/// 不能反）。有动作才落流水。
+fn run_pkg_restore_resume(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<DbState>() else {
+        return;
+    };
+    let Ok(data_dir) = current_data_dir() else {
+        return;
+    };
+    let photos_root = data_dir.join(photo::PHOTOS_DIR_NAME);
+    let outcome = run_with_conn(&state.0, |conn| {
+        Ok::<restore_pkg::PkgResumeOutcome, String>(restore_pkg::resume_pending_pkg_restores(
+            &data_dir,
+            &photos_root,
+            conn,
+        ))
+    });
+    match outcome {
+        Ok(o) if !o.resumed.is_empty() || !o.discarded.is_empty() || !o.errors.is_empty() => {
+            if !o.errors.is_empty() {
+                applog::log_error(&format!(
+                    "数据包恢复续跑未完成（下次启动重试）: {}",
+                    o.errors.join("；")
+                ));
+            }
+            if !o.resumed.is_empty() || !o.discarded.is_empty() {
+                applog::log_action(&format!(
+                    "数据包恢复续跑：完成 {} 个暂存目录的照片落位，丢弃 {} 个半截暂存目录{}",
+                    o.resumed.len(),
+                    o.discarded.len(),
+                    if o.landed.is_empty() {
+                        String::new()
+                    } else {
+                        format!("，落位照片 {} 张", o.landed.len())
+                    }
+                ));
+            }
+        }
+        Ok(_) => {}
+        // run_with_conn 已落过失败日志；这里只补续跑语境
+        Err(_) => {}
+    }
+}
+
+/// 启动巡检放后台线程：照片多时扫盘不挡启动。先续跑数据包恢复（票 10）再
+/// 巡检——顺序见 [`run_pkg_restore_resume`]。
 fn spawn_orphan_scan(app: &tauri::AppHandle) {
     let app = app.clone();
-    std::thread::spawn(move || run_orphan_scan(&app));
+    std::thread::spawn(move || {
+        run_pkg_restore_resume(&app);
+        run_orphan_scan(&app);
+    });
 }
 
 /// 启动触发点（D2 ②）与写入触发点共用的后台执行入口：判定（含时钟回拨钳制）
@@ -1226,12 +1277,13 @@ fn spawn_auto_backup(app: &tauri::AppHandle) {
 
 /// rfd 系统文件选择框选备份文件（取消返回 None）。async command：对话框不能占
 /// 主线程（与 pick_backup_dir 同理，评审 R1-2）。`default_dir` = 备份目录已设置
-/// 时作为对话框初始位置（目录真实存在才生效）。
+/// 时作为对话框初始位置（目录真实存在才生效）。票 10：同时认数据包（.zip）与
+/// 旧裸库（.db），恢复侧按扩展名分流。
 #[tauri::command]
 async fn pick_restore_file(default_dir: Option<String>) -> Result<Option<String>, String> {
     let mut dialog = rfd::AsyncFileDialog::new()
         .set_title("选择要恢复的备份文件")
-        .add_filter("SQLite 数据库", &["db"]);
+        .add_filter("备份数据包 / 数据库", &["zip", "db"]);
     if let Some(dir) = default_dir {
         let p = std::path::PathBuf::from(&dir);
         if p.is_dir() {

@@ -73,6 +73,10 @@ zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 # 数据包 manifest 的库/照片 SHA256（规格 F：清单自洽可校验）。sha2 已在依赖树
 #（Tauri 传递依赖，Cargo.lock 同版本 0.10），显式点名零新增编译面。
 sha2 = "0.10"
+# 数据包恢复的磁盘空间预检（票 10，规格 F：按 zip 条目元数据 ×1.2 与目标盘可用
+# 空间比较）。windows-sys 已在依赖树（0.60.2 传递依赖），显式点名只为
+# GetDiskFreeSpaceExW 一个声明；declare-style 裸 FFI crate，无运行时。
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

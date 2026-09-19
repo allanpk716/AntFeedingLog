@@ -29,7 +29,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -44,7 +44,7 @@ pub const MANIFEST_ENTRY: &str = "manifest.json";
 pub const DB_ENTRY: &str = crate::db::DB_FILE_NAME;
 
 /// manifest 照片条目。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PackageManifestPhoto {
     /// photos/ 下相对路径（正斜杠，`<colonyId>/<uuid>.jpg`）。
     pub path: String,
@@ -53,7 +53,7 @@ pub struct PackageManifestPhoto {
 }
 
 /// 数据包根级清单（manifest.json 的结构；恢复侧按 format_version 校验后消费）。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PackageManifest {
     pub format_version: u32,
     pub app_version: String,
@@ -211,11 +211,11 @@ fn referenced_photo_paths(db_snapshot: &Path) -> Result<Vec<String>, String> {
     }
 }
 
-/// 数据包内照片路径 grammar（与恢复侧严格 grammar 同源，规格 F）：
-/// 仅 `<段>/<文件>.jpg` 两段，段内字符限 `[A-Za-z0-9_-]`。`.tmp-`/`.orphan-*`
-/// 以 `.` 开头、`..`/反斜杠/冒号/绝对路径全都不在字符集内——「永不进包」
-/// 在这一个闸上成立。
-fn is_packable_rel_path(rel: &str) -> bool {
+/// 数据包内照片路径 grammar（打包侧与恢复侧同一份表驱动判定，规格 F：
+/// 仅 `<段>/<文件>.jpg` 两段，段内字符限 `[A-Za-z0-9_-]`）。`.tmp-`/`.orphan-*`
+/// 以 `.` 开头、`..`/反斜杠/冒号/绝对路径全都不在字符集内——「永不进包」与
+/// 「解包只认清单内合法路径」在这一个闸上同时成立。
+pub fn is_packable_rel_path(rel: &str) -> bool {
     let mut parts = rel.split('/');
     match (parts.next(), parts.next(), parts.next()) {
         (Some(dir), Some(file), None) => {

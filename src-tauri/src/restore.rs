@@ -65,6 +65,9 @@ pub struct RestoreSummary {
     /// 备份内的备份目录设置值（settings 表 `backup_dir` 键；D1 后备份设置存库外，
     /// 新备份无此键 → None，前端点明「备份设置保持当前值，不随恢复回滚」）。
     pub backup_dir_in_backup: Option<String>,
+    /// 备份内照片张数（webui-checkin 票 10）：数据包 = manifest 张数；
+    /// 裸库 = 0（前端标注「不含照片」）。
+    pub photo_count: usize,
 }
 
 /// 恢复执行结果（restore_apply 返回体）。
@@ -233,6 +236,8 @@ fn build_summary(
         colony_count,
         log_count,
         backup_dir_in_backup,
+        // 裸库不含照片（票 10）：photo_count 恒 0，前端标注「不含照片」
+        photo_count: 0,
     })
 }
 
@@ -450,13 +455,31 @@ where
 
 // ── 编排：preview 与 apply ──────────────────────────────────────────────
 
+/// 来源分流（票 10）：.zip = 数据包（走 restore_pkg 新链）；其余按裸库走既有链。
+/// 文件选择器只放 .zip/.db，但这里按扩展名再判一次（不区分大小写）。
+fn is_package_source(source: &Path) -> bool {
+    source
+        .extension()
+        .map(|e| e.eq_ignore_ascii_case("zip"))
+        .unwrap_or(false)
+}
+
 /// 恢复预览（restore_preview 主体）：步骤 1+2，产出摘要后 staging 即清。
+/// .zip 数据包分流到 [`crate::restore_pkg`]（票 10），协议见其模块头。
 pub fn run_preview(
     source: &Path,
     current_db: &Path,
     data_dir: &Path,
     stamp: &str,
 ) -> Result<RestoreSummary, String> {
+    if is_package_source(source) {
+        return crate::restore_pkg::run_preview_pkg(
+            source,
+            data_dir,
+            stamp,
+            &crate::restore_pkg::real_free_space(data_dir),
+        );
+    }
     let (conn, staging, summary) = stage_and_validate(source, current_db, data_dir, stamp)?;
     discard_staging(conn, &staging);
     Ok(summary)
@@ -469,6 +492,8 @@ pub fn run_preview(
 /// 之间的业务写入会被恢复覆盖丢弃——恢复点之后的写本就属被弃范围，如实说
 /// 不是"无损"）。每段拿锁都走同一 `take_lock`
 /// 闭包——锁内禁写复查（评审 R1 TOCTOU）在两段都生效。staging 无论成败一律清理。
+/// .zip 数据包分流到 [`crate::restore_pkg::run_apply_pkg`]（票 10；同一快照/替换
+/// 原语 + 落位/清退/中断可续）。
 pub fn run_apply<G, L, O>(
     source: &Path,
     current_db: &Path,
@@ -482,6 +507,17 @@ where
     G: std::ops::DerefMut<Target = Connection>,
     O: Fn(&Path) -> Result<Connection, String>,
 {
+    if is_package_source(source) {
+        return crate::restore_pkg::run_apply_pkg(
+            source,
+            current_db,
+            data_dir,
+            stamp,
+            &crate::restore_pkg::real_free_space(data_dir),
+            take_lock,
+            open_conn,
+        );
+    }
     let (conn, staging, _summary) = stage_and_validate(source, current_db, data_dir, stamp)?;
     // 校验完先关临时库连接（句柄释放）；staging 留给步骤 4 替换用，替换后才清
     drop(conn);
@@ -1214,13 +1250,21 @@ mod tests {
             colony_count: 2,
             log_count: 3,
             backup_dir_in_backup: Some("D:/old-bk".into()),
+            photo_count: 4,
         };
         let json = serde_json::to_string(&s).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        for key in ["backup_date", "colony_count", "log_count", "backup_dir_in_backup"] {
+        for key in [
+            "backup_date",
+            "colony_count",
+            "log_count",
+            "backup_dir_in_backup",
+            "photo_count",
+        ] {
             assert!(v.get(key).is_some(), "缺 {key}，实际：{json}");
         }
         assert_eq!(v["backup_dir_in_backup"], "D:/old-bk");
+        assert_eq!(v["photo_count"], 4, "票 10：摘要带照片张数");
 
         assert_eq!(
             serde_json::to_string(&ApplyOutcome::Done).unwrap(),
