@@ -8,7 +8,7 @@
  */
 import { computed, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { Colony, ColonyAction, FoodItem, MonthDayRecords } from "../types";
+import type { CareActionItem, Colony, ColonyAction, FoodItem, MonthDayRecords } from "../types";
 import { nowLocalDateTime } from "../lib/care";
 import { todayIso } from "../lib/dates";
 import { buildMarkers, duplicateInfo, dupWarningText } from "../lib/monthview";
@@ -58,6 +58,18 @@ async function loadMonth(y: number, m: number) {
 }
 onMounted(() => void loadMonth(viewMonth.value.year, viewMonth.value.month));
 
+// 终局评审：名字表口径统一——colony.actions 只有启用项，停用操作的标记名会丢；
+// 改拉 list_actions 全量（含停用），与 LogListPage 编辑弹窗一致
+const allActions = ref<CareActionItem[]>([]);
+async function loadActions() {
+  try {
+    allActions.value = await invoke<CareActionItem[]>("list_actions");
+  } catch {
+    // 名字表是增强，失败静默（当前操作名有 props 兜底）
+  }
+}
+onMounted(() => void loadActions());
+
 // 复审 #15/#16：「现在/±10分/选日期」可跨月，月份跟随时间值重同步（黄条判定依赖 viewMonth）
 watch(
   () => time.value.slice(0, 7),
@@ -71,11 +83,11 @@ function onMonth(view: { year: number; month: number }) {
   void loadMonth(view.year, view.month);
 }
 
-/** 日历标记：当前操作橙点、其它操作灰点——名字表必须全量（colony.actions），
- * 否则 buildMarkers 跳过缺名操作、灰点与 tip 整体失效（复审 #1/#2） */
+/** 日历标记：当前操作橙点、其它操作灰点——名字表必须全量（list_actions，含停用操作），
+ * 否则 buildMarkers 跳过缺名操作、灰点与 tip 整体失效（复审 #1/#2；口径与编辑弹窗一致） */
 const markers = computed(() => {
-  const names = new Map<number, string>(props.colony.actions.map((a) => [a.action_id, a.name]));
-  names.set(props.action.action_id, props.action.name); // 兜底：当前操作不在 actions 里也不丢橙点
+  const names = new Map<number, string>(allActions.value.map((a) => [a.id, a.name]));
+  names.set(props.action.action_id, props.action.name); // 兜底：当前操作不在字典里也不丢橙点
   return buildMarkers(monthRows.value, props.action.action_id, names);
 });
 

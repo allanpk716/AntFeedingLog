@@ -268,6 +268,32 @@ describe("记录列表页（票 08）", () => {
     }
   });
 
+  it("IME 两段式：组词期不查询，compositionend 补同步后带词查询（交互第三轮 #4 回归）", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }); // 同上：不劫持 setImmediate，flushPromises 会挂死
+    try {
+      const wrapper = await mountPage();
+      invokeMock.mockClear();
+      const kw = wrapper.find(".f-keyword");
+
+      // 组词期：拼音片段 input 被守卫挡下——不同步表单、不挂防抖
+      await kw.trigger("compositionstart");
+      await kw.setValue("mianbaochong");
+      await vi.advanceTimersByTimeAsync(400);
+      expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_logs")).toBe(false);
+
+      // 上屏确认：compositionend 复位守卫并补同步（读 target.value 的最终上屏文本）+ 挂 300ms 防抖
+      (kw.element as HTMLInputElement).value = "面包虫";
+      await kw.trigger("compositionend");
+      await vi.advanceTimersByTimeAsync(301);
+      const calls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_logs");
+      expect(calls.length).toBe(1); // 组词期零查询，上屏后恰好一次
+      const last = calls[calls.length - 1][1] as { filter: { note_keyword: string | null } };
+      expect(last.filter.note_keyword).toBe("面包虫");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("防抖挂起时点「重置」：挂起回调被取消，旧关键词不回写（复审 #8/#9）", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] }); // 同上：不劫持 setImmediate
     try {

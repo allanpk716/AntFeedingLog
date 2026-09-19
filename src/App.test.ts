@@ -1087,6 +1087,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
       if (cmd === "list_colonies") return currentColonies;
       if (cmd === "list_locations") return locations;
       if (cmd === "list_foods") return foods;
+      if (cmd === "list_actions") return actions; // 弹窗 markers 名字表全量来源（终局评审口径）
       return null;
     });
     const wrapper = await mountApp();
@@ -1121,6 +1122,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
         case "list_colonies": return currentColonies;
         case "list_locations": return locations;
         case "colony_month_records": return []; // 弹窗挂载拉当月标记，给空月
+        case "list_actions": return actions; // 弹窗 markers 名字表全量来源（终局评审口径）
         default: return null;
       }
     });
