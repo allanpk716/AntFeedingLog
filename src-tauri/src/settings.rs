@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 pub const K_MASTER: &str = "notify_master_enabled";
 pub const K_OVERDUE: &str = "notify_overdue_enabled";
 pub const K_HIBERNATION: &str = "notify_hibernation_enabled";
+pub const K_RETRIEVAL: &str = "notify_retrieval_enabled";
 pub const K_WAKE_AHEAD: &str = "wake_remind_days_ahead";
 pub const K_AUTOSTART: &str = "autostart_enabled";
 /// 存量基线时刻（票 01，F4）：v7 迁移为升级库写入，全新安装不写——缺键即"无存量"。
@@ -21,12 +22,16 @@ pub const K_RETRIEVAL_BASELINE: &str = "retrieval_baseline_at";
 /// 临近出眠提前天数默认值（spec 设置节）。
 pub const DEFAULT_WAKE_AHEAD_DAYS: i64 = 7;
 
-/// 设置模型（spec：通知总开关/超期开关/冬眠开关/临近出眠提前天数/开机自启）。
+/// 设置模型（spec：通知总开关/超期开关/冬眠开关/撤食开关（票 05）/临近出眠提前
+/// 天数/开机自启）。超期/冬眠两键已作废（反馈第二轮 Q7/Q9，行为由总开关统一），
+/// 撤食开关是唯一仍生效的分类开关。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub notify_master_enabled: bool,
     pub notify_overdue_enabled: bool,
     pub notify_hibernation_enabled: bool,
+    /// 撤食提醒开关（票 05）：与总开关都开才发撤食通知；默认开。
+    pub notify_retrieval_enabled: bool,
     pub wake_remind_days_ahead: i64,
     pub autostart_enabled: bool,
 }
@@ -37,6 +42,7 @@ impl Default for AppSettings {
             notify_master_enabled: true,
             notify_overdue_enabled: true,
             notify_hibernation_enabled: true,
+            notify_retrieval_enabled: true,
             wake_remind_days_ahead: DEFAULT_WAKE_AHEAD_DAYS,
             autostart_enabled: true,
         }
@@ -95,6 +101,7 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings, String> {
         notify_master_enabled: read_bool(conn, K_MASTER, d.notify_master_enabled)?,
         notify_overdue_enabled: read_bool(conn, K_OVERDUE, d.notify_overdue_enabled)?,
         notify_hibernation_enabled: read_bool(conn, K_HIBERNATION, d.notify_hibernation_enabled)?,
+        notify_retrieval_enabled: read_bool(conn, K_RETRIEVAL, d.notify_retrieval_enabled)?,
         wake_remind_days_ahead: read_i64(conn, K_WAKE_AHEAD, d.wake_remind_days_ahead)?,
         autostart_enabled: read_bool(conn, K_AUTOSTART, d.autostart_enabled)?,
     })
@@ -112,6 +119,7 @@ pub fn set_settings(conn: &Connection, s: &AppSettings) -> Result<AppSettings, S
     upsert(conn, K_MASTER, bool_str(effective.notify_master_enabled))?;
     upsert(conn, K_OVERDUE, bool_str(effective.notify_overdue_enabled))?;
     upsert(conn, K_HIBERNATION, bool_str(effective.notify_hibernation_enabled))?;
+    upsert(conn, K_RETRIEVAL, bool_str(effective.notify_retrieval_enabled))?;
     upsert(conn, K_WAKE_AHEAD, &effective.wake_remind_days_ahead.to_string())?;
     upsert(conn, K_AUTOSTART, bool_str(effective.autostart_enabled))?;
     Ok(effective)
@@ -180,6 +188,7 @@ mod tests {
             notify_master_enabled: false,
             notify_overdue_enabled: false,
             notify_hibernation_enabled: true,
+            notify_retrieval_enabled: false,
             wake_remind_days_ahead: 3,
             autostart_enabled: false,
         };
@@ -189,6 +198,26 @@ mod tests {
         // 落库格式：'1'/'0'
         assert_eq!(raw(&conn, K_MASTER), "0");
         assert_eq!(raw(&conn, K_WAKE_AHEAD), "3");
+    }
+
+    #[test]
+    fn retrieval_notify_switch_defaults_on_and_round_trips() {
+        // 票 05：notify_retrieval_enabled 默认开；'1'/'0' 落库读写同款惯例
+        let conn = mem_conn();
+        assert!(get_settings(&conn).unwrap().notify_retrieval_enabled, "默认开");
+
+        let saved = set_settings(
+            &conn,
+            &AppSettings { notify_retrieval_enabled: false, ..Default::default() },
+        )
+        .unwrap();
+        assert!(!saved.notify_retrieval_enabled);
+        assert_eq!(raw(&conn, K_RETRIEVAL), "0");
+        assert!(!get_settings(&conn).unwrap().notify_retrieval_enabled);
+
+        let saved = set_settings(&conn, &AppSettings::default()).unwrap();
+        assert!(saved.notify_retrieval_enabled);
+        assert_eq!(raw(&conn, K_RETRIEVAL), "1");
     }
 
     #[test]

@@ -747,3 +747,72 @@ describe("设置弹窗·操作页签撤食行（票 01）", () => {
     expect(invokeMock).toHaveBeenCalledWith("set_action_enabled", { id: 5, enabled: false });
   });
 });
+
+// ── 通知页签「撤食提醒」开关（票 05）──
+
+function settingsFixture(overrides: Record<string, unknown> = {}) {
+  return {
+    notify_master_enabled: true,
+    notify_overdue_enabled: true,
+    notify_hibernation_enabled: true,
+    notify_retrieval_enabled: true,
+    wake_remind_days_ahead: 7,
+    autostart_enabled: true,
+    ...overrides,
+  };
+}
+
+async function openNotifyTab(settings: object, saved?: object) {
+  baseMock();
+  invokeMock.mockImplementation(async (cmd: string) => {
+    switch (cmd) {
+      case "list_actions":
+      case "list_foods":
+      case "list_locations":
+        return [];
+      case "get_settings":
+        return settings;
+      case "set_settings":
+        return saved ?? settings;
+      default:
+        return null;
+    }
+  });
+  const wrapper = mount(SettingsDialog);
+  await flushPromises();
+  await wrapper.find(".tab-notify").trigger("click");
+  await flushPromises();
+  return wrapper;
+}
+
+describe("设置弹窗·通知页签撤食提醒开关（票 05）", () => {
+  it("开关存在且回显设置值：notify_retrieval_enabled=false → 未勾选", async () => {
+    const wrapper = await openNotifyTab(settingsFixture({ notify_retrieval_enabled: false }));
+
+    const box = wrapper.find(".retrieval-input").element as HTMLInputElement;
+    expect(wrapper.find(".retrieval-input").exists()).toBe(true);
+    expect(box.checked).toBe(false);
+  });
+
+  it("缺省（旧数据无该键）→ 兜底为开（默认开语义）", async () => {
+    const legacy = settingsFixture();
+    delete (legacy as Record<string, unknown>).notify_retrieval_enabled;
+    const wrapper = await openNotifyTab(legacy);
+
+    expect((wrapper.find(".retrieval-input").element as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("保存：入参带 notify_retrieval_enabled，开关状态原样落库（总开关关仍全静默是 Rust 侧语义）", async () => {
+    const wrapper = await openNotifyTab(settingsFixture());
+
+    await wrapper.find(".retrieval-input").setValue(false);
+    invokeMock.mockClear();
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("set_settings", {
+      input: settingsFixture({ notify_retrieval_enabled: false }),
+    });
+    expect(wrapper.find(".saved-hint").text()).toContain("已保存");
+  });
+});

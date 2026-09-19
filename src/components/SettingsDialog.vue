@@ -11,7 +11,8 @@
  *   follow（跟随喂食）行（票 01：撤食预置）固定标注「跟随喂食」，无性质切换与
  *   间隔编辑，停用按钮照常（停用 = 撤食提醒整体关闭）。
  * - 地点 tab 复用 LocationManagerPanel。
- * - 通知 tab（票 06 + 反馈第二轮 F4）：推送通知总开关（桌面 + 手机，分类子开关作废）+
+ * - 通知 tab（票 06 + 反馈第二轮 F4 + 票 05）：推送通知总开关（桌面 + 手机）+
+ *   「撤食提醒」独立开关（票 05：只闸撤食这一类，默认开）+
  *   临近出眠提前天数 + Pushover 配置状态 + 「发送测试通知」按钮（双通道分别回显结果，
  *   排障用）；开机自启开关（票 09）随保存一起落库，
  *   Rust 侧 set_settings 同步自启插件状态。
@@ -35,7 +36,6 @@
 import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type {
-  AppSettings,
   BackupConfigInput,
   BackupConfigInfo,
   CareActionItem,
@@ -58,7 +58,13 @@ import {
   type ActionRow,
   type FoodRow,
 } from "../lib/dict";
-import { DAYS_AHEAD_ERROR, toForm, toSettings, type NotifySettingsForm } from "../lib/notifySettings";
+import {
+  DAYS_AHEAD_ERROR,
+  toForm,
+  toSettings,
+  type NotifySettingsForm,
+  type NotifySettingsModel,
+} from "../lib/notifySettings";
 import { formatAbnormalExit } from "../lib/applog";
 import {
   KEEP_COUNT_ERROR,
@@ -88,8 +94,8 @@ const addFoodName = ref("");
 const error = ref("");
 const busy = ref(false);
 
-// ── 通知 tab（票 06 + 反馈第二轮 F4）──
-const notifyForm = ref<NotifySettingsForm>({ master: true, daysAheadText: "7" });
+// ── 通知 tab（票 06 + 反馈第二轮 F4 + 票 05 撤食开关）──
+const notifyForm = ref<NotifySettingsForm>({ master: true, retrieval: true, daysAheadText: "7" });
 const autostart = ref(true);
 const notifyError = ref("");
 const notifySaved = ref("");
@@ -101,7 +107,7 @@ async function load() {
     invoke<CareActionItem[]>("list_actions"),
     invoke<FoodItem[]>("list_foods"),
     invoke<LocationItem[]>("list_locations"),
-    invoke<AppSettings>("get_settings"),
+    invoke<NotifySettingsModel>("get_settings"),
     invoke<PushoverStatus>("pushover_status"),
   ]);
   actionRows.value = buildActionRows(actions);
@@ -286,7 +292,7 @@ async function saveNotify() {
   notifyError.value = "";
   notifySaved.value = "";
   try {
-    const saved = await invoke<AppSettings>("set_settings", { input });
+    const saved = await invoke<NotifySettingsModel>("set_settings", { input });
     notifyForm.value = toForm(saved);
     autostart.value = saved.autostart_enabled;
     notifySaved.value = "已保存";
@@ -663,12 +669,20 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         <LocationManagerPanel :locations="locations" @saved="onPanelSaved" @changed="onPanelChanged" />
       </div>
 
-      <!-- 通知（票 06）+ 开机自启（票 09）+ Pushover 双通道（反馈第二轮 F4） -->
+      <!-- 通知（票 06 + 票 09 + 票 05 撤食开关）+ Pushover 双通道（反馈第二轮 F4） -->
       <div v-else-if="activeTab === 'notify'" class="tab-body">
         <div class="notify-row">
           <label>
             <input v-model="notifyForm.master" type="checkbox" />
             推送通知（桌面 + 手机）
+          </label>
+        </div>
+        <div class="notify-row">
+          <label
+            title="超过撤食间隔仍未收走残食时每天提醒一条，直到打卡撤食；冬眠中的窝照常提醒。关掉只静默撤食这一类，不影响其它提醒；总开关关闭时全部静默"
+          >
+            <input v-model="notifyForm.retrieval" class="retrieval-input" type="checkbox" />
+            撤食提醒
           </label>
         </div>
         <div class="notify-row">
@@ -695,6 +709,7 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         </div>
         <p class="hint">
           超期每天最多提醒一条；冬眠中的窝静音；改预计出眠日后，没发过的提醒按新日期重算。
+          撤食提醒每天一条直到打卡撤食，冬眠中的窝照常提醒；补录的过期喂食次日起才催。
           总开关关闭时完全静默（不写提醒台账），重开后照常提醒。
         </p>
         <p v-if="notifyError" class="form-error">{{ notifyError }}</p>

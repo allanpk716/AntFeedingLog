@@ -1,6 +1,6 @@
 //! 提醒引擎（票 06）：算「今天该发什么」+ 台账去重 + 补发窗口。
 //!
-//! 纯函数核心只吃 `&Connection`、today 可注入，cargo test 直接覆盖：
+//! 纯函数核心只吃 `&Connection`、today/now 可注入，cargo test 直接覆盖：
 //! - [`compute_due_reminders`]：按窝状态 × 启用中的提醒类操作，算出「今天应发」清单（不落库）；
 //! - [`run_check`]：读设置 → 算 → 总开关过滤 → 台账去重落库，返回真正要发的
 //!   桌面条目与待发手机推送（发送/了结在锁外由调用方驱动）；
@@ -14,15 +14,24 @@
 //!   各算各的（基准日 = 今天 − 食物周期），台账加 food 维度去重；冬眠同样静音；
 //! - 临近出眠：冬眠中的窝、今天 ≥ 预计出眠日 − 提前天数，基准日 = 预计出眠日，一次；
 //! - 出眠日：冬眠中的窝、今天 ≥ 预计出眠日，基准日 = 预计出眠日，一次；
+//! - 撤食（票 05，retrieval_due）：消费 care::retrieval_due_for_colony 的派生结果，
+//!   到期用注入的完整时刻比较（喂食时刻 + N 小时，Q4）；参与窝 = 活跃或冬眠
+//!   （不吃冬眠静音，Q7），已结束不提醒；台账基准日 = 当前自然日 → 每窝每天
+//!   至多一条，随今天推进实现每日催促（Q6）；通知三分类（F3 字面口径 + F4 存量
+//!   基线）：新鲜喂食（录入时未逾期，分钟级容差）到期后每日一条；补录喂食
+//!   （录入时已逾期）录入当轮不追溯补发、自录入次日起每日催促；存量喂食
+//!   （created_at ≤ retrieval_baseline_at）永不推送，仅状态红与托盘概要；
+//!   撤食操作（follow）停用 = 功能整体关闭；
 //! - 补发上限（规则 3）：临近/出眠的基准日在近 7 天内才补，更旧不补；
 //!   超期的基准日锚定今天，重开后天然只发「当前这一天」的一条；
 //! - 提前出眠后状态回活跃，冬眠类提醒随之停发（规则 4）；
 //! - 改预计出眠日：未发的按新日期自然重算（基准日跟着新出眠日走、不撞旧台账），
 //!   已发的不追回（旧行保留、也不重发）；
-//! - 开关关 = 完全静默（不发送也不写台账），重开后按去重规则正常发。
+//! - 开关关 = 完全静默（不发送也不写台账），重开后按去重规则正常发；
+//!   撤食另受 notify_retrieval_enabled 单独闸（与总开关都开才发，票 05）。
 
-use chrono::Duration;
-use rusqlite::{params, Connection};
+use chrono::{Datelike, Duration};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::settings::{self, AppSettings};
@@ -32,6 +41,11 @@ pub const BACKFILL_WINDOW_DAYS: i64 = 7;
 
 /// 手机推送补发窗口（天）：登记起两天内没发成功就放弃（Q8=A，超窗防陈年补发）。
 pub const PUSHOVER_RETRY_DAYS: i64 = 2;
+
+/// 撤食「录入时未逾期」判定的分钟级容差（票 05 F3）：due_at 需比 created_at 晚
+/// 超过该分钟数才算新鲜；贴边（补录恰卡在到期前后几秒）按补录口径处理——
+/// 录入当天不追发、次日起每日催促，避免「补录当场立即一条」的轰炸。
+pub const RETRIEVAL_FRESH_TOLERANCE_MINUTES: i64 = 5;
 
 /// 一个待发推送任务：IO 在锁外做，成功后拿 ledger_id 去 settle。
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -63,6 +77,8 @@ pub enum ReminderKind {
     ApproachingWake,
     /// 出眠日当天（一次）
     WakeDay,
+    /// 撤食到期：易腐食物超过撤食间隔未收走（活跃或冬眠窝，票 05）
+    RetrievalDue,
 }
 
 impl ReminderKind {
@@ -72,6 +88,7 @@ impl ReminderKind {
             ReminderKind::FoodOverdue => "food_overdue",
             ReminderKind::ApproachingWake => "approaching_wake",
             ReminderKind::WakeDay => "wake_day",
+            ReminderKind::RetrievalDue => "retrieval_due",
         }
     }
 }
@@ -88,11 +105,18 @@ pub struct Reminder {
     /// 仅食物层（FoodOverdue）非空（F3）。
     pub food_id: Option<i64>,
     pub food_name: Option<String>,
-    /// 去重基准日：超期 = 今天 − 建议间隔；临近/出眠日 = 预计出眠日。
+    /// 去重基准日：超期 = 今天 − 建议间隔；临近/出眠日 = 预计出眠日；
+    /// 撤食 = 当前自然日（每窝每天至多一条，票 05）。
     pub base_date: String,
     /// 超期类：距上次天数（通知文案用）。
     pub days_since_last: Option<i64>,
     pub suggested_interval_days: Option<i64>,
+    /// 仅撤食类（RetrievalDue）非空：基准喂食发生时刻（库内统一文本格式）。
+    pub fed_at: Option<String>,
+    /// 仅撤食类非空：该次喂食所选有效易腐食物名（按字典序，文案并列用）。
+    pub retrieval_food_names: Option<Vec<String>>,
+    /// 仅撤食类非空：now − due_at 的整小时数（文案「已超过 N 小时」，逾期时长口径）。
+    pub hours_overdue: Option<i64>,
 }
 
 impl Reminder {
@@ -139,6 +163,30 @@ impl Reminder {
                     self.colony_name, self.base_date
                 ),
             ),
+            ReminderKind::RetrievalDue => {
+                let foods = self
+                    .retrieval_food_names
+                    .as_ref()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.join("、"))
+                    .unwrap_or_else(|| "易腐食物".to_string());
+                let fed = self
+                    .fed_at
+                    .as_deref()
+                    .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
+                    .map(|dt| format!("{}月{}日 {}", dt.month(), dt.day(), dt.format("%H:%M")))
+                    .unwrap_or_else(|| self.fed_at.clone().unwrap_or_default());
+                (
+                    "该撤食了".into(),
+                    format!(
+                        "「{}」该撤食了：{} 喂的{}已超过 {} 小时",
+                        self.colony_name,
+                        fed,
+                        foods,
+                        self.hours_overdue.unwrap_or(0)
+                    ),
+                )
+            }
         }
     }
 }
@@ -150,20 +198,39 @@ fn parse_iso(s: &str) -> Result<chrono::NaiveDate, String> {
         .map_err(|_| format!("日期格式应为 YYYY-MM-DD：{s}"))
 }
 
+/// 库内统一时刻解析（`YYYY-MM-DD HH:MM:SS`，文本序 = 时间序）。
+fn parse_ts(s: &str) -> Result<chrono::NaiveDateTime, String> {
+    chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S")
+        .map_err(|_| format!("时刻格式应为 YYYY-MM-DD HH:MM:SS：{s}"))
+}
+
 fn db_err(e: rusqlite::Error) -> String {
     format!("数据库操作失败: {e}")
 }
 
 /// 算出「今天应发」的提醒清单。`days_ahead` = 临近出眠提前天数（负值按 0）。
-/// 已结束的窝全不发；冬眠中的窝不发超期；活跃窝不发冬眠类。
+/// `now` = 完整时刻（撤食类到期比较用；日粒度类仍用 `today`）。
+/// 已结束的窝全不发；冬眠中的窝不发超期；活跃窝不发冬眠类；撤食两类窝都发。
 /// 脏数据（冬眠状态无开放段 / 出眠日解析失败）按窝跳过，不毒死整轮。
 pub fn compute_due_reminders(
     conn: &Connection,
     today: &str,
+    now: &str,
     days_ahead: i64,
 ) -> Result<Vec<Reminder>, String> {
     let today = parse_iso(today)?;
+    let now = parse_ts(now)?;
     let ahead = Duration::days(days_ahead.max(0));
+    // 撤食（票 05）全局前提，整轮取一次：follow 操作启用（停用 = 功能整体关闭，
+    // 用户故事 12）与存量基线（缺键 = 无非存量，F4）
+    let follow_enabled: i64 = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM care_action WHERE kind = 'follow' AND enabled = 1)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(db_err)?;
+    let baseline = settings::get_retrieval_baseline_at(conn)?;
     let mut due = Vec::new();
 
     let colonies: Vec<(i64, String, String)> = {
@@ -204,6 +271,9 @@ pub fn compute_due_reminders(
                             base_date: base,
                             days_since_last: tile.days_since_last,
                             suggested_interval_days: tile.suggested_interval_days,
+                            fed_at: None,
+                            retrieval_food_names: None,
+                            hours_overdue: None,
                         });
                     }
                     // 食物层（F3）：与统一层各记各的，台账按 food 维度去重
@@ -223,6 +293,9 @@ pub fn compute_due_reminders(
                             base_date: base,
                             days_since_last: f.days_since_last,
                             suggested_interval_days: f.suggested_interval_days,
+                            fed_at: None,
+                            retrieval_food_names: None,
+                            hours_overdue: None,
                         });
                     }
                 }
@@ -250,6 +323,9 @@ pub fn compute_due_reminders(
                         base_date: base.clone(),
                         days_since_last: None,
                         suggested_interval_days: None,
+                        fed_at: None,
+                        retrieval_food_names: None,
+                        hours_overdue: None,
                     });
                 }
                 // 出眠日：当天一次；错过 ≤ 7 天补发一条
@@ -265,19 +341,135 @@ pub fn compute_due_reminders(
                         base_date: base,
                         days_since_last: None,
                         suggested_interval_days: None,
+                        fed_at: None,
+                        retrieval_food_names: None,
+                        hours_overdue: None,
                     });
                 }
             }
             _ => {} // ended 与未知状态：全不发
         }
+        // 撤食（票 05）：活跃或冬眠（不吃冬眠静音，Q7）都算；已结束与未知状态不算。
+        // follow 操作停用 = 撤食功能整体关闭（用户故事 12）。
+        if follow_enabled != 0 && (status == "active" || status == "hibernating") {
+            if let Some(r) =
+                retrieval_reminder_if_due(conn, colony_id, &colony_name, now, baseline.as_deref())?
+            {
+                due.push(r);
+            }
+        }
     }
     Ok(due)
+}
+
+// ── 撤食提醒（票 05）：派生消费 + 通知三分类 ─────────────────────────────
+
+/// 撤食到期提醒的判定：消费 care::retrieval_due_for_colony 的派生结果，按注入
+/// 时刻比较到期，套用通知三分类过滤（F3 字面口径 + F4 存量基线）：
+/// ① 新鲜喂食（录入时未逾期，分钟级容差）→ 到期即催；
+/// ② 补录喂食（录入时已逾期）→ 录入当轮不追溯补发，自录入次日起每日催促；
+/// ③ 存量喂食（created_at ≤ 基线）→ 永不推送（仅状态红与托盘概要）。
+/// 无待撤食 / 未到期 / 脏时刻 → None（脏数据按窝跳过，不毒死整轮）。
+fn retrieval_reminder_if_due(
+    conn: &Connection,
+    colony_id: i64,
+    colony_name: &str,
+    now: chrono::NaiveDateTime,
+    baseline: Option<&str>,
+) -> Result<Option<Reminder>, String> {
+    let Some(rd) = crate::care::retrieval_due_for_colony(conn, colony_id)? else {
+        return Ok(None); // 无待撤食（从未喂有效易腐，或最近一次已被撤食清空）
+    };
+    // 到期时刻比较（喂食时刻 + N 小时，Q4：完整时刻注入而非日粒度）
+    let Ok(due_at) = parse_ts(&rd.due_at) else {
+        return Ok(None);
+    };
+    if now < due_at {
+        return Ok(None); // 未到期
+    }
+    let Ok(created_at) = parse_ts(&rd.created_at) else {
+        return Ok(None); // 脏 created_at 按窝跳过
+    };
+    // ③ 存量（F4）：created_at ≤ 迁移基线 → 永不推送；基线缺省（全新库）视为无非存量
+    if baseline.is_some_and(|b| rd.created_at.as_str() <= b) {
+        return Ok(None);
+    }
+    // ①② 新鲜/补录分野：录入时已逾期（due ≤ created + 分钟级容差）为补录——
+    // 录入当轮不补发，自录入次日起每日催促（通知日须晚于 created_at 所在自然日）
+    let fresh_at_entry =
+        due_at > created_at + Duration::minutes(RETRIEVAL_FRESH_TOLERANCE_MINUTES);
+    if !fresh_at_entry && now.date() <= created_at.date() {
+        return Ok(None);
+    }
+    let foods = retrieval_anchor_food_names(conn, colony_id, &rd.fed_at)?;
+    Ok(Some(Reminder {
+        colony_id,
+        colony_name: colony_name.to_string(),
+        kind: ReminderKind::RetrievalDue,
+        action_id: None,
+        action_name: None,
+        food_id: None,
+        food_name: None,
+        // 台账基准日 = 当前自然日 → uq_ledger_retrieval (窝, 当日) 每天至多一条，
+        // 随今天推进实现每日催促（Q6）
+        base_date: now.date().format("%Y-%m-%d").to_string(),
+        days_since_last: None,
+        suggested_interval_days: None,
+        fed_at: Some(rd.fed_at),
+        retrieval_food_names: Some(foods),
+        // N 小时 = now − due_at（逾期时长口径，与「已超过 N 小时」文案自洽）
+        hours_overdue: Some((now - due_at).num_hours().max(0)),
+    }))
+}
+
+/// 该次基准喂食所选「有效易腐」食物名（文案用，按字典序）。锚定方式与
+/// care::retrieval_due_for_colony 同口径：窝内 occurred_at = fed_at 的合格喂食
+/// （含有效易腐食物的喂食类记录）取最大 id——正是派生选中的那条。
+fn retrieval_anchor_food_names(
+    conn: &Connection,
+    colony_id: i64,
+    fed_at: &str,
+) -> Result<Vec<String>, String> {
+    let log_id: Option<i64> = conn
+        .query_row(
+            "SELECT l.id
+             FROM care_log l
+             JOIN log_food lf ON lf.log_id = l.id
+             JOIN food f ON f.id = lf.food_id
+             JOIN care_action a ON a.id = l.action_id AND a.is_feeding = 1
+             WHERE l.colony_id = ?1 AND l.occurred_at = ?2
+               AND f.perishable = 1 AND f.retrieval_hours IS NOT NULL
+             ORDER BY l.id DESC
+             LIMIT 1",
+            params![colony_id, fed_at],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some(log_id) = log_id else {
+        return Ok(Vec::new()); // 理论外（与派生口径一致时必有）；空清单由文案兜底
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT f.name FROM log_food lf
+             JOIN food f ON f.id = lf.food_id
+             WHERE lf.log_id = ?1 AND f.perishable = 1 AND f.retrieval_hours IS NOT NULL
+             ORDER BY f.sort, f.id",
+        )
+        .map_err(db_err)?;
+    let names = stmt
+        .query_map(params![log_id], |row| row.get(0))
+        .map_err(db_err)?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(db_err)?;
+    Ok(names)
 }
 
 // ── 核心：一整轮检查（总开关 + 台账去重落库 + 推送补发）─────────────────
 
 /// 一轮完整检查：读设置 → 算应发 → 台账去重落库，返回真正要发的条目与待发推送。
-/// 总开关关 = 完全静默（不发也不写台账）。`now` 供台账 sent_at。
+/// 总开关关 = 完全静默（不发也不写台账）；撤食另受 notify_retrieval_enabled 单独
+/// 闸（关 = 撤食类不发不写台账，其余种类照发，票 05）。`now` 供台账 sent_at。
 /// 反馈第二轮 Q7/Q9：分类子开关作废，总开关是唯一闸门；本函数零网络 IO，
 /// 手机推送的发送与了结都由调用方在锁外做（settle_pushover）。
 pub fn run_check(conn: &Connection, today: &str, now: &str) -> Result<CheckOutcome, String> {
@@ -285,7 +477,12 @@ pub fn run_check(conn: &Connection, today: &str, now: &str) -> Result<CheckOutco
     if !s.notify_master_enabled {
         return Ok(CheckOutcome::default());
     }
-    let due = compute_due_reminders(conn, today, s.wake_remind_days_ahead)?;
+    let due = compute_due_reminders(conn, today, now, s.wake_remind_days_ahead)?;
+    // 票 05：撤食独立开关关 → 撤食类完全静默（不发送也不写台账），其它种类不受影响
+    let due: Vec<Reminder> = due
+        .into_iter()
+        .filter(|r| r.kind != ReminderKind::RetrievalDue || s.notify_retrieval_enabled)
+        .collect();
 
     let mut outcome = CheckOutcome::default();
     if !due.is_empty() {
@@ -372,6 +569,8 @@ pub fn settle_pushover(conn: &Connection, ids: &[i64]) -> Result<(), String> {
 /// 托盘 tooltip 一句话概要（spec 界面节示例："2 窝活跃 · 大头一号喂食超期 1 天"）。
 /// 无窝 → "暂无窝"；否则 = 活跃数 +（冬眠数 > 0 时）+ 逐条超期摘要（仅活跃窝，
 /// 冬眠窝静音）。F3：设周期食物各自超期再补「某窝该喂某食物了」一条，与统一层并存。
+/// 票 05：待撤食逾期（红态）的窝补「某窝待撤食」——冬眠窝同样提示（撤食不吃
+/// 冬眠静音）、存量类（永不推送）也在此露面、已结束不算。
 /// Windows tooltip 上限 128 字符，超长按字符截断。
 pub fn tray_summary(colonies: &[crate::colony::Colony]) -> String {
     if colonies.is_empty() {
@@ -398,6 +597,16 @@ pub fn tray_summary(colonies: &[crate::colony::Colony]) -> String {
             for f in t.foods.iter().filter(|f| f.overdue) {
                 parts.push(format!("{}该喂{}了", c.name, f.name));
             }
+        }
+    }
+    // 撤食（票 05）：红态（已超到期时刻）才提示——pending 未到期不算「该收食」
+    for c in colonies.iter().filter(|c| c.status == "active" || c.status == "hibernating") {
+        if c
+            .actions
+            .iter()
+            .any(|t| t.kind == "follow" && t.retrieval_state == "overdue")
+        {
+            parts.push(format!("{}待撤食", c.name));
         }
     }
     let text = parts.join(" · ");
@@ -759,7 +968,7 @@ mod tests {
         // 活跃窝从未记录：不发
         let _fresh = colony(&conn, "新窝一号", "active");
 
-        let due = compute_due_reminders(&conn, TODAY, 7).unwrap();
+        let due = compute_due_reminders(&conn, TODAY, NOW, 7).unwrap();
         assert!(
             due.is_empty(),
             "冬眠不发超期、已结束不发、登记类永不催、从未记录不发：{due:?}"
@@ -865,7 +1074,7 @@ mod tests {
         // 推进到预计出眠日当天：临近/出眠日不再触发（规则 4）。
         // 出眠后「距上次」从出眠日重新起算（5 天没喂 → 统一层超期；
         // F3：种子（周期 3）同样从出眠日起算 5 > 3，食物层各自再发一条）。
-        let due = compute_due_reminders(&conn, &fmt(end), 7).unwrap();
+        let due = compute_due_reminders(&conn, &fmt(end), NOW, 7).unwrap();
         assert_eq!(due.len(), 2, "统一超期 + 种子食物层各一条，实际：{due:?}");
         assert_eq!(due[0].kind, ReminderKind::Overdue);
         assert_eq!(due[0].base_date, fmt(end - Duration::days(3)));
@@ -1043,6 +1252,246 @@ mod tests {
         assert!(run_check(&conn, TODAY, NOW).unwrap().toasts.is_empty());
     }
 
+    // ── 撤食提醒（票 05）──
+
+    /// 喂食挂食物 + 指定录入时刻（三分类的分野在 created_at vs due_at/baseline）。
+    fn feed_foods_created(
+        conn: &Connection,
+        colony_id: i64,
+        happened_at: &str,
+        created_at: &str,
+        foods: &[&str],
+    ) {
+        crate::care::log_care(
+            conn,
+            &crate::care::CareLogInput {
+                colony_id,
+                action_id: action_id(conn, "喂食"),
+                happened_at: happened_at.into(),
+                note: None,
+                food_ids: foods.iter().map(|f| food_id(conn, f)).collect(),
+            },
+            created_at,
+        )
+        .expect("记账失败");
+    }
+
+    /// 打卡撤食（follow 预置操作；录入时刻 = 发生时刻）。
+    fn retrieve(conn: &Connection, colony_id: i64, happened_at: &str) {
+        crate::care::log_care(
+            conn,
+            &crate::care::CareLogInput {
+                colony_id,
+                action_id: action_id(conn, "撤食"),
+                happened_at: happened_at.into(),
+                note: None,
+                food_ids: vec![],
+            },
+            happened_at,
+        )
+        .expect("撤食打卡失败");
+    }
+
+    /// 直写存量基线键（模拟 v7 升级迁移写入；缺省 = 无非存量）。
+    fn set_baseline(conn: &Connection, ts: &str) {
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('retrieval_baseline_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![ts],
+        )
+        .expect("写存量基线失败");
+    }
+
+    /// 只留撤食类的 toasts（补录/存量场景里操作层超期会照发，各算各的）。
+    fn retrieval_kinds(out: &CheckOutcome) -> Vec<ReminderKind> {
+        out.toasts.iter().map(|r| r.kind).filter(|k| *k == ReminderKind::RetrievalDue).collect()
+    }
+
+    #[test]
+    fn retrieval_fires_after_due_and_repeats_daily_until_retrieved() {
+        // 验收 1：新鲜喂食（录入时未逾期）→ 到期后每日一条，打卡撤食即停
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号", "active");
+        // 09-17 09:00 喂面包虫（24h）；录入 NOW（09-18 08:00）时 due（09-18 09:00）还在未来 → 新鲜
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫"]);
+
+        // 喂后 25 小时检查（now = 09-18 10:00 ≥ due）：桌面 toast + 手机推送任务各一条
+        let out = run_check(&conn, TODAY, "2026-09-18 10:00:00").unwrap();
+        assert_eq!(out.toasts.len(), 1);
+        assert_eq!(out.push_jobs.len(), 1, "同一登记同时驱动桌面与 Pushover");
+        assert_eq!(out.toasts[0].kind, ReminderKind::RetrievalDue);
+        assert_eq!(out.toasts[0].base_date, TODAY, "台账基准日 = 当前自然日");
+        let (title, body) = out.toasts[0].notification_text();
+        assert_eq!(title, "该撤食了");
+        assert_eq!(body, "「大头一号」该撤食了：9月17日 09:00 喂的面包虫已超过 1 小时");
+
+        // 同日再查：台账 (窝, 当日) 去重 → 不重发（验收 6）
+        assert!(run_check(&conn, TODAY, "2026-09-18 20:00:00").unwrap().toasts.is_empty());
+        assert_eq!(ledger_count(&conn), 1);
+
+        // 再过 24 小时未撤 → 又一条
+        let out = run_check(&conn, "2026-09-19", "2026-09-19 10:00:00").unwrap();
+        assert_eq!(out.toasts.len(), 1);
+        assert_eq!(out.toasts[0].kind, ReminderKind::RetrievalDue);
+
+        // 打卡撤食 → 不再发
+        retrieve(&conn, c, "2026-09-19 11:00:00");
+        assert!(run_check(&conn, "2026-09-19", "2026-09-19 12:00:00").unwrap().toasts.is_empty());
+        assert!(run_check(&conn, "2026-09-20", "2026-09-20 08:00:00").unwrap().toasts.is_empty());
+    }
+
+    #[test]
+    fn retrieval_fires_for_hibernating_but_not_ended() {
+        // 验收 2：撤食不吃冬眠静音（Q7）；已结束窝不提醒
+        let conn = mem_conn();
+        let h = colony(&conn, "冬眠一号", "hibernating");
+        open_seg(&conn, h, "2027-03-01");
+        feed_foods_created(&conn, h, "2026-09-17 09:00:00", NOW, &["面包虫"]);
+        let e = colony(&conn, "结束一号", "ended");
+        feed_foods_created(&conn, e, "2026-09-17 09:00:00", NOW, &["面包虫"]);
+
+        let due = compute_due_reminders(&conn, TODAY, "2026-09-18 10:00:00", 7).unwrap();
+        assert_eq!(due.len(), 1, "只有冬眠窝的撤食一条：{due:?}");
+        assert_eq!(due[0].kind, ReminderKind::RetrievalDue);
+        assert_eq!(due[0].colony_name, "冬眠一号");
+    }
+
+    #[test]
+    fn backlogged_retrieval_waits_until_day_after_entry() {
+        // 验收 3：补录 3 天前的面包虫 → 录入当天零通知，次日起每日一条直到撤食
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号", "active");
+        feed_foods_created(&conn, c, "2026-09-15 09:00:00", NOW, &["面包虫"]);
+
+        assert!(compute_due_reminders(&conn, TODAY, "2026-09-18 08:30:00", 7)
+            .unwrap()
+            .is_empty());
+        let out = run_check(&conn, TODAY, "2026-09-18 23:00:00").unwrap();
+        assert!(out.toasts.is_empty(), "录入当天不追溯补发");
+        assert_eq!(ledger_count(&conn), 0, "静默期不写台账");
+
+        // 次日起每日一条（操作层超期从 09-19 起也各发各的，这里只数撤食类）
+        let out = run_check(&conn, "2026-09-19", "2026-09-19 08:00:00").unwrap();
+        assert_eq!(retrieval_kinds(&out).len(), 1, "自录入次日起每日催促");
+        let out = run_check(&conn, "2026-09-19", "2026-09-19 12:00:00").unwrap();
+        assert!(retrieval_kinds(&out).is_empty(), "同日不重发");
+        let out = run_check(&conn, "2026-09-20", "2026-09-20 08:00:00").unwrap();
+        assert_eq!(retrieval_kinds(&out).len(), 1);
+
+        retrieve(&conn, c, "2026-09-20 09:00:00");
+        let out = run_check(&conn, "2026-09-21", "2026-09-21 08:00:00").unwrap();
+        assert!(retrieval_kinds(&out).is_empty(), "撤食后停发");
+    }
+
+    #[test]
+    fn stock_retrieval_never_pushes() {
+        // 验收 4：存量喂食（created_at ≤ retrieval_baseline_at）零推送
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号", "active");
+        set_baseline(&conn, NOW); // created_at = NOW ≤ 基线（同刻含边界）→ 存量
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫"]);
+
+        for (d, now) in [
+            ("2026-09-18", "2026-09-18 10:00:00"),
+            ("2026-09-19", "2026-09-19 08:00:00"),
+            ("2026-09-25", "2026-09-25 08:00:00"),
+        ] {
+            let out = run_check(&conn, d, now).unwrap();
+            assert!(retrieval_kinds(&out).is_empty(), "存量永不推送：{d}，实际 {:#?}", out.toasts);
+        }
+        let retrieval_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_ledger WHERE kind = 'retrieval_due'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retrieval_rows, 0, "存量不落撤食台账（状态红与托盘概要另行体现）");
+    }
+
+    #[test]
+    fn retrieval_switch_gates_only_retrieval_kind() {
+        // 验收 5：总开关关 → 全静默；仅撤食开关关 → 其它照发、撤食不发（不发不写台账）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号", "active");
+        // 操作层超期用「垃圾清理」（8 天 > 7）承担——喂食本身会被下面的易腐喂食刷新，
+        // 两个场景得分开搭
+        feed(&conn, c, "垃圾清理", "2026-09-10 08:00:00");
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫"]); // 撤食到期
+
+        settings::set_settings(
+            &conn,
+            &AppSettings { notify_retrieval_enabled: false, ..Default::default() },
+        )
+        .unwrap();
+        let out = run_check(&conn, TODAY, "2026-09-18 10:00:00").unwrap();
+        assert_eq!(out.toasts.len(), 1, "只发操作超期");
+        assert_eq!(out.toasts[0].kind, ReminderKind::Overdue);
+        let retrieval_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reminder_ledger WHERE kind = 'retrieval_due'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(retrieval_rows, 0, "撤食开关关 = 撤食不发也不写台账");
+
+        // 总开关关 → 全静默（既有语义不变）
+        settings::set_settings(
+            &conn,
+            &AppSettings { notify_master_enabled: false, ..Default::default() },
+        )
+        .unwrap();
+        assert!(run_check(&conn, "2026-09-19", "2026-09-19 08:00:00").unwrap().toasts.is_empty());
+
+        // 双开 → 撤食与其它都发
+        settings::set_settings(&conn, &AppSettings::default()).unwrap();
+        let out = run_check(&conn, "2026-09-19", "2026-09-19 08:00:00").unwrap();
+        assert_eq!(out.toasts.len(), 2, "操作超期 + 撤食各一条");
+    }
+
+    #[test]
+    fn retrieval_fresh_tolerance_treats_barely_future_due_as_backlogged() {
+        // 分钟级容差：due 只比 created 晚 2 分钟（≤ 容差）→ 按补录口径当天不发；
+        // 晚 6 分钟（> 容差）→ 新鲜口径，到期即发
+        let conn = mem_conn();
+        let tight = colony(&conn, "贴边一号", "active");
+        feed_foods_created(&conn, tight, "2026-09-17 08:02:00", NOW, &["面包虫"]); // due 09-18 08:02
+        let clear = colony(&conn, "过界一号", "active");
+        feed_foods_created(&conn, clear, "2026-09-17 08:06:00", NOW, &["面包虫"]); // due 09-18 08:06
+
+        let out = run_check(&conn, TODAY, "2026-09-18 10:00:00").unwrap();
+        let names: Vec<&str> = out.toasts.iter().map(|r| r.colony_name.as_str()).collect();
+        assert_eq!(names, vec!["过界一号"], "容差内按补录不发，超出容差按新鲜发：{names:?}");
+
+        // 次日：贴边窝按补录次日起催，过界窝照常每日一条
+        let out = run_check(&conn, "2026-09-19", "2026-09-19 08:00:00").unwrap();
+        assert_eq!(retrieval_kinds(&out).len(), 2);
+    }
+
+    #[test]
+    fn retrieval_silent_when_follow_action_disabled() {
+        // 用户故事 12：停用「撤食」操作 = 撤食功能整体关闭（历史记录保留）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号", "active");
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫"]);
+        conn.execute("UPDATE care_action SET enabled = 0 WHERE kind = 'follow'", []).unwrap();
+        let due = compute_due_reminders(&conn, TODAY, "2026-09-18 10:00:00", 7).unwrap();
+        assert!(due.is_empty(), "撤食操作停用 → 引擎不再产撤食提醒：{due:?}");
+    }
+
+    #[test]
+    fn retrieval_text_lists_anchor_feeding_perishable_foods() {
+        // 文案食物名 = 该次喂食所选有效易腐食物（可多食物并列，按字典序）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号", "active");
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫", "干虾仁"]);
+        let out = run_check(&conn, TODAY, "2026-09-18 10:00:00").unwrap();
+        assert_eq!(out.toasts.len(), 1);
+        let (_, body) = out.toasts[0].notification_text();
+        assert_eq!(body, "「大头一号」该撤食了：9月17日 09:00 喂的干虾仁、面包虫已超过 1 小时");
+    }
+
     // ── 通知文案 ──
 
     #[test]
@@ -1058,6 +1507,9 @@ mod tests {
             base_date: "2026-09-15".into(),
             days_since_last: Some(4),
             suggested_interval_days: Some(3),
+            fed_at: None,
+            retrieval_food_names: None,
+            hours_overdue: None,
         };
         let (title, body) = r.notification_text();
         assert_eq!(title, "喂食超期");
@@ -1080,6 +1532,39 @@ mod tests {
         let (title, body) = r.notification_text();
         assert_eq!(title, "出眠日");
         assert!(body.contains("2026-10-01"), "{body}");
+    }
+
+    #[test]
+    fn notification_text_retrieval_due_kind() {
+        let r = Reminder {
+            colony_id: 1,
+            colony_name: "大头一号".into(),
+            kind: ReminderKind::RetrievalDue,
+            action_id: None,
+            action_name: None,
+            food_id: None,
+            food_name: None,
+            base_date: "2026-09-18".into(),
+            days_since_last: None,
+            suggested_interval_days: None,
+            fed_at: Some("2026-09-17 09:00:00".into()),
+            retrieval_food_names: Some(vec!["面包虫".into()]),
+            hours_overdue: Some(25),
+        };
+        let (title, body) = r.notification_text();
+        assert_eq!(title, "该撤食了");
+        assert_eq!(body, "「大头一号」该撤食了：9月17日 09:00 喂的面包虫已超过 25 小时");
+
+        // 多食物并列；字段缺省的兜底：无食物名 → 「易腐食物」、无小时 → 0
+        let r = Reminder {
+            retrieval_food_names: Some(vec!["干虾仁".into(), "面包虫".into()]),
+            ..r
+        };
+        let (_, body) = r.notification_text();
+        assert!(body.contains("喂的干虾仁、面包虫已超过 25 小时"), "{body}");
+        let r = Reminder { retrieval_food_names: None, hours_overdue: None, ..r };
+        let (_, body) = r.notification_text();
+        assert!(body.contains("喂的易腐食物已超过 0 小时"), "{body}");
     }
 
     // ── 托盘概要 ──
@@ -1186,6 +1671,43 @@ mod tests {
         );
         let text = tray_summary(&[fresh]);
         assert_eq!(text, "1 窝活跃", "无食物明细且统一层不超期 → 不加食物行");
+    }
+
+    /// follow（撤食）块专用：只有三态通道，无超期/间隔/食物明细。
+    fn follow_tile(retrieval_state: &str) -> crate::care::ActionTile {
+        crate::care::ActionTile {
+            action_id: 5,
+            name: "撤食".into(),
+            icon: None,
+            kind: "follow".into(),
+            is_feeding: false,
+            suggested_interval_days: None,
+            days_since_last: None,
+            overdue: false,
+            foods: vec![],
+            retrieval_state: retrieval_state.into(),
+        }
+    }
+
+    #[test]
+    fn tray_summary_includes_overdue_retrieval_for_active_and_hibernating() {
+        // 验收 7（托盘概要含待撤食）：红态（已超到期时刻）补「窝名待撤食」；
+        // 冬眠窝同样提示（撤食不吃冬眠静音）；未到期 pending 与已结束不提示
+        let a = col(
+            "大头一号",
+            "active",
+            vec![tile("喂食", "reminding", false, Some(1)), follow_tile("overdue")],
+        );
+        let h = col("冬眠一号", "hibernating", vec![follow_tile("overdue")]);
+        let pending = col("针毛一号", "active", vec![follow_tile("pending")]);
+        let ended = col("老窝", "ended", vec![follow_tile("overdue")]);
+
+        assert_eq!(
+            tray_summary(&[a, h, pending.clone(), ended]),
+            "2 窝活跃 · 1 窝冬眠中 · 大头一号待撤食 · 冬眠一号待撤食"
+        );
+        // 只有 pending（未到期）→ 不进概要
+        assert_eq!(tray_summary(&[pending]), "1 窝活跃");
     }
 
     #[test]
