@@ -105,7 +105,8 @@ export interface IntervalRow extends StatsInterval {
   avgLabel: string | null;
   /** 建议刻度竖线位置（%）；仅提醒类有（登记类恒 null，界面标「仅登记」） */
   markPct: number | null;
-  /** 右侧文案尾巴："建议 N 天" / "未设建议间隔"（提醒类没设值）/ "仅登记"（按 kind 判定） */
+  /** 右侧文案尾巴："建议 N 天" / "未设建议间隔"（提醒类没设值）/ "仅登记"（按 kind 判定）/
+   * "跟随喂食"（follow：撤食等跟随喂食的操作，无建议间隔口径，票 03） */
   tail: string;
 }
 
@@ -123,13 +124,16 @@ export function intervalRows(intervals: StatsInterval[]): IntervalRow[] {
       avgPct,
       avgLabel: it.avg_days === null ? null : it.avg_days.toFixed(1),
       markPct,
-      // 按 kind 判定（票 07 停靠②）：提醒类但没设建议间隔时不误标「仅登记」
+      // 按 kind 判定（票 07 停靠②）：提醒类但没设建议间隔时不误标「仅登记」；
+      // follow（跟随喂食，票 03）走兜底文案——它没有间隔口径，也不算「未设建议」
       tail:
         it.kind === "log_only"
           ? "仅登记"
-          : suggested === null
-            ? "未设建议间隔"
-            : `建议 ${suggested} 天`,
+          : it.kind === "reminding"
+            ? suggested === null
+              ? "未设建议间隔"
+              : `建议 ${suggested} 天`
+            : "跟随喂食",
     };
   });
 }

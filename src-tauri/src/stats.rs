@@ -64,7 +64,7 @@ pub struct WeeklyCount {
 pub struct IntervalStat {
     pub action_id: i64,
     pub name: String,
-    pub kind: String, // reminding | log_only
+    pub kind: String, // reminding | log_only | follow（跟随喂食：无建议间隔口径，票 03）
     /// 仅提醒类有值（前端画建议刻度竖线）；登记类恒 None（界面标「仅登记」）。
     pub suggested_interval_days: Option<i64>,
     /// 有效间隔样本数（= 各窝样本数之和；0 = 记录不足）。
@@ -504,6 +504,23 @@ mod tests {
         .expect("插冬眠段失败");
     }
 
+    /// 直插预置「撤食」行（kind='follow'，票 01 v7 迁移落地后的字典形态）。
+    /// 当前 schema（v6）的 kind CHECK 尚不含 'follow'，用连接级 PRAGMA 临时
+    /// 绕过 CHECK 仅作种子辅助：不碰迁移；迁移落地后该行本就合法，行为不变。
+    fn seed_retrieval_action(conn: &Connection) -> i64 {
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
+            .expect("放开 CHECK 失败");
+        conn.execute(
+            "INSERT INTO care_action (name, icon, kind, suggested_interval_days, enabled, sort)
+             VALUES ('撤食', NULL, 'follow', NULL, 1, 5)",
+            [],
+        )
+        .expect("插撤食操作失败");
+        conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
+            .expect("恢复 CHECK 失败");
+        action_id(conn, "撤食")
+    }
+
     fn d(s: &str) -> chrono::NaiveDate {
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").expect("测试日期应为合法 ISO")
     }
@@ -756,6 +773,49 @@ mod tests {
             earliest_log_date(&conn).unwrap(),
             Some("2025-12-01".to_string())
         );
+    }
+
+    #[test]
+    fn retrieval_logs_count_into_daily_weekly_hover_and_interval_without_suggestion() {
+        // 票 03（撤食统计切片）：撤食作为普通维护操作进全部统计口径——
+        // 按日计数、每周次数、悬停明细照常聚合；follow 性质不参与建议间隔
+        // 口径（suggested_interval_days 恒 None），实际间隔照常成对计算。
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        seed_retrieval_action(&conn);
+
+        log(&conn, c, "喂食", "2026-09-12 08:00:00");
+        log(&conn, c, "撤食", "2026-09-12 09:00:00"); // 同天第二笔
+        log(&conn, c, "撤食", "2026-09-15 09:00:00"); // 与上一条成对：3 天
+
+        let stats = get_stats(&conn, Some(c), "2026-09-08", "2026-09-21").unwrap();
+
+        // 按日：撤食与喂食各计 1，同天合并为 2
+        let day = |date: &str| stats.daily.iter().find(|d| d.date == date).unwrap().count;
+        assert_eq!(day("2026-09-12"), 2);
+        assert_eq!(day("2026-09-15"), 1);
+
+        // 每周（周一为周首）：09-12 落 09-07 周、09-15 落 09-14 周
+        let week = |ws: &str| stats.weekly.iter().find(|w| w.week_start == ws).unwrap().count;
+        assert_eq!(week("2026-09-07"), 2, "撤食进每周操作次数");
+        assert_eq!(week("2026-09-14"), 1);
+
+        // 悬停明细：撤食条目可见、无食物括注
+        let day12 = stats.daily_detail.iter().find(|d| d.date == "2026-09-12").unwrap();
+        assert_eq!(day12.entries.len(), 2);
+        let retrieval_entry = day12.entries.iter().find(|e| e.action_name == "撤食").unwrap();
+        assert!(retrieval_entry.food_names.is_empty(), "撤食无食物括注");
+
+        // 间隔：follow 无建议间隔（不参与超期/建议口径），实际间隔照常算
+        let retrieval = stats.intervals.iter().find(|i| i.name == "撤食").unwrap();
+        assert_eq!(retrieval.kind, "follow");
+        assert_eq!(retrieval.suggested_interval_days, None, "follow 无建议间隔口径");
+        assert_eq!(retrieval.sample_count, 1);
+        assert_eq!(retrieval.avg_days, Some(3.0), "09-12 → 09-15 = 3 天");
+
+        // 回归守护：喂食的建议间隔不受新性质影响
+        let feed = stats.intervals.iter().find(|i| i.name == "喂食").unwrap();
+        assert_eq!(feed.suggested_interval_days, Some(3));
     }
 
     #[test]

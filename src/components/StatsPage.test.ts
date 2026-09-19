@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import StatsPage from "./StatsPage.vue";
-import type { Colony, StatsPayload } from "../types";
+import type { Colony, StatsInterval, StatsPayload } from "../types";
 import { addDays, todayIso } from "../lib/dates";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC
@@ -213,6 +213,54 @@ describe("统计页（票 07）", () => {
     expect(water.find(".imark").exists()).toBe(false);
     expect(water.text()).toContain("仅登记");
     expect(water.text()).toContain("记录不足");
+  });
+
+  it("撤食统计切片（票 03）：撤食进热力图计数与悬停明细；follow 间隔行标「跟随喂食」无刻度", async () => {
+    currentStats = makePayload({
+      daily: [
+        { date: "2026-09-10", count: 1 },
+        { date: "2026-09-12", count: 2 },
+      ],
+      daily_detail: [
+        {
+          date: "2026-09-12",
+          entries: [
+            { action_name: "喂食", food_names: ["面包虫"] },
+            { action_name: "撤食", food_names: [] },
+          ],
+        },
+      ],
+      weekly: [{ week_start: "2026-09-14", count: 2 }],
+      intervals: [
+        {
+          action_id: 5,
+          name: "撤食",
+          // Rust 端 kind 原样透传 "follow"（票 01 落库）；types 未收录时按运行时值处理
+          kind: "follow" as unknown as StatsInterval["kind"],
+          suggested_interval_days: null,
+          sample_count: 1,
+          avg_days: 3,
+          min_days: 3,
+          max_days: 3,
+        },
+      ],
+    });
+    const wrapper = await mountPage();
+
+    // 间隔行：follow 无建议刻度，文案「跟随喂食」（不误标「未设建议间隔」/「仅登记」）
+    const rows = wrapper.findAll(".irow");
+    expect(rows.length).toBe(1);
+    expect(rows[0].text()).toContain("撤食");
+    expect(rows[0].text()).toContain("跟随喂食");
+    expect(rows[0].find(".imark").exists()).toBe(false);
+
+    // 热力图数据含撤食当天计数；悬停明细（tooltip formatter）含撤食条目与食物括注
+    const heatOption = echartsSetOption.mock.calls.map((c) => c[0]).find((o) => o.calendar);
+    expect(heatOption).toBeDefined();
+    expect(heatOption.series[0].data).toContainEqual(["2026-09-12", 2]);
+    const hover: string = heatOption.tooltip.formatter({ value: ["2026-09-12", 2] });
+    expect(hover).toContain("面包虫");
+    expect(hover).toContain("撤食");
   });
 
   it("空数据/单天范围不崩溃：零计数也能渲染图表配置，并显示暂无提示（验收 4）", async () => {

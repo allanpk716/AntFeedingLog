@@ -46,6 +46,9 @@ const actions: CareActionItem[] = [
   { id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: 3, enabled: true, sort: 1, referenced: false, is_preset: true },
   { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, referenced: true, is_preset: true },
   { id: 3, name: "降温", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: false, sort: 3, referenced: true, is_preset: false },
+  // 撤食（票 03/票 01）：第五种预置操作，性质 follow（跟随喂食）；kind 原样透传字符串，
+  // types 未收录时按运行时值处理——页面只依赖 enabled / is_feeding 两个标记位
+  { id: 4, name: "撤食", icon: null, kind: "follow" as unknown as CareActionItem["kind"], is_feeding: false, suggested_interval_days: null, enabled: true, sort: 5, referenced: false, is_preset: true },
 ];
 
 const foods: FoodItem[] = [
@@ -539,5 +542,66 @@ describe("记录列表页（票 08）", () => {
       },
     });
     expect((wrapper.find(".f-colony").element as HTMLSelectElement).value).toBe("");
+  });
+
+  it("撤食流水切片（票 03）：筛选下拉含撤食，选中即按该操作查询（通用字典，无白名单）", async () => {
+    const wrapper = await mountPage();
+    const actionOpts = wrapper.findAll(".f-action option").map((o) => o.text());
+    expect(actionOpts, "停用项不进筛选入口").toEqual(["全部", "喂食", "活动区换水", "撤食"]);
+
+    invokeMock.mockClear();
+    await wrapper.find(".f-action").setValue("4");
+    await flushPromises();
+    const calls = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_logs");
+    expect(calls.length).toBe(1);
+    expect((calls[0][1] as { filter: { action_id: number } }).filter.action_id).toBe(4);
+  });
+
+  it("撤食行照常编辑/删除（票 03）：无食物区、food_ids 空数组提交、两段确认删除", async () => {
+    currentPage = {
+      total: 1,
+      rows: [
+        {
+          id: 201,
+          colony_id: 1,
+          colony_name: "大头一号",
+          location_name: "家",
+          action_id: 4,
+          action_name: "撤食",
+          occurred_at: "2026-09-18 09:00:00",
+          created_at: "2026-09-18 09:00:00",
+          note: "收走面包虫",
+          food_ids: [],
+          food_names: [],
+        },
+      ],
+    };
+    const wrapper = await mountPage();
+
+    // 行渲染：操作列显示撤食、食物列占位、编辑/删除按钮照常
+    const row = wrapper.find('.log-row[data-log-id="201"]');
+    expect(row.find(".c-action").text()).toBe("撤食");
+    expect(row.find(".c-foods").text()).toBe("—");
+
+    // 编辑：弹窗操作选中撤食、非喂食无食物区，提交 update_log（food_ids 空数组）
+    const dlg = await openEdit(wrapper, 201);
+    expect((dlg.find(".action-select").element as HTMLSelectElement).value).toBe("4");
+    expect(dlg.find(".foods").exists()).toBe(false);
+    await dlg.find(".save-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_log", {
+      id: 201,
+      input: { occurred_at: "2026-09-18T09:00", action_id: 4, food_ids: [], note: "收走面包虫" },
+    });
+
+    // 删除：两段确认后 delete_log
+    const delBtn = () => wrapper.find('.log-row[data-log-id="201"] .delete-btn');
+    await delBtn().trigger("click");
+    await flushPromises();
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "delete_log")).toBe(false);
+    await delBtn().trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("delete_log", { id: 201 });
+    expect(wrapper.emitted("changed")).toBeTruthy();
   });
 });

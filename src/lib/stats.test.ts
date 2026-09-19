@@ -194,6 +194,27 @@ describe("间隔条布局（照 mock-b .itrack/.ibar/.imark）", () => {
     expect(row.tail).not.toContain("仅登记");
   });
 
+  it("跟随喂食（follow，撤食性质）：无建议刻度、实际间隔照常展示，文案标「跟随喂食」（票 03）", () => {
+    // Rust 端 kind 原样透传字符串（票 01 落库 kind='follow'）；types 尚未收录时按运行时值处理
+    const retrieval: StatsInterval = {
+      action_id: 5,
+      name: "撤食",
+      kind: "follow" as unknown as StatsInterval["kind"],
+      suggested_interval_days: null,
+      sample_count: 1,
+      avg_days: 3,
+      min_days: 3,
+      max_days: 3,
+    };
+    const [row] = intervalRows([retrieval]);
+    expect(row.suggested).toBeNull();
+    expect(row.markPct).toBeNull();
+    expect(row.avgPct).not.toBeNull();
+    expect(row.tail).toBe("跟随喂食");
+    expect(row.tail).not.toContain("未设建议间隔");
+    expect(row.tail).not.toContain("仅登记");
+  });
+
   it("无样本（记录不足）：avgPct 为 null，不产生 NaN", () => {
     const none: StatsInterval = { ...feed, sample_count: 0, avg_days: null, min_days: null, max_days: null };
     const [row] = intervalRows([none]);
@@ -216,5 +237,18 @@ describe("热力图悬停明细（验收 3：明细含喂食的食物）", () =>
     const map = buildDetailMap(payload.daily_detail);
     expect(dayTooltip("2026-09-10", map)).toBe("2026-09-10 · 2 次：喂食（种子、干虾仁）、巢穴保湿");
     expect(dayTooltip("2026-09-12", map)).toBe("2026-09-12 · 无记录");
+  });
+
+  it("撤食作为普通维护操作进悬停明细：参与当天次数、无食物括注（票 03）", () => {
+    const map = buildDetailMap([
+      {
+        date: "2026-09-12",
+        entries: [
+          { action_name: "喂食", food_names: ["面包虫"] },
+          { action_name: "撤食", food_names: [] },
+        ],
+      },
+    ]);
+    expect(dayTooltip("2026-09-12", map)).toBe("2026-09-12 · 2 次：喂食（面包虫）、撤食");
   });
 });
