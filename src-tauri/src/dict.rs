@@ -5,8 +5,8 @@
 //!
 //! 行为对齐 spec 评审附录规则 10：
 //! - 改名只改显示名（id 不变），历史记录跟随新显示名；
-//! - 未被引用可物理删；被引用只能停用（操作被 care_log / reminder_ledger 引用、
-//!   食物被 log_food 引用时拒绝删除）；
+//! - 未被引用可物理删；被引用只能停用（操作被 care_log / reminder_ledger /
+//!   每窝周期行引用、食物被 log_food 引用时拒绝删除）；
 //! - 停用项不出现在新建记录入口（log_care 已拒停用项，list 由前端过滤 enabled）；
 //! - set_action_policy：切换 提醒/仅登记 性质 + 建议间隔；切到登记类时保留间隔值
 //!   （spec：登记类也保留可编辑值以便日后切换）；is_feeding 位可编辑、不强制全局唯一。
@@ -244,8 +244,8 @@ pub fn set_action_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(
     Ok(())
 }
 
-/// 物理删；预置项禁删（反馈第二轮 F2）；被 care_log 或 reminder_ledger 引用则拒绝
-/// （友好文案，规则 10）。
+/// 物理删；预置项禁删（反馈第二轮 F2）；被 care_log、reminder_ledger 或每窝周期
+/// 行（票 05）引用则拒绝（友好文案，规则 10）。
 pub fn erase_action(conn: &Connection, id: i64) -> Result<(), String> {
     let preset: i64 = conn
         .query_row("SELECT is_preset FROM care_action WHERE id = ?1", params![id], |r| r.get(0))
@@ -275,6 +275,19 @@ pub fn erase_action(conn: &Connection, id: i64) -> Result<(), String> {
         .map_err(db_err)?;
     if ledger > 0 {
         return Err(format!("该操作仍被 {ledger} 条提醒台账引用，不能删除；可改为停用"));
+    }
+    let intervals: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM colony_action_interval WHERE action_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if intervals > 0 {
+        // 每窝周期票 05：复合主键保证一行=一窝，行数即设了该操作周期的窝数
+        return Err(format!(
+            "该操作仍被 {intervals} 个窝的每窝周期引用，不能删除；可先清各窝的每窝周期，或改为停用"
+        ));
     }
     let changed = conn
         .execute("DELETE FROM care_action WHERE id = ?1", params![id])
@@ -763,6 +776,64 @@ mod tests {
         let err = erase_action(&conn, custom.id).unwrap_err();
         assert!(err.contains("台账"), "实际错误：{err}");
         assert_eq!(count_where_id(&conn, "care_action", custom.id), 1);
+    }
+
+    #[test]
+    fn erase_action_referenced_by_per_colony_interval_rejected() {
+        // 每窝周期票 05：操作被某窝的每窝周期引用时拒删（照 care_log/台账守卫同款），
+        // 行保留，提示先清周期或改停用
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let custom = save_action(
+            &conn,
+            &ActionInput {
+                id: None,
+                name: "降温".into(),
+                kind: "reminding".into(),
+                is_feeding: false,
+                suggested_interval_days: Some(3),
+                sort: 5,
+            },
+        )
+        .unwrap();
+        crate::colony::set_colony_action_interval(&conn, c, custom.id, Some(7)).unwrap();
+
+        let err = erase_action(&conn, custom.id).unwrap_err();
+        assert!(err.contains("周期"), "实际错误：{err}");
+        assert!(err.contains("停用"), "实际错误：{err}");
+        assert_eq!(count_where_id(&conn, "care_action", custom.id), 1, "行保留");
+        let kept: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM colony_action_interval WHERE action_id = ?1",
+                params![custom.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 1, "删除被拒时周期行不受影响");
+    }
+
+    #[test]
+    fn erase_action_succeeds_after_per_colony_intervals_cleared() {
+        // 清掉周期行后恢复可删（删行=未设，set None 幂等清除）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let custom = save_action(
+            &conn,
+            &ActionInput {
+                id: None,
+                name: "降温".into(),
+                kind: "reminding".into(),
+                is_feeding: false,
+                suggested_interval_days: Some(3),
+                sort: 5,
+            },
+        )
+        .unwrap();
+        crate::colony::set_colony_action_interval(&conn, c, custom.id, Some(7)).unwrap();
+        crate::colony::set_colony_action_interval(&conn, c, custom.id, None).unwrap();
+
+        erase_action(&conn, custom.id).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_action"), 5);
     }
 
     #[test]
