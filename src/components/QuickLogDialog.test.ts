@@ -27,6 +27,10 @@ const action: ColonyAction = {
   action_id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false,
   suggested_interval_days: null, days_since_last: 2, overdue: false, foods: [],
 };
+const retrievalAction: ColonyAction = {
+  action_id: 5, name: "撤食", icon: null, kind: "follow", is_feeding: false,
+  suggested_interval_days: null, days_since_last: null, overdue: false, foods: [],
+};
 
 function mountDlg() {
   return mount(QuickLogDialog, { props: { colony: { ...colony, actions: [action, hydrateAction] }, action } });
@@ -85,6 +89,25 @@ describe("QuickLogDialog", () => {
     expect(w.find(".form-error").text()).toContain("未来");
     expect(w.find(".quick-dialog").exists()).toBe(true);
     expect(w.emitted("saved")).toBeUndefined();
+  });
+
+  it("撤食打卡闭环：follow 块经通用面板提交 log_care（空食物）并抛 saved", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "colony_month_records" ? [] : cmd === "list_actions" ? allActions : cmd === "log_care" ? 7 : null,
+    );
+    const w = mount(QuickLogDialog, {
+      props: { colony: { ...colony, actions: [retrievalAction] }, action: retrievalAction },
+    });
+    // 标题带操作名（撤食）
+    expect(w.find("h3").text()).toContain("记录撤食");
+    await w.find(".record-btn").trigger("click");
+    await flushPromises();
+    const input = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care")![1] as {
+      input: Record<string, unknown>;
+    };
+    expect(input.input.action_id).toBe(5);
+    expect(input.input.food_ids).toEqual([]);
+    expect(w.emitted("saved")).toHaveLength(1);
   });
 });
 

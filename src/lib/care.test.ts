@@ -1,6 +1,16 @@
 import { describe, expect, it } from "vitest";
 import type { ColonyAction, FoodTileInfo, RecentLog } from "../types";
-import { actionTile, feedingTooltip, formatRecent, isFeeding, nowLocalDateTime } from "./care";
+import {
+  actionTile,
+  feedingTooltip,
+  formatRecent,
+  isFeeding,
+  isRetrieval,
+  nowLocalDateTime,
+  retrievalStateOf,
+  retrievalTile,
+  type RetrievalState,
+} from "./care";
 
 function action(partial: Partial<ColonyAction> & { action_id: number }): ColonyAction {
   return {
@@ -181,5 +191,50 @@ describe("最近记录摘要", () => {
 describe("时间默认值", () => {
   it("nowLocalDateTime 返回 datetime-local 格式", () => {
     expect(nowLocalDateTime()).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/);
+  });
+});
+
+describe("撤食块展示态（票 02）", () => {
+  /** follow 性质的撤食块；state 缺省 = 模拟旧载荷（无 retrieval_state 字段） */
+  function retrievalAction(
+    state?: RetrievalState,
+  ): ColonyAction & { retrieval_state?: RetrievalState } {
+    const base = action({
+      action_id: 9,
+      name: "撤食",
+      kind: "follow",
+      suggested_interval_days: null,
+      days_since_last: 1,
+    });
+    return state === undefined ? base : { ...base, retrieval_state: state };
+  }
+
+  it("follow 性质判定与名字无关", () => {
+    expect(isRetrieval(retrievalAction("none"))).toBe(true);
+    expect(isRetrieval(retrievalAction())).toBe(true);
+    // 名字叫「撤食」但性质不是 follow → 不是撤食块
+    expect(isRetrieval(action({ action_id: 5, name: "撤食", kind: "reminding" }))).toBe(false);
+    expect(isRetrieval(action({ action_id: 2, kind: "log_only" }))).toBe(false);
+  });
+
+  it("三态映射：无待撤置灰 / 待撤未到期正常可点 / 逾期红", () => {
+    expect(retrievalTile(retrievalAction("none"))).toEqual({ tone: "none", text: "无待撤" });
+    expect(retrievalTile(retrievalAction("pending"))).toEqual({ tone: "ok", text: "待撤食" });
+    expect(retrievalTile(retrievalAction("overdue"))).toEqual({ tone: "bad", text: "⚠ 该撤食了" });
+  });
+
+  it("无倒计时文字：pending/overdue 文案都不含小时/天/countdown 灰字", () => {
+    for (const state of ["none", "pending", "overdue"] as const) {
+      const view = retrievalTile(retrievalAction(state));
+      expect(view.text).not.toMatch(/小时|天/);
+    }
+  });
+
+  it("缺 retrieval_state 字段（旧载荷/非 follow）按 none 兜底", () => {
+    expect(retrievalStateOf(retrievalAction())).toBe("none");
+    expect(retrievalTile(action({ action_id: 9, kind: "log_only" }))).toEqual({
+      tone: "none",
+      text: "无待撤",
+    });
   });
 });

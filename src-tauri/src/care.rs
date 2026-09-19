@@ -12,7 +12,7 @@
 
 use std::collections::HashSet;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 // ── DTO ──────────────────────────────────────────────────────────────────
@@ -31,6 +31,10 @@ pub struct Food {
     /// 预置项禁删，可停用（反馈第二轮 F2）。
     pub is_preset: bool,
     pub referenced: bool,
+    /// 易腐（票 01）：开启后喂下该食物会派生「待撤食」，按撤食间隔（小时）提醒收走。
+    pub perishable: bool,
+    /// 撤食间隔（小时，1–168 整数）；NULL = 未设（派生时按不存在处理，脏数据自愈）。
+    pub retrieval_hours: Option<i64>,
 }
 
 /// 喂食块里单个食物的「距上次」明细（反馈第二轮 F3）。
@@ -63,6 +67,10 @@ pub struct ActionTile {
     pub overdue: bool,
     /// 逐食物「距上次」明细（F3）；仅喂食类非空，其余操作恒空数组。
     pub foods: Vec<FoodTileStatus>,
+    /// 撤食三态（票 02）：`none`=无待撤（前端置灰禁点）/ `pending`=待撤未到期
+    /// （正常可点）/ `overdue`=已超到期时刻（前端红）。仅 kind=follow（撤食）块
+    /// 非 "none"；不占用 days_since/overdue 通道（follow 的 overdue 恒 false）。
+    pub retrieval_state: String,
 }
 
 /// 最近记录摘要的一行（前端拼成「最近：09-17 喂食（种子）· …」）。
@@ -594,6 +602,71 @@ pub fn delete_log(conn: &Connection, id: i64) -> Result<(), String> {
 
 // ── 卡片展示数据 ─────────────────────────────────────────────────────────
 
+/// 待撤食派生结果（票 02）：基准喂食与其到期时刻。派生态、不落库；
+/// 删/改喂食或撤食记录后由下次读取自然重算。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RetrievalDue {
+    /// 基准 = 该窝最近一次含「易腐且已设间隔」食物的喂食发生时刻。
+    pub fed_at: String,
+    /// 到期 = fed_at + min(该次所选易腐食物的撤食间隔)（同喂取最短，F2）。
+    pub due_at: String,
+}
+
+/// 某窝待撤食派生（纯读库）：最近一次含有效易腐食物的喂食**严格晚于**最近一次
+/// 撤食（follow 性质）记录时为 Some；无撤食记录则任何有效易腐喂食都算。
+/// 未设间隔（NULL）的易腐食物按不存在处理（脏数据自愈）；到期取该次所选易腐
+/// 食物的最短间隔。时刻比较用库内统一 `YYYY-MM-DD HH:MM:SS` 文本序（= 时间序）。
+pub fn retrieval_due_for_colony(
+    conn: &Connection,
+    colony_id: i64,
+) -> Result<Option<RetrievalDue>, String> {
+    // 最近一次含有效易腐食物的喂食 + 该次所选易腐的最短间隔
+    let feed: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT l.occurred_at, MIN(f.retrieval_hours)
+             FROM care_log l
+             JOIN log_food lf ON lf.log_id = l.id
+             JOIN food f ON f.id = lf.food_id
+             JOIN care_action a ON a.id = l.action_id AND a.is_feeding = 1
+             WHERE l.colony_id = ?1 AND f.perishable = 1 AND f.retrieval_hours IS NOT NULL
+             GROUP BY l.id
+             ORDER BY l.occurred_at DESC, l.id DESC
+             LIMIT 1",
+            params![colony_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let Some((fed_at, min_hours)) = feed else {
+        return Ok(None);
+    };
+
+    // 最近一次撤食（follow 性质；v7 起预置「撤食」专属）
+    let retrieved: Option<String> = conn
+        .query_row(
+            "SELECT l.occurred_at
+             FROM care_log l
+             JOIN care_action a ON a.id = l.action_id
+             WHERE l.colony_id = ?1 AND a.kind = 'follow'
+             ORDER BY l.occurred_at DESC, l.id DESC
+             LIMIT 1",
+            params![colony_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    if retrieved.is_some_and(|r| fed_at.as_str() <= r.as_str()) {
+        return Ok(None); // 喂食未严格晚于最近撤食 → 已清空
+    }
+
+    let fed = chrono::NaiveDateTime::parse_from_str(&fed_at, "%Y-%m-%d %H:%M:%S")
+        .map_err(|_| "记录发生时间格式异常".to_string())?;
+    let due_at = (fed + chrono::Duration::hours(min_hours))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    Ok(Some(RetrievalDue { fed_at, due_at }))
+}
+
 /// 某窝每个「启用中」操作一块，按 sort、id 排序（字典新增操作自动出现）。
 /// 「距上次」基线（规则 5）：有出眠史的窝取 max(最近一次记录日期, 最近出眠日期)，
 /// 出眠当天全窝 0 天、不会一睁眼全红；登记类显示同样基准（只影响文案，永不红的性质不变）。
@@ -603,6 +676,17 @@ pub fn tiles_for_colony(
     conn: &Connection,
     colony_id: i64,
     today: &str,
+) -> Result<Vec<ActionTile>, String> {
+    tiles_for_colony_at(conn, colony_id, today, &now_local())
+}
+
+/// [`tiles_for_colony`] 的可注入时钟版（私有）：撤食三态的到期比较用 `now`
+/// （须为库内统一 `YYYY-MM-DD HH:MM:SS`，文本序 = 时间序；测试传固定值不碰时钟）。
+fn tiles_for_colony_at(
+    conn: &Connection,
+    colony_id: i64,
+    today: &str,
+    now: &str,
 ) -> Result<Vec<ActionTile>, String> {
     let wake = crate::hibernation::latest_wake_date(conn, colony_id);
     let mut stmt = conn
@@ -645,6 +729,14 @@ pub fn tiles_for_colony(
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
         rows
+    };
+
+    // 撤食三态基准（票 02）：有 follow 块才算一次派生，其余块恒 "none"
+    let has_follow = rows.iter().any(|(_, _, _, kind, _, _)| kind == "follow");
+    let due = if has_follow {
+        retrieval_due_for_colony(conn, colony_id)?
+    } else {
+        None
     };
 
     let mut tiles = Vec::with_capacity(rows.len());
@@ -728,6 +820,17 @@ pub fn tiles_for_colony(
         }
         let food_any = foods.iter().any(|f| f.overdue);
         let overdue = is_overdue(&kind, days, interval) || food_any;
+        // 撤食三态（票 02）：none=无待撤 / pending=待撤未到期 / overdue=已超到期时刻
+        //（恰在到期时刻即逾期）；只落在 follow 块，不占用 days_since/overdue 通道
+        let retrieval_state = if kind == "follow" {
+            match &due {
+                None => "none",
+                Some(d) if now >= d.due_at.as_str() => "overdue",
+                Some(_) => "pending",
+            }
+        } else {
+            "none"
+        };
         tiles.push(ActionTile {
             action_id,
             name,
@@ -738,6 +841,7 @@ pub fn tiles_for_colony(
             days_since_last: days,
             overdue,
             foods,
+            retrieval_state: retrieval_state.to_string(),
         });
     }
     Ok(tiles)
@@ -792,7 +896,8 @@ pub fn recent_for_colony(
 const FOOD_SQL: &str = concat!(
     "SELECT f.id, f.name, f.enabled, f.sort, f.suggested_interval_days, f.is_preset, ",
     "(EXISTS(SELECT 1 FROM log_food lf WHERE lf.food_id = f.id) ",
-    "OR EXISTS(SELECT 1 FROM reminder_ledger g WHERE g.food_id = f.id)) ",
+    "OR EXISTS(SELECT 1 FROM reminder_ledger g WHERE g.food_id = f.id)), ",
+    "f.perishable, f.retrieval_hours ",
     "FROM food f ",
 );
 
@@ -805,6 +910,8 @@ fn row_to_food(row: &rusqlite::Row<'_>) -> rusqlite::Result<Food> {
         suggested_interval_days: row.get(4)?,
         is_preset: row.get::<_, i64>(5)? != 0,
         referenced: row.get::<_, i64>(6)? != 0,
+        perishable: row.get::<_, i64>(7)? != 0,
+        retrieval_hours: row.get(8)?,
     })
 }
 
@@ -2117,5 +2224,220 @@ mod tests {
         let c = colony(&conn, "大头一号");
         assert!(colony_month_records(&conn, c, 2026, 0, None).is_err());
         assert!(colony_month_records(&conn, c, 2026, 13, None).is_err());
+    }
+
+    // ── 待撤食派生 + 撤食块三态（票 02）──
+
+    /// 派生/三态测试的固定"现在"（可注入时钟惯例：不碰系统时钟）。
+    const NOW: &str = "2026-09-19 12:00:00";
+
+    /// 建自定义易腐食物（hours=None = 未设间隔的脏数据）。
+    fn perishable_food(conn: &Connection, name: &str, hours: Option<i64>) -> i64 {
+        conn.execute(
+            "INSERT INTO food (name, enabled, sort, perishable, retrieval_hours)
+             VALUES (?1, 1, 99, 1, ?2)",
+            params![name, hours],
+        )
+        .expect("建易腐食物失败");
+        conn.last_insert_rowid()
+    }
+
+    /// 喂食记账（录入时刻固定 2026-09-19 23:00，晚于全部测试发生时刻，补录合法）。
+    fn feed_foods(conn: &Connection, colony_id: i64, happened_at: &str, foods: &[i64]) -> i64 {
+        log_care(
+            conn,
+            &CareLogInput {
+                colony_id,
+                action_id: action_id(conn, "喂食"),
+                happened_at: happened_at.into(),
+                note: None,
+                food_ids: foods.to_vec(),
+            },
+            "2026-09-19 23:00:00",
+        )
+        .expect("喂食记账失败")
+    }
+
+    /// 撤食记账（录入时刻口径同 feed_foods）。
+    fn retrieval_log(conn: &Connection, colony_id: i64, happened_at: &str) -> i64 {
+        log_care(
+            conn,
+            &CareLogInput {
+                colony_id,
+                action_id: action_id(conn, "撤食"),
+                happened_at: happened_at.into(),
+                note: None,
+                food_ids: vec![],
+            },
+            "2026-09-19 23:00:00",
+        )
+        .expect("撤食记账失败")
+    }
+
+    fn retrieval_state_of(tiles: &[ActionTile]) -> &str {
+        tiles
+            .iter()
+            .find(|t| t.kind == "follow")
+            .expect("找不到撤食块")
+            .retrieval_state
+            .as_str()
+    }
+
+    #[test]
+    fn retrieval_due_takes_shortest_interval_across_foods_fed_together() {
+        // 验收：种子(不易腐)+面包虫24h+湿食6h 同喂 → 到期 = 喂食 + 6h（同喂取最短，F2）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let wet = perishable_food(&conn, "湿食", Some(6));
+        feed_foods(
+            &conn,
+            c,
+            "2026-09-19 08:00:00",
+            &[food_id(&conn, "种子"), food_id(&conn, "面包虫"), wet],
+        );
+
+        let due = retrieval_due_for_colony(&conn, c).unwrap().expect("易腐喂食后应待撤");
+        assert_eq!(due.fed_at, "2026-09-19 08:00:00");
+        assert_eq!(due.due_at, "2026-09-19 14:00:00", "min(24, 6) = 6h 到期");
+
+        // 三态随"现在"推进：到期前 pending，恰在到期时刻起 overdue
+        let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", "2026-09-19 13:59:59").unwrap();
+        assert_eq!(retrieval_state_of(&tiles), "pending", "未到期 → 正常可点档");
+        let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", "2026-09-19 14:00:00").unwrap();
+        assert_eq!(retrieval_state_of(&tiles), "overdue", "已超到期时刻 → 红档");
+    }
+
+    #[test]
+    fn retrieval_recomputes_from_latest_perishable_feeding_only() {
+        // 验收：再喂易腐按最新一次重算；只喂不易腐食物不重置基准
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        feed_foods(&conn, c, "2026-09-17 12:00:00", &[food_id(&conn, "面包虫")]);
+        feed_foods(&conn, c, "2026-09-18 12:00:00", &[food_id(&conn, "种子")]);
+
+        let due = retrieval_due_for_colony(&conn, c).unwrap().expect("种子不撤待撤");
+        assert_eq!(due.fed_at, "2026-09-17 12:00:00", "非易腐喂食不重算基准");
+
+        let wet = perishable_food(&conn, "湿食", Some(6));
+        feed_foods(&conn, c, "2026-09-19 07:00:00", &[wet]);
+        let due = retrieval_due_for_colony(&conn, c).unwrap().expect("再喂易腐重算");
+        assert_eq!(due.fed_at, "2026-09-19 07:00:00", "按最新一次易腐喂食重算");
+        assert_eq!(due.due_at, "2026-09-19 13:00:00");
+    }
+
+    #[test]
+    fn retrieval_log_clears_only_when_not_earlier_than_feeding() {
+        // 验收：撤食一次清空；撤食晚于喂食则状态清空；撤食早于喂食不清空；
+        // 同刻不清（喂食须严格晚于撤食才算待撤）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        feed_foods(&conn, c, "2026-09-18 08:00:00", &[food_id(&conn, "面包虫")]);
+
+        retrieval_log(&conn, c, "2026-09-17 08:00:00");
+        assert!(
+            retrieval_due_for_colony(&conn, c).unwrap().is_some(),
+            "撤食早于该次易腐喂食 → 不清空"
+        );
+
+        retrieval_log(&conn, c, "2026-09-19 08:00:00");
+        assert_eq!(
+            retrieval_due_for_colony(&conn, c).unwrap(),
+            None,
+            "撤食一次清空"
+        );
+
+        feed_foods(&conn, c, "2026-09-19 10:00:00", &[food_id(&conn, "面包虫")]);
+        retrieval_log(&conn, c, "2026-09-19 10:00:00");
+        assert_eq!(
+            retrieval_due_for_colony(&conn, c).unwrap(),
+            None,
+            "同刻以撤食胜（非严格晚于即清）"
+        );
+    }
+
+    #[test]
+    fn retrieval_ignores_perishable_food_without_hours_and_recovers() {
+        // 未设间隔的易腐食物按不存在处理（脏数据自愈兜底）：只喂无间隔易腐 → 无待撤；
+        // 混喂按有效者算；最新一喂只剩无效 → 回退最近一条有效易腐喂食
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let bad = perishable_food(&conn, "坏鲜食", None);
+        feed_foods(&conn, c, "2026-09-18 08:00:00", &[bad]);
+        assert_eq!(
+            retrieval_due_for_colony(&conn, c).unwrap(),
+            None,
+            "无间隔易腐不派生"
+        );
+
+        feed_foods(&conn, c, "2026-09-19 08:00:00", &[bad, food_id(&conn, "面包虫")]);
+        let due = retrieval_due_for_colony(&conn, c).unwrap().expect("有效易腐照常派生");
+        assert_eq!(due.fed_at, "2026-09-19 08:00:00");
+        assert_eq!(due.due_at, "2026-09-20 08:00:00", "面包虫 24h");
+
+        feed_foods(&conn, c, "2026-09-19 11:00:00", &[bad]);
+        let due = retrieval_due_for_colony(&conn, c)
+            .unwrap()
+            .expect("回退最近一条有效易腐喂食");
+        assert_eq!(due.fed_at, "2026-09-19 08:00:00", "11:00 一喂只有无效易腐，视同不存在");
+    }
+
+    #[test]
+    fn tiles_retrieval_three_states_live_only_on_follow_tile() {
+        // 验收：三态 none/pending/overdue 只落在撤食块；不占用 days_since/overdue 通道
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+
+        let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", NOW).unwrap();
+        assert_eq!(retrieval_state_of(&tiles), "none", "无待撤 → 置灰档");
+        assert!(
+            tiles.iter().all(|t| t.kind == "follow" || t.retrieval_state == "none"),
+            "非 follow 块恒 none"
+        );
+        let follow = tiles.iter().find(|t| t.kind == "follow").unwrap();
+        assert!(!follow.overdue, "follow 性质 is_overdue 恒 false");
+
+        feed_foods(&conn, c, "2026-09-18 20:00:00", &[food_id(&conn, "面包虫")]);
+        let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", NOW).unwrap();
+        assert_eq!(retrieval_state_of(&tiles), "pending", "NOW 12:00 < 到期 20:00");
+        let follow = tiles.iter().find(|t| t.kind == "follow").unwrap();
+        assert!(!follow.overdue, "待撤也不走 overdue 通道");
+
+        retrieval_log(&conn, c, "2026-09-19 11:00:00");
+        let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", NOW).unwrap();
+        assert_eq!(retrieval_state_of(&tiles), "none", "撤食后回置灰档");
+        let follow = tiles.iter().find(|t| t.kind == "follow").unwrap();
+        assert_eq!(follow.days_since_last, Some(0), "days_since 通道照旧（自然日语义）");
+        assert!(!follow.overdue);
+    }
+
+    #[test]
+    fn foods_read_back_perishable_and_retrieval_hours() {
+        // 票 01 缺口收口：Food 读回链（SELECT/DTO/row 映射三处带列）
+        let conn = mem_conn();
+        let wet = perishable_food(&conn, "湿食", Some(6));
+        perishable_food(&conn, "坏鲜食", None);
+
+        let foods = list_foods(&conn).unwrap();
+        let by_name = |name: &str| {
+            foods
+                .iter()
+                .find(|f| f.name == name)
+                .unwrap_or_else(|| panic!("找不到食物 {name}"))
+                .clone()
+        };
+        assert!(!by_name("种子").perishable, "种子预置不易腐");
+        assert_eq!(by_name("种子").retrieval_hours, None);
+        assert!(by_name("干虾仁").perishable);
+        assert_eq!(by_name("干虾仁").retrieval_hours, Some(24));
+        assert!(by_name("面包虫").perishable);
+        assert_eq!(by_name("面包虫").retrieval_hours, Some(24));
+        assert!(by_name("湿食").perishable);
+        assert_eq!(by_name("湿食").retrieval_hours, Some(6));
+        assert!(by_name("坏鲜食").perishable);
+        assert_eq!(by_name("坏鲜食").retrieval_hours, None);
+
+        let wet = get_food(&conn, wet).unwrap();
+        assert!(wet.perishable);
+        assert_eq!(wet.retrieval_hours, Some(6));
     }
 }

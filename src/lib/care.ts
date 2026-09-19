@@ -49,6 +49,40 @@ export function isFeeding(a: ColonyAction): boolean {
   return a.is_feeding;
 }
 
+/** 撤食块三态（票 02，Rust ActionTile.retrieval_state）：
+ *  none=无待撤 / pending=待撤未到期 / overdue=已超到期时刻 */
+export type RetrievalState = "none" | "pending" | "overdue";
+
+/** 撤食块（follow 性质）判定：与名字无关（follow 为撤食预置专属性质，票 01）。 */
+export function isRetrieval(a: ColonyAction): boolean {
+  return a.kind === "follow";
+}
+
+/** Rust 侧派生好的撤食三态（票 02）。types.ts 的 ColonyAction 尚未收录该字段，
+ *  以可选交叉类型收窄——旧载荷/非 follow 块缺字段按 none 兜底。 */
+export function retrievalStateOf(
+  a: ColonyAction & { retrieval_state?: RetrievalState },
+): RetrievalState {
+  return a.retrieval_state ?? "none";
+}
+
+/**
+ * 撤食块展示态（票 02）：三档、无倒计时文字——无待撤置灰不可点（前端 disabled）、
+ * 待撤未到期正常可点、逾期红（复用现有超期红样式）。冬眠不静音（发霉不等人）。
+ */
+export function retrievalTile(
+  a: ColonyAction & { retrieval_state?: RetrievalState },
+): TileView {
+  switch (retrievalStateOf(a)) {
+    case "overdue":
+      return { tone: "bad", text: "⚠ 该撤食了" };
+    case "pending":
+      return { tone: "ok", text: "待撤食" };
+    default:
+      return { tone: "none", text: "无待撤" };
+  }
+}
+
 /** 喂食 tile 悬停提示：逐食物"距上次"，超期的标出来。 */
 export function feedingTooltip(foods: FoodTileInfo[]): string {
   return foods

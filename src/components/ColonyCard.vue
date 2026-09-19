@@ -8,10 +8,21 @@
  * 菜单容器 v-show 保 DOM，按钮保留原类名
  * （edit-btn/hib-btn/wake-btn/past-btn），既有测试直接点这些按钮不受影响。
  * 冬眠横幅瘦成一条，「改期」入口保留。记账/冬眠成功抛 saved 让外层 refresh（数据驱动重算）。
+ * 票 02：撤食块（follow）走三态——无待撤置灰禁点 / 待撤可点 / 逾期红，点击开通用
+ * 打卡面板（QuickLogDialog）走 log_care 闭环；派生态随数据刷新自动重算。
  */
 import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type { Colony, ColonyAction } from "../types";
-import { actionTile, feedingTooltip, formatRecent, isFeeding, type TileView } from "../lib/care";
+import {
+  actionTile,
+  feedingTooltip,
+  formatRecent,
+  isFeeding,
+  isRetrieval,
+  retrievalStateOf,
+  retrievalTile,
+  type TileView,
+} from "../lib/care";
 import { hibernationBanner } from "../lib/hibernation";
 import { todayIso } from "../lib/dates";
 import FeedDialog from "./FeedDialog.vue";
@@ -36,8 +47,14 @@ const banner = computed(() =>
     : null,
 );
 
+// 撤食块（票 02）走三态视图：无待撤置灰禁点 / 待撤正常可点 / 逾期红，无倒计时；
+// 冬眠不静音（发霉不等人）。其余操作维持原 actionTile（含冬眠静音）。
 const tiles = computed(() =>
-  props.colony.actions.map((a) => ({ action: a, view: actionTile(a, hibernating.value) as TileView })),
+  props.colony.actions.map((a) => ({
+    action: a,
+    view: (isRetrieval(a) ? retrievalTile(a) : actionTile(a, hibernating.value)) as TileView,
+    disabled: isRetrieval(a) && retrievalStateOf(a) === "none",
+  })),
 );
 
 const recentLine = computed(() => formatRecent(props.colony.recent));
@@ -92,6 +109,8 @@ function onTile(a: ColonyAction) {
     showFeed.value = true;
     return;
   }
+  // 撤食块无待撤不响应（disabled 按钮本就不触发，这里兜底）
+  if (isRetrieval(a) && retrievalStateOf(a) === "none") return;
   quickAction.value = a;
   showQuick.value = true;
 }
@@ -135,12 +154,13 @@ function onFeedSaved() {
 
     <div class="tiles">
       <button
-        v-for="{ action: a, view } in tiles"
+        v-for="{ action: a, view, disabled } in tiles"
         :key="a.action_id"
         class="tile"
         :class="view.tone"
         :data-action-id="a.action_id"
         type="button"
+        :disabled="disabled"
         :title="a.is_feeding && a.foods.length > 0 ? feedingTooltip(a.foods) : undefined"
         @click="onTile(a)"
       >
