@@ -4,17 +4,28 @@
  * 状态下拉只开放 活跃/已结束——冬眠只能走卡片「开始冬眠/确认出眠」流程（定点修 5）；
  * 编辑冬眠中的窝时该状态以禁用项显示、保存不改变它。
  * 编辑模式额外提供「置为已结束」与「删除」（删除是否成功由 Rust 判定：仅无记录窝可删）。
+ * 编辑模式再有「周期提醒」小节（每窝周期票 04）：该窝每个启用操作一行可选周期，
+ * 撤食不出现；设/清走 set_colony_action_interval，保存一并提交。
  * 本组件自己发 IPC（create/update/archive/delete_colony），成功后抛 saved 让外层刷新。
  */
 import { computed, ref } from "vue";
-import { archiveColony, createColony, deleteColony, updateColony } from "../lib/ipc";
+import {
+  archiveColony,
+  createColony,
+  deleteColony,
+  setColonyActionInterval,
+  updateColony,
+} from "../lib/ipc";
 import type { Colony, ColonyStatus, LocationItem } from "../types";
 import { COLONY_STATUS_LABELS } from "../types";
 import {
   emptyForm,
   formFromColony,
   formToInput,
+  intervalRowsFromColony,
+  planIntervalSaves,
   validateColonyForm,
+  type IntervalRowInput,
 } from "../lib/colonyForm";
 import { todayIso } from "../lib/dates";
 import DatePickerPop from "./DatePickerPop.vue";
@@ -69,10 +80,25 @@ const locationOptions = computed<LocationItem[]>(() => {
   return enabled;
 });
 
+// 「周期提醒」小节（每窝周期票 04，仅编辑模式）：新建时窝还不存在、无处设周期。
+// 行 = 该窝每个启用操作（撤食不出现，tiles 本就只含启用操作）；已设行回显原始
+// 每窝周期（tiles 契约：interval_from_colony=true 时 effective_interval_days 即原始值）。
+const intervalRows = ref<IntervalRowInput[]>(
+  props.editing ? intervalRowsFromColony(props.editing) : [],
+);
+// 回显基线（setup 时定格）：保存时只把相对基线有变化的行发给后端
+const originalIntervalRows: IntervalRowInput[] = intervalRows.value.map((r) => ({ ...r }));
+
 async function submit() {
   const error = validateColonyForm(form.value, props.colonies, editingId);
   if (error) {
     formError.value = error;
+    return;
+  }
+  // 周期行先整组过校验：任一行非法就一行都不发（不落库，人话报错带上操作名）
+  const plan = planIntervalSaves(intervalRows.value, originalIntervalRows);
+  if (plan.error !== null) {
+    formError.value = plan.error;
     return;
   }
   const input = formToInput(form.value);
@@ -83,6 +109,13 @@ async function submit() {
       await createColony({ input });
     } else {
       await updateColony({ id: editingId, input });
+      for (const save of plan.saves) {
+        await setColonyActionInterval({
+          colonyId: editingId,
+          actionId: save.actionId,
+          intervalDays: save.intervalDays,
+        });
+      }
     }
     emit("saved");
   } catch (e) {
@@ -166,6 +199,32 @@ async function remove() {
         </option>
       </select>
 
+      <!-- 周期提醒（每窝周期票 04，仅编辑模式）：启用操作各一行，留空 = 未设 -->
+      <template v-if="editingId !== null">
+        <div class="field-label">周期提醒</div>
+        <p v-if="intervalRows.length === 0" class="interval-empty">该窝暂无启用的操作</p>
+        <div v-for="row in intervalRows" :key="row.actionId" class="interval-row">
+          <span class="interval-name">{{ row.actionName }}</span>
+          <input
+            v-model="row.raw"
+            class="interval-input"
+            type="text"
+            inputmode="numeric"
+            placeholder="未设"
+            :aria-label="`${row.actionName}的每窝周期（天）`"
+          />
+          <span class="interval-unit">天</span>
+          <button
+            class="btn interval-clear-btn"
+            type="button"
+            :aria-label="`清除${row.actionName}的每窝周期`"
+            @click="row.raw = ''"
+          >
+            清除
+          </button>
+        </div>
+      </template>
+
       <p v-if="formError" class="form-error">{{ formError }}</p>
 
       <div class="dlg-btns">
@@ -236,6 +295,47 @@ async function remove() {
 
 .dialog :deep(.dp-trigger) {
   width: 100%;
+}
+
+/* 周期提醒行（每窝周期票 04）：名字占一行富余，天数输入窄条 + 清除小按钮。
+   放在既有 .dialog input[type="text"] 通用规则之后，同特异性后者生效收窄宽度 */
+.interval-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.interval-name {
+  flex: 1;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dialog input.interval-input {
+  width: 76px;
+  flex: none;
+  padding: 5px 8px;
+}
+
+.interval-unit {
+  font-size: 12px;
+  color: var(--muted);
+  flex: none;
+}
+
+.btn.interval-clear-btn {
+  flex: none;
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.interval-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
 }
 
 .form-error {

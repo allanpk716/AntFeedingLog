@@ -322,6 +322,16 @@ export const updateColony = cmdFn<{ id: number; input: ColonyInput }, void>("upd
 export const archiveColony = cmdFn<{ id: number }, void>("archive_colony");
 export const deleteColony = cmdFn<{ id: number }, void>("delete_colony");
 
+// ── 每窝周期（ColonyFormDialog「周期提醒」小节）：桌面专属命令，不入网页端
+//    HTTP 白名单（webui_server.rs 侧保持不动），网页端本也无窝编辑入口 ──
+
+/** 设/清某窝某操作的每窝周期：intervalDays = 1..365 整数设/改（已设即改），
+ *  null = 清除删行（未设时也成功，幂等）；人话报错以字符串 reject。 */
+export const setColonyActionInterval = cmdFn<
+  { colonyId: number; actionId: number; intervalDays: number | null },
+  void
+>("set_colony_action_interval");
+
 // ── 记账（ColonyCard → FeedDialog / QuickLogDialog）──
 
 export const listFoods = cmdFn<void, FoodItem[]>("list_foods");
