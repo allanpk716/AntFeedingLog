@@ -604,7 +604,7 @@ describe("设置 · 字典管理（票 04）", () => {
     await dlg.find(".tab-body .btn.primary").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("save_food", {
-      input: { id: 1, name: "瓜子", sort: 0, suggested_interval_days: 5 },
+      input: { id: 1, name: "瓜子", sort: 0, suggested_interval_days: 5, perishable: false, retrieval_hours: null },
     });
 
     invokeMock.mockClear();
@@ -683,11 +683,13 @@ describe("设置 · 通知（票 06）", () => {
     const dlg = await openNotifyTab(wrapper);
 
     const boxes = dlg.findAll(".notify-row input[type=checkbox]");
-    // 总开关 + 开机自启（票 09）；分类子开关已作废（反馈第二轮 Q7/Q9）
-    expect(boxes.length).toBe(2);
+    // 总开关 + 撤食提醒（票 05）+ 开机自启（票 09）；分类子开关已作废（反馈第二轮 Q7/Q9）
+    expect(boxes.length).toBe(3);
     expect((boxes[0].element as HTMLInputElement).checked).toBe(true);
-    // 开机自启默认开
+    // 撤食提醒默认开
     expect((boxes[1].element as HTMLInputElement).checked).toBe(true);
+    // 开机自启默认开
+    expect((boxes[2].element as HTMLInputElement).checked).toBe(true);
     expect((dlg.find(".days-input").element as HTMLInputElement).value).toBe("7");
 
     await dlg.find(".days-input").setValue("3");
@@ -703,6 +705,7 @@ describe("设置 · 通知（票 06）", () => {
         notify_master_enabled: true,
         notify_overdue_enabled: true, // 分类开关作废：前端固定回写 true（键保留在库里）
         notify_hibernation_enabled: true,
+        notify_retrieval_enabled: true, // 撤食提醒开关（票 05）
         wake_remind_days_ahead: 3,
         autostart_enabled: true,
       },
@@ -719,7 +722,7 @@ describe("设置 · 通知（票 06）", () => {
     const dlg = await openNotifyTab(wrapper);
 
     const boxes = dlg.findAll(".notify-row input[type=checkbox]");
-    await boxes[1].setValue(false);
+    await boxes[2].setValue(false); // 自启在撤食提醒开关之后（票 05 加了一档）
 
     invokeMock.mockClear();
     invokeMock.mockResolvedValueOnce({ ...currentSettings, autostart_enabled: false });
@@ -733,7 +736,7 @@ describe("设置 · 通知（票 06）", () => {
     const boxesAfter = wrapper
       .find(".settings-dialog")
       .findAll(".notify-row input[type=checkbox]");
-    expect((boxesAfter[1].element as HTMLInputElement).checked).toBe(false);
+    expect((boxesAfter[2].element as HTMLInputElement).checked).toBe(false);
   });
 
   it("通知 tab：提前天数非法时报错且不落库", async () => {
