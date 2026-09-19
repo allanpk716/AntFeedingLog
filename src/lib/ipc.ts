@@ -218,13 +218,15 @@ function sseConnect(): void {
   state.connecting = true;
   fetchSseTicket()
     .then((ticket) => {
-      const cur = browserSse;
-      if (!cur) return; // 取票期间已全部退订
-      cur.connecting = false;
+      // 归属判定用捕获的 state（票 08 停靠）：取票期间若全部退订又重新订阅，
+      // browserSse 已是新对象——旧一轮读到「当前值」会把票据连到新状态上，
+      // 造成一条多余连接；只有「自己那一轮还活着」才继续。
+      if (browserSse !== state) return;
+      state.connecting = false;
       const es = new EventSource(`/api/sse?ticket=${encodeURIComponent(ticket)}`);
-      cur.es = es;
+      state.es = es;
       es.onopen = () => {
-        cur.attempt = 0; // 连上过：退避归零
+        state.attempt = 0; // 连上过：退避归零
       };
       es.onmessage = (ev) => {
         try {
@@ -246,16 +248,16 @@ function sseConnect(): void {
       es.onerror = () => {
         // 票据一次性：原生自动重连只会拿旧票撞 401 —— close 关掉它，重取票据再来
         es.close();
-        if (browserSse === cur) {
-          cur.es = null;
+        if (browserSse === state) {
+          state.es = null;
           scheduleSseReconnect();
         }
       };
     })
     .catch(() => {
-      const cur = browserSse;
-      if (!cur) return;
-      cur.connecting = false;
+      // 同 then：只给自己那一轮收尾（票 08 停靠）
+      if (browserSse !== state) return;
+      state.connecting = false;
       scheduleSseReconnect();
     });
 }

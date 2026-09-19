@@ -27,6 +27,12 @@ function mountDlg() {
 beforeEach(() => { invokeMock.mockReset(); });
 
 describe("QuickLogDialog", () => {
+  it("手机竖屏断点类：弹窗挂 vp-dialog（≤480px 输入放大/大按钮的媒体查询落点，webui-checkin 票 08）", () => {
+    const w = mountDlg();
+    expect(w.find(".vp-dialog").exists()).toBe(true);
+    expect(w.find(".vp-dialog").classes()).toContain("quick-dialog");
+  });
+
   it("取消：直接关闭，不触发 log_care", async () => {
     const w = mountDlg();
     await w.find(".cancel-btn").trigger("click");

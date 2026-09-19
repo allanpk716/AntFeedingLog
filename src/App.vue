@@ -149,7 +149,7 @@ onMounted(() => {
           <span class="cnt">{{ g.colonies.length }} 窝</span>
           <div class="rule"></div>
         </div>
-        <div class="cards">
+        <div class="cards vp-cards">
           <ColonyCard
             v-for="c in g.colonies"
             :key="c.id"
@@ -165,7 +165,7 @@ onMounted(() => {
           已结束（{{ endedColonies.length }}）{{ endedOpen ? "▲ 收起" : "▼ 展开" }}
         </button>
         <div v-show="endedOpen" class="ended-section">
-          <div class="cards">
+          <div class="cards vp-cards">
             <ColonyCard
               v-for="c in endedColonies"
               :key="c.id"
@@ -408,5 +408,23 @@ onMounted(() => {
 .new-colony:hover {
   border-color: var(--accent);
   color: var(--accent-deep);
+}
+
+/* ── 手机竖屏（webui-checkin 票 08）：≤480px 单列卡片 + 顶栏可换行；
+   vp-cards 是媒体查询落点（断点类名供组件测试断言——jsdom 不套用媒体查询）── */
+@media (max-width: 480px) {
+  .topbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+
+  .container {
+    padding: 0 12px 60px;
+  }
+
+  .vp-cards {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

@@ -1,25 +1,35 @@
 <script setup lang="ts">
 /**
- * 巢况时间线弹窗（webui-checkin 票 02；照片随票 07）：新增/编辑/删除一窝的
+ * 巢况时间线弹窗（webui-checkin 票 02；照片随票 07/08）：新增/编辑/删除一窝的
  * 巢况登记（日期、蚁后数、工蚁数都可空、换巢标记、备注），每条登记带照片
  * 上传与缩略图网格。
  * - 时间线按日期倒序（Rust 排好），最早一条标「基线」chip（基线 = 最早登记日期，
  *   纯投影：改首条日期/删首条后 Rust 侧自然顺延）；
  * - 至少一项非空才可提交（前端先行拦截，后端兜底）；日期可补录过去，未来日期
  *   后端拒绝；
- * - 照片（票 07）：「传照片」→ pick_photo_files 多选 → attach_photos（Rust 校验
- *   重编码 + 写入协议）→ 重拉时间线；缩略图经 asset 协议读数据目录 photos/
- *   （lib/photos.ts），点开大图；文件缺失（库有元数据、磁盘没文件）显示占位符
- *   提示，不崩溃；删除确认文案补「该登记的 N 张照片将一并删除」；
+ * - 照片（票 07 桌面 / 票 08 网页端，同一套组件按环境分流）：
+ *   「传照片」桌面走 pick_photo_files 系统文件对话框 → attach_photos；
+ *   浏览器走隐藏 <input type=file>（capture=environment 手机直调相机）→
+ *   uploadPhotosHttp（multipart POST /api/photos）——两边都由 Rust 校验重编码 +
+ *   写入协议落库，成功后重拉时间线；**失败分支也重拉**（批量可能部分成功，
+ *   已落库的照片立即出现）；
+ *   缩略图桌面经 asset 协议读数据目录 photos/（lib/photos.ts photoSrc），浏览器
+ *   经 loadPhotoBlobUrl fetch blob（<img> 带不了 Authorization 头，token 不进
+ *   URL），组件卸载 revokeObjectUrl 释放；点开大图；文件缺失（库有元数据、
+ *   磁盘没文件）显示占位符提示，不崩溃；删除确认文案补「该登记的 N 张照片
+ *   将一并删除」；
+ * - 手机竖屏（票 08）：≤480px 视口单列表单 + 大号按钮（.vp-form-stack 媒体查询
+ *   落点，断点类名供组件测试断言——jsdom 不套用媒体查询）；
  * - 删除两段确认照 LogListPage 先例；
- * - 巢况永不参与提醒：本组件只发 save/list/update/delete_checkin/attach_photos。
+ * - 巢况永不参与提醒：本组件只发 save/list/update/delete_checkin 与照片通路。
  * 本组件自持状态、自己发 IPC，任何写成功后抛 saved 让外层刷新（卡片摘要即时跟上）。
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import {
   attachPhotos,
   deleteCheckin,
   getPhotoAbsDir,
+  isTauri,
   listCheckins,
   pickPhotoFiles,
   saveCheckin,
@@ -27,7 +37,7 @@ import {
 } from "../lib/ipc";
 import type { Colony, NestCheckin, NestPhotoMeta } from "../types";
 import { checkinEntryLine } from "../lib/checkin";
-import { photoSrc } from "../lib/photos";
+import { loadPhotoBlobUrl, photoSrc, revokeObjectUrl, uploadPhotosHttp } from "../lib/photos";
 import { todayIso } from "../lib/dates";
 
 const props = defineProps<{ colony: Colony }>();
@@ -77,13 +87,16 @@ function resetForm() {
 async function load() {
   try {
     entries.value = await listCheckins({ colonyId: props.colony.id });
+    if (!isTauri()) {
+      void loadPhotoBlobs(entries.value.flatMap((c) => c.photos));
+    }
     loadError.value = "";
   } catch (e) {
     loadError.value = String(e);
   }
 }
 
-// ── 照片（webui-checkin 票 07）：上传 / 网格 / 大图 / 缺图占位 ──
+// ── 照片（webui-checkin 票 07/08）：上传 / 网格 / 大图 / 缺图占位 ──
 
 const photoAbsDir = ref("");
 const photoBusy = ref(false);
@@ -93,14 +106,47 @@ const missingPhotoIds = ref<Set<number>>(new Set());
 /** 大图查看器当前照片；null = 关闭。 */
 const viewerPhoto = ref<NestPhotoMeta | null>(null);
 
+/** 浏览器侧 objectURL 表（照片 id → blob: URL）；桌面走 asset 协议不经此。 */
+const blobUrls = ref<Record<number, string>>({});
+
 function photoSrcOf(p: NestPhotoMeta): string {
+  if (!isTauri()) {
+    return blobUrls.value[p.id] ?? "";
+  }
   return photoSrc(p.rel_path, photoAbsDir.value);
 }
 
+/** 浏览器取图（票 08）：逐张 fetch blob（时间线照片量小，串行即可）；
+ * 失败标 missing → 「文件缺失」占位。换数据后释放不再在场的旧 URL。 */
+async function loadPhotoBlobs(list: NestPhotoMeta[]) {
+  const keep = new Set(list.map((p) => p.id));
+  for (const [id, url] of Object.entries(blobUrls.value)) {
+    if (!keep.has(Number(id))) {
+      revokeObjectUrl(url);
+      delete blobUrls.value[Number(id)];
+    }
+  }
+  for (const p of list) {
+    if (blobUrls.value[p.id] !== undefined) continue;
+    try {
+      blobUrls.value[p.id] = await loadPhotoBlobUrl(p.rel_path);
+    } catch {
+      markPhotoMissing(p.id);
+    }
+  }
+}
+
+onBeforeUnmount(() => {
+  for (const url of Object.values(blobUrls.value)) {
+    revokeObjectUrl(url);
+  }
+  blobUrls.value = {};
+});
+
 type PhotoState = "ok" | "missing" | "unavailable";
 
-/** 缺图三态：ok=有 URL；missing=加载失败（文件缺失）；unavailable=无 URL 可用
- * （照片根目录未就绪/浏览器环境）。后两态都渲染占位符，不崩溃。 */
+/** 缺图三态：ok=有 URL；missing=加载失败（文件缺失）；unavailable=URL 未就绪
+ *（桌面照片根目录未就绪/浏览器 blob 还在路上）。后两态都渲染占位符，不崩溃。 */
 function photoState(p: NestPhotoMeta): PhotoState {
   if (missingPhotoIds.value.has(p.id)) return "missing";
   return photoSrcOf(p) === "" ? "unavailable" : "ok";
@@ -112,7 +158,16 @@ function markPhotoMissing(id: number) {
   missingPhotoIds.value = next;
 }
 
-async function addPhotos(c: NestCheckin) {
+/** 上传成功后的公共收尾：清缺图标记、重拉时间线、通知外层刷新。 */
+async function afterPhotosLanded() {
+  missingPhotoIds.value = new Set();
+  await load();
+  emit("saved");
+}
+
+// ── 桌面上传（票 07）：系统文件对话框 → attach_photos ──
+
+async function addPhotosDesktop(c: NestCheckin) {
   photoError.value = "";
   let picked: string[] | null = null;
   try {
@@ -125,11 +180,46 @@ async function addPhotos(c: NestCheckin) {
   photoBusy.value = true;
   try {
     await attachPhotos({ checkinId: c.id, paths: picked });
-    missingPhotoIds.value = new Set();
-    await load();
-    emit("saved");
+    await afterPhotosLanded();
   } catch (e) {
     photoError.value = String(e);
+    // 批量可能部分成功（前几张已完整落库）：也重拉时间线让已到的照片出现
+    await load();
+  } finally {
+    photoBusy.value = false;
+  }
+}
+
+// ── 浏览器上传（票 08）：隐藏 file input（capture=environment 手机直调相机）
+// → uploadPhotosHttp（multipart POST /api/photos，客户端预检 15MB/9 张）──
+
+const fileInput = ref<HTMLInputElement | null>(null);
+/** 待上传的登记 id（input change 时无从知道点的是哪条，点击时记下）。 */
+let uploadTargetId = 0;
+
+function onAddPhotos(c: NestCheckin) {
+  if (isTauri()) {
+    void addPhotosDesktop(c);
+    return;
+  }
+  uploadTargetId = c.id;
+  fileInput.value?.click();
+}
+
+async function onFilesChosen(ev: Event) {
+  const input = ev.target as HTMLInputElement;
+  const files = Array.from(input.files ?? []);
+  input.value = ""; // 清空：同一批文件二次选择也能触发 change
+  if (files.length === 0) return; // 用户取消
+  photoError.value = "";
+  photoBusy.value = true;
+  try {
+    await uploadPhotosHttp(uploadTargetId, files);
+    await afterPhotosLanded();
+  } catch (e) {
+    photoError.value = String(e);
+    // 批量部分成功也重拉（服务端逐张落库，失败时可能已到几张）
+    await load();
   } finally {
     photoBusy.value = false;
   }
@@ -243,8 +333,20 @@ async function requestDelete(c: NestCheckin) {
 
 <template>
   <div class="overlay" @click.self="$emit('close')">
-    <div class="dialog checkin-dialog">
+    <div class="dialog checkin-dialog vp-form-stack">
       <h3>巢况时间线 · {{ colony.name }}</h3>
+
+      <!-- 浏览器照片上传（票 08）：capture=environment 手机直调相机；
+           桌面忽略此 input（走 pick_photo_files 系统对话框） -->
+      <input
+        ref="fileInput"
+        class="photo-file-input"
+        type="file"
+        accept="image/*"
+        multiple
+        capture="environment"
+        @change="onFilesChosen"
+      />
 
       <p v-if="loadError" class="form-error">{{ loadError }}</p>
       <p v-if="photoError" class="form-error photo-error">{{ photoError }}</p>
@@ -294,7 +396,7 @@ async function requestDelete(c: NestCheckin) {
                 type="button"
                 :disabled="photoBusy"
                 title="选择照片（自动压缩：长边 2048、JPEG，原图与 GPS 信息不留）"
-                @click="addPhotos(c)"
+                @click="onAddPhotos(c)"
               >
                 {{ photoBusy ? "处理中…" : "传照片" }}
               </button>
@@ -681,5 +783,54 @@ div.photo-missing {
 .btn:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+/* 隐藏的浏览器上传入口（票 08）：视觉隐藏但可 programmatic click */
+.photo-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* ── 手机竖屏（票 08）：≤480px 单列表单 + 大号可点目标；vp-form-stack 是
+   媒体查询落点（断点类名供组件测试断言——jsdom 不套用媒体查询）── */
+@media (max-width: 480px) {
+  .vp-form-stack.dialog {
+    padding: 12px;
+    max-height: 92vh;
+  }
+
+  .vp-form-stack .form-grid {
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .vp-form-stack input[type="date"],
+  .vp-form-stack input[type="number"],
+  .vp-form-stack textarea {
+    padding: 11px 12px;
+    font-size: 16px; /* ≥16px 防 iOS 聚焦自动放大 */
+  }
+
+  .vp-form-stack .entry-btn {
+    padding: 6px 14px;
+    font-size: 13px;
+  }
+
+  .vp-form-stack .btn {
+    padding: 11px 22px;
+    font-size: 15px;
+  }
+
+  .vp-form-stack .photo-thumb {
+    width: 88px;
+    height: 88px;
+  }
+
+  .vp-form-stack .dlg-btns {
+    flex-direction: row-reverse;
+  }
 }
 </style>

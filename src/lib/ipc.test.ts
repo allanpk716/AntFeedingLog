@@ -340,6 +340,33 @@ describe("浏览器 SSE（data-version 订阅，票 06）", () => {
     expect(FakeEventSource.instances.length).toBe(2);
   });
 
+  it("取票期间退订并重新订阅：旧一轮的票据不建连，新一轮独立取票（票 08 停靠）", async () => {
+    // sseConnect 的 then/catch 必须用捕获的 state 判归属：退订后重订时
+    // browserSse 已换成新对象，旧一轮若读「当前值」会把票据连到新状态上，
+    // 造成一条多余连接（与新连接并存、还互相覆写 es 字段）。
+    vi.useFakeTimers();
+    let ticketSeq = 0;
+    const fetchMock = vi.fn(async () => {
+      ticketSeq += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ ticket: `tick-${ticketSeq}`, expires_in: 60 }),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("EventSource", FakeEventSource);
+
+    const un1 = await subscribe("data-version", () => {});
+    un1(); // 第一轮取票还挂在天上（未 flush 微任务）就退订
+    await subscribe("data-version", () => {}); // 第二轮：全新的连接状态
+    await vi.advanceTimersByTimeAsync(0);
+
+    // 旧一轮的取票 resolve 也不得建连；只有新一轮的一张连接
+    expect(FakeEventSource.instances.length).toBe(1);
+    expect(FakeEventSource.instances[0].url).toBe("/api/sse?ticket=tick-2");
+  });
+
   it("取票失败（服务不可达）不建连，同样按退避重试", async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn(async () => {

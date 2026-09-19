@@ -143,6 +143,13 @@ beforeEach(() => {
 });
 
 describe("首页卡片墙", () => {
+  it("手机竖屏断点类：卡片墙挂 vp-cards（≤480px 单列的媒体查询落点，webui-checkin 票 08）", async () => {
+    const wrapper = await mountApp();
+    const cards = wrapper.findAll(".vp-cards");
+    expect(cards.length).toBeGreaterThanOrEqual(1);
+    expect(cards[0].classes()).toContain("cards");
+  });
+
   it("按地点清单顺序分组，卡片含名字/物种徽章/状态徽章/饲养天数大数字", async () => {
     const wrapper = await mountApp();
 

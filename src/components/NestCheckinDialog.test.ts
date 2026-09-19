@@ -5,9 +5,24 @@ import type { Colony, NestCheckin } from "../types";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（沿 QuickLogDialog.test.ts 先例）
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+// 票 08：网页端照片通路（blob 取图/HTTP 上传）打桩；photoSrc 等 桌面既有函数透传
+const { uploadPhotosHttpMock, loadPhotoBlobUrlMock, revokeObjectUrlMock } = vi.hoisted(() => ({
+  uploadPhotosHttpMock: vi.fn(),
+  loadPhotoBlobUrlMock: vi.fn(),
+  revokeObjectUrlMock: vi.fn(),
+}));
 vi.mock("../lib/ipc", async (importOriginal) => {
   const { ipcModuleMock } = await import("../testing/ipcMock");
   return ipcModuleMock(invokeMock)(importOriginal);
+});
+vi.mock("../lib/photos", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/photos")>();
+  return {
+    ...actual,
+    uploadPhotosHttp: uploadPhotosHttpMock,
+    loadPhotoBlobUrl: loadPhotoBlobUrlMock,
+    revokeObjectUrl: revokeObjectUrlMock,
+  };
 });
 
 const colony: Colony = {
@@ -413,5 +428,131 @@ describe("NestCheckinDialog 巢况照片（webui-checkin 票 07）", () => {
 
     await w.find(".photo-viewer").trigger("click");
     expect(w.find(".photo-viewer").exists()).toBe(false);
+  });
+});
+
+// ── 网页端（webui-checkin 票 08）：浏览器照片通路 + 手机竖屏断点类 ─────────
+
+describe("NestCheckinDialog 网页端（webui-checkin 票 08）", () => {
+  const REL = "1/6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg";
+  const browserPhoto = {
+    id: 11,
+    checkin_id: 7,
+    rel_path: REL,
+    original_name: "ok.jpg",
+    note: "",
+  };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    uploadPhotosHttpMock.mockReset();
+    loadPhotoBlobUrlMock.mockReset();
+    revokeObjectUrlMock.mockReset();
+    // 浏览器形态：不注入 __TAURI_INTERNALS__（isTauri() === false）
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  /** 浏览器形态挂载：list_checkins 回 entries，其余命令回 null。 */
+  async function mountBrowser(entries: NestCheckin[]) {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_checkins" ? entries : null,
+    );
+    const w = mount(NestCheckinDialog, { props: { colony } });
+    await flushPromises();
+    return w;
+  }
+
+  it("竖屏断点类挂载（≤480px 媒体查询的落点，断点类名可测）", async () => {
+    const w = await mountBrowser([]);
+    expect(w.find(".vp-form-stack").exists()).toBe(true);
+  });
+
+  it("上传入口是 file input：accept=image/* + multiple + capture=environment（手机直调相机）；点按钮不调 pick_photo_files", async () => {
+    const w = await mountBrowser([checkin({ id: 7 })]);
+    const input = w.find(".photo-file-input");
+    expect(input.exists()).toBe(true);
+    expect(input.attributes("accept")).toBe("image/*");
+    expect(input.attributes("multiple")).toBeDefined();
+    expect(input.attributes("capture")).toBe("environment");
+
+    invokeMock.mockClear();
+    await w.find(".photo-add-btn").trigger("click");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "pick_photo_files")).toBe(false);
+  });
+
+  it("选文件后 uploadPhotosHttp(checkinId, files) → 重拉时间线 + 抛 saved；input 值清空可重选同一批", async () => {
+    const w = await mountBrowser([checkin({ id: 7 })]);
+    uploadPhotosHttpMock.mockResolvedValue([{ ...browserPhoto }]);
+    // 上传成功后的重拉：时间线带上新照片
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_checkins" ? [checkin({ id: 7, photos: [{ ...browserPhoto }] })] : null,
+    );
+
+    // 先点「传照片」记下目标登记（真实交互顺序），再模拟选完文件触发 change
+    await w.find(".photo-add-btn").trigger("click");
+    const files = [new File(["a"], "a.jpg"), new File(["b"], "b.png")];
+    const input = w.find(".photo-file-input");
+    Object.defineProperty(input.element, "files", { value: files, configurable: true });
+    await input.trigger("change");
+    await flushPromises();
+
+    expect(uploadPhotosHttpMock).toHaveBeenCalledWith(7, files);
+    expect(w.emitted("saved")).toHaveLength(1);
+    expect((input.element as HTMLInputElement).value).toBe("");
+    // 时间线重拉出照片缩略图（blob 通路在下一用例细验）
+    expect(w.findAll(".entry-photos").length).toBe(1);
+  });
+
+  it("上传失败（批量可能部分成功）：错误展示 + 仍重拉时间线，不抛 saved", async () => {
+    const w = await mountBrowser([checkin({ id: 7 })]);
+    uploadPhotosHttpMock.mockRejectedValue("一次最多上传 9 张照片");
+
+    await w.find(".photo-add-btn").trigger("click");
+    const input = w.find(".photo-file-input");
+    Object.defineProperty(input.element, "files", {
+      value: [new File(["a"], "a.jpg")],
+      configurable: true,
+    });
+    await input.trigger("change");
+    await flushPromises();
+
+    expect(w.find(".photo-error").text()).toContain("最多上传 9 张");
+    // 失败分支也重拉（初始挂载一次 + 失败后一次）：已落库的部分照片立即出现
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "list_checkins").length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(w.emitted("saved")).toBeUndefined();
+  });
+
+  it("浏览器缩略图走 loadPhotoBlobUrl 的 objectURL；取图失败标「文件缺失」占位", async () => {
+    const okRel = "1/6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg";
+    loadPhotoBlobUrlMock.mockImplementation(async (rel: string) =>
+      rel === okRel ? "blob:ok-url" : Promise.reject("HTTP 404"),
+    );
+    const w = await mountBrowser([
+      checkin({
+        id: 7,
+        photos: [
+          { ...browserPhoto, rel_path: okRel },
+          { ...browserPhoto, id: 12, rel_path: "1/gone.jpg", original_name: null },
+        ],
+      }),
+    ]);
+    await flushPromises();
+
+    expect(loadPhotoBlobUrlMock).toHaveBeenCalledWith(okRel);
+    expect(loadPhotoBlobUrlMock).toHaveBeenCalledWith("1/gone.jpg");
+    expect(w.find('img[title="ok.jpg"]').attributes("src")).toBe("blob:ok-url");
+    expect(w.find(".photo-missing").exists()).toBe(true);
+  });
+
+  it("组件卸载释放全部 objectURL（不泄漏）", async () => {
+    loadPhotoBlobUrlMock.mockResolvedValue("blob:bye");
+    const w = await mountBrowser([checkin({ id: 7, photos: [{ ...browserPhoto }] })]);
+    await flushPromises();
+    expect(w.find('img[title="ok.jpg"]').exists()).toBe(true);
+
+    w.unmount();
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:bye");
   });
 });
