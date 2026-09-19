@@ -14,6 +14,7 @@ const existing: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
 ];
 

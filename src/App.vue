@@ -6,8 +6,8 @@
  * 设置弹窗（票 04）：字典管理三 tab，任何变更抛 changed → refresh，卡片红/灰即时跟上。
  */
 import { computed, onMounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { getWebUiWizardDone, isTauri, listColonies, listLocations, subscribe } from "./lib/ipc";
+import { watchDataVersion } from "./lib/versionSync";
 import type { Colony, LocationItem } from "./types";
 import { groupColonies, splitColonies } from "./lib/home";
 import { todayLabel } from "./lib/dates";
@@ -16,6 +16,7 @@ import ColonyFormDialog from "./components/ColonyFormDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import StatsPage from "./components/StatsPage.vue";
 import LogListPage from "./components/LogListPage.vue";
+import WebUiWizard from "./components/WebUiWizard.vue";
 
 /** 顶栏三页 nav（票 08 接活「记录」） */
 type Page = "home" | "stats" | "logs";
@@ -29,6 +30,8 @@ const showForm = ref(false);
 const editing = ref<Colony | null>(null);
 const showSettings = ref(false);
 const endedOpen = ref(false);
+/** 网页端首启向导（webui-checkin 票 03）：启动时查到「未做」才弹一次。 */
+const showWebUiWizard = ref(false);
 
 const activeColonies = computed(() => splitColonies(colonies.value).active);
 const endedColonies = computed(() => splitColonies(colonies.value).ended);
@@ -37,8 +40,8 @@ const groups = computed(() => groupColonies(activeColonies.value, locations.valu
 async function refresh() {
   try {
     const [cols, locs] = await Promise.all([
-      invoke<Colony[]>("list_colonies"),
-      invoke<LocationItem[]>("list_locations"),
+      listColonies(),
+      listLocations(),
     ]);
     colonies.value = cols;
     locations.value = locs;
@@ -74,11 +77,27 @@ function onSettingsClosed() {
 
 onMounted(() => {
   void refresh();
-  // 恢复完成广播（数据安全二期票 04）：整库被替换，各页数据全部重拉——
-  // 首页在此刷新；统计/记录页离开再进时按 v-if 重挂载自然重拉
-  void listen("db-restored", () => {
+  // 恢复完成广播（数据安全二期票 04，语义=无条件刷新，票 06 不改）：整库被
+  // 替换，各页数据全部重拉——首页在此刷新；统计/记录页离开再进时按 v-if
+  // 重挂载自然重拉
+  void subscribe("db-restored", () => {
     void refresh();
   });
+  // 数据版本广播（webui-checkin 票 06）：任一端记录、开着的一端自动刷新——
+  // 同 epoch 版本落后重拉当前页；epoch 变（电脑重启过）无条件重拉。桌面走
+  // data-version 事件、浏览器走 SSE（versionSync 对账）；恢复完成在浏览器侧
+  // 也经恢复后的版本帧到达（服务端已做跨恢复单调抬升）。本组件是根，常驻
+  // 不卸载，与 db-restored 同款不退订。
+  void watchDataVersion(() => {
+    void refresh();
+  });
+  // 网页端首启向导（webui-checkin 票 03）：只在明确查到「未做」（false）时弹；
+  // 查询失败（网页端浏览器态/异常）静默——向导不该挡住正常使用
+  void getWebUiWizardDone()
+    .then((done) => {
+      if (done === false) showWebUiWizard.value = true;
+    })
+    .catch(() => {});
 });
 </script>
 
@@ -96,6 +115,7 @@ onMounted(() => {
           首页
         </button>
         <button
+          v-if="isTauri()"
           class="tab"
           :class="{ active: page === 'stats' }"
           type="button"
@@ -114,8 +134,9 @@ onMounted(() => {
       </nav>
       <div class="today">{{ todayLabel() }}</div>
       <div class="tools">
-        <button class="ghost-btn new-top-btn" type="button" @click="openCreate">＋ 新建窝</button>
-        <button class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
+        <!-- 终局评审：新建窝/设置是桌面专属（网页端 API 白名单本就挡住），浏览器不渲染入口 -->
+        <button v-if="isTauri()" class="ghost-btn new-top-btn" type="button" @click="openCreate">＋ 新建窝</button>
+        <button v-if="isTauri()" class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
           ⚙ 设置
         </button>
       </div>
@@ -133,7 +154,7 @@ onMounted(() => {
           <span class="cnt">{{ g.colonies.length }} 窝</span>
           <div class="rule"></div>
         </div>
-        <div class="cards">
+        <div class="cards vp-cards">
           <ColonyCard
             v-for="c in g.colonies"
             :key="c.id"
@@ -149,7 +170,7 @@ onMounted(() => {
           已结束（{{ endedColonies.length }}）{{ endedOpen ? "▲ 收起" : "▼ 展开" }}
         </button>
         <div v-show="endedOpen" class="ended-section">
-          <div class="cards">
+          <div class="cards vp-cards">
             <ColonyCard
               v-for="c in endedColonies"
               :key="c.id"
@@ -181,6 +202,7 @@ onMounted(() => {
       @close="onSettingsClosed"
       @changed="onSettingsChanged"
     />
+    <WebUiWizard v-if="showWebUiWizard" @close="showWebUiWizard = false" />
   </div>
 </template>
 
@@ -385,5 +407,23 @@ onMounted(() => {
 
 .ended-section {
   margin-top: 12px;
+}
+
+/* ── 手机竖屏（webui-checkin 票 08）：≤480px 单列卡片 + 顶栏可换行；
+   vp-cards 是媒体查询落点（断点类名供组件测试断言——jsdom 不套用媒体查询）── */
+@media (max-width: 480px) {
+  .topbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px;
+  }
+
+  .container {
+    padding: 0 12px 60px;
+  }
+
+  .vp-cards {
+    grid-template-columns: 1fr;
+  }
 }
 </style>

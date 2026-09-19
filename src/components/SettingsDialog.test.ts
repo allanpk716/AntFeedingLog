@@ -1,15 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import SettingsDialog from "./SettingsDialog.vue";
-import type { BackupConfigInfo, RestoreSummary } from "../types";
+import type { BackupConfigInfo, RestoreSummary, WebUiConfigInfo } from "../types";
 
-// 不依赖 Tauri 运行时：mock 掉 IPC 与事件监听（沿 LogListPage.test.ts 先例）
-const { invokeMock, listenStub } = vi.hoisted(() => ({
-  invokeMock: vi.fn(),
-  listenStub: vi.fn(async () => () => {}),
-}));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: listenStub }));
+// 不依赖 Tauri 运行时：统一 mock 调用层（命令包装按 cmdName 透传给唯一的
+// invokeMock；事件订阅走 mock 工厂内置的立即退订空桩）
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+vi.mock("../lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("../testing/ipcMock");
+  return ipcModuleMock(invokeMock)(importOriginal);
+});
 
 function baseMock(updateState: object = { status: "idle" }) {
   invokeMock.mockImplementation(async (cmd: string) => {
@@ -19,13 +19,9 @@ function baseMock(updateState: object = { status: "idle" }) {
       case "list_locations":
         return [];
       case "get_settings":
-        return {
-          notify_master_enabled: true,
-          notify_overdue_enabled: true,
-          notify_hibernation_enabled: true,
-          wake_remind_days_ahead: 7,
-          autostart_enabled: true,
-        };
+        return settingsFixture();
+      case "pushover_status":
+        return { source: "none", configured: false };
       case "get_app_version":
         return "0.1.0";
       case "get_update_state":
@@ -34,6 +30,62 @@ function baseMock(updateState: object = { status: "idle" }) {
         return null;
     }
   });
+}
+
+/** 票 11：设置回放统一带凭据两键（覆盖处用参数换值） */
+function settingsFixture(overrides: Partial<{ pushover_user: string; pushover_token: string }> = {}) {
+  return {
+    notify_master_enabled: true,
+    notify_overdue_enabled: true,
+    notify_hibernation_enabled: true,
+    wake_remind_days_ahead: 7,
+    autostart_enabled: true,
+    pushover_user: "",
+    pushover_token: "",
+    ...overrides,
+  };
+}
+
+// ── 通知 tab Pushover 应用内配置（webui-checkin 票 11）──
+
+function notifyTabMock(
+  opts: {
+    status?: { source: string; configured: boolean };
+    pushover_user?: string;
+    pushover_token?: string;
+    saved?: object;
+  } = {},
+) {
+  baseMock();
+  invokeMock.mockImplementation(async (cmd: string) => {
+    switch (cmd) {
+      case "list_actions":
+      case "list_foods":
+      case "list_locations":
+        return [];
+      case "get_settings":
+        return settingsFixture({ pushover_user: opts.pushover_user ?? "", pushover_token: opts.pushover_token ?? "" });
+      case "pushover_status":
+        return opts.status ?? { source: "none", configured: false };
+      case "set_settings":
+        return opts.saved ?? settingsFixture({ pushover_user: opts.pushover_user ?? "", pushover_token: opts.pushover_token ?? "" });
+      case "get_app_version":
+        return "0.1.0";
+      case "get_update_state":
+        return { status: "idle" };
+      default:
+        return null;
+    }
+  });
+}
+
+async function openNotifyTab(opts?: Parameters<typeof notifyTabMock>[0]) {
+  notifyTabMock(opts);
+  const wrapper = mount(SettingsDialog);
+  await flushPromises();
+  await wrapper.find(".tab-notify").trigger("click");
+  await flushPromises();
+  return wrapper;
 }
 
 async function openUpdateTab(updateState?: object) {
@@ -47,11 +99,95 @@ async function openUpdateTab(updateState?: object) {
 
 beforeEach(() => {
   invokeMock.mockReset();
-  listenStub.mockClear();
 });
 
-describe("设置弹窗「更新」节（票 06）", () => {
-  it("新增「更新」tab：点开显示当前版本与检查入口（验收 1 的挂载面）", async () => {
+describe("设置弹窗通知 tab Pushover 应用内配置（webui-checkin 票 11）", () => {
+  it("生效来源三态标注：应用内配置 / 系统环境变量 / 未配置（验收 2 后半）", async () => {
+    const cases = [
+      { status: { source: "app", configured: true }, label: "应用内配置" },
+      { status: { source: "env", configured: true }, label: "系统环境变量" },
+      { status: { source: "none", configured: false }, label: "未配置" },
+    ];
+    for (const c of cases) {
+      const wrapper = await openNotifyTab({ status: c.status });
+      const label = wrapper.find(".pushover-source-label");
+      expect(label.exists()).toBe(true);
+      expect(label.text()).toContain(c.label);
+      wrapper.unmount();
+    }
+  });
+
+  it("两输入框默认打码（type=password），「查看明文」切换明文、可再隐藏（验收 2 前半）", async () => {
+    const wrapper = await openNotifyTab({ pushover_user: "u-应用内", pushover_token: "t-令牌" });
+
+    const user = wrapper.find(".pushover-user-input");
+    const token = wrapper.find(".pushover-token-input");
+    expect((user.element as HTMLInputElement).type).toBe("password");
+    expect((token.element as HTMLInputElement).type).toBe("password");
+    expect((user.element as HTMLInputElement).value).toBe("u-应用内");
+    expect((token.element as HTMLInputElement).value).toBe("t-令牌");
+
+    await wrapper.find(".pushover-reveal-user-btn").trigger("click");
+    await wrapper.find(".pushover-reveal-token-btn").trigger("click");
+    expect((user.element as HTMLInputElement).type).toBe("text");
+    expect((token.element as HTMLInputElement).type).toBe("text");
+    expect(wrapper.find(".pushover-reveal-user-btn").text()).toContain("隐藏");
+
+    await wrapper.find(".pushover-reveal-user-btn").trigger("click");
+    expect((user.element as HTMLInputElement).type).toBe("password");
+  });
+
+  it("占位符提示「留空则使用系统环境变量」（回落语义上屏）", async () => {
+    const wrapper = await openNotifyTab();
+
+    expect((wrapper.find(".pushover-user-input").element as HTMLInputElement).placeholder).toContain("留空");
+    expect((wrapper.find(".pushover-user-input").element as HTMLInputElement).placeholder).toContain("环境变量");
+    expect((wrapper.find(".pushover-token-input").element as HTMLInputElement).placeholder).toContain("环境变量");
+  });
+
+  it("明文入库并随备份扩散的风险提示固定展示（验收 4）", async () => {
+    const wrapper = await openNotifyTab();
+
+    const hint = wrapper.find(".pushover-risk-hint");
+    expect(hint.exists()).toBe(true);
+    expect(hint.text()).toContain("明文");
+    expect(hint.text()).toContain("备份");
+  });
+
+  it("保存：凭据两值随 set_settings 落库，保存后重查生效来源（验收 3 的持久化入口）", async () => {
+    const wrapper = await openNotifyTab();
+
+    await wrapper.find(".pushover-user-input").setValue("u-新值");
+    await wrapper.find(".pushover-token-input").setValue("t-新值");
+    invokeMock.mockClear();
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "set_settings",
+      expect.objectContaining({
+        input: expect.objectContaining({ pushover_user: "u-新值", pushover_token: "t-新值" }),
+      }),
+    );
+    // 保存后生效来源可能切换：pushover_status 至少被重查一次
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "pushover_status")).toBe(true);
+    expect(wrapper.find(".saved-hint").text()).toContain("已保存");
+  });
+
+  it("「发送测试通知」按钮在通知 tab 照旧可用（验收 3：测的就是当前生效来源）", async () => {
+    const wrapper = await openNotifyTab({ status: { source: "env", configured: true } });
+
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce({ desktop_ok: true, desktop_error: null, pushover: { ok: true, error: null } });
+    await wrapper.find(".tab-body .dlg-btns .btn:not(.primary)").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("send_test_notification");
+    expect(wrapper.find(".saved-hint").text()).toContain("手机 ✓");
+  });
+});
+
+describe("设置弹窗「更新」节（票 06）", () => {  it("新增「更新」tab：点开显示当前版本与检查入口（验收 1 的挂载面）", async () => {
     const wrapper = await openUpdateTab();
 
     expect(wrapper.find(".tab-update").exists()).toBe(true);
@@ -66,6 +202,59 @@ describe("设置弹窗「更新」节（票 06）", () => {
     expect(banner.exists()).toBe(true);
     expect(banner.text()).toContain("上次升级未完成");
     expect(banner.text()).toContain("v0.3.0");
+  });
+});
+
+// ── 网页端 tab（webui-checkin 票 03）：挂载面接线；面板细节在 WebUiPanel.test.ts ──
+
+function webUiConfigFixture(): WebUiConfigInfo {
+  return {
+    enabled: false,
+    segments: [],
+    port: 17321,
+    token: "0123456789abcdef0123456789abcdef",
+    token_generated_at: "2026-09-19 08:00:00",
+  };
+}
+
+describe("设置弹窗「网页端」tab（webui-checkin 票 03）", () => {
+  it("新增「网页端」tab：点开渲染面板（总开关/网段/端口/凭证/地址），面板加载走新命令", async () => {
+    baseMock();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_actions":
+        case "list_foods":
+        case "list_locations":
+          return [];
+        case "get_settings":
+          return {
+            notify_master_enabled: true,
+            notify_overdue_enabled: true,
+            notify_hibernation_enabled: true,
+            wake_remind_days_ahead: 7,
+            autostart_enabled: true,
+          };
+        case "get_webui_config":
+          return webUiConfigFixture();
+        case "list_network_segments":
+          return [{ cidr: "100.84.0.0/16", encrypted_mesh: true, label: "NetBird 虚拟网" }];
+        case "get_access_url":
+          return "http://100.84.12.3:17321/#token=0123456789abcdef0123456789abcdef";
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+    await wrapper.find(".tab-webui").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".webui-panel").exists()).toBe(true);
+    expect((wrapper.find(".webui-enabled-input").element as HTMLInputElement).checked).toBe(false);
+    expect(wrapper.findAll(".seg-row")[0].text()).toContain("NetBird 虚拟网");
+    expect(wrapper.find(".token-masked").exists()).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("get_webui_config");
+    expect(invokeMock).toHaveBeenCalledWith("list_network_segments");
   });
 });
 
@@ -369,6 +558,7 @@ function restoreSummaryFixture(overrides: Partial<RestoreSummary> = {}): Restore
     colony_count: 2,
     log_count: 5,
     backup_dir_in_backup: null,
+    photo_count: 0,
     ...overrides,
   };
 }
@@ -445,7 +635,7 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
     expect(manualPos).toBeGreaterThan(restorePos);
   });
 
-  it("选完文件调 restore_preview，摘要展示备份日期/窝数/记录数/备份内目录值 + 固定文案（验收 1）", async () => {
+  it("选完文件调 restore_preview，摘要展示备份日期/窝数/记录数/照片/备份内目录值 + 固定文案（验收 1）", async () => {
     const wrapper = await openDataTabForRestore({
       pickResult: "D:\\ant-bk\\ant-feeding-log-backup-20260910-080000.db",
       preview: restoreSummaryFixture({ backup_dir_in_backup: "D:\\old-bk" }),
@@ -467,6 +657,8 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
     expect(text).toContain("2");
     expect(text).toContain("5");
     expect(text).toContain("D:\\old-bk");
+    // 票 10：裸库恢复摘要标注不含照片
+    expect(text).toContain("不含照片");
     expect(text).toContain("恢复将整体替换当前全部数据");
     expect(text).toContain("备份设置保持当前值，不随恢复回滚");
   });
@@ -581,5 +773,113 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
 
     expect(wrapper.find(".restore-panel").exists()).toBe(false);
     expect(invokeMock).not.toHaveBeenCalledWith("restore_apply", expect.anything());
+  });
+});
+
+// ── 数据页签巢况照片孤儿区（webui-checkin 票 07）──
+
+function orphanFixture(overrides: { dir_count?: number; file_count?: number; total_bytes?: number } = {}) {
+  return { dir_count: 1, file_count: 3, total_bytes: 15 * 1024 * 1024, ...overrides };
+}
+
+async function openDataTabWithOrphans(
+  stats: { dir_count: number; file_count: number; total_bytes: number } | null,
+  cleanOutcome?: { removed_dirs: number; freed_bytes: number; errors: string[] },
+) {
+  baseMock();
+  invokeMock.mockImplementation(async (cmd: string) => {
+    switch (cmd) {
+      case "list_actions":
+      case "list_foods":
+      case "list_locations":
+        return [];
+      case "get_settings":
+        return {
+          notify_master_enabled: true,
+          notify_overdue_enabled: true,
+          notify_hibernation_enabled: true,
+          wake_remind_days_ahead: 7,
+          autostart_enabled: true,
+        };
+      case "get_recent_errors":
+        return [];
+      case "get_last_abnormal_exit":
+        return null;
+      case "list_orphan_photos":
+        if (stats === null) throw "数据目录未初始化";
+        return stats;
+      case "clean_orphan_photos":
+        return cleanOutcome ?? { removed_dirs: 0, freed_bytes: 0, errors: [] };
+      default:
+        return null;
+    }
+  });
+  const wrapper = mount(SettingsDialog);
+  await flushPromises();
+  await wrapper.find(".tab-data").trigger("click");
+  await flushPromises();
+  return wrapper;
+}
+
+describe("设置弹窗「数据」页签巢况照片孤儿区（webui-checkin 票 07）", () => {
+  it("有孤儿：展示隔离目录数/张数/占用，出「清理孤儿照片」按钮", async () => {
+    const wrapper = await openDataTabWithOrphans(orphanFixture());
+
+    expect(wrapper.find(".orphan-section").exists()).toBe(true);
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("1 个隔离目录");
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("共 3 张");
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("15.0 MB");
+    expect(wrapper.find(".orphan-clean-btn").exists()).toBe(true);
+    expect(wrapper.find(".orphan-clean-btn").text()).toBe("清理孤儿照片");
+  });
+
+  it("无孤儿：显示「无孤儿」，不出清理按钮", async () => {
+    const wrapper = await openDataTabWithOrphans(orphanFixture({ dir_count: 0, file_count: 0, total_bytes: 0 }));
+
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("无孤儿");
+    expect(wrapper.find(".orphan-clean-btn").exists()).toBe(false);
+  });
+
+  it("两段确认：第一次点只进入确认态，第二次才调 clean_orphan_photos 并重拉统计", async () => {
+    const wrapper = await openDataTabWithOrphans(
+      orphanFixture(),
+      { removed_dirs: 1, freed_bytes: 15 * 1024 * 1024, errors: [] },
+    );
+
+    invokeMock.mockClear();
+    await wrapper.find(".orphan-clean-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".orphan-clean-btn").text()).toBe("再次点击确认清理");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "clean_orphan_photos")).toBe(false);
+
+    await wrapper.find(".orphan-clean-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("clean_orphan_photos");
+    expect(wrapper.find(".orphan-result").text()).toContain("已清理 1 个隔离目录");
+    expect(wrapper.find(".orphan-result").text()).toContain("15.0 MB");
+    // 清理完成后重拉统计（本 mock 仍返回有孤儿，只验证重拉发生）
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "list_orphan_photos").length,
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  it("「重新统计」按钮重调 list_orphan_photos", async () => {
+    const wrapper = await openDataTabWithOrphans(orphanFixture());
+
+    invokeMock.mockClear();
+    await wrapper.find(".orphan-refresh-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("list_orphan_photos");
+  });
+
+  it("统计读取失败（首载）静默不打扰，手动重试才报错", async () => {
+    const wrapper = await openDataTabWithOrphans(null);
+
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("读取失败");
+    expect(wrapper.find(".orphan-error").exists()).toBe(false);
+
+    await wrapper.find(".orphan-refresh-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".orphan-error").text()).toContain("数据目录未初始化");
   });
 });

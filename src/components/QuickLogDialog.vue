@@ -7,7 +7,7 @@
  * 选中日已有同操作记录出黄条（不拦提交）。
  */
 import { computed, onMounted, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { colonyMonthRecords, listActions, logCare } from "../lib/ipc";
 import type { CareActionItem, Colony, ColonyAction, MonthDayRecords } from "../types";
 import { nowLocalDateTime } from "../lib/care";
 import { todayIso } from "../lib/dates";
@@ -30,7 +30,7 @@ async function loadMonth(y: number, m: number) {
   viewMonth.value = { year: y, month: m };
   const seq = ++monthSeq;
   try {
-    const res = await invoke<MonthDayRecords[]>("colony_month_records", {
+    const res = await colonyMonthRecords({
       colonyId: props.colony.id,
       year: y,
       month: m,
@@ -48,7 +48,7 @@ onMounted(() => void loadMonth(viewMonth.value.year, viewMonth.value.month));
 const allActions = ref<CareActionItem[]>([]);
 async function loadActions() {
   try {
-    allActions.value = await invoke<CareActionItem[]>("list_actions");
+    allActions.value = await listActions();
   } catch {
     // 名字表是增强，失败静默（当前操作名有 props 兜底）
   }
@@ -86,7 +86,7 @@ async function submit() {
   busy.value = true;
   formError.value = "";
   try {
-    await invoke("log_care", {
+    await logCare({
       input: {
         colony_id: props.colony.id,
         action_id: props.action.action_id,
@@ -106,7 +106,7 @@ async function submit() {
 
 <template>
   <div class="overlay" @click.self="$emit('close')">
-    <div class="dialog quick-dialog">
+    <div class="dialog quick-dialog vp-dialog">
       <h3>记录{{ action.name }} · {{ colony.name }}</h3>
 
       <div class="field-label">时间（默认现在，可补录）</div>
@@ -220,5 +220,28 @@ async function submit() {
 .btn:disabled {
   opacity: 0.6;
   cursor: default;
+}
+
+/* ── 手机竖屏（webui-checkin 票 08）：≤480px 输入放大 + 大号按钮；
+   vp-dialog 是媒体查询落点（断点类名供组件测试断言——jsdom 不套用媒体查询）── */
+@media (max-width: 480px) {
+  .vp-dialog.dialog {
+    padding: 14px;
+  }
+
+  .vp-dialog input[type="datetime-local"],
+  .vp-dialog textarea {
+    padding: 11px 12px;
+    font-size: 16px; /* ≥16px 防 iOS 聚焦自动放大 */
+  }
+
+  .vp-dialog .btn {
+    padding: 11px 22px;
+    font-size: 15px;
+  }
+
+  .vp-dialog .dlg-btns {
+    flex-direction: row-reverse; /* 主按钮在拇指侧 */
+  }
 }
 </style>

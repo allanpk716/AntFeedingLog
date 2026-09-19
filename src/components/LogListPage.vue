@@ -10,7 +10,17 @@
  * 首页「距上次」与超期态即时重算（数据驱动）。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import {
+  colonyMonthRecords,
+  deleteLog,
+  listActions,
+  listColonies,
+  listFoods,
+  listLocations,
+  listLogs,
+  updateLog,
+} from "../lib/ipc";
+import { watchDataVersion } from "../lib/versionSync";
 import type {
   CareActionItem,
   Colony,
@@ -65,7 +75,7 @@ async function load(offset: number) {
   const seq = ++loadSeq;
   loading.value = true;
   try {
-    const res = await invoke<LogPage>("list_logs", {
+    const res = await listLogs({
       filter: buildLogFilter(form.value, offset),
     });
     if (seq !== loadSeq) return; // 过期响应，丢弃
@@ -222,7 +232,7 @@ async function loadEditMonth(y: number, m: number) {
   if (row === null) return;
   const seq = ++editMonthSeq;
   try {
-    const res = await invoke<MonthDayRecords[]>("colony_month_records", {
+    const res = await colonyMonthRecords({
       colonyId: row.colony_id,
       year: y,
       month: m,
@@ -291,7 +301,7 @@ async function saveEdit() {
   editBusy.value = true;
   editError.value = "";
   try {
-    await invoke("update_log", {
+    await updateLog({
       id: editing.value.id,
       input: buildUpdateInput({
         happenedAt: editTime.value,
@@ -321,7 +331,7 @@ async function requestDelete(row: LogRow) {
   }
   confirmDeleteId.value = null;
   try {
-    await invoke("delete_log", { id: row.id });
+    await deleteLog({ id: row.id });
     emit("changed");
     await load(0);
   } catch (e) {
@@ -329,13 +339,15 @@ async function requestDelete(row: LogRow) {
   }
 }
 
-onMounted(async () => {
+/** 全量重拉：字典三件套 + 首页流水（筛选表单原样保留）。挂载与版本广播
+ * （webui-checkin 票 06，别端记录后本页开着就刷新）共用这一个入口。 */
+async function reloadAll() {
   try {
     const [cols, acts, fds, locs] = await Promise.all([
-      invoke<Colony[]>("list_colonies"),
-      invoke<CareActionItem[]>("list_actions"),
-      invoke<FoodItem[]>("list_foods"),
-      invoke<LocationItem[]>("list_locations"),
+      listColonies(),
+      listActions(),
+      listFoods(),
+      listLocations(),
     ]);
     colonies.value = cols;
     actions.value = acts;
@@ -345,6 +357,18 @@ onMounted(async () => {
     pageError.value = String(e);
   }
   await load(0);
+}
+
+/** 版本广播退订柄（票 06；页签卸载时调用）。 */
+let unwatchVersion: (() => void) | null = null;
+
+onMounted(() => {
+  void reloadAll();
+  unwatchVersion = watchDataVersion(() => void reloadAll());
+});
+
+onBeforeUnmount(() => {
+  unwatchVersion?.();
 });
 </script>
 

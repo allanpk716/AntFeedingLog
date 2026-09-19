@@ -5,9 +5,13 @@ import DatePickerPop from "./DatePickerPop.vue";
 import DateTimeField from "./DateTimeField.vue";
 import type { CareActionItem, Colony, FoodItem, LocationItem, LogPage, LogRow } from "../types";
 
-// 不依赖 Tauri 运行时：mock 掉 IPC
+// 不依赖 Tauri 运行时：统一 mock 调用层（命令包装按 cmdName 透传给唯一的
+// invokeMock，调用形状 (命令名, 入参) 与旧式 vi.mock("@tauri-apps/api/core") 一致）
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("../lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("../testing/ipcMock");
+  return ipcModuleMock(invokeMock)(importOriginal);
+});
 
 const locations: LocationItem[] = [
   { id: 1, name: "家", enabled: true, sort: 1 },
@@ -27,6 +31,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
   {
     id: 2,
@@ -39,6 +44,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
 ];
 

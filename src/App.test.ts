@@ -6,14 +6,14 @@ import { addDays, todayIso, todayLabel } from "./lib/dates";
 import DateTimeField from "./components/DateTimeField.vue";
 import DatePickerPop from "./components/DatePickerPop.vue";
 
-// 不依赖 Tauri 运行时：mock 掉 IPC，按命令名回放数据
-const { invokeMock, listenStub } = vi.hoisted(() => ({
-  invokeMock: vi.fn(),
-  listenStub: vi.fn(async () => () => {}),
-}));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
-// 票 04：App.vue 监听 db-restored 事件（恢复后各页刷新），测试里同样 mock 掉
-vi.mock("@tauri-apps/api/event", () => ({ listen: listenStub }));
+// 不依赖 Tauri 运行时：统一 mock 调用层（命令包装按 cmdName 透传给唯一的
+// invokeMock，调用形状 (命令名, 入参) 与旧式 vi.mock("@tauri-apps/api/core") 一致）；
+// 事件订阅（db-restored 等）走 mock 工厂内置的立即退订空桩
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+vi.mock("./lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("./testing/ipcMock");
+  return ipcModuleMock(invokeMock)(importOriginal);
+});
 
 // 票 07：统计页图表在 happy-dom 无 canvas，mock 掉 echarts（导航测试只验接线）
 const { echartsSetOption } = vi.hoisted(() => ({ echartsSetOption: vi.fn() }));
@@ -21,13 +21,15 @@ vi.mock("echarts", () => ({
   init: vi.fn(() => ({ setOption: echartsSetOption, dispose: vi.fn(), resize: vi.fn() })),
 }));
 
-/** 票 06：get_settings 的回放数据（测试里可整体替换） */
+/** 票 06：get_settings 的回放数据（测试里可整体替换）；票 11 增凭据两键 */
 const defaultSettings: AppSettings = {
   notify_master_enabled: true,
   notify_overdue_enabled: true,
   notify_hibernation_enabled: true,
   wake_remind_days_ahead: 7,
   autostart_enabled: true,
+  pushover_user: "",
+  pushover_token: "",
 };
 let currentSettings: AppSettings = defaultSettings;
 
@@ -64,6 +66,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
   {
     id: 2,
@@ -76,6 +79,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
   {
     id: 3,
@@ -88,6 +92,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
   {
     id: 4,
@@ -100,6 +105,7 @@ const colonies: Colony[] = [
     actions: [],
     recent: [],
     hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
   },
 ];
 
@@ -139,10 +145,20 @@ beforeEach(() => {
   invokeMock.mockReset();
   currentColonies = colonies;
   currentSettings = defaultSettings;
+  // 桌面 WebView 形态为默认（终局评审：桌面专属入口按 isTauri 渲染）；
+  // 浏览器形态在「浏览器模式隐藏桌面专属入口」describe 里单独删掉注入
+  (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
   baseMock();
 });
 
 describe("首页卡片墙", () => {
+  it("手机竖屏断点类：卡片墙挂 vp-cards（≤480px 单列的媒体查询落点，webui-checkin 票 08）", async () => {
+    const wrapper = await mountApp();
+    const cards = wrapper.findAll(".vp-cards");
+    expect(cards.length).toBeGreaterThanOrEqual(1);
+    expect(cards[0].classes()).toContain("cards");
+  });
+
   it("按地点清单顺序分组，卡片含名字/物种徽章/状态徽章/饲养天数大数字", async () => {
     const wrapper = await mountApp();
 
@@ -169,6 +185,53 @@ describe("首页卡片墙", () => {
   it("冬眠中的窝显示冬眠状态徽章", async () => {
     const wrapper = await mountApp();
     expect(wrapper.find('.card[data-colony-id="3"] .chip.st').text()).toContain("冬眠");
+  });
+
+  it("卡片显示最新巢况数与距上次登记天数（webui-checkin 票 02）；「巢况」按钮打开时间线", async () => {
+    currentColonies = colonies.map((c) =>
+      c.id === 1
+        ? {
+            ...c,
+            checkin: {
+              latest: {
+                id: 3,
+                colony_id: 1,
+                date: "2026-09-15",
+                queen_count: 2,
+                worker_count: 3000,
+                moved_nest: false,
+                note: "",
+                created_at: "2026-09-15 21:00:00",
+                photos: [],
+              },
+              baseline_date: "2026-09-01",
+              days_since_last: 3,
+            },
+          }
+        : c,
+    );
+    const wrapper = await mountApp();
+    const card = wrapper.find('.card[data-colony-id="1"]');
+    expect(card.find(".checkin-line").text()).toBe("巢况：蚁后 2 · 工蚁 3000 · 距上次登记 3 天");
+
+    // 打开巢况时间线弹窗：按窝拉时间线
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return currentColonies;
+        case "list_locations":
+          return locations;
+        case "list_checkins":
+          return [];
+        default:
+          return null;
+      }
+    });
+    await card.find(".checkin-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".checkin-dialog").exists()).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("list_checkins", { colonyId: 1 });
+    expect(wrapper.find(".checkin-dialog .checkin-empty").text()).toContain("还没有巢况登记");
   });
 
   it("已结束的窝默认折叠，展开后可见，且不占分组", async () => {
@@ -614,6 +677,67 @@ describe("设置 · 字典管理（票 04）", () => {
   });
 });
 
+describe("网页端首启向导（webui-checkin 票 03）", () => {
+  const wizardConfig = {
+    enabled: false,
+    segments: [],
+    port: 17321,
+    token: "0123456789abcdef0123456789abcdef",
+    token_generated_at: "2026-09-19 08:00:00",
+  };
+
+  it("get_webui_wizard_done 返回 false（未做）→ 启动即弹一次向导；完成/跳过写键后关闭", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return [];
+        case "list_locations":
+          return locations;
+        case "get_webui_wizard_done":
+          return false;
+        case "get_webui_config":
+          return wizardConfig;
+        case "list_network_segments":
+          return [{ cidr: "100.84.0.0/16", encrypted_mesh: true, label: "NetBird 虚拟网" }];
+        default:
+          return null;
+      }
+    });
+    const wrapper = await mountApp();
+
+    const wizard = wrapper.find(".webui-wizard");
+    expect(wizard.exists()).toBe(true);
+    expect(wizard.text()).toContain("首次设置向导");
+
+    // 跳过：写完成键 + 关闭（不发任何保存）
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "mark_webui_wizard_done" ? null : null,
+    );
+    await wrapper.find(".wiz-skip-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("mark_webui_wizard_done");
+    expect(wrapper.find(".webui-wizard").exists()).toBe(false);
+  });
+
+  it("get_webui_wizard_done 返回 true（已做）→ 不弹向导", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return [];
+        case "list_locations":
+          return locations;
+        case "get_webui_wizard_done":
+          return true;
+        default:
+          return null;
+      }
+    });
+    const wrapper = await mountApp();
+    expect(wrapper.find(".webui-wizard").exists()).toBe(false);
+  });
+});
+
 describe("顶栏导航（票 07/08）", () => {
   it("顶栏显示今天日期（YYYY-MM-DD 周X，票 09 停靠 F 对齐 mock）", async () => {
     const wrapper = await mountApp();
@@ -705,6 +829,8 @@ describe("设置 · 通知（票 06）", () => {
         notify_hibernation_enabled: true,
         wake_remind_days_ahead: 3,
         autostart_enabled: true,
+        pushover_user: "", // 票 11：凭据随表单整体回写（未填 = 空串，回落环境变量）
+        pushover_token: "",
       },
     });
     // changed → 外层刷新首页
@@ -797,11 +923,11 @@ describe("设置 · 数据与备份（票 09）", () => {
     expect(invokeMock).toHaveBeenCalledWith("reveal_data_folder");
 
     invokeMock.mockClear();
-    invokeMock.mockResolvedValueOnce("D:\\backup\\ant-feeding-log-backup-20260918.db");
+    invokeMock.mockResolvedValueOnce("D:\\backup\\ant-feeding-log-backup-20260918-091530.zip");
     await dlg.find(".backup-btn").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("backup_to");
-    expect(dlg.find(".data-result").text()).toContain("ant-feeding-log-backup-20260918.db");
+    expect(dlg.find(".data-result").text()).toContain("ant-feeding-log-backup-20260918-091530.zip");
 
     // 用户在对话框取消（Rust 返回 null）：不报错也不留旧结果
     invokeMock.mockClear();
@@ -1328,5 +1454,31 @@ describe("冬眠管理（票 05）", () => {
     const logCall = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
     expect(logCall).toBeDefined();
     expect((logCall![1] as { input: { colony_id: number } }).input.colony_id).toBe(3);
+  });
+});
+
+describe("浏览器模式隐藏桌面专属入口（终局评审 Important）", () => {
+  it("浏览器模式：顶栏无「统计」/设置/新建窝、卡片无「编辑」；首页/记录与巢况入口照常", async () => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    const wrapper = await mountApp();
+
+    // 顶栏只剩 首页/记录 两个 tab（统计是桌面专属页）
+    const tabs = wrapper.findAll(".topbar .tab");
+    expect(tabs.map((t) => t.text())).toEqual(["首页", "记录"]);
+    expect(wrapper.find(".settings-btn").exists()).toBe(false);
+    expect(wrapper.find(".new-top-btn").exists()).toBe(false);
+    // 卡片「编辑」按钮（ColonyCard）同样隐藏；「巢况」是网页端功能不隐藏
+    expect(wrapper.find(".card .edit-btn").exists()).toBe(false);
+    expect(wrapper.find(".card .checkin-btn").exists()).toBe(true);
+  });
+
+  it("桌面模式：统计 tab / 设置 / 新建窝 / 卡片编辑四入口照常渲染", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    const wrapper = await mountApp();
+
+    expect(wrapper.findAll(".topbar .tab").map((t) => t.text())).toEqual(["首页", "统计", "记录"]);
+    expect(wrapper.find(".settings-btn").exists()).toBe(true);
+    expect(wrapper.find(".new-top-btn").exists()).toBe(true);
+    expect(wrapper.find(".card .edit-btn").exists()).toBe(true);
   });
 });

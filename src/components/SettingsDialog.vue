@@ -7,10 +7,12 @@
  *   （预置项或被历史记录/提醒台账引用时删除禁用，只能停用——规则 10 + 反馈第二轮 F2）。
  * - 食物行：名字、建议间隔（F3：留空=只按喂食统一周期）、停用/启用、删除（预置或被引用禁用）。
  * - 地点 tab 复用 LocationManagerPanel。
- * - 通知 tab（票 06 + 反馈第二轮 F4）：推送通知总开关（桌面 + 手机，分类子开关作废）+
- *   临近出眠提前天数 + Pushover 配置状态 + 「发送测试通知」按钮（双通道分别回显结果，
- *   排障用）；开机自启开关（票 09）随保存一起落库，
- *   Rust 侧 set_settings 同步自启插件状态。
+ * - 通知 tab（票 06 + 反馈第二轮 F4 + webui-checkin 票 11）：推送通知总开关
+ *   （桌面 + 手机，分类子开关作废）+ 临近出眠提前天数 + Pushover 应用内凭据
+ *   两输入框（type=password 打码、可切换明文、留空回落环境变量）+ 生效来源
+ *   三态标注（应用内/环境变量/未配置）+ 明文入库随备份扩散的风险提示 +
+ *   「发送测试通知」按钮（双通道分别回显结果，排障用）；开机自启开关（票 09）
+ *   随保存一起落库，Rust 侧 set_settings 同步自启插件状态。
  * - 数据 tab（票 09）：打开数据文件夹 / 安全备份（Rust 拷贝库文件，无需退出）/
  *   导出 CSV / JSON（归档带走）；帮助文案写明手动拷贝需先从托盘真实退出。
  *   数据 tab 自动备份区（数据安全二期票 02）：开关 / 备份目录（系统文件夹选择框）/
@@ -23,25 +25,52 @@
  *   刷新或重启提示。整库替换语义（ADR-0002）。
  * - 更新 tab（release-update 票 06）：当前版本 / 立即检查更新 / 确认下载安装，
  *   全部走 Tauri command；升级未完成残留的引导也挂在本节顶（UpdatePanel）。
+ * - 网页端 tab（webui-checkin 票 03）：总开关（默认关）/ 受信网段多选（NetBird
+ *   置顶标名，勾物理网段强制明文确认）/ 端口（1024–65535）/ 凭证（打码可看、
+ *   只可重生成）/ 完整地址复制 + 风险提示；保存落 webui-config.json 并联动防火墙
+ *   （失败给现成 netsh 手动命令）。面板本体在 WebUiPanel（首启向导复用其子组件）。
  *
  * 行级 停用/启用/删除 即时落库并抛 changed（外层刷新首页，卡片红/灰随之变化）；
  * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
  * 成功后重拉字典并抛 changed。停用项整行置灰。
  */
-import { onMounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { computed, onMounted, ref } from "vue";
+import {
+  backupTo,
+  cleanOrphanPhotos,
+  eraseAction as eraseActionCmd,
+  eraseFood as eraseFoodCmd,
+  exportData as exportDataCmd,
+  getBackupConfig,
+  getLastAbnormalExit,
+  getRecentErrors,
+  getSettings,
+  listActions,
+  listFoods,
+  listLocations,
+  listOrphanPhotos,
+  openLogsFolder,
+  pickBackupDir as pickBackupDirCmd,
+  pickRestoreFile,
+  pushoverStatus as getPushoverStatus,
+  restoreApply,
+  restorePreview,
+  revealDataFolder,
+  saveAction,
+  saveFood,
+  sendTestNotification,
+  setActionEnabled as setActionEnabledCmd,
+  setBackupConfig,
+  setFoodEnabled as setFoodEnabledCmd,
+  setSettings,
+} from "../lib/ipc";
 import type {
-  AppSettings,
   BackupConfigInput,
   BackupConfigInfo,
-  CareActionItem,
-  FoodItem,
   LocationItem,
+  OrphanPhotoStats,
   PushoverStatus,
-  RestoreApplyOutcome,
   RestoreSummary,
-  TestNotifyOutcome,
-  AbnormalExitInfo,
 } from "../types";
 import {
   buildActionRows,
@@ -68,10 +97,17 @@ import {
   summaryLooksSuspicious,
   summaryRows,
 } from "../lib/restoreUi";
+import { formatBytes } from "../lib/photos";
+import {
+  PUSHOVER_PLACEHOLDER,
+  PUSHOVER_PLAINTEXT_WARNING,
+  pushoverSourceLabel,
+} from "../lib/pushoverUi";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
+import WebUiPanel from "./WebUiPanel.vue";
 
-type Tab = "actions" | "foods" | "locations" | "notify" | "data" | "update";
+type Tab = "actions" | "foods" | "locations" | "notify" | "webui" | "data" | "update";
 
 const emit = defineEmits<{ close: []; changed: [] }>();
 
@@ -84,28 +120,39 @@ const addFoodName = ref("");
 const error = ref("");
 const busy = ref(false);
 
-// ── 通知 tab（票 06 + 反馈第二轮 F4）──
-const notifyForm = ref<NotifySettingsForm>({ master: true, daysAheadText: "7" });
+// ── 通知 tab（票 06 + 反馈第二轮 F4 + webui-checkin 票 11）──
+const notifyForm = ref<NotifySettingsForm>({ master: true, daysAheadText: "7", pushoverUser: "", pushoverToken: "" });
 const autostart = ref(true);
 const notifyError = ref("");
 const notifySaved = ref("");
 const notifyBusy = ref(false);
 const pushoverStatus = ref<PushoverStatus | null>(null);
+// 凭据打码切换（票 11）：type=password 打码，点「查看明文」临时切 text
+const revealPushoverUser = ref(false);
+const revealPushoverToken = ref(false);
 
 async function load() {
-  const [actions, foods, locs, s, pushStatus] = await Promise.all([
-    invoke<CareActionItem[]>("list_actions"),
-    invoke<FoodItem[]>("list_foods"),
-    invoke<LocationItem[]>("list_locations"),
-    invoke<AppSettings>("get_settings"),
-    invoke<PushoverStatus>("pushover_status"),
+  const [actions, foods, locs, s] = await Promise.all([
+    listActions(),
+    listFoods(),
+    listLocations(),
+    getSettings(),
   ]);
   actionRows.value = buildActionRows(actions);
   foodRows.value = buildFoodRows(foods);
   locations.value = locs;
   notifyForm.value = toForm(s);
   autostart.value = s.autostart_enabled;
-  pushoverStatus.value = pushStatus;
+  await refreshPushoverStatus();
+}
+
+/** 生效来源三态（票 11）：读取失败静默降级为「读取失败」标注，不打扰其他功能区 */
+async function refreshPushoverStatus() {
+  try {
+    pushoverStatus.value = await getPushoverStatus();
+  } catch {
+    pushoverStatus.value = null;
+  }
 }
 
 onMounted(async () => {
@@ -118,6 +165,8 @@ onMounted(async () => {
   await loadLogSection();
   // 自动备份区（票 02）加载失败同样静默：配置读不出时整区隐藏，不挡其他功能区
   await loadBackupSection();
+  // 孤儿照片区（票 07）加载失败同样静默：辅助信息不打扰
+  await loadOrphanSection();
 });
 
 // ── 行级即时操作 ──
@@ -158,7 +207,7 @@ async function setActionEnabled(row: ActionRow, enabled: boolean) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("set_action_enabled", { id: row.id, enabled });
+    await setActionEnabledCmd({ id: row.id, enabled });
     row.enabled = enabled;
     emit("changed");
   } catch (e) {
@@ -176,7 +225,7 @@ async function eraseAction(row: ActionRow) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("erase_action", { id: row.id });
+    await eraseActionCmd({ id: row.id });
     actionRows.value = actionRows.value.filter((r) => r !== row);
     emit("changed");
   } catch (e) {
@@ -191,7 +240,7 @@ async function setFoodEnabled(row: FoodRow, enabled: boolean) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("set_food_enabled", { id: row.id, enabled });
+    await setFoodEnabledCmd({ id: row.id, enabled });
     row.enabled = enabled;
     emit("changed");
   } catch (e) {
@@ -209,7 +258,7 @@ async function eraseFood(row: FoodRow) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("erase_food", { id: row.id });
+    await eraseFoodCmd({ id: row.id });
     foodRows.value = foodRows.value.filter((r) => r !== row);
     emit("changed");
   } catch (e) {
@@ -231,7 +280,7 @@ async function saveActions() {
   error.value = "";
   try {
     for (const input of toActionInputs(actionRows.value)) {
-      await invoke("save_action", { input });
+      await saveAction({ input });
     }
     await load();
     emit("changed");
@@ -252,7 +301,7 @@ async function saveFoods() {
   error.value = "";
   try {
     for (const input of toFoodInputs(foodRows.value)) {
-      await invoke("save_food", { input });
+      await saveFood({ input });
     }
     await load();
     emit("changed");
@@ -275,10 +324,12 @@ async function saveNotify() {
   notifyError.value = "";
   notifySaved.value = "";
   try {
-    const saved = await invoke<AppSettings>("set_settings", { input });
+    const saved = await setSettings({ input });
     notifyForm.value = toForm(saved);
     autostart.value = saved.autostart_enabled;
     notifySaved.value = "已保存";
+    // 票 11：凭据保存后生效来源可能切换（如首次填应用内 → 从环境变量/未配置变应用内）
+    await refreshPushoverStatus();
     emit("changed");
   } catch (e) {
     notifyError.value = String(e);
@@ -291,7 +342,7 @@ async function testNotify() {
   notifyError.value = "";
   notifySaved.value = "";
   try {
-    const r = await invoke<TestNotifyOutcome>("send_test_notification");
+    const r = await sendTestNotification();
     const parts = [
       r.desktop_ok ? "桌面 ✓" : `桌面 ✗（${r.desktop_error ?? "未知错误"}）`,
       r.pushover === null ? "手机：未配置" : r.pushover.ok ? "手机 ✓" : `手机 ✗（${r.pushover.error}）`,
@@ -318,7 +369,7 @@ const dataBusy = ref(false);
 async function revealFolder() {
   dataError.value = "";
   try {
-    await invoke<string>("reveal_data_folder");
+    await revealDataFolder();
   } catch (e) {
     dataError.value = String(e);
   }
@@ -329,7 +380,7 @@ async function runBackup() {
   dataError.value = "";
   dataResult.value = "";
   try {
-    const path = await invoke<string | null>("backup_to");
+    const path = await backupTo();
     dataResult.value = path ? `已备份到：${path}` : "";
   } catch (e) {
     dataError.value = String(e);
@@ -343,7 +394,7 @@ async function exportData(format: "csv" | "json") {
   dataError.value = "";
   dataResult.value = "";
   try {
-    const path = await invoke<string | null>("export_data", { format });
+    const path = await exportDataCmd({ format });
     dataResult.value = path ? `已导出到：${path}` : "";
   } catch (e) {
     dataError.value = String(e);
@@ -359,8 +410,8 @@ const abnormalExitText = ref<string | null>(null);
 async function loadLogSection() {
   try {
     const [errs, abnormal] = await Promise.all([
-      invoke<string[]>("get_recent_errors"),
-      invoke<AbnormalExitInfo | null>("get_last_abnormal_exit"),
+      getRecentErrors(),
+      getLastAbnormalExit(),
     ]);
     recentErrors.value = errs ?? [];
     abnormalExitText.value = formatAbnormalExit(abnormal);
@@ -372,7 +423,7 @@ async function loadLogSection() {
 async function openLogs() {
   dataError.value = "";
   try {
-    await invoke<string>("open_logs_folder");
+    await openLogsFolder();
   } catch (e) {
     dataError.value = String(e);
   }
@@ -404,7 +455,7 @@ function applyBackupConfig(c: BackupConfigInfo | null) {
 
 async function loadBackupSection() {
   try {
-    applyBackupConfig(await invoke<BackupConfigInfo>("get_backup_config"));
+    applyBackupConfig(await getBackupConfig());
   } catch {
     // 静默：配置读不出（理论外路径，Rust 侧缺失/损坏都回默认值）不挡其他功能区
   }
@@ -414,7 +465,7 @@ async function pickBackupDir() {
   backupError.value = "";
   backupSaved.value = "";
   try {
-    const dir = await invoke<string | null>("pick_backup_dir");
+    const dir = await pickBackupDirCmd();
     if (dir) autoForm.value.backupDir = dir;
   } catch (e) {
     backupError.value = String(e);
@@ -438,7 +489,7 @@ async function saveBackupConfig() {
       keep_count: keep,
     };
     // 返回收敛后的生效值（Rust 侧已规整目录/校验份数），回显以它为准
-    applyBackupConfig(await invoke<BackupConfigInfo>("set_backup_config", { input }));
+    applyBackupConfig(await setBackupConfig({ input }));
     backupSaved.value = "已保存";
   } catch (e) {
     backupError.value = String(e);
@@ -466,17 +517,17 @@ async function startRestore() {
   // 对话框默认定位备份目录（已设置时；读取失败不挡选文件）
   let defaultDir: string | null = null;
   try {
-    defaultDir = (await invoke<BackupConfigInfo>("get_backup_config")).backup_dir;
+    defaultDir = (await getBackupConfig()).backup_dir;
   } catch {
     // 静默：默认定位是锦上添花
   }
   try {
-    const picked = await invoke<string | null>("pick_restore_file", { defaultDir });
+    const picked = await pickRestoreFile({ defaultDir });
     if (!picked) return; // 用户取消选文件
     restorePath.value = picked;
     restoreBusy.value = true;
     // 校验链 + 摘要（Rust staging 临时库，当前库零改动）；拒绝原因直接展示
-    restoreSummary.value = await invoke<RestoreSummary>("restore_preview", { path: picked });
+    restoreSummary.value = await restorePreview({ path: picked });
     restoreConfirming.value = false; // 每份新摘要都重新走二段确认
   } catch (e) {
     restoreError.value = String(e);
@@ -496,7 +547,7 @@ async function confirmRestoreApply() {
   restoreBusy.value = true;
   restoreError.value = "";
   try {
-    const outcome = await invoke<RestoreApplyOutcome>("restore_apply", { path: restorePath.value });
+    const outcome = await restoreApply({ path: restorePath.value });
     restoreResult.value = formatRestoreOutcome(outcome);
     restoreSummary.value = null;
     restoreConfirming.value = false;
@@ -514,6 +565,56 @@ function cancelRestore() {
   restoreSummary.value = null;
   restoreConfirming.value = false;
   restoreError.value = "";
+}
+
+// ── 数据 tab：巢况照片孤儿区（webui-checkin 票 07）──
+// 孤儿 = 库已不引用、启动/恢复巡检时被移进 photos/.orphan-<时间戳>/ 隔离区的
+// 照片文件。本区只管「查看现状 + 一键清理」（清理 = 删除隔离目录，两段确认）；
+// 巡检隔离本身在 Rust 启动/恢复后自动做，本区不做移动。
+
+const orphanStats = ref<OrphanPhotoStats | null>(null);
+const orphanConfirming = ref(false);
+const orphanBusy = ref(false);
+const orphanError = ref("");
+const orphanResult = ref("");
+
+const orphanStatsText = computed(() => {
+  const s = orphanStats.value;
+  if (!s) return "";
+  return s.file_count === 0
+    ? "无孤儿"
+    : `${s.dir_count} 个隔离目录，共 ${s.file_count} 张，占 ${formatBytes(s.total_bytes)}`;
+});
+
+async function loadOrphanSection(reportError = false) {
+  orphanError.value = "";
+  try {
+    orphanStats.value = await listOrphanPhotos();
+  } catch (e) {
+    if (reportError) orphanError.value = String(e);
+    // 静默路径（首载）：辅助信息读不出不挡其他功能区
+  }
+}
+
+async function requestCleanOrphans() {
+  orphanError.value = "";
+  orphanResult.value = "";
+  // 两段确认（与删除记录/恢复同待遇）：第一次进入确认态，第二次才真删
+  if (!orphanConfirming.value) {
+    orphanConfirming.value = true;
+    return;
+  }
+  orphanConfirming.value = false;
+  orphanBusy.value = true;
+  try {
+    const outcome = await cleanOrphanPhotos();
+    orphanResult.value = `已清理 ${outcome.removed_dirs} 个隔离目录，释放 ${formatBytes(outcome.freed_bytes)}`;
+    await loadOrphanSection(true);
+  } catch (e) {
+    orphanError.value = String(e);
+  } finally {
+    orphanBusy.value = false;
+  }
 }
 
 function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
@@ -539,6 +640,9 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         </button>
         <button class="tab tab-notify" :class="{ active: activeTab === 'notify' }" type="button" @click="activeTab = 'notify'">
           通知
+        </button>
+        <button class="tab tab-webui" :class="{ active: activeTab === 'webui' }" type="button" @click="activeTab = 'webui'">
+          网页端
         </button>
         <button class="tab tab-data" :class="{ active: activeTab === 'data' }" type="button" @click="activeTab = 'data'">
           数据
@@ -641,15 +745,46 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
             推送通知（桌面 + 手机）
           </label>
         </div>
-        <div class="notify-row">
-          <span>手机推送（Pushover）：</span>
-          <span v-if="pushoverStatus?.user_found && pushoverStatus?.token_found" class="push-ok">
-            已配置（环境变量 PUSHOVER_USER / PUSHOVER_TOKEN）
-          </span>
-          <span v-else class="push-miss">
-            未检测到（需设置环境变量 PUSHOVER_USER / PUSHOVER_TOKEN，配置后重启应用生效）
+        <div class="notify-row pushover-source-row">
+          <span>手机推送（Pushover）当前生效：</span>
+          <span class="pushover-source-label" :class="pushoverStatus?.configured ? 'push-ok' : 'push-miss'">
+            {{ pushoverSourceLabel(pushoverStatus) }}
           </span>
         </div>
+        <!-- 票 11：应用内凭据两输入框——type=password 打码 + 查看明文切换；留空回落环境变量。
+             输入框/切换按钮不用既有 .days-input/.btn 类，避免干扰 tab 内既有选择器语义 -->
+        <div class="notify-row pushover-cred-row">
+          <label class="pushover-cred-label">
+            用户键
+            <input
+              v-model="notifyForm.pushoverUser"
+              class="pushover-input pushover-user-input"
+              :type="revealPushoverUser ? 'text' : 'password'"
+              :placeholder="PUSHOVER_PLACEHOLDER"
+              autocomplete="off"
+            />
+          </label>
+          <button class="pushover-reveal-btn pushover-reveal-user-btn" type="button" @click="revealPushoverUser = !revealPushoverUser">
+            {{ revealPushoverUser ? "隐藏" : "查看明文" }}
+          </button>
+        </div>
+        <div class="notify-row pushover-cred-row">
+          <label class="pushover-cred-label">
+            应用令牌
+            <input
+              v-model="notifyForm.pushoverToken"
+              class="pushover-input pushover-token-input"
+              :type="revealPushoverToken ? 'text' : 'password'"
+              :placeholder="PUSHOVER_PLACEHOLDER"
+              autocomplete="off"
+            />
+          </label>
+          <button class="pushover-reveal-btn pushover-reveal-token-btn" type="button" @click="revealPushoverToken = !revealPushoverToken">
+            {{ revealPushoverToken ? "隐藏" : "查看明文" }}
+          </button>
+        </div>
+        <!-- 票 11：明文入库并随备份扩散的风险（规格 G 已明示接受），固定展示 -->
+        <p class="hint pushover-risk-hint">{{ PUSHOVER_PLAINTEXT_WARNING }}</p>
         <div class="notify-row">
           <label>
             临近出眠提前
@@ -674,6 +809,11 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
           <span class="spacer"></span>
           <button class="btn primary" type="button" :disabled="notifyBusy" @click="saveNotify">保存</button>
         </div>
+      </div>
+
+      <!-- 网页端（webui-checkin 票 03）：网段 / 端口 / 凭证 / 访问地址 / 防火墙联动 -->
+      <div v-else-if="activeTab === 'webui'" class="tab-body">
+        <WebUiPanel @changed="onPanelChanged" />
       </div>
 
       <!-- 更新（release-update 票 06）：检查更新 / 确认安装 / 升级残留引导 -->
@@ -774,6 +914,39 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
             </div>
           </div>
           <p v-if="restoreResult" class="data-result restore-result">{{ restoreResult }}</p>
+        </div>
+
+        <!-- 巢况照片孤儿区（webui-checkin 票 07）：隔离区现状 + 一键清理（两段确认）。
+             巡检隔离在 Rust 启动/恢复后自动做，本区只查看与清理。 -->
+        <div class="backup-section orphan-section">
+          <div class="notify-row">
+            <span>巢况照片孤儿：</span>
+            <span v-if="orphanStats" class="orphan-stats-value">{{ orphanStatsText }}</span>
+            <span v-else class="orphan-stats-value">读取失败</span>
+          </div>
+          <div class="notify-row">
+            <button
+              class="btn data-btn orphan-refresh-btn"
+              type="button"
+              title="重新统计 photos/.orphan-* 隔离区现状"
+              @click="loadOrphanSection(true)"
+            >
+              重新统计
+            </button>
+            <button
+              v-if="orphanStats && orphanStats.file_count > 0"
+              class="btn data-btn orphan-clean-btn"
+              :class="{ confirming: orphanConfirming }"
+              type="button"
+              :disabled="orphanBusy"
+              title="删除全部隔离目录，释放空间（两段确认）"
+              @click="requestCleanOrphans"
+            >
+              {{ orphanConfirming ? "再次点击确认清理" : "清理孤儿照片" }}
+            </button>
+          </div>
+          <p v-if="orphanError" class="form-error orphan-error">{{ orphanError }}</p>
+          <p v-if="orphanResult" class="data-result orphan-result">{{ orphanResult }}</p>
         </div>
 
         <div class="data-actions">
@@ -915,6 +1088,36 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   color: var(--bad);
 }
 
+/* Pushover 应用内凭据（webui-checkin 票 11）：独立类，不复用 .days-input/.btn */
+.pushover-cred-row {
+  gap: 8px;
+}
+
+.pushover-cred-label {
+  font-size: 14px;
+}
+
+.pushover-input {
+  width: 220px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  background: var(--card);
+  color: var(--text);
+}
+
+.pushover-reveal-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--tile);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
 .days-input {
   width: 64px;
   padding: 6px 8px;
@@ -1016,6 +1219,18 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   border-color: var(--bad);
   color: #fff;
   font-weight: 600;
+}
+
+/* 巢况照片孤儿区（webui-checkin 票 07）：确认态红色警示与恢复按钮同款 */
+.orphan-clean-btn.confirming {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #fff;
+  font-weight: 600;
+}
+
+.orphan-stats-value {
+  color: var(--muted);
 }
 
 .data-btn {

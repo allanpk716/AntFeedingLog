@@ -9,7 +9,7 @@
  * 行内未保存的改名/排序不受影响（行状态在本地维护，不因外层刷新重建）。
  */
 import { ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { eraseLocation, saveLocation, setLocationEnabled } from "../lib/ipc";
 import type { LocationItem } from "../types";
 
 interface Row {
@@ -72,7 +72,7 @@ async function save() {
   try {
     for (let i = 0; i < rows.value.length; i++) {
       const row = rows.value[i]!;
-      await invoke("save_location", { input: { id: row.id, name: row.name, sort: i } });
+      await saveLocation({ input: { id: row.id, name: row.name, sort: i } });
     }
     emit("saved");
   } catch (e) {
@@ -87,7 +87,7 @@ async function setEnabled(row: Row, enabled: boolean) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("set_location_enabled", { id: row.id, enabled });
+    await setLocationEnabled({ id: row.id, enabled });
     row.enabled = enabled;
     emit("changed");
   } catch (e) {
@@ -102,7 +102,7 @@ async function erase(row: Row) {
   busy.value = true;
   error.value = "";
   try {
-    await invoke("erase_location", { id: row.id });
+    await eraseLocation({ id: row.id });
     rows.value = rows.value.filter((r) => r !== row);
     emit("changed");
   } catch (e) {

@@ -20,7 +20,12 @@ use rusqlite::Connection;
 /// v6：双层喂食周期（反馈第二轮 F3）——food 加 suggested_interval_days（预置按名
 ///     回填）；reminder_ledger 整表重建加 food_id 维度（v1 的 kind CHECK 不含
 ///     'food_overdue'，重建时顺带去掉该 CHECK、改由应用层保证）。
-pub const SCHEMA_VERSION: i64 = 6;
+/// v7：巢况登记三表（webui-checkin 票 02，只加不改）——nest_checkin（蚁口/换巢/
+///     备注登记）、nest_photo（照片元数据，本票只建表，写入随票 07）、data_meta
+///     （数据版本计数器等键值，计数器本身随票 06 接线）。settings 是键值表无需
+///     结构变更：pushover_user/pushover_token 两键不在此建行，读侧缺键回默认
+///     （设置 UI 随票 08；插空串占位反而与「未配置」难以区分）。
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -109,6 +114,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             3 => migrate_v3_to_v4(conn)?,
             4 => migrate_v4_to_v5(conn)?,
             5 => migrate_v5_to_v6(conn)?,
+            6 => migrate_v6_to_v7(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -248,6 +254,50 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<(), rusqlite::Error> {
         "#,
     )?;
     tx.pragma_update(None, "user_version", 6)?;
+    tx.commit()
+}
+
+/// v7（webui-checkin 票 02，只加不改）：巢况登记三表——
+/// ① nest_checkin：蚁口/换巢/备注登记（蚁后数/工蚁数可空 = 未数；日期可补录过去，
+///    未来日期由应用层拒绝；至少一项非空同样由应用层把守——schema 层用 NOT NULL
+///    DEFAULT 放行空壳行，避免把展示语义焊死在 CHECK 里）；
+/// ② nest_photo：照片元数据（rel_path 为 photos/ 下相对路径 `<colonyId>/<uuid>.jpg`，
+///    客户端原始文件名仅作备注；本票无写入路径，随票 07 照片管线接线）；
+/// ③ data_meta：键值元信息（数据版本计数器等，计数器本身随票 06 接线）。
+/// settings 键值表零改动（pushover 两键读侧缺键回默认，见 SCHEMA_VERSION 注）。
+/// 单事务原子完成，旧表结构零改动。
+fn migrate_v6_to_v7(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE nest_checkin (
+            id           INTEGER PRIMARY KEY,
+            colony_id    INTEGER NOT NULL REFERENCES colony(id),
+            date         TEXT    NOT NULL, -- 登记日期 ISO YYYY-MM-DD（可补录过去）
+            queen_count  INTEGER,          -- 蚁后数；NULL = 未数
+            worker_count INTEGER,          -- 工蚁数；NULL = 未数
+            moved_nest   INTEGER NOT NULL DEFAULT 0 CHECK (moved_nest IN (0, 1)),
+            note         TEXT    NOT NULL DEFAULT '',
+            created_at   TEXT    NOT NULL  -- 录入时间
+        );
+        CREATE INDEX idx_nest_checkin_colony ON nest_checkin(colony_id, date);
+
+        CREATE TABLE nest_photo (
+            id            INTEGER PRIMARY KEY,
+            checkin_id    INTEGER NOT NULL REFERENCES nest_checkin(id),
+            rel_path      TEXT    NOT NULL, -- photos/ 下相对路径（票 07 起写入）
+            original_name TEXT,             -- 客户端原始文件名，仅备注
+            note          TEXT    NOT NULL DEFAULT ''
+        );
+        CREATE INDEX idx_nest_photo_checkin ON nest_photo(checkin_id);
+
+        CREATE TABLE data_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 7)?;
     tx.commit()
 }
 
@@ -429,10 +479,13 @@ mod tests {
                 "care_action",
                 "care_log",
                 "colony",
+                "data_meta",
                 "food",
                 "hibernation",
                 "location",
                 "log_food",
+                "nest_checkin",
+                "nest_photo",
                 "reminder_ledger",
                 "settings",
             ]
@@ -443,7 +496,111 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
+    }
+
+    #[test]
+    fn v6_db_upgrades_to_v7_additive_only() {
+        // 真实 v6 库（完整迁移链 v0→v6）+ 用户数据，升 v7：
+        // ① 旧表/旧索引 DDL 逐条零改动（只加不改的硬验收）；
+        // ② 旧数据原样；③ 新三表可写。
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).unwrap();
+        seed_v1_presets(&conn).unwrap();
+        migrate_v1_to_v2(&conn).unwrap();
+        migrate_v2_to_v3(&conn).unwrap();
+        migrate_v3_to_v4(&conn).unwrap();
+        migrate_v4_to_v5(&conn).unwrap();
+        migrate_v5_to_v6(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (1, 1, '2026-09-15 08:00:00', '', '2026-09-15 08:00:00')",
+            [],
+        )
+        .unwrap();
+
+        let before: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, sql FROM sqlite_master
+                     WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(schema_version_of(&conn).unwrap(), 6);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(schema_version_of(&conn).unwrap(), 7);
+        let after: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, sql FROM sqlite_master
+                     WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%'
+                     ORDER BY name",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for (name, sql) in &before {
+            let found = after
+                .iter()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("升级后旧对象 {name} 消失"));
+            assert_eq!(found.1, *sql, "旧对象 {name} 的 DDL 被改动");
+        }
+        let new_names: Vec<&str> = after
+            .iter()
+            .filter(|(n, _)| !before.iter().any(|(b, _)| b == n))
+            .map(|(n, _)| n.as_str())
+            .collect();
+        assert_eq!(
+            new_names,
+            vec!["data_meta", "idx_nest_checkin_colony", "idx_nest_photo_checkin", "nest_checkin", "nest_photo"],
+            "v7 恰好新增三表两索引"
+        );
+
+        // 旧数据原样
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_log"), 1);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM settings"), 5, "settings 键值表无结构变更，pushover 键不在此建行");
+
+        // 新表可写：登记（全可空字段走默认）、照片元数据、键值
+        conn.execute(
+            "INSERT INTO nest_checkin (colony_id, date, queen_count, worker_count, moved_nest, note, created_at)
+             VALUES (1, '2026-09-18', 2, 300, 0, '', '2026-09-18 08:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+             VALUES (1, '1/uuid.jpg', NULL, '')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO data_meta (key, value) VALUES ('data_version', '1')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM nest_checkin"), 1);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM nest_photo"), 1);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM data_meta"), 1);
+
+        // 再次 migrate 幂等
+        migrate(&conn).unwrap();
     }
 
     #[test]

@@ -1,18 +1,29 @@
 mod applog;
 mod auto_backup;
 mod backup_config;
+mod backup_pkg;
 mod care;
 mod colony;
+mod data_meta;
+mod data_version;
 mod db;
 mod dict;
+mod firewall;
 mod hibernation;
+mod nest_checkin;
+mod netseg;
+mod photo;
 mod pushover;
 mod reminder;
 mod restore;
+mod restore_pkg;
 mod settings;
 mod stats;
 mod system;
 mod updater;
+mod webui_config;
+mod webui_args;
+mod webui_server;
 
 /// 全链冒烟（数据安全二期票 05）：造数据 → 自动备份 → 改数据 → 恢复 的端到端
 /// 断言。只在测试构建编译。
@@ -20,7 +31,7 @@ mod updater;
 mod full_chain;
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rusqlite::Connection;
@@ -34,20 +45,31 @@ pub struct SchemaInfo {
 }
 
 /// 数据库连接托管在应用状态里：Rust 是数据层唯一属主，前端只经 command 读写。
-/// `.1` 是库文件路径（安全备份直接拷这个文件，journal_mode=DELETE 拷贝即完整）。
-pub struct DbState(Mutex<Connection>, std::path::PathBuf);
+/// 锁包一层 Arc（票 04）：网页端 HTTP 服务（webui_server）要拿同一把库锁派发
+/// 命令——单连接不变，只是让 tokio 任务能持有克隆的锁柄。`.1` 是库文件路径
+/// （安全备份直接拷这个文件，journal_mode=DELETE 拷贝即完整）。
+pub struct DbState(Arc<Mutex<Connection>>, std::path::PathBuf);
 
-/// 借出连接的统一入口（锁被毒化时转成前端可见的错误串）。
+impl DbState {
+    /// 库锁的共享柄（HTTP 服务与桌面 IPC 同锁串行的接缝）。
+    pub(crate) fn conn_handle(&self) -> Arc<Mutex<Connection>> {
+        self.0.clone()
+    }
+}
+
+/// 借出连接的统一入口（锁被毒化时转成前端可见的错误串）。`with_conn`（桌面
+/// Tauri command）与网页端 HTTP 派发（webui_server::dispatch_command）共用本
+/// 函数：同一把锁、同一禁写窗口、同一失败日志，两条通路一个口径。
 /// 票 04 禁写窗口：快照完成后到进程退出前，一切请求在此拒绝。取舍：挂在统一
 /// 入口把读也一并拦下——窗口只有安装器拉起前的一瞬（随后进程退出），读失败
 /// 只是前端一次报错；而逐个写命令去挂太散、未来新命令可能漏挂。
 /// 复查必须在锁内（评审 R1 TOCTOU）：置位发生在快照的持锁段，若在拿锁前检查，
 /// 置位前已通过检查、正阻塞在 lock 上的在途写会在快照放锁后落库。
-fn with_conn<T>(
-    state: tauri::State<'_, DbState>,
+pub(crate) fn run_with_conn<T>(
+    conn_mutex: &Mutex<Connection>,
     f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
 ) -> Result<T, String> {
-    let conn = match state.0.lock() {
+    let conn = match conn_mutex.lock() {
         Ok(conn) => conn,
         Err(e) => {
             // 票 01：命令失败落日志（库锁不可用）
@@ -66,6 +88,14 @@ fn with_conn<T>(
         applog::log_error(&format!("命令执行失败: {e}"));
     }
     result
+}
+
+/// 桌面命令入口：State 里借出锁交给 [`run_with_conn`]。
+fn with_conn<T>(
+    state: tauri::State<'_, DbState>,
+    f: impl FnOnce(&rusqlite::Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    run_with_conn(&state.0, f)
 }
 
 /// IPC 通路健康检查：返回 schema 版本（迁移正常时应为 1）。
@@ -152,6 +182,177 @@ fn delete_log(
         trigger_after_write(&app);
     }
     result
+}
+
+// ── 巢况登记（webui-checkin 票 02）──
+// 巢况永不参与提醒/催促：不进维护操作清单、不调 refresh_tray_tooltip
+// （托盘 tooltip 只算喂食/维护超期）；仅数据写入触发自动备份。
+
+#[tauri::command]
+fn save_checkin(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    input: nest_checkin::CheckinInput,
+) -> Result<nest_checkin::NestCheckin, String> {
+    let result = with_conn(state, |conn| {
+        nest_checkin::save_checkin(conn, &input, &colony::today_iso(), &care::now_local())
+    });
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+#[tauri::command]
+fn list_checkins(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+) -> Result<Vec<nest_checkin::NestCheckin>, String> {
+    with_conn(state, |conn| nest_checkin::list_checkins(conn, colony_id))
+}
+
+#[tauri::command]
+fn update_checkin(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    id: i64,
+    input: nest_checkin::CheckinUpdateInput,
+) -> Result<nest_checkin::NestCheckin, String> {
+    let result = with_conn(state, |conn| {
+        nest_checkin::update_checkin(conn, id, &input, &colony::today_iso())
+    });
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+#[tauri::command]
+fn delete_checkin(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    id: i64,
+) -> Result<(), String> {
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let result = with_conn(state, |conn| {
+        // 删除顺序（票 07，规格 E）：先库事务删元数据提交，再删文件；
+        // 文件删失败仅产生孤儿（下轮巡检隔离），不回滚库。
+        let rel_paths = photo::collect_checkin_photo_paths(conn, id)?;
+        nest_checkin::delete_checkin(conn, id)?;
+        report_photo_orphans(&photo::delete_photo_files(&photos_root, &rel_paths));
+        Ok(())
+    });
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+#[tauri::command]
+fn get_checkin_digest(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+) -> Result<nest_checkin::CheckinDigest, String> {
+    with_conn(state, |conn| {
+        nest_checkin::digest_for_colony(conn, colony_id, &colony::today_iso())
+    })
+}
+
+// ── 巢况照片（webui-checkin 票 07）：上传校验重编码 / 写入协议 / 孤儿治理 ──
+// 纯核全在 photo.rs；这里只是 Tauri 薄包装。桌面 5 命令均**不入网页端白名单**
+//（照片上传/读取的 HTTP 通路随票 08 单独登记，pick/get_photo_abs_dir 这类
+// 桌面专属出口永不出网）。
+
+/// 照片文件清理的孤儿记账：失败仅遗留孤儿（下轮巡检隔离），绝不回滚库（规格 E）。
+fn report_photo_orphans(failures: &[String]) {
+    for f in failures {
+        applog::log_error(&format!("照片文件删除失败（遗留孤儿，待巡检隔离）: {f}"));
+    }
+}
+
+/// rfd 系统文件选择框多选巢况照片（取消返回 None）。async command：对话框
+/// 不能占主线程（评审 R1-2，与 pick_backup_dir 同理）。图片过滤器只是少让
+/// 用户选错——白名单真闸在 Rust 校验链（按魔数探测，不信扩展名）。
+#[tauri::command]
+async fn pick_photo_files() -> Result<Option<Vec<String>>, String> {
+    let picked = rfd::AsyncFileDialog::new()
+        .set_title("选择巢况照片")
+        .add_filter("图片（JPEG/PNG/WebP）", &["jpg", "jpeg", "png", "webp"])
+        .pick_files()
+        .await
+        .map(|files| {
+            files
+                .iter()
+                .map(|handle| handle.path().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        });
+    Ok(picked)
+}
+
+/// 上传巢况照片：读盘 → 校验链重编码（格式白名单/尺寸/解码炸弹头/缩放/JPEG
+/// 重编码清 EXIF）→ 写入协议落盘插库。解码/编码是 CPU 重活且不碰库，放在
+/// spawn_blocking 且库锁外做（锁内只留写入协议的几条小 IO + 插行）；成功 =
+/// 元数据已提交（「照片写库即算当日新数据」的自动备份语义以它为准），走
+/// trigger_after_write 与其他写命令同一咽喉。
+#[tauri::command]
+async fn attach_photos(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    checkin_id: i64,
+    paths: Vec<String>,
+) -> Result<Vec<nest_checkin::NestPhotoMeta>, String> {
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let conn_handle = state.inner().conn_handle();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let uploads = photo::read_photo_files(&paths)?;
+        let uploads = photo::process_uploads(uploads)?;
+        run_with_conn(&conn_handle, |conn| {
+            photo::attach_photos(conn, &photos_root, checkin_id, &uploads)
+        })
+    })
+    .await
+    .map_err(|e| format!("照片上传任务异常退出: {e}"))?;
+    if outcome.is_ok() {
+        trigger_after_write(&app);
+    }
+    outcome
+}
+
+/// 照片根目录绝对路径：桌面显示本地图用——前端 convertFileSrc 把
+/// `<数据目录>/photos/<relPath>` 变成 asset 协议 URL（scope 限定 photos/
+/// 的配置在 tauri.conf.json app.security.assetProtocol）。
+#[tauri::command]
+fn get_photo_abs_dir() -> Result<String, String> {
+    let dir = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// 孤儿照片隔离区现状（设置页数据 tab「巢况照片孤儿」区）。
+#[tauri::command]
+fn list_orphan_photos() -> Result<photo::OrphanPhotoStats, String> {
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    Ok(photo::orphan_stats(&photos_root))
+}
+
+/// 一键清理孤儿照片（删除 photos/.orphan-* 隔离目录；前端两段确认后调用）。
+/// 成败落流水（D7）。
+#[tauri::command]
+fn clean_orphan_photos() -> Result<photo::OrphanCleanOutcome, String> {
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let outcome = photo::clean_orphans(&photos_root);
+    if outcome.errors.is_empty() {
+        applog::log_action(&format!(
+            "孤儿照片清理完成：删除 {} 个隔离目录，释放 {} 字节",
+            outcome.removed_dirs, outcome.freed_bytes
+        ));
+    } else {
+        applog::log_error(&format!(
+            "孤儿照片清理部分失败（已删 {} 个目录）: {}",
+            outcome.removed_dirs,
+            outcome.errors.join("；")
+        ));
+    }
+    Ok(outcome)
 }
 
 // ── 字典管理与操作性质设置（票 04）──
@@ -323,7 +524,14 @@ fn delete_colony(
     app: tauri::AppHandle,
     id: i64,
 ) -> Result<(), String> {
-    let result = with_conn(state, |conn| colony::delete_colony(conn, id));
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let result = with_conn(state, |conn| {
+        // 删窝级联（票 07）：库事务删行提交后清照片文件；失败仅孤儿，不回滚库
+        let rel_paths = photo::collect_colony_photo_paths(conn, id)?;
+        colony::delete_colony(conn, id)?;
+        report_photo_orphans(&photo::delete_photo_files(&photos_root, &rel_paths));
+        Ok(())
+    });
     reminder::refresh_tray_tooltip(&app);
     if result.is_ok() {
         trigger_after_write(&app);
@@ -525,16 +733,19 @@ fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> 
 }
 
 /// 发送测试通知（设置弹窗按钮；不经开关与台账，排障用）。
-/// 双通道各测各的：桌面失败不影响手机，pushover=None 表示未配置环境变量。
+/// 双通道各测各的：桌面失败不影响手机，pushover=None 表示未配置。
+/// ⚠ 严禁注册进网页端 HTTP 白名单：设置面命令桌面专属（规格 H；webui-checkin 票 11）。
 #[tauri::command]
 fn send_test_notification(app: tauri::AppHandle) -> reminder::TestNotifyOutcome {
     reminder::send_test_notification_dual(&app)
 }
 
-/// Pushover 配置状态探测：只报环境变量在/不在，不回报值。
+/// Pushover 配置状态探测（webui-checkin 票 11 三态）：只报生效来源
+///（应用内/环境变量/未配置）与是否已配置，不回报值。
+/// ⚠ 严禁注册进网页端 HTTP 白名单：设置面命令桌面专属（规格 H；同票 03 禁入先例）。
 #[tauri::command]
-fn pushover_status() -> pushover::PushoverStatus {
-    pushover::status_from_env()
+fn pushover_status(state: tauri::State<DbState>) -> Result<pushover::PushoverStatus, String> {
+    with_conn(state, pushover::status_from_db)
 }
 
 // ── 更新检查（票 02）──
@@ -658,6 +869,172 @@ fn open_releases_page(app: tauri::AppHandle) -> Result<(), String> {
     result
 }
 
+// ── 网页端设置（webui-checkin 票 03）：网段枚举 / 配置与凭证 / 防火墙联动 ──
+// 配置存数据目录 webui-config.json（库外，恢复不触碰，同 backup-config.json 取舍）。
+// 票 04 起：保存成功后按新配置对齐内嵌 HTTP 服务（起/停/改端口即重启）；
+// 凭证与网段由服务每请求现读，重生成/改网段即刻生效，无须动服务。
+
+/// 枚举本机网段（虚拟化噪音已滤、NetBird 段置顶标名）。async：PowerShell 枚举
+/// 不能占主线程（评审 R1-2 同款，与 pick_backup_dir 同理）。
+#[tauri::command]
+async fn list_network_segments() -> Result<Vec<netseg::NetworkSegment>, String> {
+    tauri::async_runtime::spawn_blocking(netseg::enumerate)
+        .await
+        .map_err(|e| format!("网段枚举任务异常退出: {e}"))?
+}
+
+/// 读网页端配置；凭证为空顺路补生成并落盘（首次打开设置页即有凭证可用）。
+///
+/// ⚠ **严禁注册进网页端 HTTP 白名单**：本命令响应含**访问凭证明文**，只允许
+/// 桌面 Tauri IPC 调用——webui_server::WEBUI_COMMANDS 的
+/// `registry_excludes_forbidden_commands` 测试钉死本命令不得入表（票 03 评审
+/// Important 的落点），一旦暴露，凭证即泄漏给页面侧脚本。
+#[tauri::command]
+fn get_webui_config() -> Result<webui_config::WebUiConfig, String> {
+    let data_dir = current_data_dir()?;
+    webui_config::load_ready(&data_dir)
+}
+
+/// save_webui_config 返回体（半成功语义，同 settle_settings_save 取舍）：配置
+/// 落盘是事实，防火墙失败不吞掉它——结构化回传错误 + 现成手动命令，前端分开展示。
+/// 服务起停结果同理（票 04）：端口被占用 → 配置已保存但 server_error 给人话
+/// 提示（设置页回显），绝不把已保存的配置标成失败。
+#[derive(Serialize)]
+pub struct WebUiSaveOutcome {
+    pub config: webui_config::WebUiConfig,
+    pub firewall_ok: bool,
+    pub firewall_error: Option<String>,
+    pub firewall_manual_cmd: Option<String>,
+    /// 网页端服务按新配置对齐成功（含「停用即关停」）。
+    pub server_ok: bool,
+    /// 服务起停失败的人话原因（端口占用等）；None = 正常。
+    pub server_error: Option<String>,
+}
+
+/// 保存网页端配置（enabled/segments/port；CIDR 与端口校验在 webui_config 纯核，
+/// 绕过前端的直调在此兜底拦下）。成功后两件联动，都走阻塞线程池/异步不冻 UI：
+/// 防火墙规则（开 = 先删后建幂等，关 = 删规则，UAC 弹窗）+ 内嵌 HTTP 服务按新
+/// 配置对齐（票 04：起/停/改端口重启；端口被占用不崩溃，人话错误回设置页）。
+/// 防火墙与服务成败都落流水（D7），且都不吞掉已保存的配置（半成功语义）。
+///
+/// ⚠ **严禁注册进网页端 HTTP 白名单**：本命令可改受信网段/端口/开关（闸一
+/// 安全配置），只能由桌面设置页发起；网页端的功能面不含任何设置操作（规格 H），
+/// webui_server::WEBUI_COMMANDS 的禁入断言测试钉死本命令不得入表。
+#[tauri::command]
+async fn save_webui_config(
+    app: tauri::AppHandle,
+    input: webui_config::WebUiSaveInput,
+) -> Result<WebUiSaveOutcome, String> {
+    let data_dir = current_data_dir()?;
+    let saved = webui_config::save_webui(&data_dir, &input)?;
+    let segments_text = if saved.segments.is_empty() {
+        "无".to_string()
+    } else {
+        saved.segments.join(",")
+    };
+    applog::log_action(&format!(
+        "网页端配置已保存：开关{}，端口 {}，网段 {}",
+        if saved.enabled { "开" } else { "关" },
+        saved.port,
+        segments_text,
+    ));
+    let fw_segments = saved.segments.clone();
+    let fw_port = saved.port;
+    let fw_enabled = saved.enabled;
+    let fw = tauri::async_runtime::spawn_blocking(move || {
+        firewall::sync(fw_enabled, &fw_segments, fw_port)
+    })
+    .await
+    .map_err(|e| format!("防火墙同步任务异常退出: {e}"))?;
+    let (firewall_ok, firewall_error, firewall_manual_cmd) = match fw {
+        Ok(()) => {
+            applog::log_action("防火墙规则已同步（AntFeedingLog WebUI）");
+            (true, None, None)
+        }
+        Err(e) => {
+            applog::log_error(&format!("防火墙规则同步失败: {}（手动命令已给前端）", e.message));
+            (false, Some(e.message), Some(e.manual_cmd))
+        }
+    };
+    // 服务对齐（票 04）：失败不回滚已落盘的配置，人话错误随回传体给设置页
+    let server_outcome = sync_webui_server(&app, &saved).await;
+    let (server_ok, server_error) = match server_outcome {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
+    Ok(WebUiSaveOutcome {
+        config: saved,
+        firewall_ok,
+        firewall_error,
+        firewall_manual_cmd,
+        server_ok,
+        server_error,
+    })
+}
+
+/// 按配置对齐网页端服务（启动序列与 save_webui_config 共用入口）。
+/// 从 Tauri 状态拿运行时槽位与共享依赖；状态未就绪（极端早退路径）报人话错误。
+async fn sync_webui_server(app: &tauri::AppHandle, cfg: &webui_config::WebUiConfig) -> Result<(), String> {
+    let runtime = app
+        .try_state::<webui_server::WebUiRuntime>()
+        .ok_or_else(|| "网页端服务运行时未就绪".to_string())?;
+    let deps = app
+        .try_state::<Arc<webui_server::SharedDeps>>()
+        .ok_or_else(|| "网页端服务依赖未就绪".to_string())?;
+    runtime.sync(deps.inner().clone(), cfg).await
+}
+
+/// 重生成访问凭证（旧地址即刻作废 = 覆盖写）。成功记一条动作流水（D7）。
+///
+/// ⚠ **严禁注册进网页端 HTTP 白名单**：本命令返回**新凭证明文**且可直接作废
+/// 全部旧地址（安全管理操作），只允许桌面设置页调用——webui_server 的
+/// `registry_excludes_forbidden_commands` 测试钉死本命令不得入表。
+/// 凭证重生成后旧地址即刻失效的机制：HTTP 服务每请求现读配置文件（webui_server
+/// auth_mw 取舍注释），无需通知服务。
+#[tauri::command]
+fn regenerate_token() -> Result<webui_config::WebUiConfig, String> {
+    let data_dir = current_data_dir()?;
+    let cfg = webui_config::regenerate_token(&data_dir)?;
+    applog::log_action("网页端访问凭证已重生成（旧地址即刻作废）");
+    Ok(cfg)
+}
+
+/// 完整访问地址 `http://<IP>:<端口>/#token=<凭证>`：按配置第一个受信网段上的
+/// 本机 IP 拼（多段取第一个）。网段当前不在线报错（如拔掉 NetBird 后）。
+/// async：网卡枚举不能占主线程。
+///
+/// ⚠ **严禁注册进网页端 HTTP 白名单**：本命令响应就是**含凭证的完整访问地址**，
+/// 只允许桌面设置页/向导调用——webui_server 的 `registry_excludes_forbidden_commands`
+/// 测试钉死本命令不得入表，经网页端 API 取到它等于把进门凭证递给页面侧。
+#[tauri::command]
+async fn get_access_url() -> Result<String, String> {
+    let data_dir = current_data_dir()?;
+    let cfg = webui_config::load_ready(&data_dir)?;
+    if cfg.segments.is_empty() {
+        return Err("尚未选择受信网段，先在设置里勾选".into());
+    }
+    let first = cfg.segments[0].clone();
+    let nics = tauri::async_runtime::spawn_blocking(netseg::list_nics)
+        .await
+        .map_err(|e| format!("网卡枚举任务异常退出: {e}"))??;
+    let ip = netseg::pick_ip_for_segment(&nics, &first).ok_or_else(|| {
+        format!("所选网段 {first} 上未发现本机地址（网段当前不在线？确认 NetBird/该网段已连接）")
+    })?;
+    Ok(webui_config::build_access_url(&ip, cfg.port, &cfg.token))
+}
+
+/// 网页端首启向导做过没有（缺省 = 未做，前端据此弹一次向导）。
+#[tauri::command]
+fn get_webui_wizard_done(state: tauri::State<'_, DbState>) -> Result<bool, String> {
+    with_conn(state, settings::get_webui_wizard_done)
+}
+
+/// 标记网页端首启向导已处理（完成或跳过都写；幂等）。
+#[tauri::command]
+fn mark_webui_wizard_done(state: tauri::State<'_, DbState>) -> Result<(), String> {
+    with_conn(state, settings::mark_webui_wizard_done)
+}
+
 // ── 日志与异常退出（数据安全二期票 01，D10 命令契约）──
 
 /// 打开日志文件夹（opener 打开数据目录下 logs/；目录不存在先创建）。
@@ -762,11 +1139,16 @@ fn get_backup_status() -> Result<backup_config::BackupStatus, String> {
 
 // ── 自动备份引擎（数据安全二期票 03，D2/D3/D4；引擎本体在 auto_backup.rs）──
 
-/// 业务写入成功后的触发点（D2 ①）：先同步记 `last_data_write_date`（配置锁内
-/// 快速落账，账目不丢），再后台线程判定 + 备份——网络盘等慢速目标目录不阻塞
-/// 命令返回与 UI（spec D3 锁外拷贝）。备份失败静默（记账+日志），绝不把错误
-/// 报给业务命令：写入照常成功返回（票面铁律）。
+/// 业务写入成功后的触发点（D2 ①）：票 06 起，第一件事是数据版本 +1 并双端
+/// 广播（库内 data_meta 计数器 +1 → SSE hub 发布 → 桌面 `data-version` 事件）。
+/// 这是统一咽喉：桌面 21 个写命令直接调本函数，HTTP 写命令经 webui_after_write
+/// 钩子同路——绝不在各命令里散写 bump。随后照旧：同步记 `last_data_write_date`
+/// （配置锁内快速落账，账目不丢），再后台线程判定 + 备份——网络盘等慢速目标
+/// 目录不阻塞命令返回与 UI（spec D3 锁外拷贝）。备份失败静默（记账+日志），
+/// 绝不把错误报给业务命令：写入照常成功返回（票面铁律），版本自增失败同样
+/// 只落日志（少一次广播，客户端下次 hello/重连自动对齐）。
 fn trigger_after_write(app: &tauri::AppHandle) {
+    bump_data_version_and_broadcast(app);
     let data_dir = match current_data_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -779,6 +1161,118 @@ fn trigger_after_write(app: &tauri::AppHandle) {
         applog::log_error(&format!("记录业务写入日期失败: {e}"));
     }
     spawn_auto_backup(app);
+}
+
+/// 数据版本自增 + 双端广播（webui-checkin 票 06）：库内计数 +1（与写命令同一
+/// 把库锁、锁外串行），网页端经 SSE hub 收推、桌面端收 `data-version` 事件
+/// （负载 {epoch, version} 与 SSE 帧同形）。Tauri 状态未就绪（极端早退路径）
+/// 或自增失败只落日志，绝不影响业务写入结果。
+fn bump_data_version_and_broadcast(app: &tauri::AppHandle) {
+    let Some(db) = app.try_state::<DbState>() else {
+        return;
+    };
+    let Some(deps) = app.try_state::<Arc<webui_server::SharedDeps>>() else {
+        return;
+    };
+    match webui_server::bump_and_publish(&db.0, &deps.versions) {
+        Ok(frame) => {
+            use tauri::Emitter;
+            let _ = app.emit("data-version", frame);
+        }
+        Err(e) => applog::log_error(&format!("数据版本自增失败（跳过广播）: {e}")),
+    }
+}
+
+/// 孤儿照片巡检（票 07，规格 E/F）：库无引用文件移入 `photos/.orphan-<时间戳>/`
+/// （移动非删除），`.tmp-` 残留直接删。启动时与恢复完成后各跑一轮；有动作才落
+/// 流水（干净不刷屏）。
+fn run_orphan_scan(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<DbState>() else {
+        return;
+    };
+    let Ok(photos_root) = current_data_dir().map(|d| d.join(photo::PHOTOS_DIR_NAME)) else {
+        return;
+    };
+    let outcome = run_with_conn(&state.0, |conn| {
+        Ok::<photo::OrphanScanOutcome, String>(photo::scan_orphans(
+            conn,
+            &photos_root,
+            &photo::stamp_now(),
+        ))
+    });
+    match outcome {
+        Ok(o) if !o.moved.is_empty() || !o.removed_tmp.is_empty() || !o.errors.is_empty() => {
+            applog::log_action(&format!(
+                "孤儿照片巡检：隔离 {} 个无引用文件，清理 {} 个 .tmp- 残留{}",
+                o.moved.len(),
+                o.removed_tmp.len(),
+                if o.errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("，失败 {} 个：{}", o.errors.len(), o.errors.join("；"))
+                }
+            ));
+        }
+        Ok(_) => {}
+        // run_with_conn 已落过失败日志；这里只补巡检语境
+        Err(_) => {}
+    }
+}
+
+/// 数据包恢复中断续跑（webui-checkin 票 10）：库替换后进程被杀 → 暂存目录
+/// 留存，启动时把「当前库引用而 photos/ 缺失」且暂存区有的照片继续落位，然后
+/// 清暂存目录。必须在孤儿巡检之前跑（巡检会把换库前的旧照片按孤儿隔离，顺序
+/// 不能反）。有动作才落流水。
+fn run_pkg_restore_resume(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<DbState>() else {
+        return;
+    };
+    let Ok(data_dir) = current_data_dir() else {
+        return;
+    };
+    let photos_root = data_dir.join(photo::PHOTOS_DIR_NAME);
+    let outcome = run_with_conn(&state.0, |conn| {
+        Ok::<restore_pkg::PkgResumeOutcome, String>(restore_pkg::resume_pending_pkg_restores(
+            &data_dir,
+            &photos_root,
+            conn,
+        ))
+    });
+    match outcome {
+        Ok(o) if !o.resumed.is_empty() || !o.discarded.is_empty() || !o.errors.is_empty() => {
+            if !o.errors.is_empty() {
+                applog::log_error(&format!(
+                    "数据包恢复续跑未完成（下次启动重试）: {}",
+                    o.errors.join("；")
+                ));
+            }
+            if !o.resumed.is_empty() || !o.discarded.is_empty() {
+                applog::log_action(&format!(
+                    "数据包恢复续跑：完成 {} 个暂存目录的照片落位，丢弃 {} 个半截暂存目录{}",
+                    o.resumed.len(),
+                    o.discarded.len(),
+                    if o.landed.is_empty() {
+                        String::new()
+                    } else {
+                        format!("，落位照片 {} 张", o.landed.len())
+                    }
+                ));
+            }
+        }
+        Ok(_) => {}
+        // run_with_conn 已落过失败日志；这里只补续跑语境
+        Err(_) => {}
+    }
+}
+
+/// 启动巡检放后台线程：照片多时扫盘不挡启动。先续跑数据包恢复（票 10）再
+/// 巡检——顺序见 [`run_pkg_restore_resume`]。
+fn spawn_orphan_scan(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        run_pkg_restore_resume(&app);
+        run_orphan_scan(&app);
+    });
 }
 
 /// 启动触发点（D2 ②）与写入触发点共用的后台执行入口：判定（含时钟回拨钳制）
@@ -801,12 +1295,13 @@ fn spawn_auto_backup(app: &tauri::AppHandle) {
 
 /// rfd 系统文件选择框选备份文件（取消返回 None）。async command：对话框不能占
 /// 主线程（与 pick_backup_dir 同理，评审 R1-2）。`default_dir` = 备份目录已设置
-/// 时作为对话框初始位置（目录真实存在才生效）。
+/// 时作为对话框初始位置（目录真实存在才生效）。票 10：同时认数据包（.zip）与
+/// 旧裸库（.db），恢复侧按扩展名分流。
 #[tauri::command]
 async fn pick_restore_file(default_dir: Option<String>) -> Result<Option<String>, String> {
     let mut dialog = rfd::AsyncFileDialog::new()
         .set_title("选择要恢复的备份文件")
-        .add_filter("SQLite 数据库", &["db"]);
+        .add_filter("备份数据包 / 数据库", &["zip", "db"]);
     if let Some(dir) = default_dir {
         let p = std::path::PathBuf::from(&dir);
         if p.is_dir() {
@@ -879,11 +1374,28 @@ fn restore_apply(
             // 确实换了，前端此时应展示重启提示而不是旧数据）
             // Further Notes 落账：Q13 授权的「提示重启」降级未触发——db-restored
             // 事件刷新链路已工作（组件测试覆盖前端侧），降级预案仅在未来链路
-            // 失灵时启用。
+            // 失灵时启用。db-restored 语义保持=无条件刷新（票 06 不改它）。
             use tauri::Emitter;
             let _ = app.emit("db-restored", ());
+            // 票 06：恢复后版本可能回退（换入旧备份的计数器更小）——用
+            // restore_bump_and_publish 把新库计数抬到「本实例已广播最大值+1」
+            // 并广播 version 帧，网页端对账必判落后 → 无条件刷新。失败只落
+            // 日志：桌面端已有 db-restored 兜底，网页端等下次写/重连对齐。
+            if let Some(deps) = app.try_state::<Arc<webui_server::SharedDeps>>() {
+                match webui_server::restore_bump_and_publish(&state.0, &deps.versions) {
+                    Ok(frame) => {
+                        let _ = app.emit("data-version", frame);
+                    }
+                    Err(e) => {
+                        applog::log_error(&format!("恢复后数据版本对齐失败: {e}"));
+                    }
+                }
+            }
             // 托盘 tooltip 是库内超期摘要的投影，恢复后立即重算
             reminder::refresh_tray_tooltip(&app);
+            // 孤儿照片巡检（票 07）：换入的库/照片集合可能不一致（旧裸库恢复
+            // 后照片场景按孤儿治理，规格 F），恢复完成立即扫一轮
+            run_orphan_scan(&app);
         }
         Err(e) => {
             applog::log_error(&format!("恢复执行失败（来源 {path}）: {e}"));
@@ -935,30 +1447,65 @@ fn date_stamp() -> String {
     chrono::Local::now().format("%Y%m%d").to_string()
 }
 
-/// 安全备份：rfd 选目标 → 短暂拿锁挡住并发写 → 拷贝库文件
-/// （journal_mode=DELETE，拷贝即完整，评审附录规则 11）。用户取消返回 None。
-/// 成败都落流水（终局评审 D7：备份成功/失败；本命令不经 with_conn）。
+/// 安全备份（票 09 起产出数据包）：rfd 选目标 → 锁内拷库到临时（挡并发写，
+/// 毫秒级本地拷贝，journal_mode=DELETE 拷贝即完整）→ 锁外打包（读 photos/ +
+/// 流式写 zip；照片文件 immutable 文件名、清单以锁内库快照为准，一致性论证见
+/// backup_pkg.rs 模块头）→ 清临时。缺照片文件降级（跳过+错误流水），包照常
+/// 产出。用户取消返回 None。成败都落流水（终局评审 D7：备份成功/失败；本命令
+/// 不经 with_conn）。
 #[tauri::command]
 async fn backup_to(state: tauri::State<'_, DbState>) -> Result<Option<String>, String> {
     let db_path = state.1.clone();
-    let default_name = format!("ant-feeding-log-backup-{}.db", date_stamp());
-    let Some(target) = pick_save_path(&default_name, "SQLite 数据库", &["db"]).await else {
+    let stamp = auto_backup::stamp_now();
+    // 评审 R1：手动命名 manual- 中缀——parse_backup_file_name 不识别 → 落进
+    // 自动备份目录也绝不进保留轮换池（手动产物由用户自管）。
+    let default_name = auto_backup::manual_backup_file_name(&stamp);
+    let Some(target) = pick_save_path(&default_name, "蚂蚁饲养记录数据包（zip）", &["zip"]).await
+    else {
         return Ok(None);
     };
-    // 拷贝期间短暂持锁：保证没有并发写（对话框阶段不持锁，不卡其他命令）
-    let _guard = match state.0.lock() {
-        Ok(guard) => guard,
-        Err(e) => {
-            applog::log_error(&format!("安全备份失败（库锁不可用）: {e}"));
-            return Err(e.to_string());
-        }
+    let data_dir = current_data_dir()?;
+    // 锁内拷库（对话框阶段不持锁，不卡其他命令）；staging 用手动链独立前缀
+    //（manual-backup-staging-，评审 R1：与自动备份同秒不撞名）
+    let temp_db = {
+        let guard = match state.0.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                applog::log_error(&format!("安全备份失败（库锁不可用）: {e}"));
+                return Err(e.to_string());
+            }
+        };
+        let copied = auto_backup::copy_db_to_temp_manual(&db_path, &data_dir, &stamp);
+        drop(guard); // 照片打包在锁外，不阻塞业务命令
+        copied?
     };
-    if let Err(e) = system::backup_db_file(&db_path, &target) {
-        applog::log_error(&format!("安全备份失败: {e}"));
-        return Err(e);
+    let photos_root = data_dir.join(photo::PHOTOS_DIR_NAME);
+    let mut on_skip = |msg: &str| {
+        applog::log_error(&format!("安全备份照片跳过（包内不含该张）: {msg}"))
+    };
+    let result = backup_pkg::build_package(
+        &temp_db,
+        &photos_root,
+        &applog::now_local(),
+        &target,
+        &mut on_skip,
+    );
+    let _ = std::fs::remove_file(&temp_db);
+    match result {
+        Ok(outcome) => {
+            applog::log_action(&format!(
+                "安全备份成功: {}（照片 {} 张，包 {} 字节）",
+                target.display(),
+                outcome.photo_count,
+                std::fs::metadata(&target).map(|m| m.len()).unwrap_or(0),
+            ));
+            Ok(Some(target.to_string_lossy().to_string()))
+        }
+        Err(e) => {
+            applog::log_error(&format!("安全备份失败: {e}"));
+            Err(e)
+        }
     }
-    applog::log_action(&format!("安全备份成功: {}", target.display()));
-    Ok(Some(target.to_string_lossy().to_string()))
 }
 
 /// 导出归档（评审附录规则 11：定位为归档带走；恢复走应用内恢复通道 restore.rs）：csv=记录流水一行一条
@@ -1024,7 +1571,44 @@ pub fn run() {
             let autostart_on = settings::get_settings(&conn)
                 .map(|s| s.autostart_enabled)
                 .unwrap_or(true);
-            app.manage(DbState(Mutex::new(conn), db_path));
+            let db_state = DbState(Arc::new(Mutex::new(conn)), db_path);
+            // 网页端服务（票 04）：共享依赖（与桌面 IPC 同一把库锁的柄）+ 运行时
+            // 槽位先就位；配置 enabled 即拉起。启动失败只落日志不挡启动（不弹窗
+            // 不崩溃；设置页保存时会对齐并回显错误，用户可当场看到原因）。
+            // 票 05 接线两个钩子：
+            // - after_write：写命令成功后的桌面同款收尾（按命令性质刷托盘 tooltip
+            //   + trigger_after_write 自动备份记账/后台判定）；HTTP 写命令不再另
+            //   起一条对齐路径，桌面/网页共用同一套触发点。
+            // - frontend_assets：打包后的 frontendDist 产物嵌在二进制里，经
+            //   asset resolver 取出托管（浏览器打开 / 即完整前端）；tauri dev 期
+            //   嵌入资源为空，静态路由 404（开发期浏览器走 devUrl）。
+            let webui_after_write: webui_server::AfterWriteHook = {
+                let handle = app.handle().clone();
+                Arc::new(move |with_tray| {
+                    if with_tray {
+                        reminder::refresh_tray_tooltip(&handle);
+                    }
+                    trigger_after_write(&handle);
+                })
+            };
+            let webui_assets: webui_server::AssetLookup = {
+                let handle = app.handle().clone();
+                Arc::new(move |path| {
+                    handle
+                        .asset_resolver()
+                        .get(path.to_string())
+                        .map(|asset| asset.bytes().to_vec())
+                })
+            };
+            let webui_deps = Arc::new(webui_server::SharedDeps::with_hooks(
+                db_state.conn_handle(),
+                data_dir.clone(),
+                webui_after_write,
+                webui_assets,
+            ));
+            app.manage(webui_deps);
+            app.manage(webui_server::WebUiRuntime::new());
+            app.manage(db_state);
             // 托盘常驻 + 提醒调度（启动即查一次，此后每 30 分钟；评审附录规则 1）。
             reminder::setup_tray(app)?;
             reminder::spawn_scheduler(app.handle().clone());
@@ -1051,6 +1635,9 @@ pub fn run() {
             // 序列后，后台判定（含时钟回拨钳制）→ 有未备份的新数据才补跑
             // （跨日空启动不备；备份失败留给本触发点下次启动补）。
             spawn_auto_backup(app.handle());
+            // 孤儿照片巡检（票 07）：启动后扫 photos/，库无引用文件移入隔离区。
+            // 后台线程跑，扫盘不挡启动。
+            spawn_orphan_scan(app.handle());
             // 关窗 = 最小化到托盘（票 09 验收 1）：拦截关闭请求只隐藏，托盘「退出」才真退。
             if let Some(window) = app.get_webview_window("main") {
                 let win = window.clone();
@@ -1070,6 +1657,18 @@ pub fn run() {
                 )),
                 Err(e) => applog::log_error(&format!("启动时同步开机自启失败: {e}")),
             }
+            // 网页端服务自启（票 04）：上次会话启用过即拉起（绑定失败时 start()
+            // 已落日志——端口占用等细节在流水里，设置页重新保存可回显）。disabled
+            // 静默（每次启动都记「未启用」是刷屏）。
+            let webui_cfg = webui_config::load(&data_dir);
+            if webui_cfg.enabled {
+                let app_handle = app.handle().clone();
+                let outcome =
+                    tauri::async_runtime::block_on(sync_webui_server(&app_handle, &webui_cfg));
+                if let Err(e) = outcome {
+                    applog::log_error(&format!("启动时拉起网页端服务失败: {e}"));
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1080,6 +1679,16 @@ pub fn run() {
             colony_month_records,
             update_log,
             delete_log,
+            save_checkin,
+            list_checkins,
+            update_checkin,
+            delete_checkin,
+            get_checkin_digest,
+            pick_photo_files,
+            attach_photos,
+            get_photo_abs_dir,
+            list_orphan_photos,
+            clean_orphan_photos,
             list_actions,
             save_action,
             set_action_enabled,
@@ -1127,6 +1736,13 @@ pub fn run() {
             export_data,
             get_stats,
             earliest_log_date,
+            list_network_segments,
+            get_webui_config,
+            save_webui_config,
+            regenerate_token,
+            get_access_url,
+            get_webui_wizard_done,
+            mark_webui_wizard_done,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

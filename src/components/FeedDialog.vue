@@ -7,7 +7,7 @@
  * 选中日已有同操作记录出黄条（不拦提交）。接入与 QuickLogDialog 同构。
  */
 import { computed, onMounted, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { colonyMonthRecords, listActions, listFoods, logCare } from "../lib/ipc";
 import type { CareActionItem, Colony, ColonyAction, FoodItem, MonthDayRecords } from "../types";
 import { nowLocalDateTime } from "../lib/care";
 import { todayIso } from "../lib/dates";
@@ -31,7 +31,7 @@ const enabledFoods = computed(() => foods.value.filter((f) => f.enabled));
 
 onMounted(async () => {
   try {
-    foods.value = await invoke<FoodItem[]>("list_foods");
+    foods.value = await listFoods();
   } catch (e) {
     formError.value = String(e);
   }
@@ -45,7 +45,7 @@ async function loadMonth(y: number, m: number) {
   viewMonth.value = { year: y, month: m };
   const seq = ++monthSeq;
   try {
-    const res = await invoke<MonthDayRecords[]>("colony_month_records", {
+    const res = await colonyMonthRecords({
       colonyId: props.colony.id,
       year: y,
       month: m,
@@ -63,7 +63,7 @@ onMounted(() => void loadMonth(viewMonth.value.year, viewMonth.value.month));
 const allActions = ref<CareActionItem[]>([]);
 async function loadActions() {
   try {
-    allActions.value = await invoke<CareActionItem[]>("list_actions");
+    allActions.value = await listActions();
   } catch {
     // 名字表是增强，失败静默（当前操作名有 props 兜底）
   }
@@ -111,7 +111,7 @@ async function submit() {
   busy.value = true;
   formError.value = "";
   try {
-    await invoke("log_care", {
+    await logCare({
       input: {
         colony_id: props.colony.id,
         action_id: props.action.action_id,

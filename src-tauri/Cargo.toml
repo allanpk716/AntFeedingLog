@@ -18,7 +18,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# protocol-asset（webui-checkin 票 07）：tauri.conf.json 启用了 assetProtocol
+#（scope 限定 $APPDATA/photos/**），桌面缩略图/大图经 asset 协议读照片文件
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-opener = "2"
@@ -31,6 +33,50 @@ serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ureq = "2"
+# 网页端访问凭证随机源（webui-checkin 票 03）：OS 级随机 ≥128bit，只程序生成
+getrandom = "0.3"
+# 网页端内嵌 HTTP 服务（webui-checkin 票 04）。选型 axum：票 06 的 SSE 长连接有
+# 内置支持（axum::response::sse），中间件分层天然承载闸一/闸二；Tauri 2 本就跑在
+# tokio 上（updater 等在用），hyper 1.x / tower 0.5 已是 Tauri 传递依赖，axum 0.8
+# 与其版本对齐，实际新增编译面只有 axum 自身。hyper / hyper-util 直接依赖只为
+# 两样 axum::serve 摸不到的东西：http1 构建器上的读超时（header_read_timeout，
+# 慢速请求防挂）与 TowerToHyperService（自管 accept 循环里做闸一 TCP 层准入）。
+# multipart feature（webui-checkin 票 08）：照片上传端点 POST /api/photos 的
+# Multipart 提取器按需开启（multer 随之进编译面，仅此端点消费）。
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "multipart"] }
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
+# SSE 帧流（票 06）：axum 的 Sse 响应体要 futures_core::Stream——自写 VersionStream
+#（hello 首帧 + watch 变更帧 + Drop 归还 SSE 槽位）只差这个 trait；crate 已在
+# axum 依赖树里（0.3），显式点名零新增编译面
+futures-core = "0.3"
+# tokio 直依赖（票 04）：服务生命周期要 TcpListener/watch/JoinSet/timeout——
+# Tauri 本就带着 tokio（同版本共享），这里只是把已在树里的 crate 显式点名
+tokio = { version = "1", default-features = false, features = ["net", "rt", "sync", "time", "io-util"] }
+# SSE 帧流的 watch 包装（票 06）：VersionStream 用 WatchStream 把「订阅即得当前值
+# + 每次发布一帧」变成 Stream（tokio 自身不带 Stream 实现）；sync feature 只开
+# watch 包装
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
+# 照片管线（webui-checkin 票 07）：上传照片解码→缩放→重编码 JPEG。选型 image：
+# 纯 Rust、格式白名单三样（JPEG/PNG/WebP 静态解码）齐备；能先只读头部宽高
+#（ImageReader::into_dimensions，不解码像素）做解码炸弹前置拦截，再配 Limits
+#（max_image_width/height/max_alloc）解码双保险；重编码 JPEG 天然不携带 APP1
+#（EXIF/GPS 所在段），输出即干净图。只开三个编解码 feature，不拖其余格式。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+# 数据包备份（webui-checkin 票 09，规格 F）：备份产物升级为单文件 zip 数据包
+#（库+照片+manifest.json）。选型 zip（zip-rs/zip2）：纯 Rust 事实标准，本应用
+# 只需要「写 deflate 包」（打包）与「按名读条目」（测试抽取；恢复侧票 10 复用）。
+# 注意不选 `deflate` feature：它 = zopfli（压缩比极高但极慢）+ zlib-rs，备份是
+# 常规操作要快；用 `deflate-flate2`（flate2 默认 miniz_oxide 后端，纯 Rust 快速
+# deflate）。aes-crypto/bzip2/zstd/lzma 等其余一概不进编译面。
+zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
+# 数据包 manifest 的库/照片 SHA256（规格 F：清单自洽可校验）。sha2 已在依赖树
+#（Tauri 传递依赖，Cargo.lock 同版本 0.10），显式点名零新增编译面。
+sha2 = "0.10"
+# 数据包恢复的磁盘空间预检（票 10，规格 F：按 zip 条目元数据 ×1.2 与目标盘可用
+# 空间比较）。windows-sys 已在依赖树（0.60.2 传递依赖），显式点名只为
+# GetDiskFreeSpaceExW 一个声明；declare-style 裸 FFI crate，无运行时。
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3"

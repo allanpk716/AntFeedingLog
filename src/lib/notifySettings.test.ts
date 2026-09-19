@@ -8,24 +8,33 @@ const settings: AppSettings = {
   notify_hibernation_enabled: true,
   wake_remind_days_ahead: 7,
   autostart_enabled: true,
+  pushover_user: "u-库内",
+  pushover_token: "t-库内",
 };
 
 describe("通知设置：设置态 ↔ 表单态", () => {
-  it("toForm 回显总开关与提前天数文本（分类子开关不再出现在表单）", () => {
+  it("toForm 回显总开关、提前天数文本与 Pushover 凭据（分类子开关不再出现在表单）", () => {
     expect(toForm(settings)).toEqual({
       master: true,
       daysAheadText: "7",
+      pushoverUser: "u-库内",
+      pushoverToken: "t-库内",
     });
   });
 
-  it("toSettings 带上总开关与提前天数，分类开关固定回写 true，autostart 原样透传", () => {
-    const out = toSettings({ master: false, daysAheadText: "3" }, true);
+  it("toSettings 带上总开关、提前天数与 Pushover 凭据，分类开关固定回写 true，autostart 原样透传", () => {
+    const out = toSettings(
+      { master: false, daysAheadText: "3", pushoverUser: "u-新", pushoverToken: "t-新" },
+      true,
+    );
     expect(out).toEqual({
       notify_master_enabled: false,
       notify_overdue_enabled: true,
       notify_hibernation_enabled: true,
       wake_remind_days_ahead: 3,
       autostart_enabled: true,
+      pushover_user: "u-新",
+      pushover_token: "t-新",
     });
   });
 
@@ -37,6 +46,8 @@ describe("通知设置：设置态 ↔ 表单态", () => {
       notify_hibernation_enabled: true,
       wake_remind_days_ahead: 7,
       autostart_enabled: true,
+      pushover_user: "u-库内",
+      pushover_token: "t-库内",
     });
   });
 });
@@ -60,7 +71,7 @@ describe("通知设置：提前天数校验", () => {
 
   it("非法提前天数时 toSettings 返回 null（不落库）", () => {
     const out = toSettings(
-      { master: true, daysAheadText: "-1" },
+      { master: true, daysAheadText: "-1", pushoverUser: "u", pushoverToken: "t" },
       true,
     );
     expect(out).toBeNull();
