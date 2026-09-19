@@ -1,3 +1,75 @@
+<script lang="ts">
+/**
+ * 票 04：撤食反馈判定的纯函数（导出供测试；涉及路径受限，不进 lib/）。
+ * 判定口径 spec F6 / 决策 D17：所选含易腐且全部有有效间隔时，按「发生时刻 + 最短间隔」
+ * 分新鲜/已逾期两档文案；脏数据（易腐无有效间隔）与非易腐一律不给将来时刻的承诺。
+ */
+/** 结构化探针：FoodItem 满足它（测试 fixture 可只给这两个字段） */
+export interface PerishableProbe {
+  perishable?: boolean;
+  retrieval_hours?: number | null;
+}
+
+export interface RetrievalFeedback {
+  kind: "none" | "fresh" | "overdue";
+  /** kind=fresh：最短撤食间隔（小时）；其余 0 */
+  hours: number;
+}
+
+/** 撤食间隔合法域：1–168 整数（与设置必填守护/后端同口径） */
+const RETRIEVAL_HOURS_MIN = 1;
+const RETRIEVAL_HOURS_MAX = 168;
+const MS_PER_HOUR = 3_600_000;
+
+function validRetrievalHours(v: number | null | undefined): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= RETRIEVAL_HOURS_MIN && v <= RETRIEVAL_HOURS_MAX;
+}
+
+/** "YYYY-MM-DDTHH:MM"（datetime-local）或 "YYYY-MM-DD HH:MM:SS"（后端）→ 本机时刻毫秒；坏值 NaN */
+function parseMomentMs(s: string): number {
+  const m = s.trim().match(/^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+  if (m === null) return NaN;
+  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]).getTime();
+}
+
+/**
+ * 喂食提交后的撤食反馈判定：
+ * - 所选不含易腐 → none（现状：直接关窗）。
+ * - 含易腐但有无效间隔（脏数据，正常被设置必填堵住）→ none。
+ * - 全部有效且 发生时刻+min(间隔) > 现在 → fresh（X = 最短间隔小时数）。
+ * - 已到期（含恰好到期，严格大于才算新鲜）→ overdue。
+ */
+export function retrievalFeedback(
+  selected: readonly PerishableProbe[],
+  happenedAt: string,
+  now: string,
+): RetrievalFeedback {
+  const perishable = selected.filter((f) => f.perishable === true);
+  if (perishable.length === 0) return { kind: "none", hours: 0 };
+  if (!perishable.every((f) => validRetrievalHours(f.retrieval_hours))) return { kind: "none", hours: 0 };
+  const hours = Math.min(...perishable.map((f) => f.retrieval_hours as number));
+  const due = parseMomentMs(happenedAt);
+  const at = parseMomentMs(now);
+  if (Number.isNaN(due) || Number.isNaN(at)) return { kind: "none", hours: 0 };
+  return due + hours * MS_PER_HOUR > at ? { kind: "fresh", hours } : { kind: "overdue", hours };
+}
+
+/** 反馈句（kind=none → 空串，调用方隐藏该句） */
+export function retrievalFeedbackText(fb: RetrievalFeedback): string {
+  if (fb.kind === "fresh") return `将于 ${fb.hours} 小时后提醒撤食`;
+  if (fb.kind === "overdue") return "已逾期，明起每日提醒撤食";
+  return "";
+}
+
+/** 食物 chip 悬停说明（易腐项）；非易腐 null（不渲染 title） */
+export function perishableChipTitle(f: PerishableProbe): string | null {
+  if (f.perishable !== true) return null;
+  return validRetrievalHours(f.retrieval_hours)
+    ? `易腐 · 撤食间隔 ${f.retrieval_hours} 小时`
+    : "易腐 · 未设撤食间隔";
+}
+</script>
+
 <script setup lang="ts">
 /**
  * 喂食弹窗：食物多选 chips（仅启用食物）+ 时间（默认现在、可补录）+ 备注（可选）。
@@ -5,6 +77,8 @@
  * 停用食物不进新建入口（规则 10）。
  * 交互第三轮：换 DateTimeField（标记日历：橙点=当前操作/灰点=其它/悬停明细）+
  * 选中日已有同操作记录出黄条（不拦提交）。接入与 QuickLogDialog 同构。
+ * 票 04：易腐项加圆点记号；提交成功且有撤食反馈时行内告知、点「知道了」再关窗刷新
+ * （无反馈维持现状直接关窗，父层 onFeedSaved 负责刷新）。
  */
 import { computed, onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
@@ -103,6 +177,36 @@ function toggleFood(id: number) {
     : [...selectedIds.value, id];
 }
 
+// ── 票 04：提交成功反馈 ──
+const savedOk = ref(false);
+const savedFeedback = ref<RetrievalFeedback>({ kind: "none", hours: 0 });
+const savedFeedbackText = computed(() => retrievalFeedbackText(savedFeedback.value));
+
+/** 本餐所选食物（反馈判定只看它） */
+const selectedFoods = computed(() => foods.value.filter((f) => selectedIds.value.includes(f.id)));
+
+/** 有撤食反馈句 → 留在弹窗展示，「知道了」再抛 saved 关窗刷新；否则维持现状直接关窗 */
+function afterSaved() {
+  const fb = retrievalFeedback(selectedFoods.value, time.value, nowLocalDateTime());
+  if (retrievalFeedbackText(fb) === "") {
+    emit("saved");
+    return;
+  }
+  savedFeedback.value = fb;
+  savedOk.value = true;
+}
+
+function finishSaved() {
+  savedOk.value = false;
+  emit("saved");
+}
+
+/** 已展示成功反馈后，点遮罩同样走「知道了」收尾（保证父层刷新，不留脏弹窗） */
+function onOverlaySelf() {
+  if (savedOk.value) finishSaved();
+  else emit("close");
+}
+
 async function submit() {
   if (selectedIds.value.length === 0) {
     formError.value = "先选至少一种食物";
@@ -120,7 +224,7 @@ async function submit() {
         food_ids: selectedIds.value,
       },
     });
-    emit("saved");
+    afterSaved();
   } catch (e) {
     formError.value = String(e);
   } finally {
@@ -130,7 +234,7 @@ async function submit() {
 </script>
 
 <template>
-  <div class="overlay" @click.self="$emit('close')">
+  <div class="overlay" @click.self="onOverlaySelf">
     <div class="dialog feed-dialog">
       <h3>记录{{ action.name }} · {{ colony.name }}</h3>
 
@@ -140,11 +244,12 @@ async function submit() {
           v-for="f in enabledFoods"
           :key="f.id"
           class="food"
-          :class="{ selected: selectedIds.includes(f.id) }"
+          :class="{ selected: selectedIds.includes(f.id), perishable: f.perishable === true }"
+          :title="perishableChipTitle(f) ?? undefined"
           type="button"
           @click="toggleFood(f.id)"
         >
-          {{ f.name }}
+          {{ f.name }}<span v-if="f.perishable === true" class="p-dot" aria-hidden="true"></span>
         </button>
       </div>
 
@@ -157,9 +262,16 @@ async function submit() {
 
       <p v-if="formError" class="form-error">{{ formError }}</p>
 
+      <!-- 票 04：撤食反馈只在有话可说时出现（fresh/overdue），none 分支维持直接关窗 -->
+      <div v-if="savedOk" class="save-ok">
+        <p class="ok-line">✓ 已记录</p>
+        <p class="fb-line">{{ savedFeedbackText }}</p>
+      </div>
+
       <div class="dlg-btns">
-        <button class="btn cancel-btn" type="button" @click="$emit('close')">取消</button>
-        <button class="btn primary record-btn" type="button" :disabled="busy" @click="submit">
+        <button v-if="!savedOk" class="btn cancel-btn" type="button" @click="$emit('close')">取消</button>
+        <button v-if="savedOk" class="btn primary record-btn" type="button" @click="finishSaved">知道了</button>
+        <button v-else class="btn primary record-btn" type="button" :disabled="busy" @click="submit">
           记录
         </button>
       </div>
@@ -223,6 +335,17 @@ async function submit() {
   font-weight: 600;
 }
 
+/* 易腐记号（票 04）：chip 内小圆点，色同日历当前操作点（--accent 橙），悬停说明在 title */
+.food .p-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent, #d97706);
+  margin-left: 6px;
+  vertical-align: middle;
+}
+
 .dialog textarea {
   width: 100%;
   padding: 7px 10px;
@@ -251,6 +374,24 @@ async function submit() {
   margin-top: 10px;
   font-size: 13px;
   color: var(--bad);
+}
+
+/* 提交成功反馈（票 04）：已记录 + 撤食安排句（fresh/overdue 文案在组件里拼好） */
+.save-ok {
+  margin-top: 10px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  background: var(--ok-soft);
+  font-size: 12px;
+}
+
+.save-ok .ok-line {
+  color: var(--ok);
+  font-weight: 600;
+}
+
+.save-ok .fb-line {
+  color: var(--text);
 }
 
 .dlg-btns {
