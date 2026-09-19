@@ -20,7 +20,8 @@ describe("DateTimeField（日期+时间组合）", () => {
     const w = mountField("");
     await w.find(".dp-trigger").trigger("click");
     await w.findAll(".dp-day").find((d) => d.text() === "16")!.trigger("click");
-    expect(w.emitted("update:modelValue")![0]).toEqual(["2026-09-16T00:00"]);
+    // 空值时弹层开在真实今天所在月，期望值不能硬编码月份——只锁日期号 16 与兜底 00:00 语义
+    expect(w.emitted("update:modelValue")![0][0] as string).toMatch(/^\d{4}-\d{2}-16T00:00$/);
   });
 
   // 时间类断言全部「固定基值单步」：mount 无 v-model 回写，props 恒为初值，多步链式断言必假失败
