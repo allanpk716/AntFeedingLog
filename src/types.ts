@@ -351,3 +351,12 @@ export interface RestoreSummary {
 /** restore_apply 返回体：done = 界面当场刷新；done_needs_restart = 新库文件已
  * 就位但重开连接失败，提示「请重启应用」 */
 export type RestoreApplyOutcome = "done" | "done_needs_restart";
+
+/** 按窝按月记录摘要行（colony_month_records；交互第三轮：日历标记 + 重复提醒数据源） */
+export interface MonthDayRecords {
+  day: number;
+  action_id: number;
+  count: number;
+  /** 该 (日, 操作) 最近一条发生时刻（"YYYY-MM-DD HH:MM:SS"） */
+  last_time: string;
+}
