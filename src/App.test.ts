@@ -156,8 +156,10 @@ describe("首页卡片墙", () => {
     expect(home.find(".chip.sp").text()).toBe("大头收获蚁");
     expect(home.find(".chip.st").text()).toContain("活跃");
     expect(home.find(".daysbox .n").text()).toBe("241");
-    expect(home.text()).toContain("已饲养 / 天");
-    expect(home.text()).toContain("开始饲养 2026-01-20");
+    // 交互第三轮 #7 紧凑形态：天数内联为「241 天」，无「已饲养 / 天」文案、无开始日期行
+    expect(home.find(".daysbox").text()).toContain("241");
+    expect(home.text()).not.toContain("已饲养 / 天");
+    expect(home.text()).not.toContain("开始饲养 2026-01-20");
 
     const corpCards = wrapper.findAll(".group")[1].findAll(".card");
     expect(corpCards.map((c) => c.find(".cname").text())).toEqual(["针毛一号", "大头二号"]);
@@ -193,14 +195,27 @@ describe("首页卡片墙", () => {
     );
     const wrapper = await mountApp();
     expect(wrapper.find(".empty").text()).toContain("暂无窝");
-    expect(wrapper.find(".new-colony").exists()).toBe(true);
+    // 新建窝入口挪到顶栏（交互第三轮 #7）
+    expect(wrapper.find(".topbar .new-top-btn").exists()).toBe(true);
+  });
+
+  it("紧凑卡片：⋯ 菜单默认隐藏，点开可见编辑/冬眠入口（交互第三轮 #7）", async () => {
+    const wrapper = await mountApp();
+    const card = wrapper.find('.card[data-colony-id="1"]');
+    const menu = card.find(".card-menu");
+    expect(menu.exists()).toBe(true);
+    expect((menu.element as HTMLElement).style.display).toBe("none");
+    await card.find(".dots").trigger("click");
+    expect((menu.element as HTMLElement).style.display).not.toBe("none");
+    expect(menu.find(".edit-btn").exists()).toBe(true);
+    expect(menu.find(".hib-btn").exists()).toBe(true);
   });
 });
 
 describe("新建窝", () => {
   it("填表提交调用 create_colony（trim 后的 snake_case 入参），成功后关弹窗并刷新", async () => {
     const wrapper = await mountApp();
-    await wrapper.find(".new-colony").trigger("click");
+    await wrapper.find(".new-top-btn").trigger("click");
 
     const dialog = wrapper.find(".dialog");
     expect(dialog.exists()).toBe(true);
@@ -231,7 +246,7 @@ describe("新建窝", () => {
 
   it("重名（含首尾空格差异）被前端拦截，不发起 create_colony", async () => {
     const wrapper = await mountApp();
-    await wrapper.find(".new-colony").trigger("click");
+    await wrapper.find(".new-top-btn").trigger("click");
 
     const dialog = wrapper.find(".dialog");
     await dialog.find(".name-input").setValue("  大头一号 ");
@@ -277,7 +292,7 @@ describe("编辑窝", () => {
   it("状态下拉只有 活跃/已结束（冬眠走「开始冬眠」流程，定点修 5）；编辑冬眠窝时该状态禁用显示且保存不改变它", async () => {
     // 新建：无「冬眠中」选项
     const wrapper = await mountApp();
-    await wrapper.find(".new-colony").trigger("click");
+    await wrapper.find(".new-top-btn").trigger("click");
     let options = wrapper.findAll(".status-select option");
     expect(options.map((o) => o.text())).toEqual(["活跃", "已结束"]);
 

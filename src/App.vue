@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /**
  * 首页：按地点分组渲染窝卡片（分组顺序 = 地点清单顺序，空地点「未分组」最后），
- * 已结束的窝收底部折叠区（默认折叠）。「+ 新建窝」与设置入口（字典管理等）在本页。
+ * 已结束的窝收底部折叠区（默认折叠）。「＋ 新建窝」在顶栏（交互第三轮 #7），与设置入口同排。
  * 卡片操作块/喂食弹窗在 ColonyCard 内（票 03）：记账成功抛 saved → refresh 数据驱动重算。
  * 设置弹窗（票 04）：字典管理三 tab，任何变更抛 changed → refresh，卡片红/灰即时跟上。
  */
@@ -114,6 +114,7 @@ onMounted(() => {
       </nav>
       <div class="today">{{ todayLabel() }}</div>
       <div class="tools">
+        <button class="ghost-btn new-top-btn" type="button" @click="openCreate">＋ 新建窝</button>
         <button class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
           ⚙ 设置
         </button>
@@ -159,10 +160,6 @@ onMounted(() => {
           </div>
         </div>
       </section>
-
-      <button class="new-colony" type="button" @click="openCreate">
-        ＋ 新建窝（名字 / 物种 / 地点 / 开始饲养日期 / 状态）
-      </button>
     </main>
 
     <StatsPage v-if="page === 'stats'" />
@@ -325,19 +322,24 @@ onMounted(() => {
   font-size: 13px;
 }
 
+/* 交互第三轮 #7：分组边距收紧（视觉基线 mock-c-home-cards），首个分组贴顶 */
 .group {
-  margin-top: 26px;
+  margin-top: 14px;
+}
+
+.group:first-child {
+  margin-top: 0;
 }
 
 .group-head {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 
 .group-head h2 {
-  font-size: 16px;
+  font-size: 14px;
 }
 
 .group-head .cnt {
@@ -357,8 +359,8 @@ onMounted(() => {
 
 .cards {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 10px;
 }
 
 .ended-area {
@@ -383,24 +385,5 @@ onMounted(() => {
 
 .ended-section {
   margin-top: 12px;
-}
-
-.new-colony {
-  margin-top: 14px;
-  width: 100%;
-  border: 1.5px dashed var(--border-strong);
-  border-radius: 14px;
-  background: transparent;
-  padding: 14px;
-  cursor: pointer;
-  color: var(--muted);
-  font: inherit;
-  font-size: 14px;
-  text-align: center;
-}
-
-.new-colony:hover {
-  border-color: var(--accent);
-  color: var(--accent-deep);
 }
 </style>
