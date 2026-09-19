@@ -32,6 +32,8 @@ function outcomeFixture(overrides: Partial<WebUiSaveOutcome> = {}): WebUiSaveOut
     firewall_ok: true,
     firewall_error: null,
     firewall_manual_cmd: null,
+    server_ok: true,
+    server_error: null,
     ...overrides,
   };
 }
@@ -150,6 +152,32 @@ describe("设置「网页端」面板（webui-checkin 票 03）", () => {
     await flushPromises();
 
     expect(wrapper.find(".firewall-fail").exists()).toBe(false);
+  });
+
+  it("端口被占用 → 配置已保存照常回显 + 服务人话错误展示（票 04）", async () => {
+    const wrapper = await openPanel({
+      saveOutcome: outcomeFixture({
+        config: configFixture({ enabled: true }),
+        server_ok: false,
+        server_error: "端口 17321 被占用或不可用（拒绝访问），网页端服务未启动；可改用其他端口后重新保存",
+      }),
+    });
+
+    await wrapper.find(".save-webui-btn").trigger("click");
+    await flushPromises();
+
+    // 半成功语义：配置保存成功照常回显，服务错误单独展示
+    expect(wrapper.find(".webui-saved").text()).toContain("已保存");
+    expect(wrapper.find(".server-fail-msg").text()).toContain("端口 17321 被占用");
+    expect(wrapper.find(".firewall-fail").exists()).toBe(false);
+  });
+
+  it("服务正常起停 → 不出服务错误行", async () => {
+    const wrapper = await openPanel();
+    await wrapper.find(".save-webui-btn").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".server-fail-msg").exists()).toBe(false);
   });
 
   it("重生成按钮 → regenerate_token，凭证区刷新为新值（验收 2）", async () => {

@@ -441,11 +441,15 @@ export interface WebUiSaveInput {
   port: number;
 }
 
-/** save_webui_config 返回体（半成功语义）：配置已落盘 + 防火墙同步结果分开回传，
- * 失败时附现成 netsh 手动命令 */
+/** save_webui_config 返回体（半成功语义）：配置已落盘 + 防火墙同步结果与服务
+ * 起停结果分开回传，失败时各自附人话原因（防火墙附现成 netsh 手动命令） */
 export interface WebUiSaveOutcome {
   config: WebUiConfigInfo;
   firewall_ok: boolean;
   firewall_error: string | null;
   firewall_manual_cmd: string | null;
+  /** 网页端服务按新配置对齐成功（含「停用即关停」） */
+  server_ok: boolean;
+  /** 服务起停失败的人话原因（端口占用等）；null = 正常 */
+  server_error: string | null;
 }

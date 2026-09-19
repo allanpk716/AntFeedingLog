@@ -2,8 +2,9 @@
 /**
  * 设置弹窗「网页端」tab（webui-checkin 票 03）：总开关（默认关）/ 受信网段多选 /
  * 端口 / 凭证区 / 完整地址。保存走 save_webui_config（Rust 落数据目录
- * webui-config.json + 同步防火墙规则）；本票不含 HTTP 服务（票 04），save 后不启动监听。
- * 防火墙失败不吞掉已保存的配置（半成功语义）：展示错误 + 现成 netsh 手动命令 + 复制。
+ * webui-config.json + 同步防火墙规则 + 票 04 起按新配置起停内嵌 HTTP 服务）。
+ * 半成功语义：防火墙失败 / 端口占用等只提示、不吞掉已保存的配置——展示错误
+ * （+ 防火墙的现成 netsh 手动命令与复制）。
  * 首启向导（WebUiWizard）复用本面板的三个子组件，不复制粘贴。
  */
 import { onMounted, ref } from "vue";
@@ -132,7 +133,7 @@ async function copyManual() {
           type="number"
           min="1024"
           max="65535"
-          title="1024–65535；端口被占用时服务不启动（占用提示随服务上线在票 04 提供）"
+          title="1024–65535；端口被占用时服务不启动，保存后会在这里提示"
         />
       </label>
     </div>
@@ -155,6 +156,11 @@ async function copyManual() {
       <button class="btn copy-manual-btn" type="button" @click="copyManual">复制手动命令</button>
       <span v-if="manualCopied" class="copy-ok">已复制</span>
     </div>
+
+    <!-- 服务起停失败（半成功语义，票 04）：端口被占用等，配置已照常保存 -->
+    <p v-if="lastOutcome && !lastOutcome.server_ok" class="form-error server-fail-msg">
+      {{ lastOutcome.server_error }}
+    </p>
 
     <div class="dlg-btns">
       <span class="spacer"></span>

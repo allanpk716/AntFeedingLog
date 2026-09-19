@@ -141,6 +141,9 @@ async function closeAndMark() {
             <pre class="firewall-manual">{{ outcome.firewall_manual_cmd }}</pre>
             <p class="wiz-hint">可先跳过，稍后在设置页重新保存即可再次同步。</p>
           </div>
+          <p v-if="outcome && !outcome.server_ok" class="form-error">
+            {{ outcome.server_error }}
+          </p>
           <WebUiAccessUrl :refresh-key="urlKey" />
         </template>
       </div>

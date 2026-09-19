@@ -31,6 +31,8 @@ function outcomeFixture(firewallOk: boolean): WebUiSaveOutcome {
     firewall_manual_cmd: firewallOk
       ? null
       : 'netsh advfirewall firewall delete rule name="AntFeedingLog WebUI"',
+    server_ok: true,
+    server_error: null,
   };
 }
 
