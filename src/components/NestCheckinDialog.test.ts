@@ -248,3 +248,170 @@ describe("NestCheckinDialog（webui-checkin 票 02）", () => {
     expect(invokeMock).not.toHaveBeenCalled();
   });
 });
+
+// ── 巢况照片（webui-checkin 票 07）：网格 / 缺图占位 / 上传 / 删除连带文案 ──
+
+describe("NestCheckinDialog 巢况照片（webui-checkin 票 07）", () => {
+  const PHOTO_DIR = "C:\\data\\photos";
+  const REL = "1/6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg";
+  const photoMeta = {
+    id: 11,
+    checkin_id: 7,
+    rel_path: REL,
+    original_name: "IMG_001.jpg",
+    note: "",
+  };
+
+  /** 桌面 WebView 形态：注入 __TAURI_INTERNALS__（isTauri 判定 + convertFileSrc）。 */
+  function stubTauriInternals() {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      convertFileSrc: (p: string) => `http://asset.localhost/${encodeURIComponent(p)}`,
+    };
+  }
+
+  async function mountWithPhotos(
+    entries: NestCheckin[],
+    photoDir: string | null = PHOTO_DIR,
+  ) {
+    stubTauriInternals();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return entries;
+      if (cmd === "get_photo_abs_dir") return photoDir;
+      return null;
+    });
+    const w = mount(NestCheckinDialog, { props: { colony } });
+    await flushPromises();
+    return w;
+  }
+
+  it("有照片的登记渲染缩略图网格（asset 协议 URL = 照片根目录 + 相对路径），无照片不渲染", async () => {
+    const w = await mountWithPhotos([
+      checkin({ id: 7, photos: [photoMeta] }),
+      checkin({ id: 8, date: "2026-09-10", photos: [] }),
+    ]);
+
+    expect(invokeMock).toHaveBeenCalledWith("get_photo_abs_dir");
+    const grids = w.findAll(".entry-photos");
+    expect(grids).toHaveLength(1); // 无照片的登记不渲染照片区
+    const img = grids[0].find("img.photo-thumb");
+    expect(img.exists()).toBe(true);
+    expect(img.attributes("src")).toBe(
+      `http://asset.localhost/${encodeURIComponent("C:\\data\\photos/1/6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg")}`,
+    );
+  });
+
+  it("照片根目录取不到 → 「预览不可用」占位，不崩溃", async () => {
+    const w = await mountWithPhotos([checkin({ id: 7, photos: [photoMeta] })], null);
+    expect(w.find(".photo-unavailable").exists()).toBe(true);
+    expect(w.find(".photo-unavailable").text()).toContain("预览不可用");
+  });
+
+  it("图片加载失败（文件缺失）→ 占位符提示，不崩溃", async () => {
+    const w = await mountWithPhotos([checkin({ id: 7, photos: [photoMeta] })]);
+    expect(w.find("img.photo-thumb").exists()).toBe(true);
+
+    await w.find("img.photo-thumb").trigger("error");
+    await flushPromises();
+
+    const missing = w.find(".photo-missing");
+    expect(missing.exists()).toBe(true);
+    expect(missing.text()).toContain("文件缺失");
+    expect(w.find("img.photo-thumb").exists()).toBe(false);
+  });
+
+  it("传照片：pick_photo_files → attach_photos(checkinId, paths) → 重拉时间线并抛 saved", async () => {
+    const w = await mountWithPhotos([checkin({ id: 7 })]);
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7, photos: [photoMeta] })];
+      if (cmd === "pick_photo_files") return ["C:/pics/a.jpg", "C:/pics/b.png"];
+      if (cmd === "get_photo_abs_dir") return PHOTO_DIR;
+      if (cmd === "attach_photos") return [photoMeta];
+      return null;
+    });
+
+    await w.find(".photo-add-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("pick_photo_files");
+    expect(invokeMock).toHaveBeenCalledWith("attach_photos", {
+      checkinId: 7,
+      paths: ["C:/pics/a.jpg", "C:/pics/b.png"],
+    });
+    // 成功后重拉时间线
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "list_checkins").length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(w.emitted("saved")).toHaveLength(1);
+  });
+
+  it("取消选择（pick_photo_files 返回 null）不发 attach_photos", async () => {
+    const w = await mountWithPhotos([checkin({ id: 7 })]);
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7 })];
+      if (cmd === "pick_photo_files") return null;
+      if (cmd === "get_photo_abs_dir") return PHOTO_DIR;
+      return null;
+    });
+
+    await w.find(".photo-add-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "attach_photos")).toBe(false);
+    expect(w.emitted("saved")).toBeUndefined();
+  });
+
+  it("上传失败：错误展示在弹窗内，不抛 saved", async () => {
+    const w = await mountWithPhotos([checkin({ id: 7 })]);
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7 })];
+      if (cmd === "pick_photo_files") return ["C:/pics/a.jpg"];
+      if (cmd === "get_photo_abs_dir") return PHOTO_DIR;
+      if (cmd === "attach_photos") throw "a.jpg: 仅支持 JPEG / PNG / WebP 图片";
+      return null;
+    });
+
+    await w.find(".photo-add-btn").trigger("click");
+    await flushPromises();
+
+    expect(w.find(".photo-error").text()).toContain("JPEG / PNG / WebP");
+    expect(w.emitted("saved")).toBeUndefined();
+  });
+
+  it("删除带照片的登记：两段确认文案补「该登记的 N 张照片将一并删除」", async () => {
+    const w = await mountWithPhotos([
+      checkin({ id: 7, photos: [photoMeta, { ...photoMeta, id: 12, rel_path: "1/other.jpg" }] }),
+      checkin({ id: 8, date: "2026-09-10" }),
+    ]);
+
+    // 无照片的登记不出提示
+    const entries = w.findAll(".entry");
+    await entries[1].find(".entry-delete-btn").trigger("click");
+    expect(entries[1].find(".delete-photo-warn").exists()).toBe(false);
+
+    // 带照片的登记：第一次进入确认态即出提示，第二次才真删
+    await entries[0].find(".entry-delete-btn").trigger("click");
+    expect(entries[0].find(".delete-photo-warn").text()).toContain("该登记的 2 张照片将一并删除");
+    expect(entries[0].find(".entry-delete-btn").text()).toBe("确认删除？");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "delete_checkin")).toBe(false);
+
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [];
+      return null;
+    });
+    await entries[0].find(".entry-delete-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("delete_checkin", { id: 7 });
+  });
+
+  it("点缩略图开大图查看器，点遮罩关闭", async () => {
+    const w = await mountWithPhotos([checkin({ id: 7, photos: [photoMeta] })]);
+    expect(w.find(".photo-viewer").exists()).toBe(false);
+
+    await w.find("img.photo-thumb").trigger("click");
+    expect(w.find(".photo-viewer").exists()).toBe(true);
+    expect(w.find(".photo-viewer-name").text()).toContain("IMG_001.jpg");
+
+    await w.find(".photo-viewer").trigger("click");
+    expect(w.find(".photo-viewer").exists()).toBe(false);
+  });
+});

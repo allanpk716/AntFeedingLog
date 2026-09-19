@@ -43,6 +43,9 @@ import type {
   LogPage,
   LogUpdateInput,
   NestCheckin,
+  NestPhotoMeta,
+  OrphanCleanOutcome,
+  OrphanPhotoStats,
   PushoverStatus,
   RestoreApplyOutcome,
   RestoreSummary,
@@ -331,6 +334,18 @@ export const updateCheckin = cmdFn<
 >("update_checkin");
 export const deleteCheckin = cmdFn<{ id: number }, void>("delete_checkin");
 export const getCheckinDigest = cmdFn<{ colonyId: number }, CheckinDigest>("get_checkin_digest");
+
+// ── 巢况照片（webui-checkin 票 07）：桌面专属命令，不入网页端白名单；
+// 网页端照片上传/读取通路随票 08 单独登记 ──
+
+export const pickPhotoFiles = cmdFn<void, string[] | null>("pick_photo_files");
+export const attachPhotos = cmdFn<
+  { checkinId: number; paths: string[] },
+  NestPhotoMeta[]
+>("attach_photos");
+export const getPhotoAbsDir = cmdFn<void, string>("get_photo_abs_dir");
+export const listOrphanPhotos = cmdFn<void, OrphanPhotoStats>("list_orphan_photos");
+export const cleanOrphanPhotos = cmdFn<void, OrphanCleanOutcome>("clean_orphan_photos");
 
 // ── 冬眠（HibernationDialog；入参键沿用现状 camelCase，Tauri 侧自行映射）──
 

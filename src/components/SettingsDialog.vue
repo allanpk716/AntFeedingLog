@@ -32,9 +32,10 @@
  * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
  * 成功后重拉字典并抛 changed。停用项整行置灰。
  */
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import {
   backupTo,
+  cleanOrphanPhotos,
   eraseAction as eraseActionCmd,
   eraseFood as eraseFoodCmd,
   exportData as exportDataCmd,
@@ -45,6 +46,7 @@ import {
   listActions,
   listFoods,
   listLocations,
+  listOrphanPhotos,
   openLogsFolder,
   pickBackupDir as pickBackupDirCmd,
   pickRestoreFile,
@@ -64,6 +66,7 @@ import type {
   BackupConfigInput,
   BackupConfigInfo,
   LocationItem,
+  OrphanPhotoStats,
   PushoverStatus,
   RestoreSummary,
 } from "../types";
@@ -92,6 +95,7 @@ import {
   summaryLooksSuspicious,
   summaryRows,
 } from "../lib/restoreUi";
+import { formatBytes } from "../lib/photos";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
 import WebUiPanel from "./WebUiPanel.vue";
@@ -143,6 +147,8 @@ onMounted(async () => {
   await loadLogSection();
   // 自动备份区（票 02）加载失败同样静默：配置读不出时整区隐藏，不挡其他功能区
   await loadBackupSection();
+  // 孤儿照片区（票 07）加载失败同样静默：辅助信息不打扰
+  await loadOrphanSection();
 });
 
 // ── 行级即时操作 ──
@@ -541,6 +547,56 @@ function cancelRestore() {
   restoreError.value = "";
 }
 
+// ── 数据 tab：巢况照片孤儿区（webui-checkin 票 07）──
+// 孤儿 = 库已不引用、启动/恢复巡检时被移进 photos/.orphan-<时间戳>/ 隔离区的
+// 照片文件。本区只管「查看现状 + 一键清理」（清理 = 删除隔离目录，两段确认）；
+// 巡检隔离本身在 Rust 启动/恢复后自动做，本区不做移动。
+
+const orphanStats = ref<OrphanPhotoStats | null>(null);
+const orphanConfirming = ref(false);
+const orphanBusy = ref(false);
+const orphanError = ref("");
+const orphanResult = ref("");
+
+const orphanStatsText = computed(() => {
+  const s = orphanStats.value;
+  if (!s) return "";
+  return s.file_count === 0
+    ? "无孤儿"
+    : `${s.dir_count} 个隔离目录，共 ${s.file_count} 张，占 ${formatBytes(s.total_bytes)}`;
+});
+
+async function loadOrphanSection(reportError = false) {
+  orphanError.value = "";
+  try {
+    orphanStats.value = await listOrphanPhotos();
+  } catch (e) {
+    if (reportError) orphanError.value = String(e);
+    // 静默路径（首载）：辅助信息读不出不挡其他功能区
+  }
+}
+
+async function requestCleanOrphans() {
+  orphanError.value = "";
+  orphanResult.value = "";
+  // 两段确认（与删除记录/恢复同待遇）：第一次进入确认态，第二次才真删
+  if (!orphanConfirming.value) {
+    orphanConfirming.value = true;
+    return;
+  }
+  orphanConfirming.value = false;
+  orphanBusy.value = true;
+  try {
+    const outcome = await cleanOrphanPhotos();
+    orphanResult.value = `已清理 ${outcome.removed_dirs} 个隔离目录，释放 ${formatBytes(outcome.freed_bytes)}`;
+    await loadOrphanSection(true);
+  } catch (e) {
+    orphanError.value = String(e);
+  } finally {
+    orphanBusy.value = false;
+  }
+}
+
 function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   if (row.isPreset) return "预置项不能删除；可改为停用";
   return row.referenced ? "被历史记录引用，只能停用，不能删除" : "";
@@ -809,6 +865,39 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
           <p v-if="restoreResult" class="data-result restore-result">{{ restoreResult }}</p>
         </div>
 
+        <!-- 巢况照片孤儿区（webui-checkin 票 07）：隔离区现状 + 一键清理（两段确认）。
+             巡检隔离在 Rust 启动/恢复后自动做，本区只查看与清理。 -->
+        <div class="backup-section orphan-section">
+          <div class="notify-row">
+            <span>巢况照片孤儿：</span>
+            <span v-if="orphanStats" class="orphan-stats-value">{{ orphanStatsText }}</span>
+            <span v-else class="orphan-stats-value">读取失败</span>
+          </div>
+          <div class="notify-row">
+            <button
+              class="btn data-btn orphan-refresh-btn"
+              type="button"
+              title="重新统计 photos/.orphan-* 隔离区现状"
+              @click="loadOrphanSection(true)"
+            >
+              重新统计
+            </button>
+            <button
+              v-if="orphanStats && orphanStats.file_count > 0"
+              class="btn data-btn orphan-clean-btn"
+              :class="{ confirming: orphanConfirming }"
+              type="button"
+              :disabled="orphanBusy"
+              title="删除全部隔离目录，释放空间（两段确认）"
+              @click="requestCleanOrphans"
+            >
+              {{ orphanConfirming ? "再次点击确认清理" : "清理孤儿照片" }}
+            </button>
+          </div>
+          <p v-if="orphanError" class="form-error orphan-error">{{ orphanError }}</p>
+          <p v-if="orphanResult" class="data-result orphan-result">{{ orphanResult }}</p>
+        </div>
+
         <div class="data-actions">
           <button class="btn data-btn reveal-btn" type="button" title="在资源管理器中打开库文件所在目录" @click="revealFolder">
             打开数据文件夹
@@ -1049,6 +1138,18 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   border-color: var(--bad);
   color: #fff;
   font-weight: 600;
+}
+
+/* 巢况照片孤儿区（webui-checkin 票 07）：确认态红色警示与恢复按钮同款 */
+.orphan-clean-btn.confirming {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #fff;
+  font-weight: 600;
+}
+
+.orphan-stats-value {
+  color: var(--muted);
 }
 
 .data-btn {

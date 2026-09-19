@@ -635,3 +635,111 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
     expect(invokeMock).not.toHaveBeenCalledWith("restore_apply", expect.anything());
   });
 });
+
+// ── 数据页签巢况照片孤儿区（webui-checkin 票 07）──
+
+function orphanFixture(overrides: { dir_count?: number; file_count?: number; total_bytes?: number } = {}) {
+  return { dir_count: 1, file_count: 3, total_bytes: 15 * 1024 * 1024, ...overrides };
+}
+
+async function openDataTabWithOrphans(
+  stats: { dir_count: number; file_count: number; total_bytes: number } | null,
+  cleanOutcome?: { removed_dirs: number; freed_bytes: number; errors: string[] },
+) {
+  baseMock();
+  invokeMock.mockImplementation(async (cmd: string) => {
+    switch (cmd) {
+      case "list_actions":
+      case "list_foods":
+      case "list_locations":
+        return [];
+      case "get_settings":
+        return {
+          notify_master_enabled: true,
+          notify_overdue_enabled: true,
+          notify_hibernation_enabled: true,
+          wake_remind_days_ahead: 7,
+          autostart_enabled: true,
+        };
+      case "get_recent_errors":
+        return [];
+      case "get_last_abnormal_exit":
+        return null;
+      case "list_orphan_photos":
+        if (stats === null) throw "数据目录未初始化";
+        return stats;
+      case "clean_orphan_photos":
+        return cleanOutcome ?? { removed_dirs: 0, freed_bytes: 0, errors: [] };
+      default:
+        return null;
+    }
+  });
+  const wrapper = mount(SettingsDialog);
+  await flushPromises();
+  await wrapper.find(".tab-data").trigger("click");
+  await flushPromises();
+  return wrapper;
+}
+
+describe("设置弹窗「数据」页签巢况照片孤儿区（webui-checkin 票 07）", () => {
+  it("有孤儿：展示隔离目录数/张数/占用，出「清理孤儿照片」按钮", async () => {
+    const wrapper = await openDataTabWithOrphans(orphanFixture());
+
+    expect(wrapper.find(".orphan-section").exists()).toBe(true);
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("1 个隔离目录");
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("共 3 张");
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("15.0 MB");
+    expect(wrapper.find(".orphan-clean-btn").exists()).toBe(true);
+    expect(wrapper.find(".orphan-clean-btn").text()).toBe("清理孤儿照片");
+  });
+
+  it("无孤儿：显示「无孤儿」，不出清理按钮", async () => {
+    const wrapper = await openDataTabWithOrphans(orphanFixture({ dir_count: 0, file_count: 0, total_bytes: 0 }));
+
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("无孤儿");
+    expect(wrapper.find(".orphan-clean-btn").exists()).toBe(false);
+  });
+
+  it("两段确认：第一次点只进入确认态，第二次才调 clean_orphan_photos 并重拉统计", async () => {
+    const wrapper = await openDataTabWithOrphans(
+      orphanFixture(),
+      { removed_dirs: 1, freed_bytes: 15 * 1024 * 1024, errors: [] },
+    );
+
+    invokeMock.mockClear();
+    await wrapper.find(".orphan-clean-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".orphan-clean-btn").text()).toBe("再次点击确认清理");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "clean_orphan_photos")).toBe(false);
+
+    await wrapper.find(".orphan-clean-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("clean_orphan_photos");
+    expect(wrapper.find(".orphan-result").text()).toContain("已清理 1 个隔离目录");
+    expect(wrapper.find(".orphan-result").text()).toContain("15.0 MB");
+    // 清理完成后重拉统计（本 mock 仍返回有孤儿，只验证重拉发生）
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "list_orphan_photos").length,
+    ).toBeGreaterThanOrEqual(1);
+  });
+
+  it("「重新统计」按钮重调 list_orphan_photos", async () => {
+    const wrapper = await openDataTabWithOrphans(orphanFixture());
+
+    invokeMock.mockClear();
+    await wrapper.find(".orphan-refresh-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("list_orphan_photos");
+  });
+
+  it("统计读取失败（首载）静默不打扰，手动重试才报错", async () => {
+    const wrapper = await openDataTabWithOrphans(null);
+
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("读取失败");
+    expect(wrapper.find(".orphan-error").exists()).toBe(false);
+
+    await wrapper.find(".orphan-refresh-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".orphan-error").text()).toContain("数据目录未初始化");
+  });
+});

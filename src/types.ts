@@ -410,6 +410,22 @@ export interface CheckinDigest {
   days_since_last: number | null;
 }
 
+// ── 巢况照片（webui-checkin 票 07，Rust photo.rs；桌面专属命令）──
+
+/** list_orphan_photos 返回体：photos/.orphan-* 隔离区现状 */
+export interface OrphanPhotoStats {
+  dir_count: number;
+  file_count: number;
+  total_bytes: number;
+}
+
+/** clean_orphan_photos 返回体：删除量与释放字节；errors 非空 = 个别目录删除失败 */
+export interface OrphanCleanOutcome {
+  removed_dirs: number;
+  freed_bytes: number;
+  errors: string[];
+}
+
 // ── 网页端设置（webui-checkin 票 03，Rust netseg.rs / webui_config.rs）──
 
 /** 本机网段一行（NetBird 段已置顶标名；物理网段 encrypted_mesh=false 走硬警示） */
