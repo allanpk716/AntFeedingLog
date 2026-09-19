@@ -164,6 +164,7 @@ export interface CareLogInput {
 
 /** 记录列表筛选入参（list_logs；各筛选项可空、组合生效；start/end 为 ISO 日期） */
 export interface LogFilter {
+  location_id: number | null;
   colony_id: number | null;
   action_id: number | null;
   start: string | null;
@@ -178,6 +179,8 @@ export interface LogRow {
   id: number;
   colony_id: number;
   colony_name: string;
+  /** 窝所属地点名；未分组 = null */
+  location_name: string | null;
   action_id: number;
   action_name: string;
   occurred_at: string;

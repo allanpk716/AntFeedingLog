@@ -53,6 +53,7 @@ const rows: LogRow[] = [
     id: 101,
     colony_id: 1,
     colony_name: "大头一号",
+    location_name: null,
     action_id: 1,
     action_name: "喂食",
     occurred_at: "2026-09-17 21:00:00",
@@ -65,6 +66,7 @@ const rows: LogRow[] = [
     id: 102,
     colony_id: 2,
     colony_name: "针毛一号",
+    location_name: null,
     action_id: 2,
     action_name: "活动区换水",
     occurred_at: "2026-09-16 08:00:00",
@@ -80,6 +82,7 @@ const leftover: LogRow[] = [
     id: 103,
     colony_id: 1,
     colony_name: "大头一号",
+    location_name: null,
     action_id: 1,
     action_name: "喂食",
     occurred_at: "2026-09-10 09:00:00",
@@ -137,6 +140,7 @@ describe("记录列表页（票 08）", () => {
     expect(invokeMock).toHaveBeenCalledWith("list_foods");
     expect(invokeMock).toHaveBeenCalledWith("list_logs", {
       filter: {
+        location_id: null,
         colony_id: null,
         action_id: null,
         start: null,
@@ -174,6 +178,7 @@ describe("记录列表页（票 08）", () => {
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(invokeMock).toHaveBeenCalledWith("list_logs", {
       filter: {
+        location_id: null,
         colony_id: 1,
         action_id: 1,
         start: "2026-09-01",
@@ -337,6 +342,7 @@ describe("记录列表页（票 08）", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("list_logs", {
       filter: {
+        location_id: null,
         colony_id: null,
         action_id: null,
         start: null,

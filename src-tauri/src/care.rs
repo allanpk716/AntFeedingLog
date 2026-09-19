@@ -231,6 +231,8 @@ pub struct LogRow {
     pub id: i64,
     pub colony_id: i64,
     pub colony_name: String,
+    /// 窝所属地点名（交互第三轮 #5）；未分组 = None
+    pub location_name: Option<String>,
     pub action_id: i64,
     pub action_name: String,
     pub occurred_at: String,
@@ -252,6 +254,9 @@ pub struct LogPage {
 /// 备注子串匹配（LIKE 通配符转义）；limit 缺省 50、上限 500，offset 缺省 0。
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct LogFilter {
+    /// 地点筛选（交互第三轮 #1）：窝的所属地点；与 colony_id 组合生效
+    #[serde(default)]
+    pub location_id: Option<i64>,
     #[serde(default)]
     pub colony_id: Option<i64>,
     #[serde(default)]
@@ -293,6 +298,10 @@ fn parse_filter_date(s: &str) -> Result<String, String> {
 pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, String> {
     let mut wheres: Vec<String> = Vec::new();
     let mut args: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(location_id) = filter.location_id {
+        args.push(location_id.into());
+        wheres.push(format!("c.location_id = ?{}", args.len()));
+    }
     if let Some(colony_id) = filter.colony_id {
         args.push(colony_id.into());
         wheres.push(format!("l.colony_id = ?{}", args.len()));
@@ -324,7 +333,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
 
     let total: i64 = conn
         .query_row(
-            &format!("SELECT COUNT(*) FROM care_log l {where_sql}"),
+            &format!("SELECT COUNT(*) FROM care_log l JOIN colony c ON c.id = l.colony_id {where_sql}"),
             rusqlite::params_from_iter(args.iter()),
             |row| row.get(0),
         )
@@ -332,9 +341,10 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
 
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT l.id, l.colony_id, c.name, l.action_id, a.name, l.occurred_at, l.note, l.created_at
+            "SELECT l.id, l.colony_id, c.name, lo.name, l.action_id, a.name, l.occurred_at, l.note, l.created_at
              FROM care_log l
              JOIN colony c ON c.id = l.colony_id
+             LEFT JOIN location lo ON lo.id = c.location_id
              JOIN care_action a ON a.id = l.action_id
              {where_sql}
              ORDER BY l.occurred_at DESC, l.id DESC
@@ -347,11 +357,12 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
                 row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
             ))
         })
         .map_err(db_err)?
@@ -359,7 +370,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
         .map_err(db_err)?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (id, colony_id, colony_name, action_id, action_name, occurred_at, note, created_at) in rows {
+    for (id, colony_id, colony_name, location_name, action_id, action_name, occurred_at, note, created_at) in rows {
         let mut stmt_food = conn
             .prepare(
                 "SELECT lf.food_id, f.name FROM log_food lf JOIN food f ON f.id = lf.food_id
@@ -377,6 +388,7 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
             id,
             colony_id,
             colony_name,
+            location_name,
             action_id,
             action_name,
             occurred_at,
@@ -1626,6 +1638,59 @@ mod tests {
         assert_eq!(page.rows[0].id, id);
         assert_eq!(page.rows[0].action_name, "喂食");
         assert_eq!(page.rows[0].food_names, vec!["种子"]);
+    }
+
+    // ── 地点筛选 + 行带地点名（交互第三轮 #1/#5）──
+    // （种子依据：db.rs seeds 预置 '家'/'公司'，loc_id 按名取不会踩空）
+
+    fn colony_in_loc(conn: &Connection, name: &str, loc: Option<i64>) -> i64 {
+        conn.execute(
+            "INSERT INTO colony (name, location_id, start_date, status) VALUES (?1, ?2, '2026-01-01', 'active')",
+            params![name, loc],
+        ).expect("建窝失败");
+        conn.last_insert_rowid()
+    }
+    fn loc_id(conn: &Connection, name: &str) -> i64 {
+        conn.query_row("SELECT id FROM location WHERE name = ?1", params![name], |r| r.get(0)).expect("查地点失败")
+    }
+
+    #[test]
+    fn list_logs_filters_by_location_and_joins_location_name() {
+        let conn = mem_conn();
+        let home = loc_id(&conn, "家");
+        let c1 = colony_in_loc(&conn, "大头一号", Some(home));
+        let c2 = colony_in_loc(&conn, "游民", None);
+        log(&conn, c1, "喂食", "2026-09-17 20:00:00");
+        log(&conn, c2, "喂食", "2026-09-16 20:00:00");
+
+        let page = list_logs(&conn, &LogFilter { location_id: Some(home), ..Default::default() }).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].colony_name, "大头一号");
+        assert_eq!(page.rows[0].location_name.as_deref(), Some("家"));
+
+        // 未分组的窝：location_name = None；按「全部」查两行都在
+        let all = list_logs(&conn, &LogFilter::default()).unwrap();
+        assert_eq!(all.total, 2);
+        let nomad = all.rows.iter().find(|r| r.colony_name == "游民").unwrap();
+        assert_eq!(nomad.location_name, None);
+    }
+
+    #[test]
+    fn list_logs_location_and_colony_filters_compose() {
+        let conn = mem_conn();
+        let home = loc_id(&conn, "家");
+        let c1 = colony_in_loc(&conn, "家A", Some(home));
+        let c2 = colony_in_loc(&conn, "家B", Some(home));
+        log(&conn, c1, "喂食", "2026-09-17 20:00:00");
+        log(&conn, c2, "喂食", "2026-09-16 20:00:00");
+
+        let page = list_logs(&conn, &LogFilter {
+            location_id: Some(home),
+            colony_id: Some(c1),
+            ..Default::default()
+        }).unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.rows[0].colony_name, "家A");
     }
 
     #[test]
