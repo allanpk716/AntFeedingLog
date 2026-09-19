@@ -490,8 +490,9 @@ async fn auth_mw(
 
 // ── HTTP 层：本票登记的端点 ─────────────────────────────────────────────────
 
-/// `GET /api/health`：健康检查（**闸二豁免**——连通性探测不带凭证也能用；
-/// 响应只有 schema 版本，无敏感信息）。闸一照拦（连接准入在前）。
+/// `GET /api/health`：健康检查（**仅豁免闸二**——连通性探测不带凭证也能用；
+/// 响应只有 schema 版本，无敏感信息）。闸一照拦（连接准入在前），限额与超时
+/// 照挂（普通并发上限 8 无端点豁免——免凭证端点更要防洪泛，见 build_router）。
 async fn health_handler(State(deps): State<Shared>) -> axum::response::Response {
     respond_dispatch(dispatch_command(&deps, "health_check"))
 }
@@ -559,7 +560,10 @@ async fn sse_ticket_handler(State(deps): State<Shared>) -> axum::response::Respo
 // ── HTTP 层：路由组装 ───────────────────────────────────────────────────────
 
 /// 路由（自外向内）：全局体上限 → [限额 → 超时 → 闸二 → 端点]。
-/// `/api/health` 不挂闸二（唯一豁免）；其余一切路径 404（axum 无路由默认）。
+/// `/api/health` 挂同一套限额/超时、**仅豁免闸二**（唯一免凭证端点：若连并发
+/// 上限都无，段内无凭证者可连接洪泛，把并发任务全堵在库锁上占满 tokio worker
+/// ——恢复校验/备份持锁窗口期尤甚。规格 A「普通并发上限 8」没有端点豁免授权）。
+/// 其余一切路径 404（axum 无路由默认）。
 fn build_router(deps: Shared) -> axum::Router {
     use axum::extract::DefaultBodyLimit;
     use axum::middleware as mw;
@@ -574,6 +578,8 @@ fn build_router(deps: Shared) -> axum::Router {
         .with_state(deps.clone());
     let health = axum::Router::new()
         .route("/api/health", get(health_handler))
+        .layer(mw::from_fn(timeout_mw))
+        .layer(mw::from_fn_with_state(deps.clone(), limits_mw))
         .with_state(deps);
     health.merge(api).layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
@@ -1313,6 +1319,58 @@ mod tests {
 
         assert_eq!(probe(&old), 401, "旧凭证即刻 401（User Story 3）");
         assert_eq!(probe(&"f".repeat(32)), 200, "新凭证即刻可用");
+        block(handle.stop());
+    }
+
+    #[test]
+    fn health_is_subject_to_concurrency_limit() {
+        // 评审 R1 回归钉：health 仅豁免闸二，限额层照挂——>8 个免凭证并发请求，
+        // 超出者必须被限流（429），不得全部涌进 handler 阻塞在库锁上。
+        // 确定性手法：测试占住库锁 → 持槽的 8 个请求全部阻塞在派发层的锁上，
+        // 于是「立即返回」的只可能是被限流的后来者。
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let handle = block(start(deps.clone(), 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+
+        let guard = deps.conn.lock().expect("占住库锁失败");
+        let statuses = Arc::new(Mutex::new(Vec::<u16>::new()));
+        let mut joins = Vec::new();
+        for _ in 0..12 {
+            let base = base.clone();
+            let statuses = statuses.clone();
+            joins.push(std::thread::spawn(move || {
+                let (status, _) = http(&agent(), "GET", &format!("{base}/api/health"), None, "");
+                statuses.lock().unwrap().push(status);
+            }));
+        }
+        // 等 4 个「立即返回」——持有槽的 8 个在库锁释放前不可能完成
+        let expected_rejected = 12 - MAX_CONCURRENT_REQUESTS; // = 4
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while statuses.lock().unwrap().len() < expected_rejected {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "限流未生效：仅 {} 个请求返回（应至少 {expected_rejected} 个 429 立即返回）",
+                statuses.lock().unwrap().len()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(guard); // 放锁：8 个持槽请求立刻完成
+        for join in joins {
+            join.join().unwrap();
+        }
+        let all = statuses.lock().unwrap().clone();
+        assert_eq!(all.len(), 12);
+        assert_eq!(
+            all.iter().filter(|&&s| s == 429).count(),
+            12 - MAX_CONCURRENT_REQUESTS,
+            "超出并发上限的请求被限流"
+        );
+        assert_eq!(
+            all.iter().filter(|&&s| s == 200).count(),
+            MAX_CONCURRENT_REQUESTS,
+            "上限内的请求放行且健康检查正常"
+        );
         block(handle.stop());
     }
 
