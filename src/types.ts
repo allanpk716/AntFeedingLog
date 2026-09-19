@@ -409,3 +409,43 @@ export interface CheckinDigest {
   /** 距上次登记 = 今天 − 最新登记日期（自然日，当天 0） */
   days_since_last: number | null;
 }
+
+// ── 网页端设置（webui-checkin 票 03，Rust netseg.rs / webui_config.rs）──
+
+/** 本机网段一行（NetBird 段已置顶标名；物理网段 encrypted_mesh=false 走硬警示） */
+export interface NetworkSegment {
+  /** 归一后的 CIDR（主机位归零，如 192.168.1.0/24） */
+  cidr: string;
+  /** true = 接口身份已确认是加密 mesh（NetBird）；物理网段（含 CGNAT 地址）恒 false */
+  encrypted_mesh: boolean;
+  /** 置顶标名（仅 NetBird 段有，如「NetBird 虚拟网」） */
+  label: string | null;
+}
+
+/** 网页端配置（数据目录 webui-config.json，库外文件恢复不触碰；token 只程序生成） */
+export interface WebUiConfigInfo {
+  enabled: boolean;
+  /** 受信网段（归一 CIDR，闸一白名单） */
+  segments: string[];
+  /** 服务端口 1024–65535（默认 17321） */
+  port: number;
+  /** 访问凭证（32 位十六进制 = 128bit；空串 = 尚未生成） */
+  token: string;
+  token_generated_at: string | null;
+}
+
+/** save_webui_config 入参：用户可改的三项（凭证不可覆写，只可重生成） */
+export interface WebUiSaveInput {
+  enabled: boolean;
+  segments: string[];
+  port: number;
+}
+
+/** save_webui_config 返回体（半成功语义）：配置已落盘 + 防火墙同步结果分开回传，
+ * 失败时附现成 netsh 手动命令 */
+export interface WebUiSaveOutcome {
+  config: WebUiConfigInfo;
+  firewall_ok: boolean;
+  firewall_error: string | null;
+  firewall_manual_cmd: string | null;
+}

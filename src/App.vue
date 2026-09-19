@@ -6,7 +6,7 @@
  * 设置弹窗（票 04）：字典管理三 tab，任何变更抛 changed → refresh，卡片红/灰即时跟上。
  */
 import { computed, onMounted, ref } from "vue";
-import { listColonies, listLocations, subscribe } from "./lib/ipc";
+import { getWebUiWizardDone, listColonies, listLocations, subscribe } from "./lib/ipc";
 import type { Colony, LocationItem } from "./types";
 import { groupColonies, splitColonies } from "./lib/home";
 import { todayLabel } from "./lib/dates";
@@ -15,6 +15,7 @@ import ColonyFormDialog from "./components/ColonyFormDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import StatsPage from "./components/StatsPage.vue";
 import LogListPage from "./components/LogListPage.vue";
+import WebUiWizard from "./components/WebUiWizard.vue";
 
 /** 顶栏三页 nav（票 08 接活「记录」） */
 type Page = "home" | "stats" | "logs";
@@ -28,6 +29,8 @@ const showForm = ref(false);
 const editing = ref<Colony | null>(null);
 const showSettings = ref(false);
 const endedOpen = ref(false);
+/** 网页端首启向导（webui-checkin 票 03）：启动时查到「未做」才弹一次。 */
+const showWebUiWizard = ref(false);
 
 const activeColonies = computed(() => splitColonies(colonies.value).active);
 const endedColonies = computed(() => splitColonies(colonies.value).ended);
@@ -78,6 +81,13 @@ onMounted(() => {
   void subscribe("db-restored", () => {
     void refresh();
   });
+  // 网页端首启向导（webui-checkin 票 03）：只在明确查到「未做」（false）时弹；
+  // 查询失败（网页端浏览器态/异常）静默——向导不该挡住正常使用
+  void getWebUiWizardDone()
+    .then((done) => {
+      if (done === false) showWebUiWizard.value = true;
+    })
+    .catch(() => {});
 });
 </script>
 
@@ -180,6 +190,7 @@ onMounted(() => {
       @close="onSettingsClosed"
       @changed="onSettingsChanged"
     />
+    <WebUiWizard v-if="showWebUiWizard" @close="showWebUiWizard = false" />
   </div>
 </template>
 

@@ -47,6 +47,10 @@ import type {
   RestoreSummary,
   StatsPayload,
   TestNotifyOutcome,
+  NetworkSegment,
+  WebUiConfigInfo,
+  WebUiSaveInput,
+  WebUiSaveOutcome,
 } from "../types";
 import type { CheckOutcome, InstallOutcome, UpdateState } from "./updaterUi";
 
@@ -233,6 +237,18 @@ export const getUpdateState = cmdFn<void, UpdateState>("get_update_state");
 export const checkUpdateNow = cmdFn<void, CheckOutcome>("check_update_now");
 export const confirmAndInstall = cmdFn<void, InstallOutcome>("confirm_and_install");
 export const openReleasesPage = cmdFn<void, void>("open_releases_page");
+
+// ── 网页端设置（webui-checkin 票 03；防火墙 UAC 路径真机冒烟，不在前端测）──
+
+export const listNetworkSegments = cmdFn<void, NetworkSegment[]>("list_network_segments");
+export const getWebUiConfig = cmdFn<void, WebUiConfigInfo>("get_webui_config");
+export const saveWebUiConfig = cmdFn<{ input: WebUiSaveInput }, WebUiSaveOutcome>(
+  "save_webui_config",
+);
+export const regenerateWebUiToken = cmdFn<void, WebUiConfigInfo>("regenerate_token");
+export const getWebUiAccessUrl = cmdFn<void, string>("get_access_url");
+export const getWebUiWizardDone = cmdFn<void, boolean>("get_webui_wizard_done");
+export const markWebUiWizardDone = cmdFn<void, void>("mark_webui_wizard_done");
 
 // ── 前端异常转发（main.ts 全局错误钩子）──
 

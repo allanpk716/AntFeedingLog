@@ -23,6 +23,10 @@
  *   刷新或重启提示。整库替换语义（ADR-0002）。
  * - 更新 tab（release-update 票 06）：当前版本 / 立即检查更新 / 确认下载安装，
  *   全部走 Tauri command；升级未完成残留的引导也挂在本节顶（UpdatePanel）。
+ * - 网页端 tab（webui-checkin 票 03）：总开关（默认关）/ 受信网段多选（NetBird
+ *   置顶标名，勾物理网段强制明文确认）/ 端口（1024–65535）/ 凭证（打码可看、
+ *   只可重生成）/ 完整地址复制 + 风险提示；保存落 webui-config.json 并联动防火墙
+ *   （失败给现成 netsh 手动命令）。面板本体在 WebUiPanel（首启向导复用其子组件）。
  *
  * 行级 停用/启用/删除 即时落库并抛 changed（外层刷新首页，卡片红/灰随之变化）；
  * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
@@ -90,8 +94,9 @@ import {
 } from "../lib/restoreUi";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
+import WebUiPanel from "./WebUiPanel.vue";
 
-type Tab = "actions" | "foods" | "locations" | "notify" | "data" | "update";
+type Tab = "actions" | "foods" | "locations" | "notify" | "webui" | "data" | "update";
 
 const emit = defineEmits<{ close: []; changed: [] }>();
 
@@ -560,6 +565,9 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         <button class="tab tab-notify" :class="{ active: activeTab === 'notify' }" type="button" @click="activeTab = 'notify'">
           通知
         </button>
+        <button class="tab tab-webui" :class="{ active: activeTab === 'webui' }" type="button" @click="activeTab = 'webui'">
+          网页端
+        </button>
         <button class="tab tab-data" :class="{ active: activeTab === 'data' }" type="button" @click="activeTab = 'data'">
           数据
         </button>
@@ -694,6 +702,11 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
           <span class="spacer"></span>
           <button class="btn primary" type="button" :disabled="notifyBusy" @click="saveNotify">保存</button>
         </div>
+      </div>
+
+      <!-- 网页端（webui-checkin 票 03）：网段 / 端口 / 凭证 / 访问地址 / 防火墙联动 -->
+      <div v-else-if="activeTab === 'webui'" class="tab-body">
+        <WebUiPanel @changed="onPanelChanged" />
       </div>
 
       <!-- 更新（release-update 票 06）：检查更新 / 确认安装 / 升级残留引导 -->

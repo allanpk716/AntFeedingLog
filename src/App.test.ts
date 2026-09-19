@@ -646,6 +646,67 @@ describe("设置 · 字典管理（票 04）", () => {
   });
 });
 
+describe("网页端首启向导（webui-checkin 票 03）", () => {
+  const wizardConfig = {
+    enabled: false,
+    segments: [],
+    port: 17321,
+    token: "0123456789abcdef0123456789abcdef",
+    token_generated_at: "2026-09-19 08:00:00",
+  };
+
+  it("get_webui_wizard_done 返回 false（未做）→ 启动即弹一次向导；完成/跳过写键后关闭", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return [];
+        case "list_locations":
+          return locations;
+        case "get_webui_wizard_done":
+          return false;
+        case "get_webui_config":
+          return wizardConfig;
+        case "list_network_segments":
+          return [{ cidr: "100.84.0.0/16", encrypted_mesh: true, label: "NetBird 虚拟网" }];
+        default:
+          return null;
+      }
+    });
+    const wrapper = await mountApp();
+
+    const wizard = wrapper.find(".webui-wizard");
+    expect(wizard.exists()).toBe(true);
+    expect(wizard.text()).toContain("首次设置向导");
+
+    // 跳过：写完成键 + 关闭（不发任何保存）
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "mark_webui_wizard_done" ? null : null,
+    );
+    await wrapper.find(".wiz-skip-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("mark_webui_wizard_done");
+    expect(wrapper.find(".webui-wizard").exists()).toBe(false);
+  });
+
+  it("get_webui_wizard_done 返回 true（已做）→ 不弹向导", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return [];
+        case "list_locations":
+          return locations;
+        case "get_webui_wizard_done":
+          return true;
+        default:
+          return null;
+      }
+    });
+    const wrapper = await mountApp();
+    expect(wrapper.find(".webui-wizard").exists()).toBe(false);
+  });
+});
+
 describe("顶栏导航（票 07/08）", () => {
   it("顶栏显示今天日期（YYYY-MM-DD 周X，票 09 停靠 F 对齐 mock）", async () => {
     const wrapper = await mountApp();

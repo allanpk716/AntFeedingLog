@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import SettingsDialog from "./SettingsDialog.vue";
-import type { BackupConfigInfo, RestoreSummary } from "../types";
+import type { BackupConfigInfo, RestoreSummary, WebUiConfigInfo } from "../types";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（命令包装按 cmdName 透传给唯一的
 // invokeMock；事件订阅走 mock 工厂内置的立即退订空桩）
@@ -65,6 +65,59 @@ describe("设置弹窗「更新」节（票 06）", () => {
     expect(banner.exists()).toBe(true);
     expect(banner.text()).toContain("上次升级未完成");
     expect(banner.text()).toContain("v0.3.0");
+  });
+});
+
+// ── 网页端 tab（webui-checkin 票 03）：挂载面接线；面板细节在 WebUiPanel.test.ts ──
+
+function webUiConfigFixture(): WebUiConfigInfo {
+  return {
+    enabled: false,
+    segments: [],
+    port: 17321,
+    token: "0123456789abcdef0123456789abcdef",
+    token_generated_at: "2026-09-19 08:00:00",
+  };
+}
+
+describe("设置弹窗「网页端」tab（webui-checkin 票 03）", () => {
+  it("新增「网页端」tab：点开渲染面板（总开关/网段/端口/凭证/地址），面板加载走新命令", async () => {
+    baseMock();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_actions":
+        case "list_foods":
+        case "list_locations":
+          return [];
+        case "get_settings":
+          return {
+            notify_master_enabled: true,
+            notify_overdue_enabled: true,
+            notify_hibernation_enabled: true,
+            wake_remind_days_ahead: 7,
+            autostart_enabled: true,
+          };
+        case "get_webui_config":
+          return webUiConfigFixture();
+        case "list_network_segments":
+          return [{ cidr: "100.84.0.0/16", encrypted_mesh: true, label: "NetBird 虚拟网" }];
+        case "get_access_url":
+          return "http://100.84.12.3:17321/#token=0123456789abcdef0123456789abcdef";
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+    await wrapper.find(".tab-webui").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".webui-panel").exists()).toBe(true);
+    expect((wrapper.find(".webui-enabled-input").element as HTMLInputElement).checked).toBe(false);
+    expect(wrapper.findAll(".seg-row")[0].text()).toContain("NetBird 虚拟网");
+    expect(wrapper.find(".token-masked").exists()).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("get_webui_config");
+    expect(invokeMock).toHaveBeenCalledWith("list_network_segments");
   });
 });
 
