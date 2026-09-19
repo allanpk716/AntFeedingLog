@@ -141,6 +141,199 @@ describe("操作块展示态", () => {
   });
 });
 
+describe("每窝周期三形态（票 03）", () => {
+  /** 该窝设了每窝周期的操作（默认有效周期 7 天来自每窝；partial 可覆盖）。
+   *  判「设了」的唯一可信源是 interval_from_colony（票 02 评审要领），构造器即如此摆字段。 */
+  function colonyIntervalAction(
+    partial: Partial<ColonyAction> & { action_id: number },
+  ): ColonyAction {
+    return action({
+      interval_from_colony: true,
+      effective_interval_days: 7,
+      ...partial,
+    });
+  }
+
+  function food(id: number, name: string, overdue: boolean): FoodTileInfo {
+    return {
+      food_id: id,
+      name,
+      suggested_interval_days: 7,
+      days_since_last: overdue ? 8 : 1,
+      overdue,
+    };
+  }
+
+  it("形态①：设了周期未超 →「距上次 N 天 / 周期 M 天」（M=该窝有效周期）", () => {
+    expect(
+      actionTile(colonyIntervalAction({ action_id: 1, days_since_last: 2 }), false),
+    ).toEqual({ tone: "ok", text: "距上次 2 天 / 周期 7 天" });
+    // 当天刚记录也带周期上下文
+    expect(
+      actionTile(colonyIntervalAction({ action_id: 1, days_since_last: 0 }), false),
+    ).toEqual({ tone: "ok", text: "今天 · 已记录 / 周期 7 天" });
+  });
+
+  it("形态①喂食类同样生效：每窝周期统一层新鲜、食物也新鲜 → 距上次 / 周期", () => {
+    expect(
+      actionTile(
+        colonyIntervalAction({
+          action_id: 1,
+          is_feeding: true,
+          days_since_last: 5,
+          overdue: false,
+          foods: [food(3, "面包虫", false)],
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "ok", text: "距上次 5 天 / 周期 7 天" });
+  });
+
+  it("形态②：⚠ 超期 X 天与判定同源——X = days − 每窝有效周期，不吃操作层旧值", () => {
+    // 每窝周期 3 天；操作层残留建议间隔 100：超期 1 天（4−3），绝非按 100 算
+    expect(
+      actionTile(
+        colonyIntervalAction({
+          action_id: 1,
+          effective_interval_days: 3,
+          suggested_interval_days: 100,
+          days_since_last: 4,
+          overdue: true,
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 超期 1 天" });
+  });
+
+  it("形态②边界：严格大于（days==周期不红走形态①，+1 天红且超 1）", () => {
+    expect(
+      actionTile(
+        colonyIntervalAction({ action_id: 1, effective_interval_days: 4, days_since_last: 4 }),
+        false,
+      ),
+    ).toEqual({ tone: "ok", text: "距上次 4 天 / 周期 4 天" });
+    expect(
+      actionTile(
+        colonyIntervalAction({
+          action_id: 1,
+          effective_interval_days: 4,
+          days_since_last: 5,
+          overdue: true,
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 超期 1 天" });
+  });
+
+  it("形态③：未设周期与现状逐字节一致——残留 effective 值也不显周期、口径照旧", () => {
+    // 登记类切性质不清空间隔值：suggested/effective 残留 Some 但 interval_from_colony 缺省
+    // —— 只显示距上次、永不红（票 02 评审要领 1：不拿 effective != null 当「设了」）
+    expect(
+      actionTile(
+        action({
+          action_id: 2,
+          kind: "log_only",
+          suggested_interval_days: 3,
+          effective_interval_days: 3,
+          days_since_last: 100,
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "reg", text: "距上次 100 天" });
+    // 提醒类未设每窝周期：超期仍按建议间隔算、不追加「周期 M 天」
+    expect(
+      actionTile(
+        action({
+          action_id: 1,
+          suggested_interval_days: 3,
+          effective_interval_days: 3,
+          days_since_last: 4,
+          overdue: true,
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 超期 1 天" });
+    expect(
+      actionTile(
+        action({
+          action_id: 1,
+          suggested_interval_days: 3,
+          effective_interval_days: 3,
+          days_since_last: 2,
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "ok", text: "距上次 2 天" });
+  });
+
+  it("设了即提醒：登记类设了每窝周期，未超中性灰带周期、超期照红", () => {
+    expect(
+      actionTile(
+        colonyIntervalAction({
+          action_id: 2,
+          kind: "log_only",
+          effective_interval_days: 14,
+          days_since_last: 3,
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "reg", text: "距上次 3 天 / 周期 14 天" });
+    expect(
+      actionTile(
+        colonyIntervalAction({
+          action_id: 2,
+          kind: "log_only",
+          effective_interval_days: 14,
+          days_since_last: 20,
+          overdue: true,
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 超期 6 天" });
+  });
+
+  it("食物行照旧独立标超期：每窝周期统一层新鲜时红由食物层顶，口径不因每窝周期变", () => {
+    expect(
+      actionTile(
+        colonyIntervalAction({
+          action_id: 1,
+          is_feeding: true,
+          days_since_last: 2,
+          overdue: true,
+          foods: [food(3, "面包虫", true)],
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 该喂面包虫了" });
+    // 每窝周期统一层自己超了：维持「超期 N 天」原句式（措辞优先于食物层，与现状同构）
+    expect(
+      actionTile(
+        colonyIntervalAction({
+          action_id: 1,
+          is_feeding: true,
+          effective_interval_days: 3,
+          days_since_last: 8,
+          overdue: true,
+          foods: [food(3, "面包虫", true)],
+        }),
+        false,
+      ),
+    ).toEqual({ tone: "bad", text: "⚠ 超期 5 天" });
+  });
+
+  it("边界照旧：从未记录不催不显周期；冬眠静音不加周期、永不红", () => {
+    expect(
+      actionTile(colonyIntervalAction({ action_id: 1, days_since_last: null }), false),
+    ).toEqual({ tone: "none", text: "尚未记录" });
+    expect(
+      actionTile(colonyIntervalAction({ action_id: 1, days_since_last: 9, overdue: true }), true),
+    ).toEqual({ tone: "mute", text: "距上次 9 天（静音）" });
+    expect(
+      actionTile(colonyIntervalAction({ action_id: 1, days_since_last: 2 }), true),
+    ).toEqual({ tone: "mute", text: "距上次 2 天（静音）" });
+  });
+});
+
 describe("喂食判定", () => {
   it("按 is_feeding 标记位判定，与名字彻底解耦", () => {
     expect(isFeeding(action({ action_id: 1, name: "喂食", is_feeding: true }))).toBe(true);
