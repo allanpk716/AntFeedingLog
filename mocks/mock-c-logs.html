@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>蚂蚁饲养日志 · mock C3（记录页 · 改版）</title>
+<style>
+:root{
+  --bg:#f6f4f1; --card:#ffffff; --tile:#faf8f5; --text:#2c2822; --muted:#8f887d;
+  --border:#e8e2d8; --border-strong:#d8d1c4;
+  --accent:#d97706; --accent-deep:#b45309; --accent-soft:#fdf1de;
+  --ok:#188a4b; --ok-soft:#e7f5ec; --bad:#d13d3d; --bad-soft:#fcebeb;
+  --hib:#5b6472; --hib-soft:#eef0f3;
+  --shadow:0 1px 2px rgba(60,50,30,.05),0 4px 14px rgba(60,50,30,.06);
+  --toast-bg:#2c2822; --toast-fg:#fff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}   /* ★ 外壳不滚：只有内容区滚 */
+body{font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.55;display:flex;flex-direction:column}
+
+header{flex:none;background:var(--card);border-bottom:1px solid var(--border)}
+.hbar{max-width:1080px;width:100%;margin:0 auto;padding:8px 20px;display:flex;align-items:center;gap:18px}
+.brand{font-size:16px;font-weight:700;white-space:nowrap}
+.today{font-size:12px;color:var(--muted);white-space:nowrap}
+nav{display:flex;gap:4px;margin-left:8px}
+.tab{padding:4px 14px;border-radius:999px;cursor:pointer;color:var(--muted)}
+.tab.active{background:var(--accent-soft);color:var(--accent-deep);font-weight:600}
+.tools{margin-left:auto;display:flex;gap:8px}
+.ghost-btn{padding:4px 12px;border:1px solid var(--border-strong);border-radius:8px;cursor:pointer;color:var(--text);font-size:13px;background:var(--card)}
+.ghost-btn:hover{border-color:var(--accent);color:var(--accent-deep)}
+
+main{flex:1;overflow-y:auto;min-height:0}
+.wrap{max-width:1080px;margin:0 auto;padding:12px 20px 60px}
+.hintbar{max-width:1080px;margin:0 auto;padding:6px 20px 0;font-size:11px;color:var(--muted)}
+
+/* ── 筛选行：全部即改即查，无「查询」按钮 ── */
+.filters{display:flex;align-items:center;gap:8px;flex-wrap:wrap;position:relative}
+.f-label{font-size:12px;color:var(--muted)}
+select,.kw{
+  padding:5px 8px;border:1px solid var(--border-strong);border-radius:8px;font:inherit;font-size:13px;background:var(--card);color:var(--text)}
+select:hover,.kw:hover,.dfield:hover{border-color:var(--accent)}
+.kw{min-width:150px}
+.autonote{font-size:11px;color:var(--accent-deep);background:var(--accent-soft);padding:1px 10px;border-radius:999px;white-space:nowrap}
+
+/* 自绘日期字段（素版日历的触发器） */
+.dwrap{position:relative}
+.dfield{padding:5px 8px;border:1px solid var(--border-strong);border-radius:8px;font:inherit;font-size:13px;background:var(--card);color:var(--text);cursor:pointer;min-width:96px;text-align:left}
+.dfield.empty{color:var(--muted)}
+.dfield::after{content:'▾';float:right;color:var(--muted);margin-left:6px}
+
+.reset-btn{padding:5px 14px;border:1px solid var(--border-strong);border-radius:8px;background:var(--card);cursor:pointer;font:inherit;font-size:13px;color:var(--text)}
+.reset-btn:hover{border-color:var(--accent);color:var(--accent-deep)}
+
+/* ── 自绘日历弹层（素版：无记录标记；选完即关）── */
+.cal{position:absolute;top:36px;left:0;z-index:30;background:var(--card);border:1px solid var(--border-strong);border-radius:12px;box-shadow:0 10px 40px rgba(60,50,30,.18);padding:10px 12px;display:none;width:238px}
+.cal.open{display:block}
+.cal-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.cal-title{font-size:13px;font-weight:700;flex:1;text-align:center}
+.cal-nav{border:1px solid var(--border);background:var(--tile);border-radius:7px;cursor:pointer;font:inherit;font-size:12px;padding:1px 8px;color:var(--text)}
+.cal-nav:hover{border-color:var(--accent);color:var(--accent-deep)}
+.cal-today-btn{border:1px solid var(--border);background:var(--tile);border-radius:999px;cursor:pointer;font:inherit;font-size:11px;padding:1px 9px;color:var(--muted)}
+.cal-today-btn:hover{border-color:var(--accent);color:var(--accent-deep)}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;text-align:center}
+.cal-grid .wd{font-size:10px;color:var(--muted);padding:2px 0}
+.day{position:relative;border:none;background:transparent;font:inherit;font-size:12px;color:var(--text);border-radius:8px;padding:4px 0;cursor:pointer;min-width:28px}
+.day:hover{background:var(--accent-soft)}
+.day.dim{color:#cfc8bb;cursor:default}
+.day.dim:hover{background:transparent}
+.day.sel{background:var(--accent);color:#fff;font-weight:700}
+.day.tod:not(.sel){box-shadow:inset 0 0 0 1.5px var(--accent);color:var(--accent-deep);font-weight:600}
+.cal-foot{margin-top:6px;font-size:10px;color:var(--muted);text-align:center}
+
+.total-note{margin-top:10px;font-size:12px;color:var(--muted)}
+
+/* ── 流水表 ── */
+.table-wrap{margin-top:6px;background:var(--card);border:1px solid var(--border);border-radius:14px;box-shadow:var(--shadow);overflow:hidden}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;font-size:11px;color:var(--muted);font-weight:600;padding:8px 14px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:7px 14px;border-bottom:1px solid var(--border);vertical-align:top}
+tr:last-child td{border-bottom:none}
+.c-time{white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--text)}
+.c-colony{white-space:nowrap;font-weight:600;line-height:1.3}
+.c-colony .loc{display:block;font-size:11px;font-weight:400;color:var(--muted)}   /* ★ 窝名下挂地点 */
+.c-note{color:var(--muted)}
+.th-ops{width:1%}
+.c-ops{white-space:nowrap;text-align:right}
+.row-btn{padding:3px 9px;margin-left:6px;border:1px solid var(--border-strong);border-radius:8px;background:var(--card);cursor:pointer;font:inherit;font-size:12px;color:var(--text)}
+.row-btn:hover{border-color:var(--accent);color:var(--accent-deep)}
+.empty{padding:22px;text-align:center;color:var(--muted);font-size:13px}
+.more-btn{margin-top:12px;width:100%;padding:9px;border:1.5px dashed var(--border-strong);border-radius:12px;background:transparent;cursor:pointer;color:var(--muted);font:inherit;font-size:13px}
+.more-btn:hover{border-color:var(--accent);color:var(--accent-deep)}
+
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);background:var(--toast-bg);color:var(--toast-fg);padding:8px 18px;border-radius:999px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:99;max-width:80vw}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.stamp{position:fixed;right:12px;bottom:10px;font-size:11px;color:var(--muted);opacity:.75;z-index:5}
+</style>
+</head>
+<body>
+
+<header><div class="hbar">
+  <div class="brand">🐜 蚂蚁饲养日志</div>
+  <nav>
+    <span class="tab" data-hint="正式版切页；首页两个方向见 mock-c-home-cards / mock-c-home-rows">首页</span>
+    <span class="tab" data-hint="正式版切页">统计</span>
+    <span class="tab active">记录</span>
+  </nav>
+  <div class="today">2026-09-19 周六</div>
+  <div class="tools">
+    <span class="ghost-btn" data-hint="字典管理：操作 / 食物 / 地点">⚙ 设置</span>
+  </div>
+</div></header>
+
+<main>
+<div class="hintbar">★ 改版四件事：① 地点筛选（地点→窝 级联） ② 条件变更即查（无查询按钮，关键词停 0.3 秒自动查） ③ 窝名下挂地点 ④ 自绘日历（点「从」「到」试试——选完即关、弹层不超窗）。往下滚时顶栏不动。</div>
+<div class="wrap">
+
+  <div class="filters">
+    <label class="f-label">地点</label>
+    <select id="fLoc"><option value="">全部</option><option value="home" selected>🏠 家</option><option value="office">💼 公司</option></select>
+
+    <label class="f-label">窝</label>
+    <select id="fColony"></select>  <!-- ★ 级联：地点变 → 窝选项跟着变 -->
+
+    <label class="f-label">操作</label>
+    <select id="fAct"><option value="">全部</option><option value="feed">🌾 喂食</option><option value="water">💧 换水</option><option value="hydrate">🌫️ 保湿</option><option value="trash">🧹 清理</option></select>
+
+    <label class="f-label">从</label>
+    <span class="dwrap">
+      <button class="dfield empty" id="dStart" type="button">开始日期</button>
+    </span>
+    <label class="f-label">到</label>
+    <span class="dwrap">
+      <button class="dfield empty" id="dEnd" type="button">结束日期</button>
+    </span>
+
+    <input class="kw" id="fKw" type="search" placeholder="搜备注 · 输入即查">
+    <button class="reset-btn" id="fReset" type="button">重置</button>
+    <span class="autonote">⚡ 条件变更即查询</span>
+
+    <!-- 共用素版日历弹层（挂在筛选行上，JS 定位到触发的字段下） -->
+    <div class="cal" id="cal">
+      <div class="cal-head">
+        <button class="cal-nav" id="calPrev" type="button">‹</button>
+        <span class="cal-title" id="calTitle">2026年9月</span>
+        <button class="cal-nav" id="calNext" type="button">›</button>
+        <button class="cal-today-btn" id="calToday" type="button">今天</button>
+      </div>
+      <div class="cal-grid" id="calGrid"></div>
+      <div class="cal-foot">选中即关闭 · Esc / 点外部关闭</div>
+    </div>
+  </div>
+
+  <p class="total-note" id="totalNote"></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>时间</th><th>窝</th><th>操作</th><th>食物</th><th>备注</th><th class="th-ops"></th>
+      </tr></thead>
+      <tbody id="tbody"></tbody>
+    </table>
+    <p class="empty" id="emptyRow" hidden>没有符合条件的记录</p>
+  </div>
+
+  <button class="more-btn" id="moreBtn" hidden></button>
+
+</div>
+</main>
+
+<div id="toast"></div>
+<div class="stamp">静态示意稿 · 假数据可点 · mock-c-logs（记录页改版）</div>
+
+<script>
+const $=s=>document.querySelector(s);
+let toastTimer;
+function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),2400);}
+
+/* ── 假数据 ── */
+const COLONIES={a1:{name:'大头一号',loc:'home'},a2:{name:'针毛',loc:'office'},a3:{name:'大头二号',loc:'office'}};
+const LOCS={home:'🏠 家',office:'💼 公司'};
+const ACTS={feed:'🌾 喂食',water:'💧 换水',hydrate:'🌫️ 保湿',trash:'🧹 清理'};
+const LOGS=[
+  {t:'2026-09-19 14:32',c:'a1',act:'trash',foods:[],note:''},
+  {t:'2026-09-19 09:02',c:'a2',act:'feed',foods:['干虾仁','面包虫'],note:''},
+  {t:'2026-09-17 20:10',c:'a1',act:'feed',foods:['种子'],note:''},
+  {t:'2026-09-16 09:05',c:'a1',act:'water',foods:[],note:'活动区换水'},
+  {t:'2026-09-15 21:12',c:'a2',act:'feed',foods:['种子'],note:''},
+  {t:'2026-09-14 21:30',c:'a1',act:'feed',foods:['面包虫'],note:''},
+  {t:'2026-09-14 08:40',c:'a3',act:'water',foods:[],note:'冬眠期间例行检查'},
+  {t:'2026-09-12 19:00',c:'a1',act:'hydrate',foods:[],note:'巢穴加湿'},
+  {t:'2026-09-11 20:15',c:'a1',act:'feed',foods:['种子','干虾仁'],note:''},
+  {t:'2026-09-09 20:00',c:'a2',act:'feed',foods:['面包虫'],note:'换新一批虫'},
+  {t:'2026-09-08 08:50',c:'a1',act:'water',foods:[],note:''},
+  {t:'2026-09-07 20:00',c:'a1',act:'feed',foods:['种子'],note:''},
+  {t:'2026-09-05 21:10',c:'a2',act:'feed',foods:['干虾仁'],note:''},
+  {t:'2026-09-02 19:30',c:'a1',act:'trash',foods:[],note:'清了垃圾区'},
+  {t:'2026-09-01 20:00',c:'a1',act:'feed',foods:['种子'],note:''},
+  {t:'2026-08-30 09:00',c:'a1',act:'hydrate',foods:[],note:''},
+  {t:'2026-08-28 20:20',c:'a2',act:'feed',foods:['面包虫','种子'],note:''},
+  {t:'2026-08-26 14:00',c:'a1',act:'water',foods:[],note:''},
+  {t:'2026-08-24 20:00',c:'a3',act:'feed',foods:['种子'],note:'入眠前最后投喂'},
+  {t:'2026-08-20 10:00',c:'a3',act:'water',foods:[],note:'入眠准备，撤水盘'},
+];
+const PAGE=15;
+
+/* ── 筛选状态 ── */
+const st={loc:'home',colony:'',act:'',start:'',end:'',kw:''};
+let shown=PAGE;
+
+function colonyOptions(){
+  const sel=$('#fColony');sel.innerHTML='<option value="">全部</option>';
+  Object.entries(COLONIES).forEach(([id,c])=>{
+    if(st.loc && c.loc!==st.loc)return;                 /* ★ 级联 */
+    const o=document.createElement('option');o.value=id;o.textContent=c.name;sel.appendChild(o);
+  });
+  if(st.colony && [...sel.options].every(o=>o.value!==st.colony))st.colony=''; /* 地点变了，原窝不在列就清空 */
+  sel.value=st.colony;
+}
+
+function filtered(){
+  return LOGS.filter(l=>{
+    const c=COLONIES[l.c];
+    if(st.loc&&c.loc!==st.loc)return false;
+    if(st.colony&&l.c!==st.colony)return false;
+    if(st.act&&l.act!==st.act)return false;
+    const d=l.t.slice(0,10);
+    if(st.start&&d<st.start)return false;
+    if(st.end&&d>st.end)return false;
+    if(st.kw&&!l.note.includes(st.kw))return false;
+    return true;
+  });
+}
+
+function render(){
+  const all=filtered(),rows=all.slice(0,shown);
+  $('#totalNote').textContent=`共 ${all.length} 条记录`;
+  const tb=$('#tbody');tb.innerHTML='';
+  rows.forEach((l,i)=>{
+    const c=COLONIES[l.c],tr=document.createElement('tr');
+    tr.innerHTML=`<td class="c-time">${l.t.slice(5,16)}</td>
+      <td class="c-colony">${c.name}<span class="loc">${LOCS[c.loc]}</span></td>
+      <td>${ACTS[l.act]}</td>
+      <td>${l.foods.length?l.foods.join('、'):'—'}</td>
+      <td class="c-note">${l.note||'—'}</td>
+      <td class="c-ops"><button class="row-btn" data-op="编辑">编辑</button><button class="row-btn" data-op="删除">删除</button></td>`;
+    tr.querySelectorAll('.row-btn').forEach(b=>b.addEventListener('click',()=>toast(`示意稿：${b.dataset.op}第 ${i+1} 条（正式版两段确认删除）`)));
+    tb.appendChild(tr);
+  });
+  $('#emptyRow').hidden=all.length>0;
+  const mb=$('#moreBtn');
+  if(shown<all.length){mb.hidden=false;mb.textContent=`加载更多（已载 ${rows.length} / ${all.length}）`;}
+  else mb.hidden=true;
+}
+function query(){shown=PAGE;render();}   /* ★ 即改即查 */
+
+$('#fLoc').addEventListener('change',e=>{st.loc=e.target.value;colonyOptions();query();});
+$('#fColony').addEventListener('change',e=>{st.colony=e.target.value;query();});
+$('#fAct').addEventListener('change',e=>{st.act=e.target.value;query();});
+let kwTimer;   /* ★ 防抖 0.3s */
+$('#fKw').addEventListener('input',e=>{clearTimeout(kwTimer);kwTimer=setTimeout(()=>{st.kw=e.target.value.trim();query();},300);});
+$('#moreBtn').addEventListener('click',()=>{shown+=PAGE;render();});
+$('#fReset').addEventListener('click',()=>{
+  Object.assign(st,{loc:'',colony:'',act:'',start:'',end:'',kw:''});
+  $('#fLoc').value='';$('#fAct').value='';$('#fKw').value='';
+  setDateField('#dStart','');setDateField('#dEnd','');
+  colonyOptions();query();toast('已重置');
+});
+
+/* ── 自绘日历（素版，无标记；两个日期字段共用）── */
+const TODAY='2026-09-19';
+let cal={y:2026,m:9,sel:'',target:null};
+function openCal(btn,which){
+  cal.target=which;
+  const cur=st[which];
+  const base=cur||TODAY;cal.y=+base.slice(0,4);cal.m=+base.slice(5,7);
+  drawCal();
+  const box=$('#cal');
+  const wrap=btn.parentElement;
+  box.style.left=(wrap.offsetLeft)+'px';
+  box.classList.add('open');
+}
+function drawCal(){
+  $('#calTitle').textContent=`${cal.y}年${cal.m}月`;
+  const g=$('#calGrid');g.innerHTML='';
+  '一二三四五六日'.split('').forEach(w=>{const s=document.createElement('span');s.className='wd';s.textContent=w;g.appendChild(s);});
+  const first=new Date(cal.y,cal.m-1,1),lead=(first.getDay()+6)%7;  /* 周一开头 */
+  const days=new Date(cal.y,cal.m,0).getDate();
+  for(let i=0;i<lead;i++)g.appendChild(Object.assign(document.createElement('span'),{className:'day dim',textContent:'·'}));
+  for(let d=1;d<=days;d++){
+    const iso=`${cal.y}-${String(cal.m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const b=document.createElement('button');b.type='button';b.className='day';b.textContent=d;
+    if(iso===TODAY)b.classList.add('tod');
+    if(st[cal.target]===iso)b.classList.add('sel');
+    b.addEventListener('click',()=>{                     /* ★ 选中即关 */
+      st[cal.target]=iso;setDateField(cal.target==='start'?'#dStart':'#dEnd',iso);
+      $('#cal').classList.remove('open');query();
+    });
+    g.appendChild(b);
+  }
+}
+function setDateField(sel,v){const b=$(sel);b.textContent=v||(b.id==='dStart'?'开始日期':'结束日期');b.classList.toggle('empty',!v);}
+$('#dStart').addEventListener('click',e=>{e.stopPropagation();openCal(e.currentTarget,'start');});
+$('#dEnd').addEventListener('click',e=>{e.stopPropagation();openCal(e.currentTarget,'end');});
+$('#calPrev').addEventListener('click',e=>{e.stopPropagation();cal.m--;if(cal.m<1){cal.m=12;cal.y--;}drawCal();});
+$('#calNext').addEventListener('click',e=>{e.stopPropagation();cal.m++;if(cal.m>12){cal.m=1;cal.y++;}drawCal();});
+$('#calToday').addEventListener('click',e=>{e.stopPropagation();cal.y=2026;cal.m=9;drawCal();});
+document.addEventListener('click',e=>{if(!e.target.closest('.cal')&&!e.target.closest('.dfield'))$('#cal').classList.remove('open');});
+document.addEventListener('keydown',e=>{if(e.key==='Escape')$('#cal').classList.remove('open');});
+
+document.querySelectorAll('[data-hint]').forEach(el=>el.addEventListener('click',()=>toast(el.dataset.hint)));
+
+/* 初始化 */
+colonyOptions();render();
+</script>
+</body>
+</html>

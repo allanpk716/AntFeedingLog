@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>蚂蚁饲养日志 · mock C4（自绘日历 · 带记录标记 + 重复提醒）</title>
+<style>
+:root{
+  --bg:#f6f4f1; --card:#ffffff; --tile:#faf8f5; --text:#2c2822; --muted:#8f887d;
+  --border:#e8e2d8; --border-strong:#d8d1c4;
+  --accent:#d97706; --accent-deep:#b45309; --accent-soft:#fdf1de;
+  --ok:#188a4b; --ok-soft:#e7f5ec; --bad:#d13d3d; --bad-soft:#fcebeb;
+  --hib:#5b6472; --hib-soft:#eef0f3;
+  --warn:#b45309; --warn-soft:#fdf1de; --warn-border:#f3d9a8;
+  --shadow:0 1px 2px rgba(60,50,30,.05),0 4px 14px rgba(60,50,30,.06);
+  --toast-bg:#2c2822; --toast-fg:#fff;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.55;display:flex;flex-direction:column}
+
+header{flex:none;background:var(--card);border-bottom:1px solid var(--border)}
+.hbar{max-width:1080px;width:100%;margin:0 auto;padding:8px 20px;display:flex;align-items:center;gap:18px}
+.brand{font-size:16px;font-weight:700}
+.today{font-size:12px;color:var(--muted)}
+nav{display:flex;gap:4px;margin-left:8px}
+.tab{padding:4px 14px;border-radius:999px;cursor:pointer;color:var(--muted)}
+.tab.active{background:var(--accent-soft);color:var(--accent-deep);font-weight:600}
+
+main{flex:1;overflow-y:auto;min-height:0}
+.wrap{max-width:1080px;margin:0 auto;padding:14px 20px 60px}
+.hintbar{max-width:1080px;margin:0 auto;padding:6px 20px 0;font-size:11px;color:var(--muted)}
+h4.sec{margin:22px 0 4px;font-size:14px}
+p.sec-sub{font-size:12px;color:var(--muted);margin-bottom:10px}
+
+.stage{position:relative;display:inline-flex;align-items:flex-start;gap:0;background:var(--bg);border:1px dashed var(--border-strong);border-radius:14px;padding:24px;max-width:100%}
+
+/* ── 快捷打卡面板（真实比例弹窗）── */
+.dialog{position:relative;width:390px;background:var(--card);border-radius:14px;padding:18px;box-shadow:0 10px 40px rgba(0,0,0,.18);z-index:2}
+.dialog h3{font-size:15px;margin-bottom:12px}
+.field-label{font-size:12px;color:var(--muted);margin:12px 0 6px}
+
+/* 自绘日期触发器 */
+.dfield{width:100%;padding:7px 10px;border:1px solid var(--border-strong);border-radius:8px;font:inherit;font-size:13px;background:var(--card);color:var(--text);cursor:pointer;text-align:left;position:relative}
+.dfield::after{content:'📅';float:right;font-size:13px;opacity:.8}
+.dfield:hover{border-color:var(--accent)}
+
+/* ★ 重复提醒黄条 */
+.warn{margin-top:8px;padding:7px 10px;border-radius:9px;background:var(--warn-soft);border:1px solid var(--warn-border);color:var(--warn);font-size:12px;display:flex;gap:6px;align-items:flex-start}
+.warn b{font-weight:700}
+.warn .why{margin-left:auto;font-size:11px;opacity:.8;white-space:nowrap}
+
+/* 时间快捷行 */
+.trow{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.tchip{border:1px solid var(--border-strong);background:var(--tile);border-radius:999px;padding:3px 11px;font:inherit;font-size:12px;color:var(--text);cursor:pointer}
+.tchip:hover{border-color:var(--accent);color:var(--accent-deep)}
+.tval{display:flex;align-items:center;gap:3px;margin-left:4px;font-variant-numeric:tabular-nums}
+.tval .seg{display:flex;align-items:center;gap:2px}
+.tval .num{font-size:15px;font-weight:700;min-width:26px;text-align:center}
+.tval .sep{font-weight:700}
+.tval button{border:1px solid var(--border);background:var(--tile);border-radius:6px;cursor:pointer;font:inherit;font-size:10px;padding:1px 5px;color:var(--muted);line-height:1.3}
+.tval button:hover{border-color:var(--accent);color:var(--accent-deep)}
+
+.note-input{width:100%;height:52px;padding:7px 10px;border:1px solid var(--border-strong);border-radius:8px;font:inherit;resize:none;background:var(--card);color:var(--text);margin-top:2px}
+.dlg-btns{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}
+.btn{padding:7px 18px;border-radius:9px;border:1px solid var(--border-strong);background:var(--card);cursor:pointer;font:inherit}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+.btn.primary:hover{background:var(--accent-deep)}
+
+/* ── 自绘日历弹层（带记录标记版，向右弹）── */
+.cal{position:relative;width:264px;background:var(--card);border:1px solid var(--border-strong);border-radius:12px;box-shadow:0 10px 40px rgba(60,50,30,.2);padding:10px 12px;z-index:1;margin-left:-6px;margin-top:70px}
+.cal-head{display:flex;align-items:center;gap:6px;margin-bottom:6px}
+.cal-title{font-size:13px;font-weight:700;flex:1;text-align:center}
+.cal-nav{border:1px solid var(--border);background:var(--tile);border-radius:7px;cursor:pointer;font:inherit;font-size:12px;padding:1px 8px;color:var(--text)}
+.cal-nav:hover{border-color:var(--accent);color:var(--accent-deep)}
+.cal-today-btn{border:1px solid var(--border);background:var(--tile);border-radius:999px;cursor:pointer;font:inherit;font-size:11px;padding:1px 9px;color:var(--muted)}
+.cal-today-btn:hover{border-color:var(--accent);color:var(--accent-deep)}
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;text-align:center}
+.cal-grid .wd{font-size:10px;color:var(--muted);padding:2px 0}
+.day{position:relative;border:none;background:transparent;font:inherit;font-size:12px;color:var(--text);border-radius:8px;padding:3px 0 9px;cursor:pointer;min-width:30px}
+.day:hover{background:var(--accent-soft)}
+.day.dim{color:#cfc8bb;cursor:default;padding-bottom:3px}
+.day.dim:hover{background:transparent}
+.day.sel{background:var(--accent);color:#fff;font-weight:700}
+.day.tod:not(.sel){box-shadow:inset 0 0 0 1.5px var(--accent);color:var(--accent-deep);font-weight:600}
+/* 记录标记点：日期数字下方 */
+.dots{position:absolute;left:0;right:0;bottom:2px;display:flex;justify-content:center;gap:3px;height:5px;line-height:5px}
+.dot{width:5px;height:5px;border-radius:50%;background:#c9c1b2}          /* 其他操作 */
+.dot.cur{width:7px;height:7px;background:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)} /* 当前操作 */
+.day.sel .dot{background:rgba(255,255,255,.75)}
+.day.sel .dot.cur{background:#fff;box-shadow:none}
+.cal-legend{margin-top:7px;padding-top:7px;border-top:1px dashed var(--border);font-size:10px;color:var(--muted);display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+.cal-legend .k{display:flex;align-items:center;gap:4px}
+.cal-legend .dot{position:static}
+.cal-foot{margin-top:4px;font-size:10px;color:var(--muted);text-align:center}
+
+/* 悬停明细气泡 */
+.tip{position:absolute;z-index:40;background:var(--toast-bg);color:var(--toast-fg);border-radius:9px;padding:6px 10px;font-size:11px;line-height:1.5;pointer-events:none;display:none;white-space:nowrap;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+.tip.show{display:block}
+.tip .d{font-weight:700;margin-bottom:1px}
+
+/* ── 素版日历演示区 ── */
+.plain-demo{display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap}
+.pfields{display:flex;gap:8px;align-items:center;padding-top:8px}
+.pfields .f-label{font-size:12px;color:var(--muted)}
+.pwrap{position:relative}
+.pdfield{padding:5px 10px;border:1px solid var(--border-strong);border-radius:8px;font:inherit;font-size:13px;background:var(--card);color:var(--text);cursor:pointer;min-width:104px;text-align:left}
+.pdfield::after{content:'▾';float:right;color:var(--muted);margin-left:6px}
+.pdfield:hover{border-color:var(--accent)}
+.pcal{position:relative;width:238px;background:var(--card);border:1px solid var(--border-strong);border-radius:12px;box-shadow:0 10px 40px rgba(60,50,30,.18);padding:10px 12px}
+.pcal .day{padding:4px 0}
+
+/* 行为要点清单 */
+ul.points{margin-top:10px;padding-left:20px;font-size:12px;color:var(--text)}
+ul.points li{margin:3px 0}
+ul.points .k{color:var(--accent-deep);font-weight:600}
+
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(20px);background:var(--toast-bg);color:var(--toast-fg);padding:8px 18px;border-radius:999px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:99;max-width:80vw}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.stamp{position:fixed;right:12px;bottom:10px;font-size:11px;color:var(--muted);opacity:.75;z-index:5}
+</style>
+</head>
+<body>
+
+<header><div class="hbar">
+  <div class="brand">🐜 蚂蚁饲养日志</div>
+  <nav>
+    <span class="tab" data-hint="首页两个方向见 mock-c-home-cards / mock-c-home-rows">首页</span>
+    <span class="tab">统计</span>
+    <span class="tab" data-hint="记录页改版见 mock-c-logs.html">记录</span>
+  </nav>
+  <div class="today">2026-09-19 周六</div>
+</div></header>
+
+<main>
+<div class="hintbar">★ 自绘日历定稿示意：右图是「清理」打卡面板——日历里带该窝的记录标记（橙点=当天已有清理，灰点=其它操作），今天 09-19 有橙点 → 面板出黄条提醒。可以真的点：选别的日期黄条会变，选完日历即关。</div>
+<div class="wrap">
+
+  <h4 class="sec">① 打卡 / 喂食 / 编辑记录 → 带记录标记的日历</h4>
+  <p class="sec-sub">场景：点了「大头一号」的「🧹 清理」——今天 14:32 已经清理过一次，黄条拦一下，确认不是手滑再记。</p>
+  <div class="stage">
+    <div class="dialog">
+      <h3>记录清理 · 大头一号 <span style="font-size:11px;color:var(--muted);font-weight:400">🏠 家</span></h3>
+
+      <div class="field-label">日期（点开选，选完即收）</div>
+      <button class="dfield" id="dMain" type="button">2026-09-19 周六</button>
+
+      <div class="warn" id="warnBox">
+        <span>⚠</span>
+        <span id="warnText"><b>今天已有 1 条清理记录（14:32）</b>，请确认不是重复操作。</span>
+        <span class="why">确属再次操作可直接记录</span>
+      </div>
+
+      <div class="field-label">时间</div>
+      <div class="trow">
+        <button class="tchip" id="tNow" type="button">现在</button>
+        <button class="tchip" id="tM10" type="button">−10分</button>
+        <button class="tchip" id="tP10" type="button">＋10分</button>
+        <span class="tval">
+          <span class="seg"><button data-t="h-" type="button">‹</button><span class="num" id="tH">20</span><button data-t="h+" type="button">›</button></span>
+          <span class="sep">:</span>
+          <span class="seg"><button data-t="m-" type="button">‹</button><span class="num" id="tM">05</span><button data-t="m+" type="button">›</button></span>
+        </span>
+      </div>
+
+      <div class="field-label">备注（可选）</div>
+      <textarea class="note-input" placeholder="如：顺手检查了垃圾区"></textarea>
+
+      <div class="dlg-btns">
+        <button class="btn" id="dCancel" type="button">取消</button>
+        <button class="btn primary" id="dOk" type="button">记录</button>
+      </div>
+    </div>
+
+    <!-- 带标记日历：向右弹（示意自动避开边界） -->
+    <div class="cal" id="calMain">
+      <div class="cal-head">
+        <button class="cal-nav" id="pPrev" type="button">‹</button>
+        <span class="cal-title" id="pTitle">2026年9月</span>
+        <button class="cal-nav" id="pNext" type="button">›</button>
+        <button class="cal-today-btn" id="pToday" type="button">今天</button>
+      </div>
+      <div class="cal-grid" id="pGrid"></div>
+      <div class="cal-legend">
+        <span class="k"><span class="dot cur"></span>当天已有「清理」</span>
+        <span class="k"><span class="dot"></span>其它操作（悬停看明细）</span>
+        <span class="k" style="box-shadow:inset 0 0 0 1.5px var(--accent);border-radius:6px;padding:0 4px">今天</span>
+      </div>
+      <div class="cal-foot">选中即关闭 · 悬停日期看当天做了什么</div>
+    </div>
+  </div>
+
+  <h4 class="sec">② 筛选 / 新建窝 / 冬眠表单 → 素版（无标记）</h4>
+  <p class="sec-sub">同一个日历控件去掉标记层，纯选日期。下面这个可以点。</p>
+  <div class="plain-demo">
+    <div class="pfields">
+      <span class="f-label">从</span>
+      <span class="pwrap"><button class="pdfield" id="pdStart" type="button">开始日期</button></span>
+      <span class="f-label">到</span>
+      <span class="pwrap"><button class="pdfield" id="pdEnd" type="button">结束日期</button></span>
+    </div>
+    <div class="pcal" id="pcal">
+      <div class="cal-head">
+        <button class="cal-nav" id="qPrev" type="button">‹</button>
+        <span class="cal-title" id="qTitle">2026年9月</span>
+        <button class="cal-nav" id="pNext2" type="button">›</button>
+        <button class="cal-today-btn" id="qToday" type="button">今天</button>
+      </div>
+      <div class="cal-grid" id="qGrid"></div>
+      <div class="cal-foot">选中即关闭 · Esc / 点外部关闭</div>
+    </div>
+  </div>
+
+  <h4 class="sec">③ 定稿行为要点</h4>
+  <ul class="points">
+    <li><span class="k">选中即关</span>：点某天 → 日期进输入框、日历立即收起，不用再点别处。</li>
+    <li><span class="k">不超窗</span>：弹层贴着触发字段，向下空间不够就向上/向右弹（本稿演示向右），永远不会出窗口。</li>
+    <li><span class="k">标记含义</span>：橙点=该窝当天已有「正在记录的这项操作」；灰点=当天有其它操作。悬停出明细（喂食×1（种子）· 保湿×1）。</li>
+    <li><span class="k">重复提醒</span>：选中的日期已有同操作记录 → 面板出黄条，列出已有条数和最近时刻；不拦操作，喂食早晚两次、真的清两次都照记。</li>
+    <li><span class="k">时间快捷</span>：现在 / −10分 / ＋10分 一键；时、分可微调。补录过去日期时先挑日期再调时间。</li>
+    <li><span class="k">月份翻页 / 今天</span>：‹ › 翻月，「今天」一键回今天。</li>
+  </ul>
+
+</div>
+</main>
+
+<div class="tip" id="tip"><div class="d" id="tipD"></div><div id="tipB"></div></div>
+<div id="toast"></div>
+<div class="stamp">静态示意稿 · 假数据可点 · mock-c-calendar（自绘日历）</div>
+
+<script>
+const $=s=>document.querySelector(s);
+let toastTimer;
+function toast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>t.classList.remove('show'),2400);}
+
+const TODAY='2026-09-19';
+const CUR_ACT='清理';
+/* 大头一号 9 月假记录：day → {feed,water,hydrate,trash,feedNote} */
+const REC={
+  2:{feed:1},5:{feed:1,water:1},8:{feed:1,hydrate:1},11:{feed:1},
+  12:{trash:'19:40',hydrate:1},14:{feed:1},15:{feed:1},16:{feed:1,water:1},
+  17:{feed:1,feedNote:'种子',hydrate:1},19:{trash:'14:32'},
+};
+const WD='一二三四五六日';
+
+/* ── 带标记日历 ── */
+let vm={y:2026,m:9,sel:'2026-09-19',open:true};
+function drawMain(){
+  $('#pTitle').textContent=`${vm.y}年${vm.m}月`;
+  const g=$('#pGrid');g.innerHTML='';
+  WD.split('').forEach(w=>{const s=document.createElement('span');s.className='wd';s.textContent=w;g.appendChild(s);});
+  const lead=(new Date(vm.y,vm.m-1,1).getDay()+6)%7,days=new Date(vm.y,vm.m,0).getDate();
+  for(let i=0;i<lead;i++)g.appendChild(Object.assign(document.createElement('span'),{className:'day dim',textContent:'·'}));
+  for(let d=1;d<=days;d++){
+    const iso=`${vm.y}-${String(vm.m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const r=REC[d]&&vm.m===9?REC[d]:null;
+    const b=document.createElement('button');b.type='button';b.className='day';b.textContent=d;
+    if(iso===TODAY)b.classList.add('tod');
+    if(iso===vm.sel)b.classList.add('sel');
+    if(r){
+      const dots=document.createElement('span');dots.className='dots';
+      if(r.trash)dots.appendChild(Object.assign(document.createElement('span'),{className:'dot cur'}));
+      const others=Object.keys(r).filter(k=>k!=='trash'&&k!=='feedNote');
+      others.slice(0,2).forEach(()=>dots.appendChild(Object.assign(document.createElement('span'),{className:'dot'})));
+      b.appendChild(dots);
+      b.dataset.day=d;
+    }
+    b.addEventListener('click',()=>{
+      vm.sel=iso;closeMain();
+      $('#dMain').textContent=`${iso} 周${WD[(new Date(iso).getDay()+6)%7]}`;
+      updateWarn(iso,d);
+    });
+    b.addEventListener('mouseenter',()=>showTip(b,d));
+    b.addEventListener('mouseleave',()=>$('#tip').classList.remove('show'));
+    g.appendChild(b);
+  }
+}
+function showTip(el,d){
+  const r=REC[d]&&vm.m===9?REC[d]:null;if(!r)return;
+  const names={feed:'喂食',water:'换水',hydrate:'保湿',trash:'清理'};
+  const parts=[];
+  if(r.feed)parts.push(`喂食×${r.feed}${r.feedNote?`（${r.feedNote}）`:''}`);
+  if(r.water)parts.push(`换水×${r.water}`);
+  if(r.hydrate)parts.push(`保湿×${r.hydrate}`);
+  if(r.trash)parts.push(`清理×${typeof r.trash==='string'?1:1}${typeof r.trash==='string'?`（${r.trash}）`:''}`);
+  const rect=el.getBoundingClientRect();
+  const tip=$('#tip');
+  $('#tipD').textContent=`${vm.m}月${d}日 · 周${WD[(new Date(vm.y,vm.m-1,d).getDay()+6)%7]}`;
+  $('#tipB').textContent=parts.join(' · ');
+  tip.classList.add('show');
+  tip.style.left=Math.min(window.innerWidth-tip.offsetWidth-12,rect.left)+'px';
+  tip.style.top=(rect.top-tip.offsetHeight-8)+'px';
+}
+function closeMain(){$('#calMain').style.display='none';vm.open=false;}
+$('#dMain').addEventListener('click',e=>{
+  e.stopPropagation();
+  const c=$('#calMain');
+  if(c.style.display==='none'||vm.open===false){c.style.display='';vm.open=true;drawMain();}
+  else closeMain();
+});
+$('#pPrev').addEventListener('click',e=>{e.stopPropagation();vm.m--;if(vm.m<1){vm.m=12;vm.y--;}drawMain();});
+$('#pNext').addEventListener('click',e=>{e.stopPropagation();vm.m++;if(vm.m>12){vm.m=1;vm.y++;}drawMain();});
+$('#pToday').addEventListener('click',e=>{e.stopPropagation();vm.y=2026;vm.m=9;drawMain();});
+
+/* ★ 黄条逻辑：选中的那天已有当前操作记录就提醒 */
+function updateWarn(iso,d){
+  const r=REC[d]&&+iso.slice(5,7)===9?REC[d]:null;
+  const box=$('#warnBox');
+  if(r&&r.trash){
+    box.style.display='';
+    $('#warnText').innerHTML=`<b>${iso===TODAY?'今天':iso.slice(5).replace('-','月')+'日'}已有 1 条清理记录（${r.trash}）</b>，请确认不是重复操作。`;
+  }else box.style.display='none';
+}
+updateWarn('2026-09-19',19);
+drawMain();
+
+/* ── 时间快捷行 ── */
+let tm={h:20,m:5};
+function drawT(){$('#tH').textContent=String(tm.h).padStart(2,'0');$('#tM').textContent=String(tm.m).padStart(2,'0');}
+$('#tNow').addEventListener('click',()=>{tm={h:20,m:5};drawT();toast('正式版=取当前时刻');});
+$('#tM10').addEventListener('click',()=>{let t=tm.h*60+tm.m-10;if(t<0)t+=1440;tm={h:Math.floor(t/60),m:t%60};drawT();});
+$('#tP10').addEventListener('click',()=>{let t=tm.h*60+tm.m+10;tm={h:Math.floor(t/60)%24,m:t%60};drawT();});
+document.querySelectorAll('.tval button').forEach(b=>b.addEventListener('click',()=>{
+  const k=b.dataset.t;
+  if(k==='h-'){tm.h=(tm.h+23)%24;}if(k==='h+'){tm.h=(tm.h+1)%24;}
+  if(k==='m-'){tm.m=(tm.m+59)%60;}if(k==='m+'){tm.m=(tm.m+1)%60;}
+  drawT();
+}));
+drawT();
+$('#dOk').addEventListener('click',()=>toast('正式版：落库 + 首页距上次即时重算'));
+$('#dCancel').addEventListener('click',()=>toast('取消，不产生记录'));
+
+/* ── 素版日历（两个日期字段共用，选中即关）── */
+let pq={y:2026,m:9,target:'start'};
+const pvals={start:'',end:''};
+function drawPlain(){
+  $('#qTitle').textContent=`${pq.y}年${pq.m}月`;
+  const g=$('#qGrid');g.innerHTML='';
+  WD.split('').forEach(w=>{const s=document.createElement('span');s.className='wd';s.textContent=w;g.appendChild(s);});
+  const lead=(new Date(pq.y,pq.m-1,1).getDay()+6)%7,days=new Date(pq.y,pq.m,0).getDate();
+  for(let i=0;i<lead;i++)g.appendChild(Object.assign(document.createElement('span'),{className:'day dim',textContent:'·'}));
+  for(let d=1;d<=days;d++){
+    const iso=`${pq.y}-${String(pq.m).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+    const b=document.createElement('button');b.type='button';b.className='day';b.textContent=d;
+    if(iso===TODAY)b.classList.add('tod');
+    if(pvals[pq.target]===iso)b.classList.add('sel');
+    b.addEventListener('click',()=>{
+      pvals[pq.target]=iso;
+      const btn=$(pq.target==='start'?'#pdStart':'#pdEnd');
+      btn.textContent=iso;btn.classList.remove('empty');
+      toast(`${pq.target==='start'?'从':'到'} = ${iso} · 选中即关（正式版触发查询）`);
+      drawPlain();
+    });
+    g.appendChild(b);
+  }
+}
+$('#pdStart').addEventListener('click',e=>{e.stopPropagation();pq.target='start';drawPlain();});
+$('#pdEnd').addEventListener('click',e=>{e.stopPropagation();pq.target='end';drawPlain();});
+$('#qPrev').addEventListener('click',e=>{e.stopPropagation();pq.m--;if(pq.m<1){pq.m=12;pq.y--;}drawPlain();});
+$('#pNext2').addEventListener('click',e=>{e.stopPropagation();pq.m++;if(pq.m>12){pq.m=1;pq.y++;}drawPlain();});
+$('#qToday').addEventListener('click',e=>{e.stopPropagation();pq.y=2026;pq.m=9;drawPlain();});
+drawPlain();
+
+document.querySelectorAll('[data-hint]').forEach(el=>el.addEventListener('click',()=>toast(el.dataset.hint)));
+</script>
+</body>
+</html>
