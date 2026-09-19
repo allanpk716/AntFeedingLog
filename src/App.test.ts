@@ -630,6 +630,12 @@ describe("顶栏导航（票 07/08）", () => {
     expect(wrapper.find(".log-list").exists()).toBe(false);
   });
 
+  it("外壳：顶栏之外有独立滚动容器 .page-body（交互第三轮 #6）", async () => {
+    const wrapper = await mountApp();
+    expect(wrapper.find(".page-body").exists()).toBe(true);
+    expect(wrapper.find(".topbar").exists()).toBe(true);
+  });
+
   it("记录页里改动记录后抛 changed：首页数据即时重算（票 08 验收 5 的接线）", async () => {
     const wrapper = await mountApp();
     await wrapper.findAll(".topbar .tab")[2].trigger("click");

@@ -1,6 +1,7 @@
 import { createApp } from "vue";
 import App from "./App.vue";
 import { invoke } from "@tauri-apps/api/core";
+import { installContextMenuShield } from "./lib/shell";
 
 // 前端未捕获异常转发 Rust 落日志（数据安全二期票 01 D7）：只记不打断，
 // 应用照常运行；转发失败（如日志底座未就绪）静默吞掉，绝不二次抛错。
@@ -18,5 +19,8 @@ window.addEventListener("error", (e) => {
 window.addEventListener("unhandledrejection", (e) => {
   reportFrontendError(e.reason ?? "未处理的 Promise 拒绝");
 });
+
+// 交互第三轮 #2：屏蔽 web 原生右键菜单（输入框内保留）
+installContextMenuShield();
 
 createApp(App).mount("#app");

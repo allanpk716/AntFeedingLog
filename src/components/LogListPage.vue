@@ -348,7 +348,7 @@ onMounted(async () => {
 .container {
   max-width: 1080px;
   margin: 0 auto;
-  padding: 0 20px 80px;
+  padding: 0 20px 32px;
 }
 
 .filters {

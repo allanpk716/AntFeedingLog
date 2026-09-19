@@ -120,7 +120,9 @@ onMounted(() => {
       </div>
     </header>
 
-    <main v-if="page === 'home'" class="container">
+    <!-- 交互第三轮 #6：顶栏固定，内容区独立滚动 -->
+    <div class="page-body">
+      <main v-if="page === 'home'" class="container">
       <p v-if="pageError" class="page-error">{{ pageError }}</p>
       <p v-if="colonies.length === 0" class="empty">暂无窝</p>
 
@@ -167,6 +169,7 @@ onMounted(() => {
 
     <!-- 记录流水（票 08）：任何编辑/删除抛 changed → refresh，首页红绿态即时重算 -->
     <LogListPage v-if="page === 'logs'" @changed="void refresh()" />
+    </div>
 
     <ColonyFormDialog
       v-if="showForm"
@@ -206,7 +209,10 @@ onMounted(() => {
   --shadow: 0 1px 2px rgba(60, 50, 30, 0.05), 0 4px 14px rgba(60, 50, 30, 0.06);
   --overlay: rgba(40, 35, 25, 0.35);
 
-  min-height: 100vh;
+  height: 100vh;          /* 交互第三轮 #6：外壳固定，不再整页滚 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   background: var(--bg);
   color: var(--text);
   font-size: 14px;
@@ -214,8 +220,16 @@ onMounted(() => {
 }
 
 .topbar {
+  flex: none;             /* 顶栏固定高度，不参与滚动 */
   background: var(--card);
   border-bottom: 1px solid var(--border);
+}
+
+/* 唯一滚动容器：切换页面只有这里滚，顶栏常驻 */
+.page-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .hbar,
@@ -292,7 +306,7 @@ onMounted(() => {
 .container {
   max-width: 1080px;
   margin: 0 auto;
-  padding: 0 20px 80px;
+  padding: 0 20px 32px;   /* 原 80px 底衬是常驻滚动条元凶之一 */
 }
 
 .empty {
