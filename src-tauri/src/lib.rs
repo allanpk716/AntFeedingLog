@@ -3,9 +3,11 @@ mod auto_backup;
 mod backup_config;
 mod care;
 mod colony;
+mod data_meta;
 mod db;
 mod dict;
 mod hibernation;
+mod nest_checkin;
 mod pushover;
 mod reminder;
 mod restore;
@@ -137,6 +139,72 @@ fn delete_log(
         trigger_after_write(&app);
     }
     result
+}
+
+// ── 巢况登记（webui-checkin 票 02）──
+// 巢况永不参与提醒/催促：不进维护操作清单、不调 refresh_tray_tooltip
+// （托盘 tooltip 只算喂食/维护超期）；仅数据写入触发自动备份。
+
+#[tauri::command]
+fn save_checkin(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    input: nest_checkin::CheckinInput,
+) -> Result<nest_checkin::NestCheckin, String> {
+    let result = with_conn(state, |conn| {
+        nest_checkin::save_checkin(conn, &input, &colony::today_iso(), &care::now_local())
+    });
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+#[tauri::command]
+fn list_checkins(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+) -> Result<Vec<nest_checkin::NestCheckin>, String> {
+    with_conn(state, |conn| nest_checkin::list_checkins(conn, colony_id))
+}
+
+#[tauri::command]
+fn update_checkin(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    id: i64,
+    input: nest_checkin::CheckinUpdateInput,
+) -> Result<nest_checkin::NestCheckin, String> {
+    let result = with_conn(state, |conn| {
+        nest_checkin::update_checkin(conn, id, &input, &colony::today_iso())
+    });
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+#[tauri::command]
+fn delete_checkin(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    id: i64,
+) -> Result<(), String> {
+    let result = with_conn(state, |conn| nest_checkin::delete_checkin(conn, id));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+#[tauri::command]
+fn get_checkin_digest(
+    state: tauri::State<'_, DbState>,
+    colony_id: i64,
+) -> Result<nest_checkin::CheckinDigest, String> {
+    with_conn(state, |conn| {
+        nest_checkin::digest_for_colony(conn, colony_id, &colony::today_iso())
+    })
 }
 
 // ── 字典管理与操作性质设置（票 04）──
@@ -1064,6 +1132,11 @@ pub fn run() {
             list_logs,
             update_log,
             delete_log,
+            save_checkin,
+            list_checkins,
+            update_checkin,
+            delete_checkin,
+            get_checkin_digest,
             list_actions,
             save_action,
             set_action_enabled,

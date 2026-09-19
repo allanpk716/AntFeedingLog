@@ -32,6 +32,9 @@ pub struct Colony {
     pub recent: Vec<crate::care::RecentLog>,
     /// 进行中的冬眠段摘要（冬眠卡片横幅数据：入眠日/预计出眠）；无开放段为 None。
     pub hibernation: Option<crate::hibernation::OpenSegment>,
+    /// 巢况摘要（webui-checkin 票 02）：最新一组数 + 基线 + 距上次登记天数，
+    /// Rust 算好；从未登记 latest/baseline_date/days_since_last 皆 None。
+    pub checkin: crate::nest_checkin::CheckinDigest,
 }
 
 /// 新建/编辑窝的入参。
@@ -169,6 +172,11 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
                 actions: Vec::new(),
                 recent: Vec::new(),
                 hibernation: None,
+                checkin: crate::nest_checkin::CheckinDigest {
+                    latest: None,
+                    baseline_date: None,
+                    days_since_last: None,
+                },
             })
         },
     )
@@ -181,6 +189,7 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
         c.actions = crate::care::tiles_for_colony(conn, c.id, today)?;
         c.recent = crate::care::recent_for_colony(conn, c.id, 2)?;
         c.hibernation = crate::hibernation::open_segment(conn, c.id)?;
+        c.checkin = crate::nest_checkin::digest_for_colony(conn, c.id, today)?;
         Ok(c)
     })
 }
@@ -260,8 +269,10 @@ pub fn archive_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony,
     get_colony(conn, id, today)
 }
 
-/// 仅无记录窝可删；有 care_log 行则拒绝。顺带清掉该窝的提醒台账与冬眠段（它们不是记录）。
-/// 三条 DELETE 包在同一事务里，任一失败整体回滚，不留中间态。
+/// 仅无记录窝可删；有 care_log 行则拒绝。顺带清掉该窝的提醒台账、冬眠段与巢况
+/// 登记（webui-checkin 票 02，用户故事 11：删窝连带清巢况与照片元数据；照片文件
+/// 清理随票 07 照片管线接管）。全部 DELETE 包在同一事务里，任一失败整体回滚，
+/// 不留中间态。
 pub fn delete_colony(conn: &Connection, id: i64) -> Result<(), String> {
     let logs: i64 = conn
         .query_row(
@@ -279,6 +290,14 @@ pub fn delete_colony(conn: &Connection, id: i64) -> Result<(), String> {
     tx.execute("DELETE FROM reminder_ledger WHERE colony_id = ?1", params![id])
         .map_err(db_err)?;
     tx.execute("DELETE FROM hibernation WHERE colony_id = ?1", params![id])
+        .map_err(db_err)?;
+    tx.execute(
+        "DELETE FROM nest_photo WHERE checkin_id IN
+             (SELECT id FROM nest_checkin WHERE colony_id = ?1)",
+        params![id],
+    )
+    .map_err(db_err)?;
+    tx.execute("DELETE FROM nest_checkin WHERE colony_id = ?1", params![id])
         .map_err(db_err)?;
     let changed = tx
         .execute("DELETE FROM colony WHERE id = ?1", params![id])

@@ -1110,6 +1110,11 @@ mod tests {
             actions,
             recent: vec![],
             hibernation: None,
+            checkin: crate::nest_checkin::CheckinDigest {
+                latest: None,
+                baseline_date: None,
+                days_since_last: None,
+            },
         }
     }
 
