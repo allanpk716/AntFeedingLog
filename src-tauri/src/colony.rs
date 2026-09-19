@@ -594,8 +594,8 @@ mod tests {
         let list = list_colonies(&conn, TODAY).unwrap();
         let colony = &list[0];
 
-        // 每个启用操作一块，带距上次/超期态
-        assert_eq!(colony.actions.len(), 4);
+        // 每个启用操作一块，带距上次/超期态（v7 起撤食预置加入，5 块）
+        assert_eq!(colony.actions.len(), 5);
         let feed = colony.actions.iter().find(|t| t.name == "喂食").unwrap();
         assert_eq!(feed.days_since_last, Some(1));
         assert!(!feed.overdue);

@@ -1217,13 +1217,13 @@ mod tests {
 
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         let names: Vec<&str> = tiles.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["喂食", "活动区换水", "巢穴保湿", "垃圾清理"], "按 sort 排");
+        assert_eq!(names, vec!["喂食", "撤食", "活动区换水", "巢穴保湿", "垃圾清理"], "按 sort 排（撤食预置 v7 起 sort=2）");
 
         // 停用的操作不再出现（验收 6）
         conn.execute("UPDATE care_action SET enabled = 0 WHERE name = '巢穴保湿'", []).unwrap();
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         let names: Vec<&str> = tiles.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["喂食", "活动区换水", "垃圾清理"]);
+        assert_eq!(names, vec!["喂食", "撤食", "活动区换水", "垃圾清理"]);
     }
 
     #[test]

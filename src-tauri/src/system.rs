@@ -466,7 +466,7 @@ mod tests {
         }
         assert!(v.get("settings").and_then(|x| x.as_object()).is_some(), "缺 settings 对象");
         assert_eq!(v["colonies"].as_array().unwrap().len(), 1);
-        assert_eq!(v["actions"].as_array().unwrap().len(), 5, "预置 4 + 自建 1");
+        assert_eq!(v["actions"].as_array().unwrap().len(), 6, "预置 5（v7 起含撤食）+ 自建 1");
         assert_eq!(v["foods"].as_array().unwrap().len(), 4, "预置 3 + 自建 1");
         assert_eq!(v["locations"].as_array().unwrap().len(), 3, "预置 2 + 自建 1");
         assert_eq!(v["logs"].as_array().unwrap().len(), 3, "全部记录");

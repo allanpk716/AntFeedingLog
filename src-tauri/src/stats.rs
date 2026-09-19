@@ -504,20 +504,9 @@ mod tests {
         .expect("插冬眠段失败");
     }
 
-    /// 直插预置「撤食」行（kind='follow'，票 01 v7 迁移落地后的字典形态）。
-    /// 当前 schema（v6）的 kind CHECK 尚不含 'follow'，用连接级 PRAGMA 临时
-    /// 绕过 CHECK 仅作种子辅助：不碰迁移；迁移落地后该行本就合法，行为不变。
+    /// 取预置「撤食」行（kind='follow'）：票 01 v7 迁移起种子即含撤食（sort=2），
+    /// 直接复用该行，不再自插（v6 时代用 PRAGMA 绕 CHECK 直插的写法已随迁移作废）。
     fn seed_retrieval_action(conn: &Connection) -> i64 {
-        conn.execute_batch("PRAGMA ignore_check_constraints = ON")
-            .expect("放开 CHECK 失败");
-        conn.execute(
-            "INSERT INTO care_action (name, icon, kind, suggested_interval_days, enabled, sort)
-             VALUES ('撤食', NULL, 'follow', NULL, 1, 5)",
-            [],
-        )
-        .expect("插撤食操作失败");
-        conn.execute_batch("PRAGMA ignore_check_constraints = OFF")
-            .expect("恢复 CHECK 失败");
         action_id(conn, "撤食")
     }
 
@@ -829,7 +818,7 @@ mod tests {
         assert_eq!(stats.weekly.len(), 1);
         assert!(stats.daily_detail.is_empty());
         assert!(stats.food_share.is_empty());
-        assert_eq!(stats.intervals.len(), 4, "预置 4 个启用操作都给行");
+        assert_eq!(stats.intervals.len(), 5, "预置 5 个启用操作都给行（v7 起含撤食）");
         assert!(stats.intervals.iter().all(|i| i.sample_count == 0 && i.avg_days.is_none()));
 
         // 同一天两条记录：间隔样本 0 对（同天不成对）、当天计数 2
