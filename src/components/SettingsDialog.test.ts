@@ -19,13 +19,9 @@ function baseMock(updateState: object = { status: "idle" }) {
       case "list_locations":
         return [];
       case "get_settings":
-        return {
-          notify_master_enabled: true,
-          notify_overdue_enabled: true,
-          notify_hibernation_enabled: true,
-          wake_remind_days_ahead: 7,
-          autostart_enabled: true,
-        };
+        return settingsFixture();
+      case "pushover_status":
+        return { source: "none", configured: false };
       case "get_app_version":
         return "0.1.0";
       case "get_update_state":
@@ -34,6 +30,62 @@ function baseMock(updateState: object = { status: "idle" }) {
         return null;
     }
   });
+}
+
+/** 票 11：设置回放统一带凭据两键（覆盖处用参数换值） */
+function settingsFixture(overrides: Partial<{ pushover_user: string; pushover_token: string }> = {}) {
+  return {
+    notify_master_enabled: true,
+    notify_overdue_enabled: true,
+    notify_hibernation_enabled: true,
+    wake_remind_days_ahead: 7,
+    autostart_enabled: true,
+    pushover_user: "",
+    pushover_token: "",
+    ...overrides,
+  };
+}
+
+// ── 通知 tab Pushover 应用内配置（webui-checkin 票 11）──
+
+function notifyTabMock(
+  opts: {
+    status?: { source: string; configured: boolean };
+    pushover_user?: string;
+    pushover_token?: string;
+    saved?: object;
+  } = {},
+) {
+  baseMock();
+  invokeMock.mockImplementation(async (cmd: string) => {
+    switch (cmd) {
+      case "list_actions":
+      case "list_foods":
+      case "list_locations":
+        return [];
+      case "get_settings":
+        return settingsFixture({ pushover_user: opts.pushover_user ?? "", pushover_token: opts.pushover_token ?? "" });
+      case "pushover_status":
+        return opts.status ?? { source: "none", configured: false };
+      case "set_settings":
+        return opts.saved ?? settingsFixture({ pushover_user: opts.pushover_user ?? "", pushover_token: opts.pushover_token ?? "" });
+      case "get_app_version":
+        return "0.1.0";
+      case "get_update_state":
+        return { status: "idle" };
+      default:
+        return null;
+    }
+  });
+}
+
+async function openNotifyTab(opts?: Parameters<typeof notifyTabMock>[0]) {
+  notifyTabMock(opts);
+  const wrapper = mount(SettingsDialog);
+  await flushPromises();
+  await wrapper.find(".tab-notify").trigger("click");
+  await flushPromises();
+  return wrapper;
 }
 
 async function openUpdateTab(updateState?: object) {
@@ -49,8 +101,93 @@ beforeEach(() => {
   invokeMock.mockReset();
 });
 
-describe("设置弹窗「更新」节（票 06）", () => {
-  it("新增「更新」tab：点开显示当前版本与检查入口（验收 1 的挂载面）", async () => {
+describe("设置弹窗通知 tab Pushover 应用内配置（webui-checkin 票 11）", () => {
+  it("生效来源三态标注：应用内配置 / 系统环境变量 / 未配置（验收 2 后半）", async () => {
+    const cases = [
+      { status: { source: "app", configured: true }, label: "应用内配置" },
+      { status: { source: "env", configured: true }, label: "系统环境变量" },
+      { status: { source: "none", configured: false }, label: "未配置" },
+    ];
+    for (const c of cases) {
+      const wrapper = await openNotifyTab({ status: c.status });
+      const label = wrapper.find(".pushover-source-label");
+      expect(label.exists()).toBe(true);
+      expect(label.text()).toContain(c.label);
+      wrapper.unmount();
+    }
+  });
+
+  it("两输入框默认打码（type=password），「查看明文」切换明文、可再隐藏（验收 2 前半）", async () => {
+    const wrapper = await openNotifyTab({ pushover_user: "u-应用内", pushover_token: "t-令牌" });
+
+    const user = wrapper.find(".pushover-user-input");
+    const token = wrapper.find(".pushover-token-input");
+    expect((user.element as HTMLInputElement).type).toBe("password");
+    expect((token.element as HTMLInputElement).type).toBe("password");
+    expect((user.element as HTMLInputElement).value).toBe("u-应用内");
+    expect((token.element as HTMLInputElement).value).toBe("t-令牌");
+
+    await wrapper.find(".pushover-reveal-user-btn").trigger("click");
+    await wrapper.find(".pushover-reveal-token-btn").trigger("click");
+    expect((user.element as HTMLInputElement).type).toBe("text");
+    expect((token.element as HTMLInputElement).type).toBe("text");
+    expect(wrapper.find(".pushover-reveal-user-btn").text()).toContain("隐藏");
+
+    await wrapper.find(".pushover-reveal-user-btn").trigger("click");
+    expect((user.element as HTMLInputElement).type).toBe("password");
+  });
+
+  it("占位符提示「留空则使用系统环境变量」（回落语义上屏）", async () => {
+    const wrapper = await openNotifyTab();
+
+    expect((wrapper.find(".pushover-user-input").element as HTMLInputElement).placeholder).toContain("留空");
+    expect((wrapper.find(".pushover-user-input").element as HTMLInputElement).placeholder).toContain("环境变量");
+    expect((wrapper.find(".pushover-token-input").element as HTMLInputElement).placeholder).toContain("环境变量");
+  });
+
+  it("明文入库并随备份扩散的风险提示固定展示（验收 4）", async () => {
+    const wrapper = await openNotifyTab();
+
+    const hint = wrapper.find(".pushover-risk-hint");
+    expect(hint.exists()).toBe(true);
+    expect(hint.text()).toContain("明文");
+    expect(hint.text()).toContain("备份");
+  });
+
+  it("保存：凭据两值随 set_settings 落库，保存后重查生效来源（验收 3 的持久化入口）", async () => {
+    const wrapper = await openNotifyTab();
+
+    await wrapper.find(".pushover-user-input").setValue("u-新值");
+    await wrapper.find(".pushover-token-input").setValue("t-新值");
+    invokeMock.mockClear();
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith(
+      "set_settings",
+      expect.objectContaining({
+        input: expect.objectContaining({ pushover_user: "u-新值", pushover_token: "t-新值" }),
+      }),
+    );
+    // 保存后生效来源可能切换：pushover_status 至少被重查一次
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "pushover_status")).toBe(true);
+    expect(wrapper.find(".saved-hint").text()).toContain("已保存");
+  });
+
+  it("「发送测试通知」按钮在通知 tab 照旧可用（验收 3：测的就是当前生效来源）", async () => {
+    const wrapper = await openNotifyTab({ status: { source: "env", configured: true } });
+
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce({ desktop_ok: true, desktop_error: null, pushover: { ok: true, error: null } });
+    await wrapper.find(".tab-body .dlg-btns .btn:not(.primary)").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("send_test_notification");
+    expect(wrapper.find(".saved-hint").text()).toContain("手机 ✓");
+  });
+});
+
+describe("设置弹窗「更新」节（票 06）", () => {  it("新增「更新」tab：点开显示当前版本与检查入口（验收 1 的挂载面）", async () => {
     const wrapper = await openUpdateTab();
 
     expect(wrapper.find(".tab-update").exists()).toBe(true);

@@ -718,16 +718,19 @@ fn apply_autostart(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> 
 }
 
 /// 发送测试通知（设置弹窗按钮；不经开关与台账，排障用）。
-/// 双通道各测各的：桌面失败不影响手机，pushover=None 表示未配置环境变量。
+/// 双通道各测各的：桌面失败不影响手机，pushover=None 表示未配置。
+/// ⚠ 严禁注册进网页端 HTTP 白名单：设置面命令桌面专属（规格 H；webui-checkin 票 11）。
 #[tauri::command]
 fn send_test_notification(app: tauri::AppHandle) -> reminder::TestNotifyOutcome {
     reminder::send_test_notification_dual(&app)
 }
 
-/// Pushover 配置状态探测：只报环境变量在/不在，不回报值。
+/// Pushover 配置状态探测（webui-checkin 票 11 三态）：只报生效来源
+///（应用内/环境变量/未配置）与是否已配置，不回报值。
+/// ⚠ 严禁注册进网页端 HTTP 白名单：设置面命令桌面专属（规格 H；同票 03 禁入先例）。
 #[tauri::command]
-fn pushover_status() -> pushover::PushoverStatus {
-    pushover::status_from_env()
+fn pushover_status(state: tauri::State<DbState>) -> Result<pushover::PushoverStatus, String> {
+    with_conn(state, pushover::status_from_db)
 }
 
 // ── 更新检查（票 02）──

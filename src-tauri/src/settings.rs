@@ -17,11 +17,16 @@ pub const K_WAKE_AHEAD: &str = "wake_remind_days_ahead";
 pub const K_AUTOSTART: &str = "autostart_enabled";
 /// 网页端首启向导完成键（webui-checkin 票 03）：缺行/脏值 = 未做（false）。
 pub const K_WEBUI_WIZARD_DONE: &str = "webui_wizard_done";
+/// Pushover 应用内凭据键（webui-checkin 票 11；票 02 的 v7 不预置行）：
+/// 缺行 = 应用内未填，发送侧回落环境变量。明文入库已明示接受（规格 G）。
+pub const K_PUSHOVER_USER: &str = "pushover_user";
+pub const K_PUSHOVER_TOKEN: &str = "pushover_token";
 
 /// 临近出眠提前天数默认值（spec 设置节）。
 pub const DEFAULT_WAKE_AHEAD_DAYS: i64 = 7;
 
-/// 设置模型（spec：通知总开关/超期开关/冬眠开关/临近出眠提前天数/开机自启）。
+/// 设置模型（spec：通知总开关/超期开关/冬眠开关/临近出眠提前天数/开机自启；
+/// webui-checkin 票 11 增 Pushover 应用内凭据两键）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub notify_master_enabled: bool,
@@ -29,6 +34,10 @@ pub struct AppSettings {
     pub notify_hibernation_enabled: bool,
     pub wake_remind_days_ahead: i64,
     pub autostart_enabled: bool,
+    /// Pushover 用户键（空串 = 未填，发送侧回落环境变量）。明文入库已明示接受。
+    pub pushover_user: String,
+    /// Pushover 应用令牌（空串 = 未填）。明文入库已明示接受。
+    pub pushover_token: String,
 }
 
 impl Default for AppSettings {
@@ -39,6 +48,8 @@ impl Default for AppSettings {
             notify_hibernation_enabled: true,
             wake_remind_days_ahead: DEFAULT_WAKE_AHEAD_DAYS,
             autostart_enabled: true,
+            pushover_user: String::new(),
+            pushover_token: String::new(),
         }
     }
 }
@@ -78,6 +89,19 @@ fn read_i64(conn: &Connection, key: &str, default: i64) -> Result<i64, String> {
     }
 }
 
+/// 自由文本键（票 11 凭据）：缺行回默认空串；值原样返回（trim 在保存侧统一做）。
+fn read_string(conn: &Connection, key: &str, default: &str) -> Result<String, String> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    Ok(raw.unwrap_or_else(|| default.to_string()))
+}
+
 fn upsert(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
     conn.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2)
@@ -88,7 +112,8 @@ fn upsert(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 读全部设置；缺行/脏值回退默认。
+/// 读全部设置；缺行/脏值回退默认。凭据两键明文随本命令到前端（桌面专属
+/// IPC，不入网页端白名单，规格 H）。
 pub fn get_settings(conn: &Connection) -> Result<AppSettings, String> {
     let d = AppSettings::default();
     Ok(AppSettings {
@@ -97,16 +122,31 @@ pub fn get_settings(conn: &Connection) -> Result<AppSettings, String> {
         notify_hibernation_enabled: read_bool(conn, K_HIBERNATION, d.notify_hibernation_enabled)?,
         wake_remind_days_ahead: read_i64(conn, K_WAKE_AHEAD, d.wake_remind_days_ahead)?,
         autostart_enabled: read_bool(conn, K_AUTOSTART, d.autostart_enabled)?,
+        pushover_user: read_string(conn, K_PUSHOVER_USER, "")?,
+        pushover_token: read_string(conn, K_PUSHOVER_TOKEN, "")?,
     })
+}
+
+/// 应用内 Pushover 凭据（webui-checkin 票 11）：缺行回空串 = 未填。
+/// 返回 (user, token)；发送侧三态优先级见 pushover::resolve_pushover_credentials。
+pub fn get_pushover_credentials(conn: &Connection) -> Result<(String, String), String> {
+    Ok((
+        read_string(conn, K_PUSHOVER_USER, "")?,
+        read_string(conn, K_PUSHOVER_TOKEN, "")?,
+    ))
 }
 
 /// 保存全部设置（整体覆盖式 upsert），返回收敛后的生效值。
 /// 提前天数收敛到 0–365（票 09 停靠 B：服务端兜底，前端已先行校验同区间）。
 /// 提前 0 天 = 出眠日当天才发临近提醒，与出眠日提醒同日各一条——schema v3 的
 /// 冬眠侧唯一键已按种类区分。
+/// 票 11：凭据两键落库前去首尾空白（粘贴事故防御）；整体覆盖语义不变——
+/// 前端表单回显保证未动的键原值回写，其他键（如向导键）走独立函数不受影响。
 pub fn set_settings(conn: &Connection, s: &AppSettings) -> Result<AppSettings, String> {
     let effective = AppSettings {
         wake_remind_days_ahead: s.wake_remind_days_ahead.clamp(0, 365),
+        pushover_user: s.pushover_user.trim().to_string(),
+        pushover_token: s.pushover_token.trim().to_string(),
         ..s.clone()
     };
     upsert(conn, K_MASTER, bool_str(effective.notify_master_enabled))?;
@@ -114,6 +154,8 @@ pub fn set_settings(conn: &Connection, s: &AppSettings) -> Result<AppSettings, S
     upsert(conn, K_HIBERNATION, bool_str(effective.notify_hibernation_enabled))?;
     upsert(conn, K_WAKE_AHEAD, &effective.wake_remind_days_ahead.to_string())?;
     upsert(conn, K_AUTOSTART, bool_str(effective.autostart_enabled))?;
+    upsert(conn, K_PUSHOVER_USER, &effective.pushover_user)?;
+    upsert(conn, K_PUSHOVER_TOKEN, &effective.pushover_token)?;
     Ok(effective)
 }
 
@@ -169,6 +211,9 @@ mod tests {
         assert!(s.notify_hibernation_enabled);
         assert_eq!(s.wake_remind_days_ahead, 7);
         assert!(s.autostart_enabled);
+        // webui-checkin 票 11：凭据键缺省空串 = 应用内未填（回落环境变量）
+        assert_eq!(s.pushover_user, "");
+        assert_eq!(s.pushover_token, "");
     }
 
     #[test]
@@ -180,6 +225,8 @@ mod tests {
             notify_hibernation_enabled: true,
             wake_remind_days_ahead: 3,
             autostart_enabled: false,
+            pushover_user: "u-往返".into(),
+            pushover_token: "t-往返".into(),
         };
         let saved = set_settings(&conn, &input).unwrap();
         assert_eq!(saved, input);
@@ -256,5 +303,81 @@ mod tests {
         // 整体覆盖式 set_settings 不冲掉向导键（独立函数的取舍）
         set_settings(&conn, &AppSettings::default()).unwrap();
         assert!(get_webui_wizard_done(&conn).unwrap(), "通知设置保存不碰向导键");
+    }
+
+    #[test]
+    fn pushover_credentials_round_trip_and_missing_rows_default_empty() {
+        // webui-checkin 票 11：应用内凭据随 set_settings 落库；get_pushover_credentials
+        // 独立读入口与 get_settings 同口径（缺行回空串）
+        let conn = mem_conn();
+        assert_eq!(
+            get_pushover_credentials(&conn).unwrap(),
+            (String::new(), String::new()),
+            "票 02 v7 不预置行：缺键 = 未填"
+        );
+
+        let input = AppSettings {
+            pushover_user: "u-应用内".into(),
+            pushover_token: "t-应用内".into(),
+            ..Default::default()
+        };
+        let saved = set_settings(&conn, &input).unwrap();
+        assert_eq!(saved.pushover_user, "u-应用内");
+        assert_eq!(get_settings(&conn).unwrap().pushover_token, "t-应用内");
+        assert_eq!(
+            get_pushover_credentials(&conn).unwrap(),
+            ("u-应用内".into(), "t-应用内".into())
+        );
+        // 落库就是 settings 键值表普通行（随备份/恢复走）
+        assert_eq!(raw(&conn, K_PUSHOVER_USER), "u-应用内");
+        assert_eq!(raw(&conn, K_PUSHOVER_TOKEN), "t-应用内");
+    }
+
+    #[test]
+    fn pushover_values_are_trimmed_on_save() {
+        // 首尾空白几乎必是粘贴事故：保存时统一去掉
+        let conn = mem_conn();
+        let input = AppSettings {
+            pushover_user: "  u-key  ".into(),
+            pushover_token: "\tt-token\n".into(),
+            ..Default::default()
+        };
+        let saved = set_settings(&conn, &input).unwrap();
+        assert_eq!(saved.pushover_user, "u-key");
+        assert_eq!(saved.pushover_token, "t-token");
+        assert_eq!(get_settings(&conn).unwrap().pushover_user, "u-key");
+    }
+
+    #[test]
+    fn set_settings_with_pushover_keys_does_not_clobber_other_keys() {
+        // 票 11 扩键回归：整体覆盖式保存带上凭据后，既有键（通知开关/向导键）原样保留
+        let conn = mem_conn();
+        mark_webui_wizard_done(&conn).unwrap();
+        let first = AppSettings {
+            notify_master_enabled: false,
+            wake_remind_days_ahead: 3,
+            autostart_enabled: false,
+            pushover_user: "u-一次".into(),
+            pushover_token: "t-一次".into(),
+            ..Default::default()
+        };
+        set_settings(&conn, &first).unwrap();
+
+        // 第二次保存只改通知开关，凭据键随表单原值回写（前端表单回显保证），不误伤
+        let second = AppSettings { notify_master_enabled: true, ..first.clone() };
+        set_settings(&conn, &second).unwrap();
+
+        let s = get_settings(&conn).unwrap();
+        assert!(s.notify_master_enabled);
+        assert!(!s.autostart_enabled, "未动的键不被保存冲掉");
+        assert_eq!(s.wake_remind_days_ahead, 3);
+        assert_eq!(s.pushover_user, "u-一次", "凭据随表单原值回写不丢失");
+        assert_eq!(s.pushover_token, "t-一次");
+        assert!(get_webui_wizard_done(&conn).unwrap(), "扩键保存不冲掉向导键");
+
+        // 清空凭据（前端把输入框清空再保存）→ 落空串 = 应用内未填，回落环境变量
+        let cleared = AppSettings { pushover_user: String::new(), pushover_token: String::new(), ..second };
+        set_settings(&conn, &cleared).unwrap();
+        assert_eq!(get_pushover_credentials(&conn).unwrap(), (String::new(), String::new()));
     }
 }

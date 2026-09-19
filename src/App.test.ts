@@ -19,13 +19,15 @@ vi.mock("echarts", () => ({
   init: vi.fn(() => ({ setOption: echartsSetOption, dispose: vi.fn(), resize: vi.fn() })),
 }));
 
-/** 票 06：get_settings 的回放数据（测试里可整体替换） */
+/** 票 06：get_settings 的回放数据（测试里可整体替换）；票 11 增凭据两键 */
 const defaultSettings: AppSettings = {
   notify_master_enabled: true,
   notify_overdue_enabled: true,
   notify_hibernation_enabled: true,
   wake_remind_days_ahead: 7,
   autostart_enabled: true,
+  pushover_user: "",
+  pushover_token: "",
 };
 let currentSettings: AppSettings = defaultSettings;
 
@@ -799,6 +801,8 @@ describe("设置 · 通知（票 06）", () => {
         notify_hibernation_enabled: true,
         wake_remind_days_ahead: 3,
         autostart_enabled: true,
+        pushover_user: "", // 票 11：凭据随表单整体回写（未填 = 空串，回落环境变量）
+        pushover_token: "",
       },
     });
     // changed → 外层刷新首页

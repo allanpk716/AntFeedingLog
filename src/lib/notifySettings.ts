@@ -1,16 +1,18 @@
 /**
- * 通知设置（票 06）：设置弹窗「通知」tab 的纯逻辑。
- * get_settings / set_settings 走 Rust settings::AppSettings，这里只做
- * 表单态 ↔ 设置态转换与提前天数输入校验（type=number 经 v-model 可能给回
- * 数字或半输入状态文本，统一按 string | number 处理）。
+ * 通知设置（票 06；webui-checkin 票 11 增 Pushover 应用内凭据两字段）：
+ * 设置弹窗「通知」tab 的纯逻辑。get_settings / set_settings 走 Rust
+ * settings::AppSettings，这里只做表单态 ↔ 设置态转换与提前天数输入校验
+ *（type=number 经 v-model 可能给回数字或半输入状态文本，统一按 string | number 处理）。
  */
 
 import type { AppSettings } from "../types";
 
-/** 通知 tab 的表单态：提前天数保持文本，便于清空重输 */
+/** 通知 tab 的表单态：提前天数保持文本，便于清空重输；凭据两值原样回显（打码在 UI 层） */
 export interface NotifySettingsForm {
   master: boolean;
   daysAheadText: string | number;
+  pushoverUser: string;
+  pushoverToken: string;
 }
 
 /** 提前天数输入非法时的报错文案 */
@@ -21,6 +23,8 @@ export function toForm(s: AppSettings): NotifySettingsForm {
   return {
     master: s.notify_master_enabled,
     daysAheadText: String(s.wake_remind_days_ahead),
+    pushoverUser: s.pushover_user,
+    pushoverToken: s.pushover_token,
   };
 }
 
@@ -37,6 +41,7 @@ export function parseDaysAhead(text: string | number): number | null {
  * 表单态 → 设置态（保存入参）。提前天数非法返回 null（调用方报错不落库）；
  * autostart 由通知 tab 的「开机自启」开关提供（票 09），随保存一起落库。
  * 分类子开关作废（反馈第二轮 Q7/Q9）：键保留在库里，行为由总开关统一，固定回写 true。
+ * 凭据两值原样透传（票 11；trim 在 Rust 保存侧统一做）。
  */
 export function toSettings(f: NotifySettingsForm, autostart: boolean): AppSettings | null {
   const days = parseDaysAhead(f.daysAheadText);
@@ -47,5 +52,7 @@ export function toSettings(f: NotifySettingsForm, autostart: boolean): AppSettin
     notify_hibernation_enabled: true,
     wake_remind_days_ahead: days,
     autostart_enabled: autostart,
+    pushover_user: f.pushoverUser,
+    pushover_token: f.pushoverToken,
   };
 }

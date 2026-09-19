@@ -278,12 +278,17 @@ export interface AppSettings {
   wake_remind_days_ahead: number;
   /** 开机自启（票 09：通知 tab 开关随保存落库，Rust 同步自启插件状态） */
   autostart_enabled: boolean;
+  /** Pushover 用户键（票 11；空串 = 应用内未填，发送侧回落环境变量） */
+  pushover_user: string;
+  /** Pushover 应用令牌（票 11；空串 = 未填） */
+  pushover_token: string;
 }
 
-/** pushover_status 返回体：环境变量在/不在（不含值） */
+/** pushover_status 返回体（票 11 三态）：生效来源 + 是否已配置（不含值） */
+export type PushoverSource = "app" | "env" | "none";
 export interface PushoverStatus {
-  user_found: boolean;
-  token_found: boolean;
+  source: PushoverSource;
+  configured: boolean;
 }
 
 /** send_test_notification 返回体：分渠道结果（pushover=null 表示未配置） */

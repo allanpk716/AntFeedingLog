@@ -7,10 +7,12 @@
  *   （预置项或被历史记录/提醒台账引用时删除禁用，只能停用——规则 10 + 反馈第二轮 F2）。
  * - 食物行：名字、建议间隔（F3：留空=只按喂食统一周期）、停用/启用、删除（预置或被引用禁用）。
  * - 地点 tab 复用 LocationManagerPanel。
- * - 通知 tab（票 06 + 反馈第二轮 F4）：推送通知总开关（桌面 + 手机，分类子开关作废）+
- *   临近出眠提前天数 + Pushover 配置状态 + 「发送测试通知」按钮（双通道分别回显结果，
- *   排障用）；开机自启开关（票 09）随保存一起落库，
- *   Rust 侧 set_settings 同步自启插件状态。
+ * - 通知 tab（票 06 + 反馈第二轮 F4 + webui-checkin 票 11）：推送通知总开关
+ *   （桌面 + 手机，分类子开关作废）+ 临近出眠提前天数 + Pushover 应用内凭据
+ *   两输入框（type=password 打码、可切换明文、留空回落环境变量）+ 生效来源
+ *   三态标注（应用内/环境变量/未配置）+ 明文入库随备份扩散的风险提示 +
+ *   「发送测试通知」按钮（双通道分别回显结果，排障用）；开机自启开关（票 09）
+ *   随保存一起落库，Rust 侧 set_settings 同步自启插件状态。
  * - 数据 tab（票 09）：打开数据文件夹 / 安全备份（Rust 拷贝库文件，无需退出）/
  *   导出 CSV / JSON（归档带走）；帮助文案写明手动拷贝需先从托盘真实退出。
  *   数据 tab 自动备份区（数据安全二期票 02）：开关 / 备份目录（系统文件夹选择框）/
@@ -96,6 +98,11 @@ import {
   summaryRows,
 } from "../lib/restoreUi";
 import { formatBytes } from "../lib/photos";
+import {
+  PUSHOVER_PLACEHOLDER,
+  PUSHOVER_PLAINTEXT_WARNING,
+  pushoverSourceLabel,
+} from "../lib/pushoverUi";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
 import WebUiPanel from "./WebUiPanel.vue";
@@ -113,28 +120,39 @@ const addFoodName = ref("");
 const error = ref("");
 const busy = ref(false);
 
-// ── 通知 tab（票 06 + 反馈第二轮 F4）──
-const notifyForm = ref<NotifySettingsForm>({ master: true, daysAheadText: "7" });
+// ── 通知 tab（票 06 + 反馈第二轮 F4 + webui-checkin 票 11）──
+const notifyForm = ref<NotifySettingsForm>({ master: true, daysAheadText: "7", pushoverUser: "", pushoverToken: "" });
 const autostart = ref(true);
 const notifyError = ref("");
 const notifySaved = ref("");
 const notifyBusy = ref(false);
 const pushoverStatus = ref<PushoverStatus | null>(null);
+// 凭据打码切换（票 11）：type=password 打码，点「查看明文」临时切 text
+const revealPushoverUser = ref(false);
+const revealPushoverToken = ref(false);
 
 async function load() {
-  const [actions, foods, locs, s, pushStatus] = await Promise.all([
+  const [actions, foods, locs, s] = await Promise.all([
     listActions(),
     listFoods(),
     listLocations(),
     getSettings(),
-    getPushoverStatus(),
   ]);
   actionRows.value = buildActionRows(actions);
   foodRows.value = buildFoodRows(foods);
   locations.value = locs;
   notifyForm.value = toForm(s);
   autostart.value = s.autostart_enabled;
-  pushoverStatus.value = pushStatus;
+  await refreshPushoverStatus();
+}
+
+/** 生效来源三态（票 11）：读取失败静默降级为「读取失败」标注，不打扰其他功能区 */
+async function refreshPushoverStatus() {
+  try {
+    pushoverStatus.value = await getPushoverStatus();
+  } catch {
+    pushoverStatus.value = null;
+  }
 }
 
 onMounted(async () => {
@@ -310,6 +328,8 @@ async function saveNotify() {
     notifyForm.value = toForm(saved);
     autostart.value = saved.autostart_enabled;
     notifySaved.value = "已保存";
+    // 票 11：凭据保存后生效来源可能切换（如首次填应用内 → 从环境变量/未配置变应用内）
+    await refreshPushoverStatus();
     emit("changed");
   } catch (e) {
     notifyError.value = String(e);
@@ -725,15 +745,46 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
             推送通知（桌面 + 手机）
           </label>
         </div>
-        <div class="notify-row">
-          <span>手机推送（Pushover）：</span>
-          <span v-if="pushoverStatus?.user_found && pushoverStatus?.token_found" class="push-ok">
-            已配置（环境变量 PUSHOVER_USER / PUSHOVER_TOKEN）
-          </span>
-          <span v-else class="push-miss">
-            未检测到（需设置环境变量 PUSHOVER_USER / PUSHOVER_TOKEN，配置后重启应用生效）
+        <div class="notify-row pushover-source-row">
+          <span>手机推送（Pushover）当前生效：</span>
+          <span class="pushover-source-label" :class="pushoverStatus?.configured ? 'push-ok' : 'push-miss'">
+            {{ pushoverSourceLabel(pushoverStatus) }}
           </span>
         </div>
+        <!-- 票 11：应用内凭据两输入框——type=password 打码 + 查看明文切换；留空回落环境变量。
+             输入框/切换按钮不用既有 .days-input/.btn 类，避免干扰 tab 内既有选择器语义 -->
+        <div class="notify-row pushover-cred-row">
+          <label class="pushover-cred-label">
+            用户键
+            <input
+              v-model="notifyForm.pushoverUser"
+              class="pushover-input pushover-user-input"
+              :type="revealPushoverUser ? 'text' : 'password'"
+              :placeholder="PUSHOVER_PLACEHOLDER"
+              autocomplete="off"
+            />
+          </label>
+          <button class="pushover-reveal-btn pushover-reveal-user-btn" type="button" @click="revealPushoverUser = !revealPushoverUser">
+            {{ revealPushoverUser ? "隐藏" : "查看明文" }}
+          </button>
+        </div>
+        <div class="notify-row pushover-cred-row">
+          <label class="pushover-cred-label">
+            应用令牌
+            <input
+              v-model="notifyForm.pushoverToken"
+              class="pushover-input pushover-token-input"
+              :type="revealPushoverToken ? 'text' : 'password'"
+              :placeholder="PUSHOVER_PLACEHOLDER"
+              autocomplete="off"
+            />
+          </label>
+          <button class="pushover-reveal-btn pushover-reveal-token-btn" type="button" @click="revealPushoverToken = !revealPushoverToken">
+            {{ revealPushoverToken ? "隐藏" : "查看明文" }}
+          </button>
+        </div>
+        <!-- 票 11：明文入库并随备份扩散的风险（规格 G 已明示接受），固定展示 -->
+        <p class="hint pushover-risk-hint">{{ PUSHOVER_PLAINTEXT_WARNING }}</p>
         <div class="notify-row">
           <label>
             临近出眠提前
@@ -1035,6 +1086,36 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
 
 .push-miss {
   color: var(--bad);
+}
+
+/* Pushover 应用内凭据（webui-checkin 票 11）：独立类，不复用 .days-input/.btn */
+.pushover-cred-row {
+  gap: 8px;
+}
+
+.pushover-cred-label {
+  font-size: 14px;
+}
+
+.pushover-input {
+  width: 220px;
+  padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  background: var(--card);
+  color: var(--text);
+}
+
+.pushover-reveal-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--tile);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
 }
 
 .days-input {
