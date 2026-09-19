@@ -3,8 +3,9 @@
  * 窝卡片（交互第三轮 #7 紧凑版，视觉基线 mocks/mock-c-home-cards.html）：
  * 单行头（名字/物种徽章/状态徽章/饲养天数内联），去开始日期行；操作块单行 chip 两列；
  * 最近记录单行截断；低频操作（开始冬眠/确认出眠/补录冬眠/编辑）收进「⋯」菜单——
- * 动作执行即收（menuAction 包装）、点卡片外即收（document click 监听）、dots @click.stop
- * 防止开菜单瞬间被 document 关闭器抵消；菜单容器 v-show 保 DOM，按钮保留原类名
+ * 动作执行即收（menuAction 包装）、点卡片外即收（document click 监听 + 卡片 contains
+ * 自身守卫，dots 不拦冒泡，跨卡点 dots 时旧卡菜单即收=关旧开新）；
+ * 菜单容器 v-show 保 DOM，按钮保留原类名
  * （edit-btn/hib-btn/wake-btn/past-btn），既有测试直接点这些按钮不受影响。
  * 冬眠横幅瘦成一条，「改期」入口保留。记账/冬眠成功抛 saved 让外层 refresh（数据驱动重算）。
  */
@@ -43,18 +44,23 @@ const recentLine = computed(() => formatRecent(props.colony.recent));
 
 // ── 「⋯」菜单（交互第三轮 #7）：开合 + 两路收起 ──
 const menuOpen = ref(false);
+const cardRef = ref<HTMLElement | null>(null);
 
 function toggleMenu() {
   menuOpen.value = !menuOpen.value;
 }
 
-/** 菜单动作执行即收（复审 #12）；点卡片外也收（document click）。 */
+/** 菜单动作执行即收（复审 #12）；点卡片外也收（document click，含点别卡 dots 的跨卡场景）。 */
 function menuAction(fn: () => void) {
   menuOpen.value = false;
   fn();
 }
 
-function onDocClick() {
+/** 点自身卡内（含 dots）不收——dots 靠 toggle 开合；点卡外（别卡/空白处）即收。 */
+function onDocClick(e: MouseEvent) {
+  if (!menuOpen.value) return;
+  const root = cardRef.value;
+  if (root !== null && e.target instanceof Node && root.contains(e.target)) return;
   menuOpen.value = false;
 }
 
@@ -104,7 +110,7 @@ function onFeedSaved() {
 </script>
 
 <template>
-  <article class="card" :class="{ hib: hibernating }" :data-colony-id="colony.id">
+  <article ref="cardRef" class="card" :class="{ hib: hibernating }" :data-colony-id="colony.id">
     <div class="chead">
       <span class="cname">{{ colony.name }}</span>
       <span v-if="colony.species" class="chip sp">{{ colony.species }}</span>
@@ -147,7 +153,7 @@ function onFeedSaved() {
 
     <div class="foot">
       <span class="recent">{{ recentLine }}</span>
-      <button class="dots" type="button" title="编辑 / 冬眠等更多操作" @click.stop="toggleMenu">⋯</button>
+      <button class="dots" type="button" title="编辑 / 冬眠等更多操作" @click="toggleMenu">⋯</button>
     </div>
 
     <!-- 交互第三轮 #7：低频操作收进 ⋯ 菜单（v-show 保 DOM，按钮原类名与测试兼容） -->
