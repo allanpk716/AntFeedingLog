@@ -15,6 +15,8 @@ pub const K_OVERDUE: &str = "notify_overdue_enabled";
 pub const K_HIBERNATION: &str = "notify_hibernation_enabled";
 pub const K_WAKE_AHEAD: &str = "wake_remind_days_ahead";
 pub const K_AUTOSTART: &str = "autostart_enabled";
+/// 存量基线时刻（票 01，F4）：v7 迁移为升级库写入，全新安装不写——缺键即"无存量"。
+pub const K_RETRIEVAL_BASELINE: &str = "retrieval_baseline_at";
 
 /// 临近出眠提前天数默认值（spec 设置节）。
 pub const DEFAULT_WAKE_AHEAD_DAYS: i64 = 7;
@@ -123,6 +125,20 @@ fn bool_str(b: bool) -> &'static str {
     }
 }
 
+/// 读存量基线时刻（`YYYY-MM-DD HH:MM:SS`，与 care_log.occurred_at/created_at 同款
+/// 文本序 = 时间序）。只在 v7 迁移（升级库）写入；全新库无此键 → None（视为无
+/// 存量喂食）。只读出口：写入权在迁移，设置保存与 get/set_settings 都不碰它，
+/// 后续提醒引擎按 created_at ≤ 基线做"存量不推送"分类（票 05 消费）。
+pub fn get_retrieval_baseline_at(conn: &Connection) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![K_RETRIEVAL_BASELINE],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
 // ── 测试：只测外部行为（spec「Testing Decisions」）────────────────────────
 
 #[cfg(test)]
@@ -220,5 +236,33 @@ mod tests {
         assert!(s.notify_master_enabled, "缺行回退默认开");
         assert!(s.notify_hibernation_enabled, "脏值回退默认开");
         assert_eq!(s.wake_remind_days_ahead, 7, "脏值回退默认 7");
+    }
+
+    #[test]
+    fn retrieval_baseline_absent_on_fresh_db() {
+        // 全新库无存量基线键（v7 迁移只为升级库写）→ None，不写死默认值
+        let conn = mem_conn();
+        assert_eq!(get_retrieval_baseline_at(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn retrieval_baseline_reads_written_value() {
+        // 升级库（v7 迁移写入）→ 原样读回；删行后回到 None
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, '2026-09-19 12:34:56')",
+            params![K_RETRIEVAL_BASELINE],
+        )
+        .unwrap();
+        assert_eq!(
+            get_retrieval_baseline_at(&conn).unwrap(),
+            Some("2026-09-19 12:34:56".into())
+        );
+        conn.execute(
+            "DELETE FROM settings WHERE key = ?1",
+            params![K_RETRIEVAL_BASELINE],
+        )
+        .unwrap();
+        assert_eq!(get_retrieval_baseline_at(&conn).unwrap(), None);
     }
 }

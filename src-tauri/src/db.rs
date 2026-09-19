@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 
 /// 当前 schema 版本。schema 变更时 +1，并在 `migrate` 的 match 里加对应分支。
 /// v2：care_action 增加 is_feeding 标记位（R1 评审：喂食判定与名字解耦）。
@@ -20,7 +20,11 @@ use rusqlite::Connection;
 /// v6：双层喂食周期（反馈第二轮 F3）——food 加 suggested_interval_days（预置按名
 ///     回填）；reminder_ledger 整表重建加 food_id 维度（v1 的 kind CHECK 不含
 ///     'food_overdue'，重建时顺带去掉该 CHECK、改由应用层保证）。
-pub const SCHEMA_VERSION: i64 = 6;
+/// v7：易腐撤食地基（票 01）——food 加 perishable/retrieval_hours（预置按名回填
+///     24h）；care_action 重建把 'follow'（跟随喂食）加进 kind CHECK 并插入预置
+///     「撤食」（撞名则原位升格，F1/F7）；升级库写 retrieval_baseline_at 存量基线
+///     （全新安装不写，F4）；reminder_ledger 加 retrieval_due 每窝每日唯一索引。
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -94,13 +98,14 @@ pub fn schema_version_of(conn: &Connection) -> Result<i64, rusqlite::Error> {
 /// 把库迁移到 [`SCHEMA_VERSION`]。幂等：已是最新则什么都不做；
 /// 库版本高于应用支持时 fail-fast（报"请升级应用"，绝不静默放行，更不降级）。
 pub fn migrate(conn: &Connection) -> DbResult<()> {
-    let mut version = schema_version_of(conn)?;
-    if version > SCHEMA_VERSION {
+    let start = schema_version_of(conn)?;
+    if start > SCHEMA_VERSION {
         return Err(rusqlite::Error::InvalidParameterName(format!(
-            "库版本过新（schema v{version}，应用最高支持 v{SCHEMA_VERSION}），请升级应用后再打开"
+            "库版本过新（schema v{start}，应用最高支持 v{SCHEMA_VERSION}），请升级应用后再打开"
         ))
         .into());
     }
+    let mut version = start;
     while version < SCHEMA_VERSION {
         match version {
             0 => migrate_v0_to_v1(conn)?,
@@ -109,6 +114,8 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             3 => migrate_v3_to_v4(conn)?,
             4 => migrate_v4_to_v5(conn)?,
             5 => migrate_v5_to_v6(conn)?,
+            // 存量基线只属于"升级库"：全新安装从 v0 起步，不写 retrieval_baseline_at（F4）
+            6 => migrate_v6_to_v7(conn, start == 0)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -249,6 +256,124 @@ fn migrate_v5_to_v6(conn: &Connection) -> Result<(), rusqlite::Error> {
     )?;
     tx.pragma_update(None, "user_version", 6)?;
     tx.commit()
+}
+
+/// 库内时间戳统一格式（与 care_log.occurred_at/created_at 同款，文本序 = 时间序）。
+fn local_timestamp_now() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// v7（易腐撤食，票 01）：① food 加 perishable（0/1，默认 0）与 retrieval_hours
+/// （可空；合法值 1–168 整数，0/负/非整数由应用层拒收），预置按名回填
+/// 干虾仁/面包虫 → 易腐 24h（改名匹配不到为已知边界，同 v4 先例）；
+/// ② care_action 整表重建——kind CHECK 加入第三性质 'follow'（跟随喂食；
+/// SQLite 不能改列约束，v6 重建 reminder_ledger 同款先例），随后插入预置「撤食」
+/// (sort=2，原 sort≥2 顺延 +1)；库中已有同名自建「撤食」时改为原位升格
+/// （kind/is_preset/sort=2，id 与历史引用、停用态原样保留，不重复插入，F1/F7）；
+/// ③ 升级库写 settings 键 retrieval_baseline_at = 迁移执行时刻（F4 存量基线）；
+/// 全新安装（迁移起点 v0）不写——新库走同一条迁移链，由 fresh 分支跳过；
+/// ④ reminder_ledger 加部分唯一索引 uq_ledger_retrieval（每窝每天至多一条
+/// retrieval_due；v6 已去掉 kind CHECK，无需重建表）。
+///
+/// care_action 被 care_log / reminder_ledger 外键引用，父表重建须临时关外键
+/// （PRAGMA foreign_keys 在事务内是 no-op，故在开事务前切换、提交后还原）；
+/// 行按 id 原样拷贝，拷贝语义保证子表引用在还原后仍然成立。
+fn migrate_v6_to_v7(
+    conn: &Connection,
+    fresh_install: bool,
+) -> Result<(), rusqlite::Error> {
+    migrate_v6_to_v7_at(conn, fresh_install, &local_timestamp_now())
+}
+
+/// [`migrate_v6_to_v7`] 的可注入时钟版（测试断言基线值 = 指定迁移时刻）。
+fn migrate_v6_to_v7_at(
+    conn: &Connection,
+    fresh_install: bool,
+    now: &str,
+) -> Result<(), rusqlite::Error> {
+    let fk_before: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let tx = conn.unchecked_transaction()?;
+    let result = (|| {
+        tx.execute_batch(
+            r#"
+            ALTER TABLE food ADD COLUMN perishable INTEGER NOT NULL DEFAULT 0 CHECK (perishable IN (0, 1));
+            ALTER TABLE food ADD COLUMN retrieval_hours INTEGER;
+            UPDATE food SET perishable = 1, retrieval_hours = 24 WHERE name IN ('干虾仁', '面包虫');
+
+            CREATE TABLE care_action_v7 (
+                id                      INTEGER PRIMARY KEY,
+                name                    TEXT NOT NULL UNIQUE,
+                icon                    TEXT,
+                kind                    TEXT NOT NULL CHECK (kind IN ('reminding', 'log_only', 'follow')),
+                suggested_interval_days INTEGER, -- 仅提醒类有意义；登记类保留可编辑值以便日后切换
+                enabled                 INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+                sort                    INTEGER NOT NULL DEFAULT 0,
+                is_feeding              INTEGER NOT NULL DEFAULT 0 CHECK (is_feeding IN (0, 1)),
+                is_preset               INTEGER NOT NULL DEFAULT 0 CHECK (is_preset IN (0, 1))
+            );
+            INSERT INTO care_action_v7
+                (id, name, icon, kind, suggested_interval_days, enabled, sort, is_feeding, is_preset)
+                SELECT id, name, icon, kind, suggested_interval_days, enabled, sort, is_feeding, is_preset
+                FROM care_action;
+            DROP TABLE care_action;
+            ALTER TABLE care_action_v7 RENAME TO care_action;
+
+            CREATE UNIQUE INDEX uq_ledger_retrieval
+                ON reminder_ledger(colony_id, base_date) WHERE kind = 'retrieval_due';
+            "#,
+        )?;
+
+        // 撞名分支（F1）：同名「撤食」已存在 → 原位升格（id 不变、停用态保持）；
+        // 排序处理与预置插入分支同款（F7）：撤食归位 sort=2，其余 sort≥2 顺延 +1。
+        let existing: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM care_action WHERE name = '撤食'",
+            [],
+            |row| row.get(0),
+        )?;
+        if existing > 0 {
+            tx.execute(
+                "UPDATE care_action SET kind = 'follow', is_preset = 1, sort = 2
+                 WHERE name = '撤食'",
+                [],
+            )?;
+            tx.execute(
+                "UPDATE care_action SET sort = sort + 1 WHERE sort >= 2 AND name != '撤食'",
+                [],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE care_action SET sort = sort + 1 WHERE sort >= 2",
+                [],
+            )?;
+            tx.execute(
+                "INSERT INTO care_action
+                    (name, icon, kind, suggested_interval_days, enabled, is_feeding, is_preset, sort)
+                 VALUES ('撤食', NULL, 'follow', NULL, 1, 0, 1, 2)",
+                [],
+            )?;
+        }
+
+        // 存量基线（F4）：升级库记迁移时刻；全新安装不写（视为无非存量喂食）。
+        if !fresh_install {
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES ('retrieval_baseline_at', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![now],
+            )?;
+        }
+        tx.pragma_update(None, "user_version", 7)
+    })();
+    match result {
+        Ok(()) => tx.commit()?,
+        Err(e) => {
+            tx.rollback()?;
+            conn.execute_batch(&format!("PRAGMA foreign_keys = {fk_before};"))?;
+            return Err(e);
+        }
+    }
+    conn.execute_batch(&format!("PRAGMA foreign_keys = {fk_before};"))?;
+    Ok(())
 }
 
 /// v1 预置数据：四操作（喂食/活动区换水/巢穴保湿/垃圾清理）、三食物、两地点、五项设置默认值。
@@ -443,16 +568,31 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 6);
+        assert_eq!(SCHEMA_VERSION, 7);
+    }
+
+    /// 按真实迁移函数链手工搭到 v6 的库（票 01 v7 迁移测试地基）。
+    fn v6_conn() -> Connection {
+        let conn = Connection::open_in_memory().expect("内存库打开失败");
+        conn.execute_batch(V1_SCHEMA_SQL).expect("建 v1 schema 失败");
+        seed_v1_presets(&conn).expect("灌 v1 预置数据失败");
+        migrate_v1_to_v2(&conn).expect("升 v2 失败");
+        migrate_v2_to_v3(&conn).expect("升 v3 失败");
+        migrate_v3_to_v4(&conn).expect("升 v4 失败");
+        migrate_v4_to_v5(&conn).expect("升 v5 失败");
+        migrate_v5_to_v6(&conn).expect("升 v6 失败");
+        conn
     }
 
     #[test]
     fn v5_adds_push_columns_and_settles_legacy_rows() {
+        // 真实迁移链搭到 v4（v1→v2→v3→v4），再由 migrate() 升到最新
         let conn = Connection::open_in_memory().expect("内存库打开失败");
         conn.execute_batch(V1_SCHEMA_SQL).unwrap();
         seed_v1_presets(&conn).unwrap();
         migrate_v1_to_v2(&conn).unwrap();
         migrate_v2_to_v3(&conn).unwrap();
+        migrate_v3_to_v4(&conn).unwrap();
         conn.execute("INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')", []).unwrap();
         conn.execute(
             "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
@@ -460,7 +600,7 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", 4).unwrap(); // F2 之后真实库至少是 v4
+        migrate_v4_to_v5(&conn).unwrap(); // 停在 v5，让 migrate() 接力 v6→v7
 
         migrate(&conn).unwrap();
         // 历史行只走过桌面通道：直接视为已了结，不参与补发
@@ -475,20 +615,14 @@ mod tests {
 
     #[test]
     fn v6_adds_food_interval_and_rebuilds_ledger_with_food_dimension() {
+        // 真实迁移链搭到 v5（含 v4 的 is_preset 列），灌 v5 时期台账行，migrate() 升 v6→v7
         let conn = Connection::open_in_memory().expect("内存库打开失败");
         conn.execute_batch(V1_SCHEMA_SQL).unwrap();
         seed_v1_presets(&conn).unwrap();
         migrate_v1_to_v2(&conn).unwrap();
         migrate_v2_to_v3(&conn).unwrap();
-        conn.pragma_update(None, "user_version", 4).unwrap();
-        // v5 列（F4 之后真实库至少 v5；这里手工补齐等价结构再升 v6）
-        conn.execute_batch(
-            "ALTER TABLE reminder_ledger ADD COLUMN push_title TEXT;
-             ALTER TABLE reminder_ledger ADD COLUMN push_body TEXT;
-             ALTER TABLE reminder_ledger ADD COLUMN pushover_done INTEGER NOT NULL DEFAULT 0;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 5).unwrap();
+        migrate_v3_to_v4(&conn).unwrap();
+        migrate_v4_to_v5(&conn).unwrap();
         conn.execute(
             "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
             [],
@@ -651,7 +785,8 @@ mod tests {
         assert_eq!(flagged, vec!["喂食"]);
         assert_eq!(
             scalar_i64(&conn, "SELECT COUNT(*) FROM care_action WHERE is_feeding = 0"),
-            3
+            4,
+            "撤食预置同为非喂食类"
         );
     }
 
@@ -696,6 +831,7 @@ mod tests {
             flags,
             vec![
                 ("喂食".into(), 1),
+                ("撤食".into(), 0), // v7 预置撤食：非喂食类
                 ("活动区换水".into(), 0),
                 ("巢穴保湿".into(), 0),
                 ("垃圾清理".into(), 0),
@@ -715,7 +851,7 @@ mod tests {
             let mut stmt = conn.prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort").unwrap();
             stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
         };
-        assert_eq!(action_names, vec!["喂食", "活动区换水", "巢穴保湿", "垃圾清理"]);
+        assert_eq!(action_names, vec!["喂食", "撤食", "活动区换水", "巢穴保湿", "垃圾清理"]);
         let food_names: Vec<String> = {
             let mut stmt = conn.prepare("SELECT name FROM food WHERE is_preset = 1 ORDER BY sort").unwrap();
             stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
@@ -741,8 +877,270 @@ mod tests {
             let mut stmt = conn.prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort").unwrap();
             stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
         };
-        // 已改名的预置匹配不到（已知边界，接受）；自建项不误标
-        assert_eq!(flagged, vec!["喂食", "巢穴保湿", "垃圾清理"]);
+        // 已改名的预置匹配不到（已知边界，接受）；自建项不误标；
+        // 撤食预置由 v7 迁移插入（sort=2，列在喂食之后）
+        assert_eq!(flagged, vec!["喂食", "撤食", "巢穴保湿", "垃圾清理"]);
+    }
+
+    #[test]
+    fn v7_upgrade_preserves_rows_and_backfills_perishable_presets() {
+        // 真实 v6 库：历史记录 + 台账 + 自建操作/食物齐全，升 v7 后数据原样、
+        // 预置食物按名回填易腐 24h、撤食预置插入且其余顺延（票 01 验收 1）
+        let conn = v6_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO care_action (name, icon, kind, is_feeding, suggested_interval_days, enabled, is_preset, sort)
+             VALUES ('降温', NULL, 'log_only', 0, NULL, 1, 0, 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO food (name, enabled, sort, suggested_interval_days, is_preset)
+             VALUES ('糖水', 1, 4, NULL, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (1, 1, '2026-09-01 08:00:00', '备注', '2026-09-01 08:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO log_food (log_id, food_id) VALUES (1, 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
+             VALUES (1, 'overdue', 1, '2026-09-10', '2026-09-10 08:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+
+        // 数据原样保留
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_log"), 1);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM log_food"), 1);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM reminder_ledger"), 1);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM settings WHERE key = 'retrieval_baseline_at'"),
+            1,
+            "升级库写存量基线键"
+        );
+
+        // 食物按名回填：预置两样易腐 24h，种子/自建不动
+        let foods: Vec<(String, i64, Option<i64>)> = {
+            let mut stmt = conn
+                .prepare("SELECT name, perishable, retrieval_hours FROM food ORDER BY sort")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            foods,
+            vec![
+                ("种子".into(), 0, None),
+                ("干虾仁".into(), 1, Some(24)),
+                ("面包虫".into(), 1, Some(24)),
+                ("糖水".into(), 0, None),
+            ]
+        );
+
+        // 撤食预置插入（follow、sort=2、预置守护），原 sort≥2 顺延 +1
+        let actions: Vec<(String, String, Option<i64>, i64, i64, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, kind, suggested_interval_days, enabled, is_preset, sort
+                     FROM care_action ORDER BY sort",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            actions,
+            vec![
+                ("喂食".into(), "reminding".into(), Some(3), 1, 1, 1),
+                ("撤食".into(), "follow".into(), None, 1, 1, 2),
+                ("活动区换水".into(), "log_only".into(), None, 1, 1, 3),
+                ("巢穴保湿".into(), "log_only".into(), None, 1, 1, 4),
+                ("垃圾清理".into(), "reminding".into(), Some(7), 1, 1, 5),
+                ("降温".into(), "log_only".into(), None, 1, 0, 6),
+            ]
+        );
+
+        // 撤食预置不可删（沿用 is_preset 守护——字典层同一条 SQL，这里验证行标记）
+        assert_eq!(
+            scalar_i64(&conn, "SELECT is_preset FROM care_action WHERE name = '撤食'"),
+            1
+        );
+    }
+
+    #[test]
+    fn v7_renamed_preset_food_misses_perishable_backfill() {
+        // 已改名的预置匹配不到（已知边界，同 v4/v6 按名回填先例）
+        let conn = v6_conn();
+        conn.execute("UPDATE food SET name = '黄粉虫' WHERE name = '面包虫'", []).unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+
+        migrate(&conn).unwrap();
+        let (perishable, hours): (i64, Option<i64>) = conn
+            .query_row(
+                "SELECT perishable, retrieval_hours FROM food WHERE name = '黄粉虫'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((perishable, hours), (0, None), "改名预置不回填");
+    }
+
+    #[test]
+    fn v7_collision_with_custom_retrieval_upgrades_row_in_place() {
+        // 验收 2：旧库已自建「撤食」→ 原位升格（id 不变、历史引用不断、无重复行、
+        // 停用态保持、sort=2 归位且其它操作顺延）
+        let conn = v6_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO care_action (name, icon, kind, is_feeding, suggested_interval_days, enabled, is_preset, sort)
+             VALUES ('撤食', NULL, 'log_only', 0, NULL, 0, 0, 5)",
+            [],
+        )
+        .unwrap();
+        let custom_id: i64 = conn
+            .query_row("SELECT id FROM care_action WHERE name = '撤食'", [], |r| r.get(0))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (1, 1, '2026-09-01 08:00:00', '', '2026-09-01 08:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (1, ?1, '2026-09-02 08:00:00', '', '2026-09-02 08:00:00')",
+            params![custom_id],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+
+        migrate(&conn).unwrap();
+
+        // 无重复行，同一 id 原位升格
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM care_action WHERE name = '撤食'"),
+            1
+        );
+        let row: (i64, String, i64, i64, i64) = conn
+            .query_row(
+                "SELECT id, kind, is_preset, enabled, sort FROM care_action WHERE name = '撤食'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(row.0, custom_id, "id 不变，历史引用不断");
+        assert_eq!(row.1, "follow");
+        assert_eq!(row.2, 1, "升格为预置");
+        assert_eq!(row.3, 0, "原停用态保持");
+        assert_eq!(row.4, 2, "sort=2 归位");
+
+        // 历史引用仍然成立 + 其它操作顺延
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_log"), 2);
+        let sorts: Vec<(String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT name, sort FROM care_action ORDER BY sort")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            sorts,
+            vec![
+                ("喂食".into(), 1),
+                ("撤食".into(), 2),
+                ("活动区换水".into(), 3),
+                ("巢穴保湿".into(), 4),
+                ("垃圾清理".into(), 5),
+            ]
+        );
+    }
+
+    #[test]
+    fn v7_retrieval_due_ledger_unique_per_colony_per_day() {
+        let conn = v6_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('针毛一号', '2026-02-01')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        migrate(&conn).unwrap();
+
+        let insert = |colony: i64, base: &str| {
+            conn.execute(
+                "INSERT INTO reminder_ledger (colony_id, kind, base_date, sent_at)
+                 VALUES (?1, 'retrieval_due', ?2, '2026-09-19 08:00:00')",
+                params![colony, base],
+            )
+        };
+        assert_eq!(insert(1, "2026-09-19").unwrap(), 1);
+        // 同窝同日第二条被拒（部分唯一索引，库层去重兜底）
+        assert!(insert(1, "2026-09-19").is_err());
+        // 不同窝、不同基准日照常各一条
+        assert_eq!(insert(2, "2026-09-19").unwrap(), 1);
+        assert_eq!(insert(1, "2026-09-20").unwrap(), 1);
+    }
+
+    #[test]
+    fn v7_follow_kind_accepted_but_nonsense_rejected() {
+        let conn = v6_conn();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        migrate(&conn).unwrap();
+
+        // follow 通过重建后的 CHECK
+        conn.execute(
+            "INSERT INTO care_action (name, kind, enabled, sort) VALUES ('跟随样例', 'follow', 1, 9)",
+            [],
+        )
+        .unwrap();
+        // CHECK 仍拦非法值
+        assert!(conn
+            .execute(
+                "INSERT INTO care_action (name, kind, enabled, sort) VALUES ('坏性质', 'remind', 1, 10)",
+                [],
+            )
+            .is_err());
     }
 
     #[test]
@@ -755,10 +1153,10 @@ mod tests {
     }
 
     #[test]
-    fn seeds_four_care_actions_with_nature_and_interval() {
+    fn seeds_five_care_actions_with_retrieval_preset_in_place() {
         let (conn, _dir) = fresh_conn();
         let mut stmt = conn
-            .prepare("SELECT name, kind, suggested_interval_days FROM care_action ORDER BY sort")
+            .prepare("SELECT name, kind, suggested_interval_days, is_preset FROM care_action ORDER BY sort")
             .expect("prepare 失败");
         let rows = stmt
             .query_map([], |row| {
@@ -766,17 +1164,23 @@ mod tests {
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })
             .expect("query_map 失败")
             .collect::<Result<Vec<_>, _>>()
             .expect("读取操作失败");
 
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0], ("喂食".into(), "reminding".into(), Some(3)));
-        assert_eq!(rows[1], ("活动区换水".into(), "log_only".into(), None));
-        assert_eq!(rows[2], ("巢穴保湿".into(), "log_only".into(), None));
-        assert_eq!(rows[3], ("垃圾清理".into(), "reminding".into(), Some(7)));
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0], ("喂食".into(), "reminding".into(), Some(3), 1));
+        assert_eq!(
+            rows[1],
+            ("撤食".into(), "follow".into(), None, 1),
+            "撤食预置 sort=2、跟随喂食性质"
+        );
+        assert_eq!(rows[2], ("活动区换水".into(), "log_only".into(), None, 1));
+        assert_eq!(rows[3], ("巢穴保湿".into(), "log_only".into(), None, 1));
+        assert_eq!(rows[4], ("垃圾清理".into(), "reminding".into(), Some(7), 1));
     }
 
     #[test]
@@ -791,6 +1195,34 @@ mod tests {
             .collect::<Result<Vec<String>, _>>()
             .expect("读取食物失败");
         assert_eq!(names, vec!["种子", "干虾仁", "面包虫"]);
+    }
+
+    #[test]
+    fn seeds_perishable_defaults_on_preset_foods() {
+        // 票 01：种子不易腐；干虾仁/面包虫易腐 + 24h（全新安装走迁移链回填，同一条路）
+        let (conn, _dir) = fresh_conn();
+        let mut stmt = conn
+            .prepare("SELECT name, perishable, retrieval_hours FROM food ORDER BY sort")
+            .expect("prepare 失败");
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .expect("query_map 失败")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("读取食物失败");
+        assert_eq!(
+            rows,
+            vec![
+                ("种子".into(), 0, None),
+                ("干虾仁".into(), 1, Some(24)),
+                ("面包虫".into(), 1, Some(24)),
+            ]
+        );
     }
 
     #[test]
@@ -822,11 +1254,38 @@ mod tests {
     fn remigrate_is_noop() {
         let (conn, _dir) = fresh_conn();
         migrate(&conn).expect("对已迁移库再次 migrate 不应失败");
-        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_action"), 4);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_action"), 5);
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM food"), 3);
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM location"), 2);
+        // 全新安装不写存量基线键（F4）
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM settings"), 5);
+        assert!(conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = 'retrieval_baseline_at'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|n| n == 0)
+            .expect("查基线键失败"));
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn upgraded_db_writes_retrieval_baseline() {
+        // v6 旧库升级 → 写入存量基线键；值 = 迁移执行时刻（注入时钟断言精确值）
+        let conn = v6_conn();
+        conn.pragma_update(None, "user_version", 6).unwrap();
+        migrate_v6_to_v7_at(&conn, false, "2026-09-19 12:34:56").unwrap();
+        assert_eq!(
+            settings_value(&conn, "retrieval_baseline_at"),
+            "2026-09-19 12:34:56"
+        );
+        // 幂等：已是 v7 后再走完整 migrate 不重跑迁移、基线值不被改动
+        migrate(&conn).unwrap();
+        assert_eq!(
+            settings_value(&conn, "retrieval_baseline_at"),
+            "2026-09-19 12:34:56"
+        );
     }
 
     #[test]
@@ -854,7 +1313,7 @@ mod tests {
         let path = dir.path().join("data").join(DB_FILE_NAME);
         let _first = open_and_migrate(&path).expect("首次打开失败");
         let conn = open_and_migrate(&path).expect("二次打开失败");
-        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_action"), 4);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_action"), 5);
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
     }
 

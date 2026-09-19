@@ -58,6 +58,14 @@ describe("操作行：字典 → 本地编辑态", () => {
     expect(rows[0]!.isPreset).toBe(true);
     expect(rows[1]!.isPreset).toBe(false);
   });
+
+  it("follow（跟随喂食，票 01）性质原样进行、原样出 save 入参", () => {
+    const rows = buildActionRows([
+      actionItem({ id: 5, name: "撤食", kind: "follow", is_preset: true, sort: 2 }),
+    ]);
+    expect(rows[0]!.kind).toBe("follow");
+    expect(toActionInputs(rows)[0]).toMatchObject({ id: 5, name: "撤食", kind: "follow" });
+  });
 });
 
 describe("操作行：本地编辑态 → save 入参", () => {
@@ -141,12 +149,12 @@ describe("食物行", () => {
     expect(rows[2]!.enabled).toBe(false);
     expect(rows[2]!.intervalText).toBe("");
 
-    rows.push({ id: null, name: " 糖水 ", enabled: true, intervalText: "", referenced: false, isPreset: false });
+    rows.push({ id: null, name: " 糖水 ", enabled: true, intervalText: "", referenced: false, isPreset: false, perishable: false, retrievalHoursText: "" });
     expect(toFoodInputs(rows)).toEqual([
-      { id: 1, name: "种子", sort: 0, suggested_interval_days: 3 },
-      { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7 },
-      { id: 5, name: "面包虫", sort: 2, suggested_interval_days: null },
-      { id: null, name: "糖水", sort: 3, suggested_interval_days: null },
+      { id: 1, name: "种子", sort: 0, suggested_interval_days: 3, perishable: false, retrieval_hours: null },
+      { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7, perishable: false, retrieval_hours: null },
+      { id: 5, name: "面包虫", sort: 2, suggested_interval_days: null, perishable: false, retrieval_hours: null },
+      { id: null, name: "糖水", sort: 3, suggested_interval_days: null, perishable: false, retrieval_hours: null },
     ]);
     rows[3]!.intervalText = " 5 ";
     expect(toFoodInputs(rows)[3]!.suggested_interval_days).toBe(5);
@@ -161,13 +169,36 @@ describe("食物行", () => {
     expect(rows[1]!.isPreset).toBe(false);
   });
 
+  it("buildFoodRows 映射易腐位与撤食间隔（票 01）：缺省字段回退不易腐/空", () => {
+    const rows = buildFoodRows([
+      foodItem({ id: 1, name: "干虾仁", perishable: true, retrieval_hours: 24 }),
+      foodItem({ id: 2, name: "糖水" }),
+    ]);
+    expect(rows[0]!.perishable).toBe(true);
+    expect(rows[0]!.retrievalHoursText).toBe("24");
+    expect(rows[1]!.perishable).toBe(false);
+    expect(rows[1]!.retrievalHoursText).toBe("");
+  });
+
+  it("toFoodInputs 携带易腐入参；关易腐时撤食间隔一律 null（后端归空）", () => {
+    const rows = buildFoodRows([
+      foodItem({ id: 1, name: "干虾仁", perishable: true, retrieval_hours: 24 }),
+      foodItem({ id: 2, name: "糖水" }),
+    ]);
+    // 开易腐：间隔文本转数字
+    expect(toFoodInputs(rows)[0]).toMatchObject({ perishable: true, retrieval_hours: 24 });
+    // 关易腐：即使间隔文本有值也归 null（清空语义由行状态与校验共同保证）
+    rows[1]!.retrievalHoursText = "999";
+    expect(toFoodInputs(rows)[1]).toMatchObject({ perishable: false, retrieval_hours: null });
+  });
+
   it("validateFoodRows 拦空名与重名", () => {
     const rows = buildFoodRows([foodItem({ id: 1, name: "种子" })]);
     expect(validateFoodRows([{ ...rows[0]!, name: "  " }])).toContain("不能为空");
     expect(
       validateFoodRows([
         ...rows,
-        { id: null, name: " 种子 ", enabled: true, intervalText: "", referenced: false, isPreset: false },
+        { id: null, name: " 种子 ", enabled: true, intervalText: "", referenced: false, isPreset: false, perishable: false, retrievalHoursText: "" },
       ]),
     ).toContain("已存在");
     expect(validateFoodRows(rows)).toBe("");
@@ -184,6 +215,31 @@ describe("食物行", () => {
     rows[0]!.intervalText = 7; // type=number 输入框给回数字同样放行
     expect(validateFoodRows(rows)).toBe("");
     rows[0]!.intervalText = ""; // 空串 = 未设，合法
+    expect(validateFoodRows(rows)).toBe("");
+  });
+
+  it("validateFoodRows 易腐撤食间隔矩阵（票 01）：开易腐必填 1–168 整数，关易腐不校验", () => {
+    const rows = buildFoodRows([foodItem({ id: 1, name: "面包虫", perishable: true })]);
+
+    // 开易腐 + 空 → 必填提示
+    rows[0]!.retrievalHoursText = "";
+    expect(validateFoodRows(rows)).toBe("食物「面包虫」开易腐后必须填写撤食间隔（1–168 的整数小时）");
+
+    // 开易腐 + 0 / 负 / 越界 / 非整数 → 区间提示
+    for (const bad of ["0", "-3", "169", "abc", "1.5"]) {
+      rows[0]!.retrievalHoursText = bad;
+      expect(validateFoodRows(rows)).toBe("食物「面包虫」的撤食间隔应是 1–168 的整数小时");
+    }
+
+    // 边界内通过：1 / 24 / 168（type=number 给回数字同样放行）
+    for (const good of ["1", "24", "168", 24]) {
+      rows[0]!.retrievalHoursText = good;
+      expect(validateFoodRows(rows)).toBe("");
+    }
+
+    // 关易腐：间隔文本无论什么都不拦（保存时归 null）
+    rows[0]!.perishable = false;
+    rows[0]!.retrievalHoursText = "0";
     expect(validateFoodRows(rows)).toBe("");
   });
 });

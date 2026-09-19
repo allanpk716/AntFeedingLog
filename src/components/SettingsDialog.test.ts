@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { flushPromises, mount } from "@vue/test-utils";
+import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import SettingsDialog from "./SettingsDialog.vue";
-import type { BackupConfigInfo, RestoreSummary } from "../types";
+import type { BackupConfigInfo, CareActionItem, FoodItem, RestoreSummary } from "../types";
 
 // 不依赖 Tauri 运行时：mock 掉 IPC 与事件监听（沿 LogListPage.test.ts 先例）
 const { invokeMock, listenStub } = vi.hoisted(() => ({
@@ -581,5 +581,169 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
 
     expect(wrapper.find(".restore-panel").exists()).toBe(false);
     expect(invokeMock).not.toHaveBeenCalledWith("restore_apply", expect.anything());
+  });
+});
+
+// ── 易腐配置 + 撤食行（票 01）──
+
+function foodFixture(overrides: Partial<FoodItem> & { id: number }): FoodItem {
+  return {
+    name: `食物${overrides.id}`,
+    enabled: true,
+    sort: overrides.id,
+    suggested_interval_days: 7,
+    is_preset: true,
+    referenced: false,
+    ...overrides,
+  };
+}
+
+function foodsFixture(): FoodItem[] {
+  return [
+    foodFixture({ id: 1, name: "种子", sort: 1, suggested_interval_days: 3, perishable: false, retrieval_hours: null }),
+    foodFixture({ id: 2, name: "干虾仁", sort: 2, perishable: true, retrieval_hours: 24 }),
+    foodFixture({ id: 3, name: "面包虫", sort: 3, perishable: false, retrieval_hours: null }),
+  ];
+}
+
+function actionsFixture(): CareActionItem[] {
+  return [
+    { id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: 3, enabled: true, sort: 1, is_preset: true, referenced: false },
+    { id: 5, name: "撤食", icon: null, kind: "follow", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 2, is_preset: true, referenced: false },
+    { id: 2, name: "活动区换水", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: true, sort: 3, is_preset: true, referenced: false },
+  ];
+}
+
+function dictMock(cmd: string, foods: FoodItem[], actions: CareActionItem[]) {
+  switch (cmd) {
+    case "list_foods":
+      return foods;
+    case "list_actions":
+      return actions;
+    case "list_locations":
+      return [];
+    case "get_settings":
+      return {
+        notify_master_enabled: true,
+        notify_overdue_enabled: true,
+        notify_hibernation_enabled: true,
+        wake_remind_days_ahead: 7,
+        autostart_enabled: true,
+      };
+    default:
+      return null;
+  }
+}
+
+async function openDictTab(tab: "foods" | "actions", foods: FoodItem[], actions: CareActionItem[]) {
+  baseMock();
+  invokeMock.mockImplementation(async (cmd: string) => dictMock(cmd, foods, actions));
+  const wrapper = mount(SettingsDialog);
+  await flushPromises();
+  await wrapper.find(tab === "foods" ? ".tab-foods" : ".tab-actions").trigger("click");
+  await flushPromises();
+  return wrapper;
+}
+
+function rowsOf(wrapper: VueWrapper) {
+  return wrapper.findAll(".tab-body .dict-row");
+}
+
+describe("设置弹窗·食物易腐配置（票 01）", () => {
+  it("存量易腐回显：干虾仁勾选且间隔 24 可编辑；未开易腐的间隔输入置灰（验收 4 后半）", async () => {
+    const wrapper = await openDictTab("foods", foodsFixture(), actionsFixture());
+    const rows = rowsOf(wrapper);
+
+    const dry = rows[1]!;
+    expect((dry.find(".perish-input").element as HTMLInputElement).checked).toBe(true);
+    const dryHours = dry.find(".retrieval-hours-input").element as HTMLInputElement;
+    expect(dryHours.value).toBe("24");
+    expect(dryHours.disabled).toBe(false);
+
+    const seed = rows[0]!;
+    expect((seed.find(".perish-input").element as HTMLInputElement).checked).toBe(false);
+    expect((seed.find(".retrieval-hours-input").element as HTMLInputElement).disabled).toBe(true);
+  });
+
+  it("开易腐+24 保存 → save_food 入参带 perishable=true / retrieval_hours=24（验收 4 通过分支）", async () => {
+    const wrapper = await openDictTab("foods", foodsFixture(), actionsFixture());
+    const rows = rowsOf(wrapper);
+
+    await rows[2]!.find(".perish-input").setValue(true);
+    await rows[2]!.find(".retrieval-hours-input").setValue("24");
+
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (cmd: string) => dictMock(cmd, foodsFixture(), actionsFixture()));
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("save_food", {
+      input: { id: 3, name: "面包虫", sort: 2, suggested_interval_days: 7, perishable: true, retrieval_hours: 24 },
+    });
+  });
+
+  it("校验矩阵：开易腐+空/0/负/非整数/169 → 提示撤食间隔错误且不落库（验收 4 拒收分支）", async () => {
+    for (const bad of ["", "0", "-3", "abc", "169"]) {
+      const wrapper = await openDictTab("foods", foodsFixture(), actionsFixture());
+      const rows = rowsOf(wrapper);
+      await rows[2]!.find(".perish-input").setValue(true);
+      await rows[2]!.find(".retrieval-hours-input").setValue(bad);
+
+      invokeMock.mockClear();
+      await wrapper.find(".tab-body .btn.primary").trigger("click");
+      await flushPromises();
+
+      expect(wrapper.find(".form-error").text()).toContain("撤食间隔");
+      expect(invokeMock).not.toHaveBeenCalledWith("save_food", expect.anything());
+    }
+  });
+
+  it("关易腐 → 间隔自动清空并置灰，保存入参 retrieval_hours=null（F5）", async () => {
+    const wrapper = await openDictTab("foods", foodsFixture(), actionsFixture());
+    const rows = rowsOf(wrapper);
+    const dry = rows[1]!;
+
+    await dry.find(".perish-input").setValue(false);
+    const hours = dry.find(".retrieval-hours-input").element as HTMLInputElement;
+    expect(hours.value).toBe("");
+    expect(hours.disabled).toBe(true);
+
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (cmd: string) => dictMock(cmd, foodsFixture(), actionsFixture()));
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("save_food", {
+      input: { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7, perishable: false, retrieval_hours: null },
+    });
+  });
+});
+
+describe("设置弹窗·操作页签撤食行（票 01）", () => {
+  it("撤食行固定「跟随喂食」标注：无性质切换、无间隔编辑（验收 5）", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), actionsFixture());
+    const retrieval = rowsOf(wrapper)[1]!;
+
+    expect(retrieval.find(".name-input").element as HTMLInputElement).toBeTruthy();
+    expect((retrieval.find(".name-input").element as HTMLInputElement).value).toBe("撤食");
+    expect(retrieval.find(".follow-chip").text()).toContain("跟随喂食");
+    expect(retrieval.find(".kind-select").exists()).toBe(false);
+    expect(retrieval.find(".interval-input").exists()).toBe(false);
+
+    // 对照：普通提醒类行仍有性质切换与间隔
+    const feed = rowsOf(wrapper)[0]!;
+    expect(feed.find(".kind-select").exists()).toBe(true);
+    expect(feed.find(".interval-input").exists()).toBe(true);
+  });
+
+  it("撤食行可停用：停用按钮走 set_action_enabled（停用=功能关闭）", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), actionsFixture());
+    const retrieval = rowsOf(wrapper)[1]!;
+
+    invokeMock.mockClear();
+    await retrieval.find(".row-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("set_action_enabled", { id: 5, enabled: false });
   });
 });

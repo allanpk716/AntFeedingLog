@@ -5,8 +5,10 @@
 
 export type ColonyStatus = "active" | "hibernating" | "ended";
 
-/** 维护操作性质：reminding=提醒（超期标红可通知）/ log_only=仅登记（永不催促） */
-export type ActionKind = "reminding" | "log_only";
+/** 维护操作性质：reminding=提醒（超期标红可通知）/ log_only=仅登记（永不催促）/
+ *  follow=跟随喂食（票 01：撤食预置专属性质，由易腐喂食派生「该撤食」，
+ *  不参与提醒/登记切换、无建议间隔） */
+export type ActionKind = "reminding" | "log_only" | "follow";
 
 /** 喂食块里单个食物的「距上次」明细（Rust care::FoodTileStatus，反馈第二轮 F3） */
 export interface FoodTileInfo {
@@ -109,6 +111,10 @@ export interface FoodItem {
   /** 预置项禁删可停用（反馈第二轮 F2） */
   is_preset: boolean;
   referenced: boolean;
+  /** 易腐（票 01）：开启后喂下该食物会派生「待撤食」，按撤食间隔（小时）提醒收走 */
+  perishable?: boolean;
+  /** 撤食间隔（小时，1–168 整数）；null/缺省 = 未设（易腐食物必须配有效间隔） */
+  retrieval_hours?: number | null;
 }
 
 /** 维护操作字典项（含停用的；referenced=被记录/提醒台账引用，只能停用不能删） */
@@ -151,6 +157,10 @@ export interface FoodInput {
   sort: number;
   /** 食物建议间隔（天，F3）；null = 不设 */
   suggested_interval_days: number | null;
+  /** 易腐（票 01）：开易腐必须配 1–168 整数小时的撤食间隔（后端同款守护拒收） */
+  perishable: boolean;
+  /** 撤食间隔（小时）；关易腐时传 null（后端兜底落 NULL） */
+  retrieval_hours: number | null;
 }
 
 /** 记账入参：喂食才带 food_ids（其余操作传空数组）；happened_at 可补录过去 */

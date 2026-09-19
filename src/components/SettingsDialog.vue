@@ -2,10 +2,14 @@
 /**
  * 设置弹窗（票 04 字典管理 + 票 06 通知 + 票 09 数据收口 + release-update 票 06 更新）：
  * 操作 / 食物 / 地点 / 通知 / 数据 / 更新 六个 tab。
+ * - 食物行：名字、建议间隔（F3：留空=只按喂食统一周期）、易腐开关 + 撤食间隔小时
+ *   （票 01：开易腐必填 1–168 整数，关易腐自动清空并置灰，保存时落 null）、
+ *   停用/启用、删除（预置或被引用禁用）。
  * - 操作行可编辑：名字、性质（提醒/仅登记）、建议间隔（提醒类显示）、
  *   「喂食」标记（带提示，允许编辑不强制唯一）、停用/启用、删除
  *   （预置项或被历史记录/提醒台账引用时删除禁用，只能停用——规则 10 + 反馈第二轮 F2）。
- * - 食物行：名字、建议间隔（F3：留空=只按喂食统一周期）、停用/启用、删除（预置或被引用禁用）。
+ *   follow（跟随喂食）行（票 01：撤食预置）固定标注「跟随喂食」，无性质切换与
+ *   间隔编辑，停用按钮照常（停用 = 撤食提醒整体关闭）。
  * - 地点 tab 复用 LocationManagerPanel。
  * - 通知 tab（票 06 + 反馈第二轮 F4）：推送通知总开关（桌面 + 手机，分类子开关作废）+
  *   临近出眠提前天数 + Pushover 配置状态 + 「发送测试通知」按钮（双通道分别回显结果，
@@ -147,10 +151,17 @@ async function addActionRow(kind: "actions" | "foods") {
     });
     addActionName.value = "";
   } else {
-    foodRows.value.push({ id: null, name: raw, enabled: true, intervalText: "", isPreset: false, referenced: false });
+    foodRows.value.push({ id: null, name: raw, enabled: true, intervalText: "", perishable: false, retrievalHoursText: "", isPreset: false, referenced: false });
     addFoodName.value = "";
   }
   error.value = "";
+}
+
+/** 关易腐自动清空撤食间隔（F5）：清空 + 输入框随 ：disabled 置灰，保存时落 null。 */
+function onPerishableChange(row: FoodRow) {
+  if (!row.perishable) {
+    row.retrievalHoursText = "";
+  }
 }
 
 async function setActionEnabled(row: ActionRow, enabled: boolean) {
@@ -556,10 +567,16 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
             <button type="button" :disabled="index === actionRows.length - 1" @click="moveRow(actionRows, index, 1)">↓</button>
           </span>
           <input v-model="row.name" class="name-input" type="text" />
-          <select v-model="row.kind" class="kind-select" :title="row.kind === 'reminding' ? '提醒类：超期标红并通知' : '仅登记：只记录，永不催促'">
+          <select
+            v-if="row.kind !== 'follow'"
+            v-model="row.kind"
+            class="kind-select"
+            :title="row.kind === 'reminding' ? '提醒类：超期标红并通知' : '仅登记：只记录，永不催促'"
+          >
             <option value="reminding">提醒</option>
             <option value="log_only">仅登记</option>
           </select>
+          <span v-else class="follow-chip" title="跟随喂食：喂了易腐食物后由它收尾，不参与提醒/登记切换">跟随喂食</span>
           <input
             v-if="row.kind === 'reminding'"
             v-model="row.intervalText"
@@ -607,6 +624,19 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
             min="1"
             title="食物建议间隔：距上次喂该食物超过它就单独提醒；留空 = 只按喂食统一周期"
           />
+          <label class="perish-flag" title="易腐：喂下后超过撤食间隔就提醒收走残食">
+            <input v-model="row.perishable" class="perish-input" type="checkbox" @change="onPerishableChange(row)" />
+            易腐
+          </label>
+          <input
+            v-model="row.retrievalHoursText"
+            class="interval-input retrieval-hours-input"
+            type="number"
+            min="1"
+            max="168"
+            :disabled="!row.perishable"
+            title="撤食间隔（小时）：喂下易腐食物后经过这么久提醒撤走；1–168 整数"
+          />
           <span v-if="!row.enabled" class="disabled-chip">已停用</span>
           <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setFoodEnabled(row, false)">停用</button>
           <button v-else class="row-btn" type="button" @click="setFoodEnabled(row, true)">启用</button>
@@ -620,7 +650,7 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
           <button class="add-btn" type="button" @click="addActionRow('foods')">＋ 添加</button>
         </div>
 
-        <p class="hint">设了间隔的食物各自算「距上次」，任一超期喂食块就变红并单独提醒。</p>
+        <p class="hint">设了间隔的食物各自算「距上次」，任一超期喂食块就变红并单独提醒。勾「易腐」的食物必须填 1–168 的整数小时（喂下后到点提醒收走残食），取消勾选会清空间隔。</p>
 
         <div class="dlg-btns">
           <span class="spacer"></span>
@@ -1137,6 +1167,25 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   font-size: 13px;
   color: var(--muted);
   cursor: pointer;
+  white-space: nowrap;
+}
+
+.perish-flag {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.follow-chip {
+  font-size: 12px;
+  color: var(--accent-deep);
+  background: var(--accent-soft, rgba(0, 0, 0, 0.06));
+  border-radius: 999px;
+  padding: 2px 10px;
   white-space: nowrap;
 }
 
