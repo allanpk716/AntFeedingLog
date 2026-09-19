@@ -125,6 +125,10 @@ function onEndDatePick(iso: string) {
  * 若同步也挂到回调里，重置后 form.keyword 仍是空串，Vue 不 patch 输入框，旧词残留界面 */
 let kwTimer: ReturnType<typeof setTimeout> | undefined;
 function onKeywordInput(e: Event) {
+  // IME 组词期（拼音组词中）不同步不防抖（v-model/vModelText 同款守卫）：
+  // isComposing 在 InputEvent 上（评审原稿 cast 到 HTMLInputElement 类型错且运行时恒 undefined）；
+  // happy-dom 的 input 事件 isComposing 为 undefined，=== true 判定不影响测试
+  if ((e as InputEvent).isComposing === true) return;
   form.value.keyword = (e.target as HTMLInputElement).value;
   clearTimeout(kwTimer);
   kwTimer = setTimeout(() => {
