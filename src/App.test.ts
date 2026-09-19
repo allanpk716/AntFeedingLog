@@ -891,11 +891,11 @@ describe("设置 · 数据与备份（票 09）", () => {
     expect(invokeMock).toHaveBeenCalledWith("reveal_data_folder");
 
     invokeMock.mockClear();
-    invokeMock.mockResolvedValueOnce("D:\\backup\\ant-feeding-log-backup-20260918.db");
+    invokeMock.mockResolvedValueOnce("D:\\backup\\ant-feeding-log-backup-20260918-091530.zip");
     await dlg.find(".backup-btn").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("backup_to");
-    expect(dlg.find(".data-result").text()).toContain("ant-feeding-log-backup-20260918.db");
+    expect(dlg.find(".data-result").text()).toContain("ant-feeding-log-backup-20260918-091530.zip");
 
     // 用户在对话框取消（Rust 返回 null）：不报错也不留旧结果
     invokeMock.mockClear();
