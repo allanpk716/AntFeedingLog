@@ -162,7 +162,8 @@ watch(
 .dp-caret { float: right; color: var(--muted, #8f887d); margin-left: 6px; }
 
 .dp-pop {
-  position: absolute; top: calc(100% + 6px); left: 0; z-index: 60;
+  /* box-sizing 保证 POP_W=252 语义=总外宽（含 padding 24 + 边框 2），否则钳制少算 26px 致右缘超窗 */
+  box-sizing: border-box; position: absolute; top: calc(100% + 6px); left: 0; z-index: 60;
   width: 252px; background: var(--card, #fff); border: 1px solid var(--border-strong, #d8d1c4);
   border-radius: 12px; box-shadow: 0 10px 40px rgba(60, 50, 30, 0.2); padding: 10px 12px;
 }
