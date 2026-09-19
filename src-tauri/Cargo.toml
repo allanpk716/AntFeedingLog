@@ -31,6 +31,8 @@ serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ureq = "2"
+# 网页端访问凭证随机源（webui-checkin 票 03）：OS 级随机 ≥128bit，只程序生成
+getrandom = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

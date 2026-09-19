@@ -6,8 +6,10 @@ mod colony;
 mod data_meta;
 mod db;
 mod dict;
+mod firewall;
 mod hibernation;
 mod nest_checkin;
+mod netseg;
 mod pushover;
 mod reminder;
 mod restore;
@@ -15,6 +17,7 @@ mod settings;
 mod stats;
 mod system;
 mod updater;
+mod webui_config;
 
 /// 全链冒烟（数据安全二期票 05）：造数据 → 自动备份 → 改数据 → 恢复 的端到端
 /// 断言。只在测试构建编译。
@@ -711,6 +714,122 @@ fn open_releases_page(app: tauri::AppHandle) -> Result<(), String> {
     result
 }
 
+// ── 网页端设置（webui-checkin 票 03）：网段枚举 / 配置与凭证 / 防火墙联动 ──
+// 配置存数据目录 webui-config.json（库外，恢复不触碰，同 backup-config.json 取舍）。
+// 本票不含 HTTP 服务（票 04）——save 后不启动监听，防火墙联动与凭证/URL 即刻生效。
+
+/// 枚举本机网段（虚拟化噪音已滤、NetBird 段置顶标名）。async：PowerShell 枚举
+/// 不能占主线程（评审 R1-2 同款，与 pick_backup_dir 同理）。
+#[tauri::command]
+async fn list_network_segments() -> Result<Vec<netseg::NetworkSegment>, String> {
+    tauri::async_runtime::spawn_blocking(netseg::enumerate)
+        .await
+        .map_err(|e| format!("网段枚举任务异常退出: {e}"))?
+}
+
+/// 读网页端配置；凭证为空顺路补生成并落盘（首次打开设置页即有凭证可用）。
+#[tauri::command]
+fn get_webui_config() -> Result<webui_config::WebUiConfig, String> {
+    let data_dir = current_data_dir()?;
+    webui_config::load_ready(&data_dir)
+}
+
+/// save_webui_config 返回体（半成功语义，同 settle_settings_save 取舍）：配置
+/// 落盘是事实，防火墙失败不吞掉它——结构化回传错误 + 现成手动命令，前端分开展示。
+#[derive(Serialize)]
+pub struct WebUiSaveOutcome {
+    pub config: webui_config::WebUiConfig,
+    pub firewall_ok: bool,
+    pub firewall_error: Option<String>,
+    pub firewall_manual_cmd: Option<String>,
+}
+
+/// 保存网页端配置（enabled/segments/port；CIDR 与端口校验在 webui_config 纯核，
+/// 绕过前端的直调在此兜底拦下）。成功后同步防火墙规则：开 = 先删后建（幂等），
+/// 关 = 删规则；提权 UAC 弹窗等待用户响应，丢阻塞线程池跑、不冻 UI（async command）。
+/// 防火墙成败都落流水（D7）。
+#[tauri::command]
+async fn save_webui_config(input: webui_config::WebUiSaveInput) -> Result<WebUiSaveOutcome, String> {
+    let data_dir = current_data_dir()?;
+    let saved = webui_config::save_webui(&data_dir, &input)?;
+    let segments_text = if saved.segments.is_empty() {
+        "无".to_string()
+    } else {
+        saved.segments.join(",")
+    };
+    applog::log_action(&format!(
+        "网页端配置已保存：开关{}，端口 {}，网段 {}",
+        if saved.enabled { "开" } else { "关" },
+        saved.port,
+        segments_text,
+    ));
+    let fw_segments = saved.segments.clone();
+    let fw_port = saved.port;
+    let fw_enabled = saved.enabled;
+    let fw = tauri::async_runtime::spawn_blocking(move || {
+        firewall::sync(fw_enabled, &fw_segments, fw_port)
+    })
+    .await
+    .map_err(|e| format!("防火墙同步任务异常退出: {e}"))?;
+    let (firewall_ok, firewall_error, firewall_manual_cmd) = match fw {
+        Ok(()) => {
+            applog::log_action("防火墙规则已同步（AntFeedingLog WebUI）");
+            (true, None, None)
+        }
+        Err(e) => {
+            applog::log_error(&format!("防火墙规则同步失败: {}（手动命令已给前端）", e.message));
+            (false, Some(e.message), Some(e.manual_cmd))
+        }
+    };
+    Ok(WebUiSaveOutcome {
+        config: saved,
+        firewall_ok,
+        firewall_error,
+        firewall_manual_cmd,
+    })
+}
+
+/// 重生成访问凭证（旧地址即刻作废 = 覆盖写）。成功记一条动作流水（D7）。
+#[tauri::command]
+fn regenerate_token() -> Result<webui_config::WebUiConfig, String> {
+    let data_dir = current_data_dir()?;
+    let cfg = webui_config::regenerate_token(&data_dir)?;
+    applog::log_action("网页端访问凭证已重生成（旧地址即刻作废）");
+    Ok(cfg)
+}
+
+/// 完整访问地址 `http://<IP>:<端口>/#token=<凭证>`：按配置第一个受信网段上的
+/// 本机 IP 拼（多段取第一个）。网段当前不在线报错（如拔掉 NetBird 后）。
+/// async：网卡枚举不能占主线程。
+#[tauri::command]
+async fn get_access_url() -> Result<String, String> {
+    let data_dir = current_data_dir()?;
+    let cfg = webui_config::load_ready(&data_dir)?;
+    if cfg.segments.is_empty() {
+        return Err("尚未选择受信网段，先在设置里勾选".into());
+    }
+    let first = cfg.segments[0].clone();
+    let nics = tauri::async_runtime::spawn_blocking(netseg::list_nics)
+        .await
+        .map_err(|e| format!("网卡枚举任务异常退出: {e}"))??;
+    let ip = netseg::pick_ip_for_segment(&nics, &first).ok_or_else(|| {
+        format!("所选网段 {first} 上未发现本机地址（网段当前不在线？确认 NetBird/该网段已连接）")
+    })?;
+    Ok(webui_config::build_access_url(&ip, cfg.port, &cfg.token))
+}
+
+/// 网页端首启向导做过没有（缺省 = 未做，前端据此弹一次向导）。
+#[tauri::command]
+fn get_webui_wizard_done(state: tauri::State<'_, DbState>) -> Result<bool, String> {
+    with_conn(state, settings::get_webui_wizard_done)
+}
+
+/// 标记网页端首启向导已处理（完成或跳过都写；幂等）。
+#[tauri::command]
+fn mark_webui_wizard_done(state: tauri::State<'_, DbState>) -> Result<(), String> {
+    with_conn(state, settings::mark_webui_wizard_done)
+}
+
 // ── 日志与异常退出（数据安全二期票 01，D10 命令契约）──
 
 /// 打开日志文件夹（opener 打开数据目录下 logs/；目录不存在先创建）。
@@ -1184,6 +1303,13 @@ pub fn run() {
             export_data,
             get_stats,
             earliest_log_date,
+            list_network_segments,
+            get_webui_config,
+            save_webui_config,
+            regenerate_token,
+            get_access_url,
+            get_webui_wizard_done,
+            mark_webui_wizard_done,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

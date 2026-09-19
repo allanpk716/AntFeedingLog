@@ -15,6 +15,8 @@ pub const K_OVERDUE: &str = "notify_overdue_enabled";
 pub const K_HIBERNATION: &str = "notify_hibernation_enabled";
 pub const K_WAKE_AHEAD: &str = "wake_remind_days_ahead";
 pub const K_AUTOSTART: &str = "autostart_enabled";
+/// 网页端首启向导完成键（webui-checkin 票 03）：缺行/脏值 = 未做（false）。
+pub const K_WEBUI_WIZARD_DONE: &str = "webui_wizard_done";
 
 /// 临近出眠提前天数默认值（spec 设置节）。
 pub const DEFAULT_WAKE_AHEAD_DAYS: i64 = 7;
@@ -123,6 +125,18 @@ fn bool_str(b: bool) -> &'static str {
     }
 }
 
+/// 网页端首启向导做过没有（webui-checkin 票 03）：缺行/脏值回退未做（false），
+/// 升级老库首次启动会弹一次向导。独立函数不进 AppSettings——向导键与通知设置
+/// 互不相干，整体覆盖式 set_settings 不碰它。
+pub fn get_webui_wizard_done(conn: &Connection) -> Result<bool, String> {
+    read_bool(conn, K_WEBUI_WIZARD_DONE, false)
+}
+
+/// 标记向导已处理（完成或跳过都写）：幂等 upsert '1'。
+pub fn mark_webui_wizard_done(conn: &Connection) -> Result<(), String> {
+    upsert(conn, K_WEBUI_WIZARD_DONE, "1")
+}
+
 // ── 测试：只测外部行为（spec「Testing Decisions」）────────────────────────
 
 #[cfg(test)]
@@ -220,5 +234,27 @@ mod tests {
         assert!(s.notify_master_enabled, "缺行回退默认开");
         assert!(s.notify_hibernation_enabled, "脏值回退默认开");
         assert_eq!(s.wake_remind_days_ahead, 7, "脏值回退默认 7");
+    }
+
+    #[test]
+    fn webui_wizard_done_defaults_false_and_marks_once() {
+        // webui-checkin 票 03：向导键缺省=未做；标记后 true；set_settings 不碰它
+        let conn = mem_conn();
+        assert!(!get_webui_wizard_done(&conn).unwrap(), "缺省 = 未做（老库升级首次启动会弹向导）");
+        // 脏值回退未做
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, 'yes')",
+            params![K_WEBUI_WIZARD_DONE],
+        )
+        .unwrap();
+        assert!(!get_webui_wizard_done(&conn).unwrap(), "脏值回退未做");
+        mark_webui_wizard_done(&conn).unwrap();
+        assert!(get_webui_wizard_done(&conn).unwrap(), "标记后 = 已做");
+        mark_webui_wizard_done(&conn).unwrap(); // 幂等 upsert
+        assert!(get_webui_wizard_done(&conn).unwrap());
+
+        // 整体覆盖式 set_settings 不冲掉向导键（独立函数的取舍）
+        set_settings(&conn, &AppSettings::default()).unwrap();
+        assert!(get_webui_wizard_done(&conn).unwrap(), "通知设置保存不碰向导键");
     }
 }
