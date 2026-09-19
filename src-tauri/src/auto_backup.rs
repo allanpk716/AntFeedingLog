@@ -14,9 +14,13 @@
 //!   新数据（照片写库即算，票 07）；缺照片文件按 backup_pkg 降级（跳过+错误流水），
 //!   包照常产出；
 //! - 保留淘汰（D4）：[`stale_backup_names`] 只匹配自家命名
-//!   `ant-feeding-log-backup-<8位日期>-<6位时间>.zip`（旧版 `.db` 同名时间戳兼容
-//!   识别、照旧淘汰）且时间戳可解析的文件，按**文件名内时间戳**（非 mtime）排序
-//!   超 N 删最旧；手动备份/无关文件绝不触碰；
+//!   `ant-feeding-log-backup-<8位日期>-<6位时间>.zip` 且时间戳可解析的文件，按
+//!   **文件名内时间戳**（非 mtime）排序超 N 删最旧；无关文件绝不触碰。**两条
+//!   命名规则**（评审 R1）：自动备份 [`BACKUP_NAME_PREFIX`]（进轮换池）；手动
+//!   "安全备份" [`MANUAL_BACKUP_NAME_PREFIX`] `ant-feeding-log-manual-<时间戳>.zip`
+//!   ——前缀不同、**刻意不被 [`parse_backup_file_name`] 识别**，手动备份落进
+//!   自动备份目录也绝不进轮换池（"手动备份绝不触碰"由命名不可解析保证，不靠
+//!   调用方自觉）；旧版 `…-backup-<时间戳>.db` 兼容识别、照旧淘汰；
 //! - 触发点线程体 [`run_triggered`]：钳制持久化 → 谓词判定 → 两段式执行 →
 //!   记账/动作流水/保留淘汰。备份失败静默（记账 + 日志），绝不影响业务命令。
 //!
@@ -45,6 +49,18 @@ const LEGACY_BACKUP_NAME_SUFFIX: &str = ".db";
 /// 数据目录里两段式中转的临时文件名前缀（`auto-backup-staging-<时间戳>.db`）。
 pub const STAGING_PREFIX: &str = "auto-backup-staging-";
 
+/// 手动"安全备份"的文件名前缀（lib.rs backup_to 默认名，评审 R1）：
+/// `ant-feeding-log-manual-`。**刻意**与自动备份前缀不同——
+/// [`parse_backup_file_name`] 因此不识别它，手动备份落进自动备份目录也绝不
+/// 进保留轮换池（产物由用户自管，应用绝不触碰）。
+pub const MANUAL_BACKUP_NAME_PREFIX: &str = "ant-feeding-log-manual-";
+
+/// 手动备份两段式中转的临时文件名前缀（`manual-backup-staging-<时间戳>.db`）。
+/// 与自动备份的 [`STAGING_PREFIX`] 刻意分开：同一秒里"自动备份在跑 + 用户手动
+/// 备份"两条链的临时文件不撞名——内容互覆虽不损坏（都是锁内快照），但自动链
+/// 收尾的清理会删掉同名文件，手动链还在读就报"库快照读不了"。
+pub const MANUAL_STAGING_PREFIX: &str = "manual-backup-staging-";
+
 // ── 命名与解析（D3/D4 的地基）────────────────────────────────────────────
 
 /// 备份文件名时间戳：`YYYYMMDD-HHMMSS`（含时分秒——同日补跑不互相覆盖，D3）。
@@ -55,6 +71,13 @@ pub fn stamp_format(now: NaiveDateTime) -> String {
 /// 备份文件名：`ant-feeding-log-backup-YYYYMMDD-HHMMSS.zip`（数据包，票 09）。
 pub fn backup_file_name(stamp: &str) -> String {
     format!("{BACKUP_NAME_PREFIX}{stamp}{BACKUP_NAME_SUFFIX}")
+}
+
+/// 手动"安全备份"默认文件名：`ant-feeding-log-manual-YYYYMMDD-HHMMSS.zip`。
+/// 评审 R1：前缀与自动备份不同 → [`parse_backup_file_name`] 不识别 → 落进
+/// 备份目录也不进轮换池（手动产物由用户自管）。
+pub fn manual_backup_file_name(stamp: &str) -> String {
+    format!("{MANUAL_BACKUP_NAME_PREFIX}{stamp}{BACKUP_NAME_SUFFIX}")
 }
 
 /// 真实时钟的时间戳（编排层用；纯逻辑测试走 [`stamp_format`] 注入）。
@@ -223,7 +246,21 @@ pub fn enforce_retention(backup_dir: &Path, keep: usize) -> Result<usize, String
 /// journal_mode=DELETE 拷贝即完整，与手动备份 system::backup_db_file 同一依据）。
 /// 拷贝失败清掉半截临时文件。
 pub fn copy_db_to_temp(db_path: &Path, data_dir: &Path, stamp: &str) -> Result<PathBuf, String> {
-    let temp = data_dir.join(format!("{STAGING_PREFIX}{stamp}.db"));
+    copy_db_to_named_temp(db_path, data_dir, &format!("{STAGING_PREFIX}{stamp}.db"))
+}
+
+/// 手动备份同款阶段一（lib.rs backup_to 用，评审 R1）：独立
+/// [`MANUAL_STAGING_PREFIX`] 临时名，与自动备份同秒不撞名。
+pub fn copy_db_to_temp_manual(
+    db_path: &Path,
+    data_dir: &Path,
+    stamp: &str,
+) -> Result<PathBuf, String> {
+    copy_db_to_named_temp(db_path, data_dir, &format!("{MANUAL_STAGING_PREFIX}{stamp}.db"))
+}
+
+fn copy_db_to_named_temp(db_path: &Path, data_dir: &Path, temp_name: &str) -> Result<PathBuf, String> {
+    let temp = data_dir.join(temp_name);
     match crate::system::backup_db_file(db_path, &temp) {
         Ok(()) => Ok(temp),
         Err(e) => {
@@ -566,8 +603,33 @@ mod tests {
         assert_eq!(parse_backup_file_name("backup-20260918-090503.zip"), None);
         assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-090503.zip.bak"), None);
         assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-090503"), None);
+        // 手动备份命名（评审 R1，manual- 中缀）：绝不认——落进备份目录也不进轮换池
+        assert_eq!(
+            parse_backup_file_name(&manual_backup_file_name("20260918-090503")),
+            None,
+            "手动默认名不得被解析"
+        );
+        assert_eq!(parse_backup_file_name("ant-feeding-log-manual-20260918.zip"), None);
         // 双后缀（异常构造）：时间部分带尾巴 → 位数不对 → 不认
         assert_eq!(parse_backup_file_name("ant-feeding-log-backup-20260918-090503.db.zip"), None);
+    }
+
+    #[test]
+    fn manual_backup_default_name_is_never_in_rotation_pool() {
+        // 评审 R1 Important：手动"安全备份"默认名 manual- 中缀 → parse 不识别
+        // → enforce_retention 只对可解析文件动手 → 手动备份落进自动备份目录
+        // 也绝不被静默淘汰。
+        let name = manual_backup_file_name("20260919-103000");
+        assert_eq!(name, "ant-feeding-log-manual-20260919-103000.zip");
+        assert_eq!(parse_backup_file_name(&name), None);
+        // 混池判定：手动名与无关文件一样，绝不返回
+        let names = [
+            backup_file_name("20250101-000000"),
+            name.clone(),
+            "other.db".to_string(),
+        ];
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert_eq!(stale_backup_names(&refs, 0), vec![backup_file_name("20250101-000000")]);
     }
 
     // ── 触发谓词与钳制（D2 纯核心）───────────────────────────────────────
@@ -813,6 +875,29 @@ mod tests {
     }
 
     #[test]
+    fn same_second_manual_and_auto_staging_do_not_collide() {
+        // 评审 R1 Minor：手动链独立 staging 前缀——同一秒里自动链走完整两段式
+        // （含收尾清理 auto-backup-staging-<stamp>.db），手动链已落的临时文件
+        // 原封不动；撞名面（旧实现共前缀时自动链清掉手动链正在读的快照）消除。
+        let (_dir, data_dir, backup_dir, db_path) = io_fixture();
+        let stamp = "20260918-120000";
+        let manual_temp = copy_db_to_temp_manual(&db_path, &data_dir, stamp).unwrap();
+        assert!(manual_temp.exists());
+        assert_eq!(
+            manual_temp.file_name().unwrap().to_string_lossy(),
+            format!("{MANUAL_STAGING_PREFIX}{stamp}.db"),
+            "手动链临时名用独立前缀"
+        );
+        let target = copy_and_publish(&db_path, &data_dir, &backup_dir, stamp, || {
+            Ok::<_, String>(())
+        })
+        .unwrap();
+        assert!(target.exists(), "自动链正常产出");
+        assert!(manual_temp.exists(), "自动链的临时清理不得误删手动链 staging");
+        let _ = std::fs::remove_file(&manual_temp);
+    }
+
+    #[test]
     fn copy_and_publish_missing_db_fails_without_temp_or_target() {
         let (dir, data_dir, backup_dir, _db_path) = io_fixture();
         let err =
@@ -916,6 +1001,7 @@ mod tests {
             // 旧版纯库产物（票 09 前）：兼容识别，混池照旧淘汰
             "ant-feeding-log-backup-20241231-000000.db".to_string(), // 更旧 → 删
             "ant-feeding-log-backup-20250105.db".to_string(), // 手动备份命名：绝不碰
+            manual_backup_file_name("20250106-080000"), // 手动默认名（评审 R1）：绝不碰
             "my-manual-copy.db".to_string(),      // 无关 .db：绝不碰
             "说明文档.txt".to_string(),            // 文档：绝不碰
         ] {
@@ -925,8 +1011,12 @@ mod tests {
         assert_eq!(removed, 3, "只删超限的最旧自动备份（含旧版 .db 产物）");
         assert!(backup_dir.join(backup_file_name("20250103-000000")).exists());
         assert!(backup_dir.join(backup_file_name("20250104-235959")).exists());
-        assert!(backup_dir.join("ant-feeding-log-backup-20241231-000000.db").exists() == false, "旧版 .db 超限照旧淘汰");
+        assert!(!backup_dir.join("ant-feeding-log-backup-20241231-000000.db").exists(), "旧版 .db 超限照旧淘汰");
         assert!(backup_dir.join("ant-feeding-log-backup-20250105.db").exists(), "手动备份幸存");
+        assert!(
+            backup_dir.join(manual_backup_file_name("20250106-080000")).exists(),
+            "手动默认名落进备份目录也不被淘汰（评审 R1）"
+        );
         assert!(backup_dir.join("my-manual-copy.db").exists(), "无关 .db 幸存");
         assert!(backup_dir.join("说明文档.txt").exists(), "文档幸存");
     }

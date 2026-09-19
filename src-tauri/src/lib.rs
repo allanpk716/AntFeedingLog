@@ -1387,13 +1387,16 @@ fn date_stamp() -> String {
 async fn backup_to(state: tauri::State<'_, DbState>) -> Result<Option<String>, String> {
     let db_path = state.1.clone();
     let stamp = auto_backup::stamp_now();
-    let default_name = auto_backup::backup_file_name(&stamp);
+    // 评审 R1：手动命名 manual- 中缀——parse_backup_file_name 不识别 → 落进
+    // 自动备份目录也绝不进保留轮换池（手动产物由用户自管）。
+    let default_name = auto_backup::manual_backup_file_name(&stamp);
     let Some(target) = pick_save_path(&default_name, "蚂蚁饲养记录数据包（zip）", &["zip"]).await
     else {
         return Ok(None);
     };
     let data_dir = current_data_dir()?;
-    // 锁内拷库（对话框阶段不持锁，不卡其他命令）
+    // 锁内拷库（对话框阶段不持锁，不卡其他命令）；staging 用手动链独立前缀
+    //（manual-backup-staging-，评审 R1：与自动备份同秒不撞名）
     let temp_db = {
         let guard = match state.0.lock() {
             Ok(guard) => guard,
@@ -1402,7 +1405,7 @@ async fn backup_to(state: tauri::State<'_, DbState>) -> Result<Option<String>, S
                 return Err(e.to_string());
             }
         };
-        let copied = auto_backup::copy_db_to_temp(&db_path, &data_dir, &stamp);
+        let copied = auto_backup::copy_db_to_temp_manual(&db_path, &data_dir, &stamp);
         drop(guard); // 照片打包在锁外，不阻塞业务命令
         copied?
     };

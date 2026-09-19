@@ -23,6 +23,8 @@ describe("恢复摘要展示（数据安全二期票 04）", () => {
   it("固定确认文案同时点明替换语义与备份设置不回滚（D5/D1）", () => {
     expect(RESTORE_CONFIRM_TEXT).toContain("整体替换");
     expect(RESTORE_CONFIRM_TEXT).toContain("备份设置保持当前值");
+    // 评审 R1：窗口期写入会被恢复覆盖丢弃，确认文案如实点明
+    expect(RESTORE_CONFIRM_TEXT).toContain("恢复期间新产生的记录不会保留");
   });
 
   it("摘要行按固定顺序展示四项（验收 1 的数据面）", () => {

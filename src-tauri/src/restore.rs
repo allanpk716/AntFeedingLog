@@ -466,7 +466,8 @@ pub fn run_preview(
 /// preview 与 apply 之间源文件可能被换）→ 快照（步骤 3）→ 替换重载（步骤 4）。
 /// 锁窗口拆两段（票 09）：快照阶段一（锁内拷库，毫秒级）与替换共用锁纪律，
 /// 快照阶段二的照片打包在锁外（照片文件 immutable 文件名，读字节稳定；两锁
-/// 之间的业务写入随后被整库替换覆盖，无损）。每段拿锁都走同一 `take_lock`
+/// 之间的业务写入会被恢复覆盖丢弃——恢复点之后的写本就属被弃范围，如实说
+/// 不是"无损"）。每段拿锁都走同一 `take_lock`
 /// 闭包——锁内禁写复查（评审 R1 TOCTOU）在两段都生效。staging 无论成败一律清理。
 pub fn run_apply<G, L, O>(
     source: &Path,
@@ -830,6 +831,32 @@ mod tests {
         assert!(names.contains(&"pre-restore-20250105.db".to_string()), "手动命名幸存");
         assert!(names.contains(&"my-notes.txt".to_string()), "无关文件幸存");
         assert!(data_dir.join(snapshot_file_name("20240101-000000")).is_dir(), "目录绝不触碰");
+    }
+
+    #[test]
+    fn retain_snapshots_mixed_zip_and_legacy_db_pool_prunes_oldest() {
+        // 评审 R1 Minor：快照保留淘汰混池——新 .zip 与旧 .db（票 09 前产物）
+        // 同一时间戳池排序，超限删最旧；与 auto_backup 混池测试对齐
+        let (_dir, data_dir, _db_path) = fixture();
+        for name in [
+            snapshot_file_name("20250101-000000"),        // zip 最旧 → 删
+            "pre-restore-20250102-000000.db".to_string(), // 旧 .db 次旧 → 删（兼容淘汰）
+            snapshot_file_name("20250103-000000"),        // 留
+            "pre-restore-20250104-000000.db".to_string(), // 留（旧 .db）
+        ] {
+            std::fs::write(data_dir.join(&name), "x").unwrap();
+        }
+
+        retain_snapshots(&data_dir, 2).unwrap();
+
+        let names = list_names(&data_dir);
+        assert!(!names.contains(&snapshot_file_name("20250101-000000")), "zip 最旧被淘汰");
+        assert!(
+            !names.contains(&"pre-restore-20250102-000000.db".to_string()),
+            "旧 .db 超限照旧淘汰"
+        );
+        assert!(names.contains(&snapshot_file_name("20250103-000000")));
+        assert!(names.contains(&"pre-restore-20250104-000000.db".to_string()));
     }
 
     #[test]
