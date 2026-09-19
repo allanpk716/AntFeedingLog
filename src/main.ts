@@ -2,6 +2,7 @@ import { createApp } from "vue";
 import App from "./App.vue";
 import { logFrontendError } from "./lib/ipc";
 import { captureTokenFromHash } from "./lib/webuiEntry";
+import { installContextMenuShield } from "./lib/shell";
 
 // 网页端进门凭证入口（webui-checkin 票 05，规格 B）：挂载前先把 #token= 落进
 // localStorage——组件挂载后立刻会发首批请求，凭证必须先就位；顺路清净地址栏。
@@ -24,5 +25,8 @@ window.addEventListener("error", (e) => {
 window.addEventListener("unhandledrejection", (e) => {
   reportFrontendError(e.reason ?? "未处理的 Promise 拒绝");
 });
+
+// 交互第三轮 #2：屏蔽 web 原生右键菜单（输入框内保留）
+installContextMenuShield();
 
 createApp(App).mount("#app");

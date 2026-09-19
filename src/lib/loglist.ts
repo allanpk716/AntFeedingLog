@@ -6,13 +6,14 @@
  * 新挂停用项拒绝（后端同口径兜底）。
  */
 
-import type { CareActionItem, FoodItem, LogFilter, LogUpdateInput } from "../types";
+import type { CareActionItem, Colony, FoodItem, LogFilter, LogUpdateInput } from "../types";
 
 /** 页大小：与 Rust 端 list_logs 缺省一致 */
 export const LOG_PAGE_SIZE = 50;
 
 /** 筛选表单原始态（空串 = 未填，null = 未选） */
 export interface LogFilterForm {
+  locationId: number | null;
   colonyId: number | null;
   actionId: number | null;
   start: string;
@@ -21,13 +22,14 @@ export interface LogFilterForm {
 }
 
 export function emptyFilterForm(): LogFilterForm {
-  return { colonyId: null, actionId: null, start: "", end: "", keyword: "" };
+  return { locationId: null, colonyId: null, actionId: null, start: "", end: "", keyword: "" };
 }
 
 /** 表单 → IPC 入参：空串/纯空白收敛 null，关键词 trim；offset 供「加载更多」 */
 export function buildLogFilter(form: LogFilterForm, offset = 0): LogFilter {
   const kw = form.keyword.trim();
   return {
+    location_id: form.locationId,
     colony_id: form.colonyId,
     action_id: form.actionId,
     start: form.start === "" ? null : form.start,
@@ -85,4 +87,10 @@ export function formatLogTime(occurredAt: string): string {
 /** 「加载更多」的下一页 offset；取完（或空）为 null（按钮隐藏） */
 export function nextOffset(loadedCount: number, total: number): number | null {
   return loadedCount < total ? loadedCount : null;
+}
+
+/** 地点→窝 级联（交互第三轮 #1）：选了地点，窝下拉只列该地点的窝 */
+export function colonyOptionsFor(colonies: Colony[], locationId: number | null): Colony[] {
+  if (locationId === null) return colonies;
+  return colonies.filter((c) => c.location_id === locationId);
 }

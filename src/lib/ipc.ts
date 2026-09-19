@@ -42,6 +42,7 @@ import type {
   LogFilter,
   LogPage,
   LogUpdateInput,
+  MonthDayRecords,
   NestCheckin,
   NestPhotoMeta,
   OrphanCleanOutcome,
@@ -374,6 +375,10 @@ export const eraseLocation = cmdFn<{ id: number }, void>("erase_location");
 // ── 记录列表页（LogListPage）──
 
 export const listActions = cmdFn<void, CareActionItem[]>("list_actions");
+export const colonyMonthRecords = cmdFn<
+  { colonyId: number; year: number; month: number; excludeLogId?: number | null },
+  MonthDayRecords[]
+>("colony_month_records");
 export const listLogs = cmdFn<{ filter: LogFilter }, LogPage>("list_logs");
 export const updateLog = cmdFn<{ id: number; input: LogUpdateInput }, void>("update_log");
 export const deleteLog = cmdFn<{ id: number }, void>("delete_log");

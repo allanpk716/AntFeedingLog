@@ -195,6 +195,33 @@ impl ValidatedArgs for ColonyIdArgs {
     }
 }
 
+/// `{ colonyId, year, month, excludeLogId? }` 形命令（colony_month_records，
+/// 交互第三轮日历标记数据源；打卡面板/记录页/编辑弹窗在用，桌面与网页共用）。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ColonyMonthRecordsArgs {
+    pub colony_id: i64,
+    pub year: i64,
+    pub month: i64,
+    pub exclude_log_id: Option<i64>,
+}
+
+impl ValidatedArgs for ColonyMonthRecordsArgs {
+    fn validate(&self) -> Result<(), String> {
+        check_id(self.colony_id, "colonyId")?;
+        if !(1970..=2100).contains(&self.year) {
+            return Err("年份需在 1970–2100 之间".into());
+        }
+        if !(1..=12).contains(&self.month) {
+            return Err("月份需在 1–12 之间".into());
+        }
+        if let Some(id) = self.exclude_log_id {
+            check_id(id, "excludeLogId")?;
+        }
+        Ok(())
+    }
+}
+
 // ── 打卡：log_care ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -263,6 +290,8 @@ impl ValidatedArgs for ListLogsArgs {
 #[serde(deny_unknown_fields)]
 pub struct LogFilterArgs {
     #[serde(default)]
+    pub location_id: Option<i64>,
+    #[serde(default)]
     pub colony_id: Option<i64>,
     #[serde(default)]
     pub action_id: Option<i64>,
@@ -280,6 +309,9 @@ pub struct LogFilterArgs {
 
 impl LogFilterArgs {
     fn validate(&self) -> Result<(), String> {
+        if let Some(v) = self.location_id {
+            check_id(v, "location_id")?;
+        }
         if let Some(v) = self.colony_id {
             check_id(v, "colony_id")?;
         }
@@ -312,6 +344,7 @@ impl LogFilterArgs {
 
     pub fn into_core(self) -> care::LogFilter {
         care::LogFilter {
+            location_id: self.location_id,
             colony_id: self.colony_id,
             action_id: self.action_id,
             start: self.start,

@@ -1,13 +1,15 @@
 <script setup lang="ts">
 /**
- * 窝卡片：名字、物种徽章、状态徽章、饲养天数大数字（Rust 算好），
- * + 冬眠横幅（票 05：入眠日/预计出眠/剩余天数，预计出眠前 7 天内加「临近出眠」角标）
- * + 动态操作块（每个启用操作一块，2 列自适应；非喂食弹 QuickLogDialog 打卡面板，喂食弹 FeedDialog）
- * + 最近记录摘要行。展示态口径见 lib/care.ts（视觉基线 mock-a-light）。
- * 冬眠卡：整卡灰化、操作块静音但仍可记账；「开始冬眠 / 确认出眠 / 补录冬眠」入口在卡片底部。
- * 记账/冬眠操作成功后抛 saved 让外层 refresh（数据驱动重算）。
+ * 窝卡片（交互第三轮 #7 紧凑版，视觉基线 mocks/mock-c-home-cards.html）：
+ * 单行头（名字/物种徽章/状态徽章/饲养天数内联），去开始日期行；操作块单行 chip 两列；
+ * 最近记录单行截断；低频操作（开始冬眠/确认出眠/补录冬眠/编辑）收进「⋯」菜单——
+ * 动作执行即收（menuAction 包装）、点卡片外即收（document click 监听 + 卡片 contains
+ * 自身守卫，dots 不拦冒泡，跨卡点 dots 时旧卡菜单即收=关旧开新）；
+ * 菜单容器 v-show 保 DOM，按钮保留原类名
+ * （edit-btn/hib-btn/wake-btn/past-btn），既有测试直接点这些按钮不受影响。
+ * 冬眠横幅瘦成一条，「改期」入口保留。记账/冬眠成功抛 saved 让外层 refresh（数据驱动重算）。
  */
-import { computed, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import type { Colony, ColonyAction } from "../types";
 import { isTauri } from "../lib/ipc";
 import { actionTile, feedingTooltip, formatRecent, isFeeding, type TileView } from "../lib/care";
@@ -45,6 +47,31 @@ const recentLine = computed(() => formatRecent(props.colony.recent));
 
 /** 巢况摘要行（webui-checkin 票 02）：最新一组数 + 距上次登记天数；从未登记为空串（隐藏）。 */
 const checkinLine = computed(() => checkinCardLine(props.colony.checkin));
+
+// ── 「⋯」菜单（交互第三轮 #7）：开合 + 两路收起 ──
+const menuOpen = ref(false);
+const cardRef = ref<HTMLElement | null>(null);
+
+function toggleMenu() {
+  menuOpen.value = !menuOpen.value;
+}
+
+/** 菜单动作执行即收（复审 #12）；点卡片外也收（document click，含点别卡 dots 的跨卡场景）。 */
+function menuAction(fn: () => void) {
+  menuOpen.value = false;
+  fn();
+}
+
+/** 点自身卡内（含 dots）不收——dots 靠 toggle 开合；点卡外（别卡/空白处）即收。 */
+function onDocClick(e: MouseEvent) {
+  if (!menuOpen.value) return;
+  const root = cardRef.value;
+  if (root !== null && e.target instanceof Node && root.contains(e.target)) return;
+  menuOpen.value = false;
+}
+
+onMounted(() => document.addEventListener("click", onDocClick));
+onBeforeUnmount(() => document.removeEventListener("click", onDocClick));
 
 const showFeed = ref(false);
 const feedAction = ref<ColonyAction | null>(null);
@@ -96,23 +123,15 @@ function onCheckinSaved() {
 </script>
 
 <template>
-  <article class="card" :class="{ hib: hibernating }" :data-colony-id="colony.id">
+  <article ref="cardRef" class="card" :class="{ hib: hibernating }" :data-colony-id="colony.id">
     <div class="chead">
-      <div>
-        <div class="cname">{{ colony.name }}</div>
-        <div class="chips">
-          <span v-if="colony.species" class="chip sp">{{ colony.species }}</span>
-          <span class="chip st" :class="{ hib: colony.status === 'hibernating' }">
-            {{ STATUS_TEXT[colony.status] }}
-          </span>
-        </div>
-      </div>
-      <div class="daysbox">
-        <div class="n">{{ colony.days_raised }}</div>
-        <div class="l">已饲养 / 天</div>
-      </div>
+      <span class="cname">{{ colony.name }}</span>
+      <span v-if="colony.species" class="chip sp">{{ colony.species }}</span>
+      <span class="chip st" :class="{ hib: colony.status === 'hibernating' }">
+        {{ STATUS_TEXT[colony.status] }}
+      </span>
+      <span class="daysbox"><span class="n">{{ colony.days_raised }}</span> <span class="l">天</span></span>
     </div>
-    <div class="start">开始饲养 {{ colony.start_date }}</div>
 
     <div v-if="banner" class="banner" data-testid="hib-banner">
       {{ banner.line }}
@@ -138,15 +157,17 @@ function onCheckinSaved() {
         :title="a.is_feeding && a.foods.length > 0 ? feedingTooltip(a.foods) : undefined"
         @click="onTile(a)"
       >
-        <span class="t-head">
-          <span v-if="a.icon" class="t-ico">{{ a.icon }}</span>{{ a.name }}
-          <span v-if="a.kind === 'log_only'" class="t-tag">仅登记</span>
-        </span>
+        <span v-if="a.icon" class="t-ico">{{ a.icon }}</span>
+        <span class="t-name">{{ a.name }}</span>
+        <span v-if="a.kind === 'log_only'" class="t-tag">仅登记</span>
         <span class="pill">{{ view.text }}</span>
       </button>
     </div>
 
-    <div v-if="recentLine" class="recent">{{ recentLine }}</div>
+    <div class="foot">
+      <span class="recent">{{ recentLine }}</span>
+      <button class="dots" type="button" title="编辑 / 冬眠等更多操作" @click="toggleMenu">⋯</button>
+    </div>
 
     <div v-if="checkinLine" class="checkin-line" data-testid="checkin-line">{{ checkinLine }}</div>
 
@@ -154,34 +175,38 @@ function onCheckinSaved() {
       <button class="checkin-btn" type="button" title="蚁口 / 换巢 / 备注的时间线" @click="showCheckin = true">
         巢况
       </button>
+    </div>
+
+    <!-- 交互第三轮 #7：低频操作收进 ⋯ 菜单（v-show 保 DOM，按钮原类名与测试兼容） -->
+    <div v-show="menuOpen" class="card-menu" @click.stop>
       <button
         v-if="colony.status === 'active'"
-        class="hib-btn"
+        class="m-item hib-btn"
         type="button"
         title="期间提醒静音、仍可记账"
-        @click="openHibernation('start')"
+        @click="menuAction(() => openHibernation('start'))"
       >
         ❄ 开始冬眠
       </button>
       <button
         v-if="hibernating"
-        class="wake-btn"
+        class="m-item wake-btn"
         type="button"
-        @click="openHibernation('wake')"
+        @click="menuAction(() => openHibernation('wake'))"
       >
         ☀ 确认出眠
       </button>
       <button
         v-if="colony.status !== 'ended'"
-        class="past-btn"
+        class="m-item past-btn"
         type="button"
         title="补录已闭合的过去冬眠段"
-        @click="openHibernation('past')"
+        @click="menuAction(() => openHibernation('past'))"
       >
-        补录冬眠
+        📅 补录冬眠
       </button>
       <!-- 终局评审：窝的编辑是桌面专属（网页端 API 白名单挡住 update_colony 等），浏览器不渲染入口 -->
-      <button v-if="isTauri()" class="edit-btn" type="button" @click="$emit('edit')">编辑</button>
+      <button v-if="isTauri()" class="m-item edit-btn" type="button" @click="menuAction(() => emit('edit'))">✏️ 编辑窝信息</button>
     </div>
 
     <FeedDialog
@@ -216,41 +241,37 @@ function onCheckinSaved() {
 
 <style scoped>
 .card {
+  position: relative;
   background: var(--card);
   border: 1px solid var(--border);
-  border-radius: 14px;
-  padding: 16px;
+  border-radius: 12px;
+  padding: 10px 12px;
   box-shadow: var(--shadow);
 }
 
-/* 冬眠整卡灰化（视觉照 mock-a-light 的 .card.hib：顶部向下渐隐的冷灰） */
+/* 冬眠整卡灰化（顶部向下渐隐的冷灰） */
 .card.hib {
-  background: linear-gradient(180deg, var(--hib-soft), var(--card) 55%);
+  background: linear-gradient(180deg, var(--hib-soft), var(--card) 60%);
 }
 
 .chead {
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
+  align-items: center;
+  gap: 8px;
 }
 
 .cname {
-  font-size: 17px;
+  font-size: 15px;
   font-weight: 700;
-}
-
-.chips {
-  margin-top: 3px;
-  display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
+  white-space: nowrap;
 }
 
 .chip {
-  font-size: 12px;
-  padding: 1px 9px;
+  font-size: 11px;
+  padding: 0 8px;
   border-radius: 999px;
   border: 1px solid transparent;
+  white-space: nowrap;
 }
 
 .chip.sp {
@@ -270,34 +291,27 @@ function onCheckinSaved() {
 
 .daysbox {
   margin-left: auto;
-  text-align: right;
+  white-space: nowrap;
 }
 
 .daysbox .n {
-  font-size: 24px;
+  font-size: 16px;
   font-weight: 800;
-  line-height: 1.1;
 }
 
 .daysbox .l {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--muted);
 }
 
-.start {
-  margin-top: 6px;
-  font-size: 12px;
-  color: var(--muted);
-}
-
-/* ── 冬眠横幅（票 05，视觉照 mock-a-light 的 .banner/.chip.wake）── */
+/* ── 冬眠横幅：瘦成一条 ── */
 .banner {
-  margin: 12px 0 4px;
-  padding: 8px 12px;
-  border-radius: 10px;
+  margin-top: 8px;
+  padding: 4px 10px;
+  border-radius: 8px;
   background: var(--hib-soft);
   color: var(--hib);
-  font-size: 13px;
+  font-size: 12px;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -310,7 +324,7 @@ function onCheckinSaved() {
   font-weight: 600;
 }
 
-/* 横幅上的「改期」入口（票 09 停靠 D） */
+/* 横幅上的「改期」入口（票 09 停靠 D，改期入口保留） */
 .resched-btn {
   margin-left: auto;
   border: 1px solid var(--border);
@@ -318,7 +332,7 @@ function onCheckinSaved() {
   color: var(--hib);
   font: inherit;
   font-size: 11px;
-  padding: 1px 10px;
+  padding: 0 8px;
   border-radius: 999px;
   cursor: pointer;
   white-space: nowrap;
@@ -329,66 +343,59 @@ function onCheckinSaved() {
   color: var(--text);
 }
 
-/* ── 操作块（视觉照 mock-a-light 的 .tiles/.tile/.t-tag/.pill）── */
+/* ── 操作块：单行 chip，2 列（mock C1）── */
 .tiles {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 10px;
-  margin-top: 12px;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .tile {
   border: 1px solid var(--border);
   background: var(--tile);
-  border-radius: 11px;
-  padding: 10px 12px;
+  border-radius: 9px;
+  padding: 5px 9px;
   cursor: pointer;
-  text-align: left;
   font: inherit;
   color: var(--text);
   display: flex;
-  flex-direction: column;
+  align-items: center;
   gap: 6px;
+  font-size: 13px;
   transition: 0.12s;
+  min-width: 0;
 }
 
 .tile:hover {
   border-color: var(--accent);
-  transform: translateY(-1px);
-}
-
-.tile.ok:hover {
-  box-shadow: 0 3px 10px rgba(180, 83, 9, 0.12);
-}
-
-.tile .t-head {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-weight: 600;
-  font-size: 14px;
 }
 
 .tile .t-ico {
-  font-size: 16px;
+  font-size: 14px;
+}
+
+.tile .t-name {
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .t-tag {
-  margin-left: auto;
   font-size: 10px;
   font-weight: 400;
   color: var(--muted);
   border: 1px solid var(--border);
-  padding: 0 6px;
+  padding: 0 5px;
   border-radius: 999px;
   white-space: nowrap;
 }
 
 .pill {
-  align-self: flex-start;
-  font-size: 12px;
-  padding: 1px 9px;
+  margin-left: auto;
+  font-size: 11px;
+  padding: 0 8px;
   border-radius: 999px;
+  white-space: nowrap;
 }
 
 .tile.reg .pill,
@@ -405,10 +412,6 @@ function onCheckinSaved() {
 .tile.bad {
   border-color: var(--bad);
   background: var(--bad-soft);
-}
-
-.tile.bad:hover {
-  box-shadow: 0 3px 10px rgba(209, 61, 61, 0.15);
 }
 
 .tile.bad .pill {
@@ -430,15 +433,23 @@ function onCheckinSaved() {
 .tile:disabled {
   opacity: 0.6;
   cursor: default;
-  transform: none;
+}
+
+/* ── 底部行（最近记录截断一行）+「⋯」菜单 ── */
+.foot {
+  margin-top: 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .recent {
-  margin-top: 12px;
-  font-size: 12px;
+  flex: 1;
+  font-size: 11px;
   color: var(--muted);
-  border-top: 1px dashed var(--border);
-  padding-top: 9px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 巢况摘要行（webui-checkin 票 02）：与最近记录行同字号，紧随其后 */
@@ -456,10 +467,7 @@ function onCheckinSaved() {
   gap: 6px;
 }
 
-.edit-btn,
-.hib-btn,
-.wake-btn,
-.past-btn,
+/* 巢况按钮沿用卡片按钮基样式（其余低频按钮已收进 ⋯ 菜单，样式随菜单） */
 .checkin-btn {
   border: 1px solid var(--border-strong);
   background: var(--card);
@@ -471,27 +479,58 @@ function onCheckinSaved() {
   cursor: pointer;
 }
 
-.edit-btn:hover,
-.hib-btn:hover,
-.wake-btn:hover,
-.past-btn:hover,
+.dots {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+  cursor: pointer;
+  padding: 0 4px;
+  border-radius: 6px;
+  line-height: 1;
+}
+
 .checkin-btn:hover {
   border-color: var(--accent);
   color: var(--accent-deep);
 }
 
-/* 冬眠相关入口沿用冷灰系，与横幅呼应 */
-.hib-btn,
-.wake-btn {
-  background: var(--hib-soft);
-  color: var(--hib);
-  border-color: var(--border);
-}
-
-.hib-btn:hover,
-.wake-btn:hover {
-  border-color: var(--hib);
+.dots:hover {
+  background: var(--tile);
   color: var(--text);
 }
-</style>
 
+.card-menu {
+  position: absolute;
+  right: 10px;
+  bottom: 34px;
+  background: var(--card);
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(60, 50, 30, 0.15);
+  padding: 4px;
+  z-index: 20;
+  min-width: 108px;
+}
+
+.m-item {
+  display: block;
+  width: 100%;
+  border: none;
+  background: transparent;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.m-item:hover {
+  background: var(--accent-soft);
+  color: var(--accent-deep);
+}
+</style>

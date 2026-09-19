@@ -3,6 +3,8 @@ import { flushPromises, mount } from "@vue/test-utils";
 import App from "./App.vue";
 import type { AppSettings, CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
 import { addDays, todayIso, todayLabel } from "./lib/dates";
+import DateTimeField from "./components/DateTimeField.vue";
+import DatePickerPop from "./components/DatePickerPop.vue";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（命令包装按 cmdName 透传给唯一的
 // invokeMock，调用形状 (命令名, 入参) 与旧式 vi.mock("@tauri-apps/api/core") 一致）；
@@ -125,6 +127,8 @@ function baseMock() {
         return { total: 0, rows: [] };
       case "get_settings":
         return currentSettings;
+      case "colony_month_records":
+        return []; // 打卡/喂食弹窗挂载即拉当月标记；默认空月（黄条/标记用例各自覆写）
       default:
         return null;
     }
@@ -169,8 +173,10 @@ describe("首页卡片墙", () => {
     expect(home.find(".chip.sp").text()).toBe("大头收获蚁");
     expect(home.find(".chip.st").text()).toContain("活跃");
     expect(home.find(".daysbox .n").text()).toBe("241");
-    expect(home.text()).toContain("已饲养 / 天");
-    expect(home.text()).toContain("开始饲养 2026-01-20");
+    // 交互第三轮 #7 紧凑形态：天数内联为「241 天」，无「已饲养 / 天」文案、无开始日期行
+    expect(home.find(".daysbox").text()).toContain("241");
+    expect(home.text()).not.toContain("已饲养 / 天");
+    expect(home.text()).not.toContain("开始饲养 2026-01-20");
 
     const corpCards = wrapper.findAll(".group")[1].findAll(".card");
     expect(corpCards.map((c) => c.find(".cname").text())).toEqual(["针毛一号", "大头二号"]);
@@ -253,14 +259,27 @@ describe("首页卡片墙", () => {
     );
     const wrapper = await mountApp();
     expect(wrapper.find(".empty").text()).toContain("暂无窝");
-    expect(wrapper.find(".new-colony").exists()).toBe(true);
+    // 新建窝入口挪到顶栏（交互第三轮 #7）
+    expect(wrapper.find(".topbar .new-top-btn").exists()).toBe(true);
+  });
+
+  it("紧凑卡片：⋯ 菜单默认隐藏，点开可见编辑/冬眠入口（交互第三轮 #7）", async () => {
+    const wrapper = await mountApp();
+    const card = wrapper.find('.card[data-colony-id="1"]');
+    const menu = card.find(".card-menu");
+    expect(menu.exists()).toBe(true);
+    expect((menu.element as HTMLElement).style.display).toBe("none");
+    await card.find(".dots").trigger("click");
+    expect((menu.element as HTMLElement).style.display).not.toBe("none");
+    expect(menu.find(".edit-btn").exists()).toBe(true);
+    expect(menu.find(".hib-btn").exists()).toBe(true);
   });
 });
 
 describe("新建窝", () => {
   it("填表提交调用 create_colony（trim 后的 snake_case 入参），成功后关弹窗并刷新", async () => {
     const wrapper = await mountApp();
-    await wrapper.find(".new-colony").trigger("click");
+    await wrapper.find(".new-top-btn").trigger("click");
 
     const dialog = wrapper.find(".dialog");
     expect(dialog.exists()).toBe(true);
@@ -269,7 +288,7 @@ describe("新建窝", () => {
     await dialog.find(".name-input").setValue("  新窝一号  ");
     await dialog.find(".species-input").setValue("针毛收获蚁");
     await dialog.find(".location-select").setValue("1");
-    await dialog.find(".date-input").setValue("2026-09-18");
+    await dialog.findComponent(DatePickerPop).vm.$emit("update:modelValue", "2026-09-18");
 
     invokeMock.mockClear();
     await dialog.find(".submit-btn").trigger("click");
@@ -291,7 +310,7 @@ describe("新建窝", () => {
 
   it("重名（含首尾空格差异）被前端拦截，不发起 create_colony", async () => {
     const wrapper = await mountApp();
-    await wrapper.find(".new-colony").trigger("click");
+    await wrapper.find(".new-top-btn").trigger("click");
 
     const dialog = wrapper.find(".dialog");
     await dialog.find(".name-input").setValue("  大头一号 ");
@@ -313,7 +332,7 @@ describe("编辑窝", () => {
     expect((dialog.find(".name-input").element as HTMLInputElement).value).toBe("大头一号");
     expect((dialog.find(".species-input").element as HTMLInputElement).value).toBe("大头收获蚁");
     expect((dialog.find(".location-select").element as HTMLSelectElement).value).toBe("1");
-    expect((dialog.find(".date-input").element as HTMLInputElement).value).toBe("2026-01-20");
+    expect(dialog.findComponent(DatePickerPop).props("modelValue")).toBe("2026-01-20");
 
     await dialog.find(".name-input").setValue("大头一号B");
     await dialog.find(".status-select").setValue("ended");
@@ -337,7 +356,7 @@ describe("编辑窝", () => {
   it("状态下拉只有 活跃/已结束（冬眠走「开始冬眠」流程，定点修 5）；编辑冬眠窝时该状态禁用显示且保存不改变它", async () => {
     // 新建：无「冬眠中」选项
     const wrapper = await mountApp();
-    await wrapper.find(".new-colony").trigger("click");
+    await wrapper.find(".new-top-btn").trigger("click");
     let options = wrapper.findAll(".status-select option");
     expect(options.map((o) => o.text())).toEqual(["活跃", "已结束"]);
 
@@ -754,6 +773,12 @@ describe("顶栏导航（票 07/08）", () => {
     expect(wrapper.find(".log-list").exists()).toBe(false);
   });
 
+  it("外壳：顶栏之外有独立滚动容器 .page-body（交互第三轮 #6）", async () => {
+    const wrapper = await mountApp();
+    expect(wrapper.find(".page-body").exists()).toBe(true);
+    expect(wrapper.find(".topbar").exists()).toBe(true);
+  });
+
   it("记录页里改动记录后抛 changed：首页数据即时重算（票 08 验收 5 的接线）", async () => {
     const wrapper = await mountApp();
     await wrapper.findAll(".topbar .tab")[2].trigger("click");
@@ -1079,7 +1104,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(dialog.exists()).toBe(true);
     expect(dialog.find("h3").text()).toBe("记录活动区换水 · 大头一号");
 
-    await dialog.find(".time-input").setValue("2026-09-17T21:00");
+    await dialog.findComponent(DateTimeField).vm.$emit("update:modelValue", "2026-09-17T21:00");
     colony1With([{ ...waterReg, days_since_last: 0 }]);
     invokeMock.mockClear();
     await dialog.find(".record-btn").trigger("click");
@@ -1128,7 +1153,7 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(chips[0].classes()).not.toContain("selected");
 
     // 补录昨天时间（验收 3：距上次按发生时间算，Rust 侧覆盖计算）
-    await dialog.find(".time-input").setValue("2026-09-17T21:00");
+    await dialog.findComponent(DateTimeField).vm.$emit("update:modelValue", "2026-09-17T21:00");
     await dialog.find(".note-input").setValue("  加餐  ");
 
     invokeMock.mockClear();
@@ -1178,6 +1203,30 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "log_care")).toBe(false);
   });
 
+  it("喂食弹窗：今天已有喂食记录 → 黄条提醒但不拦提交（交互第三轮 #8）", async () => {
+    colony1With([feedCustom]);
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "colony_month_records") {
+        return [{ day: +todayIso().slice(8, 10), action_id: 9, count: 1, last_time: `${todayIso()} 08:00:00` }];
+      }
+      if (cmd === "log_care") return 5;
+      if (cmd === "list_colonies") return currentColonies;
+      if (cmd === "list_locations") return locations;
+      if (cmd === "list_foods") return foods;
+      if (cmd === "list_actions") return actions; // 弹窗 markers 名字表全量来源（终局评审口径）
+      return null;
+    });
+    const wrapper = await mountApp();
+    await wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="9"]').trigger("click");
+    await flushPromises();
+    const dlg = wrapper.find(".feed-dialog");
+    expect(dlg.find(".dup-warn").text()).toContain("已有 1 条");
+    await dlg.findAll(".food")[0].trigger("click");
+    await dlg.find(".record-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "log_care")).toBe(true);
+  });
+
   it("冬眠窝的操作块全部静音态：不红、文案带（静音）", async () => {
     currentColonies = colonies.map((c) =>
       c.id === 3 ? { ...c, actions: [feedOverdue] } : c,
@@ -1198,6 +1247,8 @@ describe("卡片操作块与一键记账（票 03）", () => {
         case "log_care": throw "操作「活动区换水」已停用，不能新记";
         case "list_colonies": return currentColonies;
         case "list_locations": return locations;
+        case "colony_month_records": return []; // 弹窗挂载拉当月标记，给空月
+        case "list_actions": return actions; // 弹窗 markers 名字表全量来源（终局评审口径）
         default: return null;
       }
     });
@@ -1245,13 +1296,13 @@ describe("冬眠管理（票 05）", () => {
 
     const dialog = wrapper.find(".hibernation-dialog");
     expect(dialog.exists()).toBe(true);
-    const start = (dialog.find(".start-input").element as HTMLInputElement).value;
+    const start = dialog.findAllComponents(DatePickerPop)[0].props("modelValue") as string;
     expect(start).toBe(todayIso());
-    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe(addDays(start, 120));
+    expect(dialog.findAllComponents(DatePickerPop)[1].props("modelValue")).toBe(addDays(start, 120));
 
-    await dialog.find(".start-input").setValue("2026-12-01");
+    await dialog.findAllComponents(DatePickerPop)[0].vm.$emit("update:modelValue", "2026-12-01");
     // 手动改预计结束（选完开始日自动预填、但用户可改）
-    await dialog.find(".end-input").setValue("2027-04-15");
+    await dialog.findAllComponents(DatePickerPop)[1].vm.$emit("update:modelValue", "2027-04-15");
 
     invokeMock.mockClear();
     await dialog.find(".submit-btn").trigger("click");
@@ -1271,13 +1322,13 @@ describe("冬眠管理（票 05）", () => {
     await wrapper.find('.card[data-colony-id="1"] .hib-btn').trigger("click");
 
     const dialog = wrapper.find(".hibernation-dialog");
-    await dialog.find(".start-input").setValue("2026-12-01");
-    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe("2027-03-31");
+    await dialog.findAllComponents(DatePickerPop)[0].vm.$emit("update:modelValue", "2026-12-01");
+    expect(dialog.findAllComponents(DatePickerPop)[1].props("modelValue")).toBe("2027-03-31");
 
     // 手动改过之后不再自动覆盖
-    await dialog.find(".end-input").setValue("2027-05-01");
-    await dialog.find(".start-input").setValue("2026-12-10");
-    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe("2027-05-01");
+    await dialog.findAllComponents(DatePickerPop)[1].vm.$emit("update:modelValue", "2027-05-01");
+    await dialog.findAllComponents(DatePickerPop)[0].vm.$emit("update:modelValue", "2026-12-10");
+    expect(dialog.findAllComponents(DatePickerPop)[1].props("modelValue")).toBe("2027-05-01");
   });
 
   it("开始冬眠被后端拒绝（如重叠）时弹窗内展示原因且弹窗保持", async () => {
@@ -1307,8 +1358,8 @@ describe("冬眠管理（票 05）", () => {
 
     const dialog = wrapper.find(".hibernation-dialog");
     expect(dialog.find("h3").text()).toContain("确认出眠");
-    expect((dialog.find(".actual-input").element as HTMLInputElement).value).toBe(todayIso());
-    await dialog.find(".actual-input").setValue("2026-09-12");
+    expect(dialog.findComponent(DatePickerPop).props("modelValue")).toBe(todayIso());
+    await dialog.findComponent(DatePickerPop).vm.$emit("update:modelValue", "2026-09-12");
 
     invokeMock.mockClear();
     await dialog.find(".submit-btn").trigger("click");
@@ -1336,8 +1387,8 @@ describe("冬眠管理（票 05）", () => {
     expect(dialog.find(".form-error").text()).toContain("日期");
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "add_past_hibernation")).toBe(false);
 
-    await dialog.find(".past-start-input").setValue("2025-12-01");
-    await dialog.find(".past-end-input").setValue("2026-02-01");
+    await dialog.findAllComponents(DatePickerPop)[0].vm.$emit("update:modelValue", "2025-12-01");
+    await dialog.findAllComponents(DatePickerPop)[1].vm.$emit("update:modelValue", "2026-02-01");
     await dialog.find(".submit-btn").trigger("click");
     await flushPromises();
 
@@ -1363,9 +1414,9 @@ describe("冬眠管理（票 05）", () => {
     const dialog = wrapper.find(".hibernation-dialog");
     expect(dialog.exists()).toBe(true);
     expect(dialog.find("h3").text()).toContain("修改预计出眠");
-    expect((dialog.find(".end-input").element as HTMLInputElement).value).toBe("2026-12-01");
+    expect(dialog.findComponent(DatePickerPop).props("modelValue")).toBe("2026-12-01");
 
-    await dialog.find(".end-input").setValue("2027-01-15");
+    await dialog.findComponent(DatePickerPop).vm.$emit("update:modelValue", "2027-01-15");
     invokeMock.mockClear();
     await dialog.find(".submit-btn").trigger("click");
     await flushPromises();
@@ -1415,7 +1466,7 @@ describe("浏览器模式隐藏桌面专属入口（终局评审 Important）", 
     const tabs = wrapper.findAll(".topbar .tab");
     expect(tabs.map((t) => t.text())).toEqual(["首页", "记录"]);
     expect(wrapper.find(".settings-btn").exists()).toBe(false);
-    expect(wrapper.find(".new-colony").exists()).toBe(false);
+    expect(wrapper.find(".new-top-btn").exists()).toBe(false);
     // 卡片「编辑」按钮（ColonyCard）同样隐藏；「巢况」是网页端功能不隐藏
     expect(wrapper.find(".card .edit-btn").exists()).toBe(false);
     expect(wrapper.find(".card .checkin-btn").exists()).toBe(true);
@@ -1427,7 +1478,7 @@ describe("浏览器模式隐藏桌面专属入口（终局评审 Important）", 
 
     expect(wrapper.findAll(".topbar .tab").map((t) => t.text())).toEqual(["首页", "统计", "记录"]);
     expect(wrapper.find(".settings-btn").exists()).toBe(true);
-    expect(wrapper.find(".new-colony").exists()).toBe(true);
+    expect(wrapper.find(".new-top-btn").exists()).toBe(true);
     expect(wrapper.find(".card .edit-btn").exists()).toBe(true);
   });
 });

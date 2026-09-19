@@ -486,10 +486,12 @@ pub const WEBUI_COMMANDS: &[&str] = &[
     // 首页：窝卡片墙（含超期投影）+ 地点下拉
     "list_colonies",
     "list_locations",
-    // 打卡：字典读 + 提交
+    // 打卡：字典读 + 提交（colony_month_records 为交互第三轮日历标记数据源，
+    // 打卡面板与记录页在用，网页端同样可达）
     "list_actions",
     "list_foods",
     "log_care",
+    "colony_month_records",
     // 历史记录：查 / 改 / 删
     "list_logs",
     "update_log",
@@ -608,6 +610,19 @@ pub fn dispatch_command(
             args,
             true,
             |conn, a: webui_args::LogCareArgs| crate::care::log_care(conn, &a.input.into_core(), &crate::care::now_local()),
+        )),
+        "colony_month_records" => Some(read_cmd(
+            deps,
+            args,
+            |conn, a: webui_args::ColonyMonthRecordsArgs| {
+                crate::care::colony_month_records(
+                    conn,
+                    a.colony_id,
+                    a.year,
+                    a.month,
+                    a.exclude_log_id,
+                )
+            },
         )),
         // ── 历史记录 ──
         "list_logs" => Some(read_cmd(deps, args, |conn, a: webui_args::ListLogsArgs| {

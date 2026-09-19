@@ -1,21 +1,41 @@
 <script setup lang="ts">
 /**
- * 记录列表页（票 08）：筛选行（窝 / 启用中操作 / 时间范围 / 备注关键词，组合生效）
- * + 流水表格（时间、窝、操作、食物、备注）+ 分页（加载更多）+ 行内编辑弹窗
- * （时间 / 操作 / 食物多选 / 备注）+ 两段确认删除。
+ * 记录列表页（票 08）：筛选行（地点 / 窝级联 / 启用中操作 / 时间范围 / 备注关键词，
+ * 组合生效；下拉/日期变更即查 + 关键词 300ms 防抖，无「查询」按钮）
+ * + 流水表格（时间、窝（下挂地点小字）、操作、食物、备注）+ 分页（加载更多）
+ * + 行内编辑弹窗（标记日历 DateTimeField / 操作 / 食物多选 / 备注 + 当天重复黄条，
+ * 月数据传 excludeLogId 排除自身）+ 两段确认删除。
  * 停用操作/食物按规则 10：历史照常显示；编辑表单原引用可保留（标「已停用」），
  * 新挂停用项前后端双重拒绝。任何编辑/删除成功抛 changed → 外层 refresh，
  * 首页「距上次」与超期态即时重算（数据驱动）。
  */
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import { deleteLog, listActions, listColonies, listFoods, listLogs, updateLog } from "../lib/ipc";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import {
+  colonyMonthRecords,
+  deleteLog,
+  listActions,
+  listColonies,
+  listFoods,
+  listLocations,
+  listLogs,
+  updateLog,
+} from "../lib/ipc";
 import { watchDataVersion } from "../lib/versionSync";
-import type { CareActionItem, Colony, FoodItem, LogPage, LogRow } from "../types";
+import type {
+  CareActionItem,
+  Colony,
+  FoodItem,
+  LocationItem,
+  LogPage,
+  LogRow,
+  MonthDayRecords,
+} from "../types";
 import {
   buildLogFilter,
   buildUpdateInput,
   canPickAction,
   canPickFood,
+  colonyOptionsFor,
   dictLabel,
   emptyFilterForm,
   filterFormError,
@@ -23,10 +43,15 @@ import {
   nextOffset,
   type LogFilterForm,
 } from "../lib/loglist";
+import { todayIso } from "../lib/dates";
+import { buildMarkers, duplicateInfo, dupWarningText } from "../lib/monthview";
+import DatePickerPop from "./DatePickerPop.vue";
+import DateTimeField from "./DateTimeField.vue";
 
 const emit = defineEmits<{ changed: [] }>();
 
 const colonies = ref<Colony[]>([]);
+const locations = ref<LocationItem[]>([]);
 const actions = ref<CareActionItem[]>([]);
 const foods = ref<FoodItem[]>([]);
 
@@ -43,33 +68,97 @@ const moreOffset = computed(() =>
 /** 筛选下拉只列启用中的操作（规则 10：停用项不进筛选入口） */
 const enabledActions = computed(() => actions.value.filter((a) => a.enabled));
 
+/** 响应序号守卫（复审修正）：即改即查后连续请求变多，旧查询后到不得覆盖新结果 */
+let loadSeq = 0;
+
 async function load(offset: number) {
+  const seq = ++loadSeq;
   loading.value = true;
   try {
     const res = await listLogs({
       filter: buildLogFilter(form.value, offset),
     });
+    if (seq !== loadSeq) return; // 过期响应，丢弃
     page.value =
       offset === 0
         ? res
         : { total: res.total, rows: [...(page.value?.rows ?? []), ...res.rows] };
     pageError.value = "";
   } catch (e) {
+    if (seq !== loadSeq) return;
     pageError.value = String(e);
   } finally {
-    loading.value = false;
+    if (seq === loadSeq) loading.value = false; // 被更新请求接管的收尾不动 loading
   }
+}
+
+/** 级联窝选项（交互第三轮 #1）：选了地点，窝下拉只列该地点的窝 */
+const colonyOptions = computed(() => colonyOptionsFor(colonies.value, form.value.locationId));
+
+function onLocationChange(e: Event) {
+  const v = (e.target as HTMLSelectElement).value;
+  form.value.locationId = v === "" ? null : Number(v);
+  // 原选中窝不在新地点 → 清空为「全部」
+  if (
+    form.value.colonyId !== null &&
+    !colonyOptions.value.some((c) => c.id === form.value.colonyId)
+  ) {
+    form.value.colonyId = null;
+  }
+  applyFilters(); // 即改即查（#4）
 }
 
 function onColonyChange(e: Event) {
   const v = (e.target as HTMLSelectElement).value;
   form.value.colonyId = v === "" ? null : Number(v);
+  applyFilters();
 }
 
 function onActionChange(e: Event) {
   const v = (e.target as HTMLSelectElement).value;
   form.value.actionId = v === "" ? null : Number(v);
+  applyFilters();
 }
+
+/** 日期变更即查（DatePickerPop 选中即 emit；命名中转，模板内联箭头在 vue-tsc 下推断不稳） */
+function onStartDatePick(iso: string) {
+  form.value.start = iso;
+  applyFilters();
+}
+
+function onEndDatePick(iso: string) {
+  form.value.end = iso;
+  applyFilters();
+}
+
+/** 关键词防抖 300ms（#4，复审修正）：输入即时同步 form.keyword、只防抖查询动作——
+ * 若同步也挂到回调里，重置后 form.keyword 仍是空串，Vue 不 patch 输入框，旧词残留界面。
+ * IME 两段式（vModelText 同款：守卫 + compositionend 补发）：组词期不同步不防抖；
+ * 携带最终上屏文本的那次 input 在 compositionend 之前发出（isComposing 仍 true），
+ * 只挡不补会吞掉确认上屏——所以 compositionend 时复位标志并补同步 */
+let kwTimer: ReturnType<typeof setTimeout> | undefined;
+const composing = ref(false);
+function syncKeyword(value: string) {
+  form.value.keyword = value;
+  clearTimeout(kwTimer);
+  kwTimer = setTimeout(() => {
+    kwTimer = undefined;
+    applyFilters();
+  }, 300);
+}
+function onKeywordInput(e: Event) {
+  if (composing.value) return; // 组词中：拼音片段不进表单、不挂防抖
+  syncKeyword((e.target as HTMLInputElement).value);
+}
+function onCompositionStart() {
+  composing.value = true;
+}
+function onCompositionEnd(e: Event) {
+  composing.value = false;
+  syncKeyword((e.target as HTMLInputElement).value); // 补上屏同步（vModelText 同款语义）
+}
+
+onBeforeUnmount(() => clearTimeout(kwTimer));
 
 function applyFilters() {
   const err = filterFormError(form.value);
@@ -80,6 +169,8 @@ function applyFilters() {
 }
 
 function resetFilters() {
+  clearTimeout(kwTimer); // 复审 #8/#9：防抖挂起时点重置，先撤挂起回调，防 300ms 后旧词回写再查
+  kwTimer = undefined;
   form.value = emptyFilterForm();
   filterError.value = "";
   confirmDeleteId.value = null;
@@ -100,6 +191,73 @@ const editIsFeeding = computed(
   () => actions.value.find((a) => a.id === editActionId.value)?.is_feeding ?? false,
 );
 
+// ── 编辑弹窗：标记日历 + 当天重复黄条（#8 编辑场景 Q10-C）─────────────────
+
+const editMonthRows = ref<MonthDayRecords[]>([]);
+const editViewMonth = ref({ year: 2026, month: 9 });
+let editMonthSeq = 0; // 复审 #10：快速翻月旧响应后到会污染标记/黄条，序号守卫丢弃过期响应
+
+/** 日历标记：当前操作橙点、其它操作灰点——名字表取 actions 全量（复审 #1/#2 同口径，
+ * 缺名操作被跳过会让灰点与 tip 整体失效） */
+const editMarkers = computed(() => {
+  const names = new Map(actions.value.map((a) => [a.id, a.name]));
+  return buildMarkers(editMonthRows.value, editActionId.value ?? -1, names);
+});
+
+/** 选中日期重复判定（时间字段前 10 位 = 日期；viewMonth 由跨月 watch 与时间值保持同步） */
+const editDup = computed(() =>
+  editing.value === null || editActionId.value === null
+    ? null
+    : duplicateInfo(
+        editMonthRows.value,
+        editViewMonth.value.year,
+        editViewMonth.value.month,
+        editTime.value.slice(0, 10),
+        editActionId.value,
+      ),
+);
+
+const editDupText = computed(() => {
+  if (editing.value === null) return "";
+  // 复审 #17：查真实操作名（切换操作后黄条跟随），查不到兜底「该操作」
+  const actionName = actions.value.find((a) => a.id === editActionId.value)?.name ?? "该操作";
+  return dupWarningText(editDup.value, editTime.value.slice(0, 10), todayIso(), actionName);
+});
+
+/** 复审修正：编辑场景传 excludeLogId=当前记录 id——否则正在编辑的这条被算成重复，
+ * 只改备注也误报黄条 */
+async function loadEditMonth(y: number, m: number) {
+  editViewMonth.value = { year: y, month: m };
+  const row = editing.value;
+  if (row === null) return;
+  const seq = ++editMonthSeq;
+  try {
+    const res = await colonyMonthRecords({
+      colonyId: row.colony_id,
+      year: y,
+      month: m,
+      excludeLogId: row.id,
+    });
+    if (seq !== editMonthSeq) return; // 过期响应，丢弃
+    editMonthRows.value = res;
+  } catch {
+    if (seq === editMonthSeq) editMonthRows.value = []; // 标记是增强，失败静默（提交校验权威在后端）
+  }
+}
+
+/** DateTimeField 的 month 事件 → 拉该月数据（显式类型，模板内联箭头在 vue-tsc 下推断不稳） */
+function onEditMonth(view: { year: number; month: number }) {
+  void loadEditMonth(view.year, view.month);
+}
+
+// 复审 #15：编辑时间跨月（现在/±10分/选日期）时月份重同步（黄条判定依赖 viewMonth）
+watch(
+  () => editTime.value.slice(0, 7),
+  (ym, old) => {
+    if (ym !== old) void loadEditMonth(+ym.slice(0, 4), +ym.slice(5, 7));
+  },
+);
+
 /** 库内 "2026-09-17 21:00:00" → datetime-local 值 "2026-09-17T21:00"；脏值原样兜底 */
 function toLocalInput(occurredAt: string): string {
   const s = occurredAt.trim().replace("T", " ");
@@ -114,6 +272,9 @@ function openEdit(row: LogRow) {
   editNote.value = row.note;
   editError.value = "";
   confirmDeleteId.value = null;
+  editMonthRows.value = []; // 清上一次弹窗的月数据，防别的窝/月份旧行瞬间误染黄条
+  // 拉编辑所在月的标记数据（watch 只在跨月变化时触发，首次打开要显式拉一次）
+  void loadEditMonth(+editTime.value.slice(0, 4), +editTime.value.slice(5, 7));
 }
 
 function closeEdit() {
@@ -182,14 +343,16 @@ async function requestDelete(row: LogRow) {
  * （webui-checkin 票 06，别端记录后本页开着就刷新）共用这一个入口。 */
 async function reloadAll() {
   try {
-    const [cols, acts, fds] = await Promise.all([
+    const [cols, acts, fds, locs] = await Promise.all([
       listColonies(),
       listActions(),
       listFoods(),
+      listLocations(),
     ]);
     colonies.value = cols;
     actions.value = acts;
     foods.value = fds;
+    locations.value = locs;
   } catch (e) {
     pageError.value = String(e);
   }
@@ -213,10 +376,16 @@ onBeforeUnmount(() => {
   <div class="log-list">
     <div class="container">
       <div class="filters">
+        <label class="f-label">地点</label>
+        <select class="f-location" :value="form.locationId ?? ''" @change="onLocationChange">
+          <option value="">全部</option>
+          <option v-for="l in locations" :key="l.id" :value="l.id">{{ l.name }}</option>
+        </select>
+
         <label class="f-label">窝</label>
         <select class="f-colony" :value="form.colonyId ?? ''" @change="onColonyChange">
           <option value="">全部</option>
-          <option v-for="c in colonies" :key="c.id" :value="c.id">{{ c.name }}</option>
+          <option v-for="c in colonyOptions" :key="c.id" :value="c.id">{{ c.name }}</option>
         </select>
 
         <label class="f-label">操作</label>
@@ -226,21 +395,29 @@ onBeforeUnmount(() => {
         </select>
 
         <label class="f-label">从</label>
-        <input class="f-start" v-model="form.start" type="date" />
+        <DatePickerPop
+          :model-value="form.start"
+          placeholder="开始日期"
+          @update:model-value="onStartDatePick"
+        />
         <label class="f-label">到</label>
-        <input class="f-end" v-model="form.end" type="date" />
+        <DatePickerPop
+          :model-value="form.end"
+          placeholder="结束日期"
+          @update:model-value="onEndDatePick"
+        />
 
         <input
           class="f-keyword"
-          v-model="form.keyword"
+          :value="form.keyword"
           type="search"
-          placeholder="搜备注关键词"
-          @keyup.enter="applyFilters"
+          placeholder="搜备注 · 输入即查"
+          @input="onKeywordInput"
+          @compositionstart="onCompositionStart"
+          @compositionend="onCompositionEnd"
         />
-        <button class="apply-btn" type="button" :disabled="loading" @click="applyFilters">
-          查询
-        </button>
         <button class="reset-btn" type="button" @click="resetFilters">重置</button>
+        <span class="auto-note">⚡ 条件变更即查询</span>
       </div>
       <p v-if="filterError" class="filter-error">{{ filterError }}</p>
 
@@ -263,7 +440,9 @@ onBeforeUnmount(() => {
           <tbody>
             <tr v-for="r in rows" :key="r.id" class="log-row" :data-log-id="r.id">
               <td class="c-time">{{ formatLogTime(r.occurred_at) }}</td>
-              <td class="c-colony">{{ r.colony_name }}</td>
+              <td class="c-colony">
+                {{ r.colony_name }}<span class="loc">{{ r.location_name ?? "未分组" }}</span>
+              </td>
               <td class="c-action">{{ r.action_name }}</td>
               <td class="c-foods">{{ r.food_names.length > 0 ? r.food_names.join("、") : "—" }}</td>
               <td class="c-note">{{ r.note !== "" ? r.note : "—" }}</td>
@@ -299,7 +478,8 @@ onBeforeUnmount(() => {
           <h3>编辑记录 · {{ editing.colony_name }}</h3>
 
           <div class="field-label">发生时间（可补录）</div>
-          <input v-model="editTime" class="time-input" type="datetime-local" />
+          <DateTimeField v-model="editTime" :markers="editMarkers" @month="onEditMonth" />
+          <p v-if="editDupText !== ''" class="dup-warn">⚠ {{ editDupText }}</p>
 
           <div class="field-label">操作</div>
           <select class="action-select" :value="editActionId ?? ''" @change="onEditActionChange">
@@ -363,7 +543,7 @@ onBeforeUnmount(() => {
 .container {
   max-width: 1080px;
   margin: 0 auto;
-  padding: 0 20px 80px;
+  padding: 0 20px 32px;
 }
 
 .filters {
@@ -394,7 +574,6 @@ onBeforeUnmount(() => {
   min-width: 160px;
 }
 
-.apply-btn,
 .reset-btn {
   padding: 6px 16px;
   border-radius: 9px;
@@ -405,20 +584,23 @@ onBeforeUnmount(() => {
   font-size: 13px;
 }
 
-.apply-btn {
-  background: var(--accent);
+.reset-btn:hover {
   border-color: var(--accent);
-  color: #fff;
-  font-weight: 600;
+  color: var(--accent-deep);
 }
 
-.apply-btn:hover {
-  background: var(--accent-deep);
+/* 与既有下拉/输入对齐（DatePickerPop 自带 8px 圆角、独立配色变量兜底） */
+.filters .dp-trigger {
+  border-radius: 9px;
 }
 
-.apply-btn:disabled {
-  opacity: 0.6;
-  cursor: default;
+.auto-note {
+  font-size: 11px;
+  color: var(--accent-deep);
+  background: var(--accent-soft);
+  padding: 1px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
 }
 
 .filter-error {
@@ -488,6 +670,14 @@ onBeforeUnmount(() => {
 .c-colony {
   white-space: nowrap;
   font-weight: 600;
+}
+
+/* 窝名下挂地点小字（交互第三轮 #5）；未分组显示占位 */
+.c-colony .loc {
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
 }
 
 .c-foods,
@@ -621,7 +811,6 @@ onBeforeUnmount(() => {
 }
 
 .dialog select,
-.dialog input[type="datetime-local"],
 .dialog textarea {
   width: 100%;
   padding: 7px 10px;
@@ -630,6 +819,22 @@ onBeforeUnmount(() => {
   font: inherit;
   background: var(--card);
   color: var(--text);
+}
+
+/* DateTimeField 日历触发器与原 datetime-local 输入同占满行宽 */
+.edit-dialog :deep(.dp-trigger) {
+  width: 100%;
+}
+
+/* 黄条：选中日已有同操作记录提醒（不拦提交，视觉基线 mocks/mock-c-calendar.html） */
+.dup-warn {
+  margin-top: 6px;
+  padding: 7px 10px;
+  border-radius: 9px;
+  background: #fdf1de;
+  border: 1px solid #f3d9a8;
+  color: #b45309;
+  font-size: 12px;
 }
 
 .dialog select option:disabled {
