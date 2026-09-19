@@ -480,6 +480,44 @@ describe("NestCheckinDialog 网页端（webui-checkin 票 08）", () => {
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "pick_photo_files")).toBe(false);
   });
 
+  it("手机双入口（终局评审）：「拍照」input 带 capture=environment，「从相册选」input 不带 capture", async () => {
+    const w = await mountBrowser([checkin({ id: 7 })]);
+
+    // 拍照入口：capture=environment 直调相机
+    const camera = w.find(".photo-file-input");
+    expect(camera.attributes("capture")).toBe("environment");
+    expect(camera.attributes("accept")).toBe("image/*");
+    expect(camera.attributes("multiple")).toBeDefined();
+
+    // 从相册选入口：不带 capture（系统弹相册/文件选择），其余属性同款
+    const album = w.find(".photo-album-input");
+    expect(album.exists()).toBe(true);
+    expect(album.attributes("accept")).toBe("image/*");
+    expect(album.attributes("multiple")).toBeDefined();
+    expect(album.attributes("capture")).toBeUndefined();
+  });
+
+  it("「从相册选」点按钮不调 pick_photo_files，选完文件同样走 uploadPhotosHttp（与拍照共用处理函数）", async () => {
+    const w = await mountBrowser([checkin({ id: 7 })]);
+    uploadPhotosHttpMock.mockResolvedValue([{ ...browserPhoto }]);
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_checkins" ? [checkin({ id: 7, photos: [{ ...browserPhoto }] })] : null,
+    );
+
+    invokeMock.mockClear();
+    await w.find(".photo-album-btn").trigger("click");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "pick_photo_files")).toBe(false);
+
+    const files = [new File(["c"], "c.jpg")];
+    const input = w.find(".photo-album-input");
+    Object.defineProperty(input.element, "files", { value: files, configurable: true });
+    await input.trigger("change");
+    await flushPromises();
+
+    expect(uploadPhotosHttpMock).toHaveBeenCalledWith(7, files);
+    expect(w.emitted("saved")).toHaveLength(1);
+  });
+
   it("选文件后 uploadPhotosHttp(checkinId, files) → 重拉时间线 + 抛 saved；input 值清空可重选同一批", async () => {
     const w = await mountBrowser([checkin({ id: 7 })]);
     uploadPhotosHttpMock.mockResolvedValue([{ ...browserPhoto }]);
@@ -544,6 +582,28 @@ describe("NestCheckinDialog 网页端（webui-checkin 票 08）", () => {
     expect(loadPhotoBlobUrlMock).toHaveBeenCalledWith("1/gone.jpg");
     expect(w.find('img[title="ok.jpg"]').attributes("src")).toBe("blob:ok-url");
     expect(w.find(".photo-missing").exists()).toBe(true);
+  });
+
+  it("瞬时取图失败后重取成功：占位恢复为图片（终局评审：missingPhotoIds 取图成功即移除，不滞留）", async () => {
+    // 第一次取图失败（瞬时机 网络/服务抖动）→ 标「文件缺失」占位
+    loadPhotoBlobUrlMock.mockRejectedValueOnce("HTTP 500");
+    loadPhotoBlobUrlMock.mockResolvedValue("blob:retry-ok");
+    const w = await mountBrowser([checkin({ id: 7, photos: [{ ...browserPhoto }] })]);
+    await flushPromises();
+    expect(w.find(".photo-missing").exists()).toBe(true);
+    expect(w.find("img.photo-thumb").exists()).toBe(false);
+
+    // 任一重拉路径（这里补一条登记触发 load）→ 同一张照片重取成功 → 占位恢复为图片
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_checkins" ? [checkin({ id: 7, photos: [{ ...browserPhoto }] })] : null,
+    );
+    await w.find(".note-input").setValue("再登记一次触发重拉");
+    await w.find(".record-btn").trigger("click");
+    await flushPromises();
+
+    expect(loadPhotoBlobUrlMock).toHaveBeenCalledTimes(2);
+    expect(w.find('img[title="ok.jpg"]').attributes("src")).toBe("blob:retry-ok");
+    expect(w.find(".photo-missing").exists()).toBe(false);
   });
 
   it("组件卸载释放全部 objectURL（不泄漏）", async () => {

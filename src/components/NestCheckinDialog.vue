@@ -9,10 +9,11 @@
  *   后端拒绝；
  * - 照片（票 07 桌面 / 票 08 网页端，同一套组件按环境分流）：
  *   「传照片」桌面走 pick_photo_files 系统文件对话框 → attach_photos；
- *   浏览器走隐藏 <input type=file>（capture=environment 手机直调相机）→
- *   uploadPhotosHttp（multipart POST /api/photos）——两边都由 Rust 校验重编码 +
- *   写入协议落库，成功后重拉时间线；**失败分支也重拉**（批量可能部分成功，
- *   已落库的照片立即出现）；
+ *   浏览器走隐藏 <input type=file> 双入口（终局评审）：「拍照」带
+ *   capture=environment 手机直调相机、「从相册选」不带 capture 弹系统相册，
+ *   共用 uploadPhotosHttp（multipart POST /api/photos）——两边都由 Rust 校验
+ *   重编码 + 写入协议落库，成功后重拉时间线；**失败分支也重拉**（批量可能
+ *   部分成功，已落库的照片立即出现）；
  *   缩略图桌面经 asset 协议读数据目录 photos/（lib/photos.ts photoSrc），浏览器
  *   经 loadPhotoBlobUrl fetch blob（<img> 带不了 Authorization 头，token 不进
  *   URL），组件卸载 revokeObjectUrl 释放；点开大图；文件缺失（库有元数据、
@@ -117,7 +118,8 @@ function photoSrcOf(p: NestPhotoMeta): string {
 }
 
 /** 浏览器取图（票 08）：逐张 fetch blob（时间线照片量小，串行即可）；
- * 失败标 missing → 「文件缺失」占位。换数据后释放不再在场的旧 URL。 */
+ * 失败标 missing → 「文件缺失」占位，取图成功即解除该 id 的标记（终局评审：
+ * 瞬时失败的占位不滞留——重拉后取图成功照常显示）。换数据后释放不再在场的旧 URL。 */
 async function loadPhotoBlobs(list: NestPhotoMeta[]) {
   const keep = new Set(list.map((p) => p.id));
   for (const [id, url] of Object.entries(blobUrls.value)) {
@@ -130,6 +132,11 @@ async function loadPhotoBlobs(list: NestPhotoMeta[]) {
     if (blobUrls.value[p.id] !== undefined) continue;
     try {
       blobUrls.value[p.id] = await loadPhotoBlobUrl(p.rel_path);
+      if (missingPhotoIds.value.has(p.id)) {
+        const next = new Set(missingPhotoIds.value);
+        next.delete(p.id);
+        missingPhotoIds.value = next;
+      }
     } catch {
       markPhotoMissing(p.id);
     }
@@ -190,20 +197,23 @@ async function addPhotosDesktop(c: NestCheckin) {
   }
 }
 
-// ── 浏览器上传（票 08）：隐藏 file input（capture=environment 手机直调相机）
-// → uploadPhotosHttp（multipart POST /api/photos，客户端预检 15MB/9 张）──
+// ── 浏览器上传（票 08）：隐藏 file input → uploadPhotosHttp（multipart
+// POST /api/photos，客户端预检 15MB/9 张）。终局评审起双入口：「拍照」带
+// capture=environment（手机直调相机）、「从相册选」不带 capture（弹系统相册/
+// 文件选择），共用同一处理函数；桌面忽略两个入口（走 pick_photo_files）──
 
 const fileInput = ref<HTMLInputElement | null>(null);
+const albumInput = ref<HTMLInputElement | null>(null);
 /** 待上传的登记 id（input change 时无从知道点的是哪条，点击时记下）。 */
 let uploadTargetId = 0;
 
-function onAddPhotos(c: NestCheckin) {
+function onAddPhotos(c: NestCheckin, source: "camera" | "album" = "camera") {
   if (isTauri()) {
     void addPhotosDesktop(c);
     return;
   }
   uploadTargetId = c.id;
-  fileInput.value?.click();
+  (source === "album" ? albumInput : fileInput).value?.click();
 }
 
 async function onFilesChosen(ev: Event) {
@@ -336,8 +346,9 @@ async function requestDelete(c: NestCheckin) {
     <div class="dialog checkin-dialog vp-form-stack">
       <h3>巢况时间线 · {{ colony.name }}</h3>
 
-      <!-- 浏览器照片上传（票 08）：capture=environment 手机直调相机；
-           桌面忽略此 input（走 pick_photo_files 系统对话框） -->
+      <!-- 浏览器照片上传（票 08；终局评审起双入口）：拍照 input 带
+           capture=environment（手机直调相机），从相册选 input 不带 capture；
+           桌面忽略这两个 input（走 pick_photo_files 系统对话框） -->
       <input
         ref="fileInput"
         class="photo-file-input"
@@ -345,6 +356,14 @@ async function requestDelete(c: NestCheckin) {
         accept="image/*"
         multiple
         capture="environment"
+        @change="onFilesChosen"
+      />
+      <input
+        ref="albumInput"
+        class="photo-album-input"
+        type="file"
+        accept="image/*"
+        multiple
         @change="onFilesChosen"
       />
 
@@ -398,7 +417,18 @@ async function requestDelete(c: NestCheckin) {
                 title="选择照片（自动压缩：长边 2048、JPEG，原图与 GPS 信息不留）"
                 @click="onAddPhotos(c)"
               >
-                {{ photoBusy ? "处理中…" : "传照片" }}
+                {{ photoBusy ? "处理中…" : (isTauri() ? "传照片" : "拍照") }}
+              </button>
+              <!-- 手机第二入口（终局评审）：从相册选（桌面不渲染，桌面单入口走系统文件对话框） -->
+              <button
+                v-if="!isTauri()"
+                class="entry-btn photo-album-btn"
+                type="button"
+                :disabled="photoBusy"
+                title="从相册选择照片（自动压缩同拍照）"
+                @click="onAddPhotos(c, 'album')"
+              >
+                从相册选
               </button>
               <button class="entry-btn entry-edit-btn" type="button" @click="startEdit(c)">
                 编辑
@@ -786,7 +816,8 @@ div.photo-missing {
 }
 
 /* 隐藏的浏览器上传入口（票 08）：视觉隐藏但可 programmatic click */
-.photo-file-input {
+.photo-file-input,
+.photo-album-input {
   position: absolute;
   width: 1px;
   height: 1px;
