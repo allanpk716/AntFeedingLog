@@ -141,6 +141,9 @@ beforeEach(() => {
   invokeMock.mockReset();
   currentColonies = colonies;
   currentSettings = defaultSettings;
+  // 桌面 WebView 形态为默认（终局评审：桌面专属入口按 isTauri 渲染）；
+  // 浏览器形态在「浏览器模式隐藏桌面专属入口」describe 里单独删掉注入
+  (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
   baseMock();
 });
 
@@ -1400,5 +1403,31 @@ describe("冬眠管理（票 05）", () => {
     const logCall = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
     expect(logCall).toBeDefined();
     expect((logCall![1] as { input: { colony_id: number } }).input.colony_id).toBe(3);
+  });
+});
+
+describe("浏览器模式隐藏桌面专属入口（终局评审 Important）", () => {
+  it("浏览器模式：顶栏无「统计」/设置/新建窝、卡片无「编辑」；首页/记录与巢况入口照常", async () => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    const wrapper = await mountApp();
+
+    // 顶栏只剩 首页/记录 两个 tab（统计是桌面专属页）
+    const tabs = wrapper.findAll(".topbar .tab");
+    expect(tabs.map((t) => t.text())).toEqual(["首页", "记录"]);
+    expect(wrapper.find(".settings-btn").exists()).toBe(false);
+    expect(wrapper.find(".new-colony").exists()).toBe(false);
+    // 卡片「编辑」按钮（ColonyCard）同样隐藏；「巢况」是网页端功能不隐藏
+    expect(wrapper.find(".card .edit-btn").exists()).toBe(false);
+    expect(wrapper.find(".card .checkin-btn").exists()).toBe(true);
+  });
+
+  it("桌面模式：统计 tab / 设置 / 新建窝 / 卡片编辑四入口照常渲染", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    const wrapper = await mountApp();
+
+    expect(wrapper.findAll(".topbar .tab").map((t) => t.text())).toEqual(["首页", "统计", "记录"]);
+    expect(wrapper.find(".settings-btn").exists()).toBe(true);
+    expect(wrapper.find(".new-colony").exists()).toBe(true);
+    expect(wrapper.find(".card .edit-btn").exists()).toBe(true);
   });
 });

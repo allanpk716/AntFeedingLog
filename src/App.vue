@@ -6,7 +6,7 @@
  * 设置弹窗（票 04）：字典管理三 tab，任何变更抛 changed → refresh，卡片红/灰即时跟上。
  */
 import { computed, onMounted, ref } from "vue";
-import { getWebUiWizardDone, listColonies, listLocations, subscribe } from "./lib/ipc";
+import { getWebUiWizardDone, isTauri, listColonies, listLocations, subscribe } from "./lib/ipc";
 import { watchDataVersion } from "./lib/versionSync";
 import type { Colony, LocationItem } from "./types";
 import { groupColonies, splitColonies } from "./lib/home";
@@ -115,6 +115,7 @@ onMounted(() => {
           首页
         </button>
         <button
+          v-if="isTauri()"
           class="tab"
           :class="{ active: page === 'stats' }"
           type="button"
@@ -133,7 +134,8 @@ onMounted(() => {
       </nav>
       <div class="today">{{ todayLabel() }}</div>
       <div class="tools">
-        <button class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
+        <!-- 终局评审：统计/设置/新建窝是桌面专属（网页端 API 白名单本就挡住），浏览器不渲染入口 -->
+        <button v-if="isTauri()" class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
           ⚙ 设置
         </button>
       </div>
@@ -177,7 +179,7 @@ onMounted(() => {
         </div>
       </section>
 
-      <button class="new-colony" type="button" @click="openCreate">
+      <button v-if="isTauri()" class="new-colony" type="button" @click="openCreate">
         ＋ 新建窝（名字 / 物种 / 地点 / 开始饲养日期 / 状态）
       </button>
     </main>

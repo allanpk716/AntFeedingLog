@@ -9,6 +9,7 @@
  */
 import { computed, ref } from "vue";
 import type { Colony, ColonyAction } from "../types";
+import { isTauri } from "../lib/ipc";
 import { actionTile, feedingTooltip, formatRecent, isFeeding, type TileView } from "../lib/care";
 import { checkinCardLine } from "../lib/checkin";
 import { hibernationBanner } from "../lib/hibernation";
@@ -179,7 +180,8 @@ function onCheckinSaved() {
       >
         补录冬眠
       </button>
-      <button class="edit-btn" type="button" @click="$emit('edit')">编辑</button>
+      <!-- 终局评审：窝的编辑是桌面专属（网页端 API 白名单挡住 update_colony 等），浏览器不渲染入口 -->
+      <button v-if="isTauri()" class="edit-btn" type="button" @click="$emit('edit')">编辑</button>
     </div>
 
     <FeedDialog
