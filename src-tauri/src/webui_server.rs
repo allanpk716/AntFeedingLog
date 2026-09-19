@@ -942,7 +942,7 @@ async fn auth_mw(
 /// 响应只有 schema 版本，无敏感信息）。闸一照拦（连接准入在前），限额与超时
 /// 照挂（普通并发上限 8 无端点豁免——免凭证端点更要防洪泛，见 build_router）。
 async fn health_handler(State(deps): State<Shared>) -> axum::response::Response {
-    respond_dispatch(dispatch_command(&deps, "health_check", &serde_json::json!({})))
+    dispatch_on_blocking(deps, "health_check".to_string(), serde_json::json!({})).await
 }
 
 fn respond_dispatch(outcome: Option<CmdOutcome>) -> axum::response::Response {
@@ -954,6 +954,27 @@ fn respond_dispatch(outcome: Option<CmdOutcome>) -> axum::response::Response {
         // 执行失败：桌面 invoke 同款人话错误串（业务拒绝/库错误）
         Some(CmdOutcome::Failed(e)) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
         None => json_error(StatusCode::NOT_FOUND, "未知命令或桌面端专属功能"),
+    }
+}
+
+/// 同步派发挪到 blocking 池执行：`dispatch_command` 与桌面 IPC 共用同一把库锁，
+/// 锁等待必须占 blocking 线程而非 tokio worker——否则 ≤8 核机器上 8 个并发请求
+/// 各占死一个 worker，整个网页端（accept/限流 429/SSE 保活）齐停到锁释放
+/// （4 核 CI runner 确定性复现，回归钉 health_is_subject_to_concurrency_limit；
+/// 先例：照片解码同走 spawn_blocking）。
+async fn dispatch_on_blocking(
+    deps: Shared,
+    cmd: String,
+    args: serde_json::Value,
+) -> axum::response::Response {
+    let joined =
+        tauri::async_runtime::spawn_blocking(move || dispatch_command(&deps, &cmd, &args)).await;
+    match joined {
+        Ok(outcome) => respond_dispatch(outcome),
+        Err(e) => json_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("命令执行线程异常: {e}"),
+        ),
     }
 }
 
@@ -995,7 +1016,7 @@ async fn cmd_handler(
         // 「也可能是桌面端专属命令」——网页端撞上的多半是这种情况。
         return json_error(StatusCode::NOT_FOUND, "未知命令或桌面端专属功能");
     }
-    respond_dispatch(dispatch_command(&deps, cmd, &args))
+    dispatch_on_blocking(deps, cmd.to_string(), args).await
 }
 
 /// `POST /api/sse-ticket`：主凭证换 60 秒一次性票据（闸二已在此路径生效）。
@@ -1034,9 +1055,19 @@ fn version_payload(deps: &SharedDeps, version: u64) -> serde_json::Value {
 /// `GET /api/data-version`（规格 A 白名单「数据版本」）：库内计数真值 + epoch。
 /// 走闸二（主凭证）；SSE 建不上的客户端也可轮询它对账（前端当前只用 SSE）。
 async fn data_version_handler(State(deps): State<Shared>) -> axum::response::Response {
-    match crate::run_with_conn(&deps.conn, |conn| Ok(crate::data_version::get(conn))) {
-        Ok(version) => json_response(axum::http::StatusCode::OK, &version_payload(&deps, version)),
-        Err(e) => json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &e),
+    // 同 dispatch_on_blocking：库锁读取挪 blocking 池，不占 tokio worker
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        crate::run_with_conn(&deps.conn, |conn| Ok(crate::data_version::get(conn)))
+            .map(|version| version_payload(&deps, version))
+    })
+    .await;
+    match joined {
+        Ok(Ok(payload)) => json_response(axum::http::StatusCode::OK, &payload),
+        Ok(Err(e)) => json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &e),
+        Err(e) => json_error(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("版本读取线程异常: {e}"),
+        ),
     }
 }
 
