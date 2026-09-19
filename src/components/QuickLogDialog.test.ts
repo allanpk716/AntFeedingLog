@@ -45,6 +45,9 @@ beforeEach(() => { invokeMock.mockReset(); });
 
 describe("QuickLogDialog", () => {
   it("手机竖屏断点类：弹窗挂 vp-dialog（≤480px 输入放大/大按钮的媒体查询落点，webui-checkin 票 08）", () => {
+    // 补 mock：不设实现时 list_actions 落 undefined → allActions.value=undefined，
+    // 组件卸载后的渲染 flush 里 markers computed .map 抛未处理拒绝（CI 35442855770 实证）
+    invokeMock.mockImplementation(async (cmd: string) => (cmd === "colony_month_records" ? [] : cmd === "list_actions" ? allActions : null));
     const w = mountDlg();
     expect(w.find(".vp-dialog").exists()).toBe(true);
     expect(w.find(".vp-dialog").classes()).toContain("quick-dialog");
