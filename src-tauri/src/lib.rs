@@ -4,6 +4,7 @@ mod backup_config;
 mod care;
 mod colony;
 mod data_meta;
+mod data_version;
 mod db;
 mod dict;
 mod firewall;
@@ -1005,11 +1006,16 @@ fn get_backup_status() -> Result<backup_config::BackupStatus, String> {
 
 // ── 自动备份引擎（数据安全二期票 03，D2/D3/D4；引擎本体在 auto_backup.rs）──
 
-/// 业务写入成功后的触发点（D2 ①）：先同步记 `last_data_write_date`（配置锁内
-/// 快速落账，账目不丢），再后台线程判定 + 备份——网络盘等慢速目标目录不阻塞
-/// 命令返回与 UI（spec D3 锁外拷贝）。备份失败静默（记账+日志），绝不把错误
-/// 报给业务命令：写入照常成功返回（票面铁律）。
+/// 业务写入成功后的触发点（D2 ①）：票 06 起，第一件事是数据版本 +1 并双端
+/// 广播（库内 data_meta 计数器 +1 → SSE hub 发布 → 桌面 `data-version` 事件）。
+/// 这是统一咽喉：桌面 21 个写命令直接调本函数，HTTP 写命令经 webui_after_write
+/// 钩子同路——绝不在各命令里散写 bump。随后照旧：同步记 `last_data_write_date`
+/// （配置锁内快速落账，账目不丢），再后台线程判定 + 备份——网络盘等慢速目标
+/// 目录不阻塞命令返回与 UI（spec D3 锁外拷贝）。备份失败静默（记账+日志），
+/// 绝不把错误报给业务命令：写入照常成功返回（票面铁律），版本自增失败同样
+/// 只落日志（少一次广播，客户端下次 hello/重连自动对齐）。
 fn trigger_after_write(app: &tauri::AppHandle) {
+    bump_data_version_and_broadcast(app);
     let data_dir = match current_data_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -1022,6 +1028,26 @@ fn trigger_after_write(app: &tauri::AppHandle) {
         applog::log_error(&format!("记录业务写入日期失败: {e}"));
     }
     spawn_auto_backup(app);
+}
+
+/// 数据版本自增 + 双端广播（webui-checkin 票 06）：库内计数 +1（与写命令同一
+/// 把库锁、锁外串行），网页端经 SSE hub 收推、桌面端收 `data-version` 事件
+/// （负载 {epoch, version} 与 SSE 帧同形）。Tauri 状态未就绪（极端早退路径）
+/// 或自增失败只落日志，绝不影响业务写入结果。
+fn bump_data_version_and_broadcast(app: &tauri::AppHandle) {
+    let Some(db) = app.try_state::<DbState>() else {
+        return;
+    };
+    let Some(deps) = app.try_state::<Arc<webui_server::SharedDeps>>() else {
+        return;
+    };
+    match webui_server::bump_and_publish(&db.0, &deps.versions) {
+        Ok(frame) => {
+            use tauri::Emitter;
+            let _ = app.emit("data-version", frame);
+        }
+        Err(e) => applog::log_error(&format!("数据版本自增失败（跳过广播）: {e}")),
+    }
 }
 
 /// 启动触发点（D2 ②）与写入触发点共用的后台执行入口：判定（含时钟回拨钳制）
@@ -1122,9 +1148,23 @@ fn restore_apply(
             // 确实换了，前端此时应展示重启提示而不是旧数据）
             // Further Notes 落账：Q13 授权的「提示重启」降级未触发——db-restored
             // 事件刷新链路已工作（组件测试覆盖前端侧），降级预案仅在未来链路
-            // 失灵时启用。
+            // 失灵时启用。db-restored 语义保持=无条件刷新（票 06 不改它）。
             use tauri::Emitter;
             let _ = app.emit("db-restored", ());
+            // 票 06：恢复后版本可能回退（换入旧备份的计数器更小）——用
+            // restore_bump_and_publish 把新库计数抬到「本实例已广播最大值+1」
+            // 并广播 version 帧，网页端对账必判落后 → 无条件刷新。失败只落
+            // 日志：桌面端已有 db-restored 兜底，网页端等下次写/重连对齐。
+            if let Some(deps) = app.try_state::<Arc<webui_server::SharedDeps>>() {
+                match webui_server::restore_bump_and_publish(&state.0, &deps.versions) {
+                    Ok(frame) => {
+                        let _ = app.emit("data-version", frame);
+                    }
+                    Err(e) => {
+                        applog::log_error(&format!("恢复后数据版本对齐失败: {e}"));
+                    }
+                }
+            }
             // 托盘 tooltip 是库内超期摘要的投影，恢复后立即重算
             reminder::refresh_tray_tooltip(&app);
         }

@@ -14,7 +14,13 @@
 //!   （取舍注释见 [`auth_mw`]）：重生成即刻生效拒旧值，零失效耦合；小文件读
 //!   在 ≤8 并发下开销可忽略，读失败按「凭证未就绪」拒绝（fail-closed）。
 //! - **SSE 短时票据**：`POST /api/sse-ticket` 主凭证换 60 秒一次性票据
-//!   （[`SseTicketStore`]，建连即消费；消费/过期纯核可测，SSE 端点票 06 挂上）。
+//!   （[`SseTicketStore`]，建连即消费；消费/过期纯核可测）。`GET /api/sse`
+//!   （票 06）：建连消费票据、首帧 `{type:"hello", epoch, version}`、此后每次
+//!   版本 bump 广播 `{type:"version", ...}`——版本枢纽 [`VersionHub`]，写侧
+//!   [`bump_and_publish`] / [`restore_bump_and_publish`]（lib.rs 写后钩子与
+//!   恢复完成的统一咽喉），连接单独计量 ≤4（[`ConnLimiter::try_acquire_sse`]）。
+//! - **数据版本查询**：`GET /api/data-version`（票 06，规格 A 白名单）回
+//!   `{epoch, version}` 库内真值。
 //!
 //! 白名单默认拒绝：`POST /api/cmd` 只派发注册表 [`WEBUI_COMMANDS`] 里登记的
 //! 命令，其余一律 404；四个网页端配置命令（凭证明文/安全配置面）**永久禁入**，
@@ -152,8 +158,8 @@ pub struct SseTicketStore {
     inner: Mutex<HashMap<String, i64>>,
 }
 
-// 票 06 接线前 consume/prune/len/is_empty 只有测试在用；逐方法豁免而非空注
-// 全 impl——issue 已在 sse_ticket_handler 生产路径上
+// 票 06 起 consume 在 SSE 建连（sse_handler）投产；len/is_empty/prune 仍只有
+// 测试与签发顺路清理在用，逐方法豁免
 impl SseTicketStore {
     pub fn new() -> Self {
         Self::default()
@@ -179,7 +185,6 @@ impl SseTicketStore {
     }
 
     /// 消费票据（建连即消费）：存在且未过期 → 移除并返回 true；否则 false。
-    #[allow(dead_code)] // 票 06 SSE 建连中间件消费
     pub fn consume(&self, ticket: &str, now: i64) -> bool {
         if ticket.is_empty() {
             return false;
@@ -224,14 +229,95 @@ impl SseTicketStore {
     }
 }
 
+// ── 数据版本广播枢纽（票 06：写后广播的进程内单写点）────────────────────────
+
+/// 一帧版本广播的负载：实例 epoch + 当前数据版本。桌面 `data-version` 事件与
+/// SSE 帧（hello / version）共用同一形状（前端对账纯函数吃同一结构）。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct VersionFrame {
+    pub epoch: String,
+    pub version: u64,
+}
+
+/// 版本广播枢纽（tokio watch：每个 SSE 连接持一个订阅者，写侧单写即通知，
+/// 不需要队列——对账只看最新值，中间值丢了由「版本落后即重拉」兜住）。
+/// 不变式：hub 值 ≡ 库内计数——初值 = 建依赖时的库内计数，此后唯一写入口是
+/// [`bump_and_publish`] / [`restore_bump_and_publish`]（bump 与发布同步）。
+pub struct VersionHub {
+    tx: tokio::sync::watch::Sender<VersionFrame>,
+    /// 必须持有：tokio watch 在「接收者数归零」时关闭通道，此后 `send` 不更新
+    /// 值只回 Err——没有 SSE 客户端在订时发生的版本 bump 会被静默丢掉，后连的
+    /// 客户端会拿到陈旧的 hello 基线。留着这个原始接收者，`send` 恒可用。
+    _keepalive: tokio::sync::watch::Receiver<VersionFrame>,
+}
+
+impl VersionHub {
+    pub fn new(epoch: String, initial_version: u64) -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(VersionFrame {
+            epoch,
+            version: initial_version,
+        });
+        VersionHub {
+            tx,
+            _keepalive: rx,
+        }
+    }
+
+    /// 当前帧（SSE hello 与 `GET /api/data-version` 用）。
+    pub fn current(&self) -> VersionFrame {
+        self.tx.borrow().clone()
+    }
+
+    /// 发布新版本（写侧；通知所有在订 SSE 连接）。
+    pub fn publish(&self, version: u64) -> VersionFrame {
+        let mut frame = self.tx.borrow().clone();
+        frame.version = version;
+        let _ = self.tx.send(frame.clone());
+        frame
+    }
+
+    /// 订阅（SSE 连接各持一个；watch 语义：订阅即见当前值，此后每次发布一帧）。
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<VersionFrame> {
+        self.tx.subscribe()
+    }
+}
+
+/// 写命令成功后的版本自增 + 广播（票 06 的统一咽喉）。生产链路：桌面写命令与
+/// HTTP 写命令（经 after_write 钩子）都汇到 lib.rs `trigger_after_write`，它调
+/// 本函数完成「库内 +1 → hub 发布 → 桌面 data-version 事件（emit 在 lib.rs 侧）」。
+/// 与写命令同一把库锁、锁外串行执行，等价「写事务内 +1」（规格 C）。
+pub fn bump_and_publish(
+    conn: &Mutex<Connection>,
+    hub: &VersionHub,
+) -> Result<VersionFrame, String> {
+    let guard = conn.lock().map_err(|e| format!("库锁不可用: {e}"))?;
+    let version = crate::data_version::bump(&guard)?;
+    Ok(hub.publish(version))
+}
+
+/// 恢复完成后的版本对齐（票 06）：恢复可能换入计数器更小的旧备份，把新库计数
+/// 抬到「max(新库计数, 本实例已广播最大值) + 1」，保证已连客户端对账必判
+/// 「落后」→ 无条件刷新（版本号跨恢复单调，规格 C；桌面端另有 db-restored
+/// 无条件刷新事件，两者并存）。
+pub fn restore_bump_and_publish(
+    conn: &Mutex<Connection>,
+    hub: &VersionHub,
+) -> Result<VersionFrame, String> {
+    let floor = hub.current().version;
+    let guard = conn.lock().map_err(|e| format!("库锁不可用: {e}"))?;
+    let version = crate::data_version::bump_floor(&guard, floor)?;
+    Ok(hub.publish(version))
+}
+
 // ── 纯核心：并发计量（普通 ≤8 与 SSE ≤4 分开计数）──────────────────────────
 
 /// 计量种类：普通请求与 SSE 长连接各用各的额度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitKind {
     Normal,
-    /// 票 06 的 SSE 路由消费（本票先落计量器）。
-    #[allow(dead_code)]
+    /// SSE 额度的具名种类（生产建连走 [`ConnLimiter::try_acquire_sse`]，
+    /// 本变体供 RAII 槽位测试与 in_flight 观测按种类取数）。
+    #[allow(dead_code)] // 仅测试构造
     Sse,
 }
 
@@ -296,6 +382,25 @@ impl ConnLimiter {
             LimitKind::Normal => self.normal.load(Ordering::Acquire),
             LimitKind::Sse => self.sse.load(Ordering::Acquire),
         }
+    }
+
+    /// 占一个 SSE 槽位（满则 false，调用方回 429）。SSE 槽随连接存活（可能
+    /// 数小时），而 RAII [`Slot`] 的借用形态进不了 'static 的 SSE 响应流——
+    /// 长连接用这对显式接口，归还走 [`Self::release_sse`]（流断开时由
+    /// [`VersionStream`] Drop 调用；建连中途早退由 handler 显式归还）。
+    pub fn try_acquire_sse(&self) -> bool {
+        self.sse
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < self.max_sse).then_some(n + 1)
+            })
+            .is_ok()
+    }
+
+    /// 归还一个 SSE 槽位（配对 [`Self::try_acquire_sse`]；饱和回 0，绝不回绕）。
+    pub fn release_sse(&self) {
+        let _ = self.sse.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            n.checked_sub(1).or(Some(0))
+        });
     }
 }
 
@@ -604,6 +709,9 @@ pub struct SharedDeps {
     pub after_write: AfterWriteHook,
     /// 前端静态资源查找（票 05；默认无资源=静态路由 404，生产 lib.rs 接线）。
     pub frontend_assets: AssetLookup,
+    /// 数据版本广播枢纽（票 06：初值 = 库内计数；SSE 连接订阅它收推送，
+    /// lib.rs 的写后/恢复链路经 bump_and_publish 系列同步发布）。
+    pub versions: VersionHub,
 }
 
 impl SharedDeps {
@@ -619,12 +727,23 @@ impl SharedDeps {
     }
 
     /// 带钩子构造（生产接线用：写后副作用 + 前端静态资源）。
+    /// 顺路完成票 06 的两件初始化：epoch（安装 id + 进程启动毫秒；安装 id 文件
+    /// 缺失则此刻生成落盘）与 hub 初值（锁内读库内计数；锁毒化按 0 起步——
+    /// 版本是提示性数据，不值得让服务起不来）。
     pub fn with_hooks(
         conn: Arc<Mutex<Connection>>,
         data_dir: PathBuf,
         after_write: AfterWriteHook,
         frontend_assets: AssetLookup,
     ) -> Self {
+        let epoch = {
+            let install_id = crate::data_version::load_or_create_install_id(&data_dir);
+            crate::data_version::epoch_of(&install_id, crate::data_version::process_start_millis())
+        };
+        let initial_version = conn
+            .lock()
+            .map(|conn| crate::data_version::get(&conn))
+            .unwrap_or(0);
         SharedDeps {
             conn,
             data_dir,
@@ -633,6 +752,7 @@ impl SharedDeps {
             read_timeout: READ_TIMEOUT,
             after_write,
             frontend_assets,
+            versions: VersionHub::new(epoch, initial_version),
         }
     }
 }
@@ -822,6 +942,146 @@ async fn sse_ticket_handler(State(deps): State<Shared>) -> axum::response::Respo
     }
 }
 
+// ── HTTP 层：SSE 端点与数据版本查询（票 06）────────────────────────────────
+
+/// `GET /api/sse` 的查询参数解析（手动拆查询串，不引 axum query feature）：
+/// EventSource 建连带不了 Authorization 头，闸二凭证在 `/api/sse-ticket` 已
+/// 验证过，这里只取一次性票据。票据是 32 hex 字符，无须百分号解码。
+fn parse_sse_ticket(uri: &axum::http::Uri) -> String {
+    uri.query()
+        .and_then(|q| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("ticket="))
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+/// `GET /api/data-version` 的应答帧：库内计数真值 + 实例 epoch。
+fn version_payload(deps: &SharedDeps, version: u64) -> serde_json::Value {
+    serde_json::json!({ "epoch": deps.versions.current().epoch, "version": version })
+}
+
+/// `GET /api/data-version`（规格 A 白名单「数据版本」）：库内计数真值 + epoch。
+/// 走闸二（主凭证）；SSE 建不上的客户端也可轮询它对账（前端当前只用 SSE）。
+async fn data_version_handler(State(deps): State<Shared>) -> axum::response::Response {
+    match crate::run_with_conn(&deps.conn, |conn| Ok(crate::data_version::get(conn))) {
+        Ok(version) => json_response(axum::http::StatusCode::OK, &version_payload(&deps, version)),
+        Err(e) => json_error(axum::http::StatusCode::INTERNAL_SERVER_ERROR, &e),
+    }
+}
+
+/// SSE 帧序列化：`{type:"hello"|"version", epoch, version}`（data: 行单行 JSON）。
+fn sse_event(kind: &str, frame: &VersionFrame) -> axum::response::sse::Event {
+    let body = serde_json::json!({ "type": kind, "epoch": frame.epoch, "version": frame.version });
+    axum::response::sse::Event::default().data(body.to_string())
+}
+
+/// SSE 帧流：首帧 `hello`（当前值，对账基线），此后每次版本发布一帧 `version`。
+/// 内核是 tokio_stream 的 WatchStream（订阅即得当前值 + 每次发布一帧）；持有
+/// `Shared` 克隆：Drop 时归还 SSE 槽位（连接活多久槽占多久——RAII [`Slot`] 的
+/// 借用进不了 'static 的响应体，见 [`ConnLimiter::try_acquire_sse`]）。
+struct VersionStream {
+    deps: Shared,
+    inner: tokio_stream::wrappers::WatchStream<VersionFrame>,
+    hello_sent: bool,
+}
+
+impl Drop for VersionStream {
+    fn drop(&mut self) {
+        self.deps.limiter.release_sse();
+    }
+}
+
+impl futures_core::Stream for VersionStream {
+    type Item = Result<axum::response::sse::Event, std::convert::Infallible>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        // 全字段 Unpin，直接 get_mut
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(frame)) => {
+                let kind = if this.hello_sent {
+                    "version"
+                } else {
+                    this.hello_sent = true;
+                    "hello"
+                };
+                std::task::Poll::Ready(Some(Ok(sse_event(kind, &frame))))
+            }
+            // 发送端没了（理论外：deps 与流同生共死）→ 结束流，连接收尾
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// SSE 建连的轻量闸：header 上限检查。不占普通并发槽（SSE 在 handler 内单独
+/// 计量 ≤4）；**不走闸二**——EventSource 建连带不了 Authorization 头，凭证换
+/// 一次性票据（规格 B），票据在 [`sse_handler`] 内建连即消费。
+async fn sse_gate_mw(req: axum::extract::Request, next: Next) -> axum::response::Response {
+    if let Some(reason) = header_limit_error(req.headers()) {
+        let peer = peer_ip(&req);
+        crate::applog::log_error(&format!("网页端拒绝来源 {peer}（{reason}）"));
+        return json_error(
+            axum::http::StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            reason,
+        );
+    }
+    next.run(req).await
+}
+
+/// `GET /api/sse?ticket=<一次性票据>`（票 06）：建连即消费票据（无效 → 401），
+/// 首帧立即推 `{type:"hello", epoch, version}`，此后每次版本 bump 广播
+/// `{type:"version", ...}`。连接计入 SSE 单独额度（≤4，规格 A）。
+///
+/// 读超时语义：本端点挂在 [`timeout_mw`] 下，但那只覆盖建连阶段（响应头产出
+/// 即返回）；流式响应体在中间件链返回后才由 hyper 消费，**30 秒读超时不掐
+/// SSE 长连接**（规格 B：读超时只对首字节/建连阶段应用）。断开由客户端断连、
+/// 服务优雅关停（3 秒宽限）或 SSE 槽位规则兜底。
+async fn sse_handler(
+    State(deps): State<Shared>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    uri: axum::http::Uri,
+) -> axum::response::Response {
+    let ticket = parse_sse_ticket(&uri);
+    // 槽位先行：满员 429 时不消费票据（客户端可原票重试一次）
+    if !deps.limiter.try_acquire_sse() {
+        let reason = format!("SSE 连接数已达上限（{MAX_CONCURRENT_SSE}），请稍后再试");
+        crate::applog::log_error(&format!("网页端拒绝来源 {}（{reason}）", peer.ip()));
+        return json_error(axum::http::StatusCode::TOO_MANY_REQUESTS, &reason);
+    }
+    // 建连即消费（一次性）：二次消费（EventSource 原生自动重连没有新票据）必拒，
+    // 前端 onerror 里 close 后重取票据重建连（ipc.ts）
+    if !deps.tickets.consume(&ticket, chrono::Utc::now().timestamp()) {
+        deps.limiter.release_sse(); // 早退：槽位当场归还（长连接槽在流 Drop 归还）
+        crate::applog::log_error(&format!(
+            "网页端拒绝来源 {}（SSE 票据无效或已过期）",
+            peer.ip()
+        ));
+        return json_error(
+            axum::http::StatusCode::UNAUTHORIZED,
+            "SSE 票据无效或已过期，请刷新页面重试",
+        );
+    }
+    let stream = VersionStream {
+        inner: tokio_stream::wrappers::WatchStream::new(deps.versions.subscribe()),
+        deps,
+        hello_sent: false,
+    };
+    axum::response::sse::Sse::new(stream)
+        // 15 秒注释帧保活：NAT/路由器不掐空闲连接（对账只认 data 帧，注释帧前端不解析）
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
 // ── HTTP 层：前端静态资源（票 05，规格「浏览器打开即完整前端」）────────────
 
 /// 静态资源响应的附加头：nosniff 防 MIME 嗅探（规格 E 精神，照片路由票 08 同款）。
@@ -898,7 +1158,13 @@ async fn static_handler(
 /// ——恢复校验/备份持锁窗口期尤甚。规格 A「普通并发上限 8」没有端点豁免授权）。
 /// 前端静态资源（票 05）同 health：**豁免闸二**（页面要先加载才能跑 `#token=`
 /// 入库的入口 JS，带不了 Authorization 头；产物是公开构建物无敏感内容），
-/// 限额/超时照挂。其余一切路径 404（axum 无路由默认）。
+/// 限额/超时照挂。
+/// `/api/sse`（票 06）独立成组：豁免闸二（EventSource 建连带不了 Bearer 头，
+/// 凭证换一次性票据在 handler 内消费）；**不占普通并发槽**（SSE 长连接单独
+/// 计量 ≤4，handler 内 try_acquire_sse）；header 上限与建连超时照挂（超时只
+/// 覆盖建连——流式响应体在中间件链返回后才被消费，见 sse_handler 注释）。
+/// `/api/data-version`（票 06）走闸二与全部限额（普通短请求）。其余一切路径
+/// 404（axum 无路由默认）。
 fn build_router(deps: Shared) -> axum::Router {
     use axum::extract::DefaultBodyLimit;
     use axum::middleware as mw;
@@ -907,6 +1173,7 @@ fn build_router(deps: Shared) -> axum::Router {
     let api = axum::Router::new()
         .route("/api/cmd", post(cmd_handler))
         .route("/api/sse-ticket", post(sse_ticket_handler))
+        .route("/api/data-version", get(data_version_handler))
         .layer(mw::from_fn_with_state(deps.clone(), auth_mw))
         .layer(mw::from_fn(timeout_mw))
         .layer(mw::from_fn_with_state(deps.clone(), limits_mw))
@@ -916,13 +1183,22 @@ fn build_router(deps: Shared) -> axum::Router {
         .layer(mw::from_fn(timeout_mw))
         .layer(mw::from_fn_with_state(deps.clone(), limits_mw))
         .with_state(deps.clone());
+    let sse = axum::Router::new()
+        .route("/api/sse", get(sse_handler))
+        .layer(mw::from_fn(sse_gate_mw))
+        .layer(mw::from_fn(timeout_mw))
+        .with_state(deps.clone());
     let assets = axum::Router::new()
         .route("/", get(index_handler))
         .route("/{*path}", get(static_handler))
         .layer(mw::from_fn(timeout_mw))
         .layer(mw::from_fn_with_state(deps.clone(), limits_mw))
         .with_state(deps);
-    health.merge(api).merge(assets).layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+    health
+        .merge(api)
+        .merge(sse)
+        .merge(assets)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
 // ── 服务生命周期：accept 循环 / 起停 ────────────────────────────────────────
@@ -2077,6 +2353,353 @@ mod tests {
     /// 构造 `{"cmd":..,"args":..}` 请求体（帮助类型推断的小工具）。
     fn json_body(cmd: &str, args: &serde_json::Value) -> String {
         serde_json::json!({ "cmd": cmd, "args": args }).to_string()
+    }
+
+    // ── 票 06：数据版本广播与 SSE 端到端（原始 TCP 读帧，ureq 不能流式读）──
+
+    /// 主凭证换一张一次性票据。
+    fn issue_ticket(agent: &ureq::Agent, base: &str, token: &str) -> String {
+        let (status, body) = http(agent, "POST", &format!("{base}/api/sse-ticket"), Some(token), "");
+        assert_eq!(status, 200, "取票失败：{body}");
+        body["ticket"].as_str().expect("缺 ticket 字段").to_string()
+    }
+
+    /// 原始 TCP 发 SSE 建连请求（EventSource 同款 GET /api/sse?ticket=）。
+    fn sse_request(port: u16, ticket: &str) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", port)).expect("SSE 建连失败");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "GET /api/sse?ticket={ticket} HTTP/1.1\r\nHost: t\r\nAccept: text/event-stream\r\n\r\n"
+        )
+        .expect("写 SSE 请求失败");
+        stream
+    }
+
+    /// 读到 HTTP 响应头结束（\r\n\r\n），返回头文本。
+    fn read_response_head(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => panic!("服务端在头部读完前关闭连接（已读 {} 字节）", buf.len()),
+                Ok(_) => buf.push(byte[0]),
+                Err(e) => panic!("读响应头失败: {e}"),
+            }
+            if buf.ends_with(b"\r\n\r\n") {
+                return String::from_utf8(buf).unwrap();
+            }
+        }
+    }
+
+    /// 读下一个带 data: 行的 SSE 帧，回解析后的 JSON。hyper 用 chunked 编码，
+    /// 帧会被 chunk 大小行/终止行包住，keep-alive 是注释帧——都按行过滤，
+    /// 只认 `data:` 行。
+    fn read_sse_data(stream: &mut std::net::TcpStream) -> serde_json::Value {
+        use std::io::Read;
+        let mut buf: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte) {
+                Ok(0) => panic!("SSE 连接被服务端关闭（已读 {} 字节）", buf.len()),
+                Ok(_) => buf.push(byte[0]),
+                Err(e) => panic!("读 SSE 帧失败: {e}"),
+            }
+            if buf.ends_with(b"\n\n") {
+                let text = String::from_utf8(buf.clone()).unwrap();
+                for line in text.lines() {
+                    if let Some(data) = line.strip_prefix("data:") {
+                        return serde_json::from_str(data.trim())
+                            .unwrap_or_else(|e| panic!("data 行不是 JSON（{e}）: {data}"));
+                    }
+                }
+                buf.clear(); // keep-alive 注释帧：跳过，继续等 data 帧
+            }
+        }
+    }
+
+    #[test]
+    fn sse_sends_hello_with_epoch_and_version_on_connect() {
+        // 验收「SSE 首帧=实例 epoch+当前版本号」：取票 → 原始 TCP 建连 →
+        // 首帧 type=hello，epoch = 安装 id-启动毫秒，version = 库内计数真值。
+        let token = "a".repeat(32);
+        let (deps, dir) = test_deps(&["127.0.0.0/8"], &token);
+        // 先写两笔（走统一咽喉），hello 应带当前计数而非 0
+        bump_and_publish(&deps.conn, &deps.versions).unwrap();
+        bump_and_publish(&deps.conn, &deps.versions).unwrap();
+        let handle = block(start(deps.clone(), 0)).expect("启动失败");
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+
+        let ticket = issue_ticket(&a, &base, &token);
+        let mut stream = sse_request(handle.port(), &ticket);
+        let head = read_response_head(&mut stream);
+        assert!(head.starts_with("HTTP/1.1 200"), "实际：{head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: text/event-stream"),
+            "SSE 响应类型：{head}"
+        );
+        let frame = read_sse_data(&mut stream);
+        assert_eq!(frame["type"], "hello");
+        assert_eq!(frame["version"], 2, "hello 带库内计数真值：{frame}");
+        let epoch = frame["epoch"].as_str().expect("缺 epoch");
+        // epoch = <安装id 32 hex>-<启动毫秒>
+        let install_id = std::fs::read_to_string(dir.path().join("install-id")).unwrap();
+        assert!(
+            epoch.starts_with(install_id.trim()) && epoch.contains('-'),
+            "epoch 应为 安装id-启动毫秒：{epoch}"
+        );
+        assert_eq!(epoch, deps.versions.current().epoch, "与 hub 同源");
+        drop(stream);
+        block(handle.stop());
+    }
+
+    #[test]
+    fn sse_pushes_version_frame_after_write_command() {
+        // 验收「HTTP 写触发广播帧」：写命令成功 → 写后钩子链（生产 = lib.rs
+        // trigger_after_write → bump_and_publish；测试注入同语义钩子）→ 在订
+        // SSE 连接收到 {type:"version"} 帧。读命令不广播。
+        let token = "a".repeat(32);
+        let deps_cell: Arc<std::sync::OnceLock<Arc<SharedDeps>>> =
+            Arc::new(std::sync::OnceLock::new());
+        let cell = deps_cell.clone();
+        let after_write: AfterWriteHook = Arc::new(move |_with_tray| {
+            if let Some(deps) = cell.get() {
+                let _ = bump_and_publish(&deps.conn, &deps.versions);
+            }
+        });
+        let (deps, _dir) = test_deps_with(&["127.0.0.0/8"], &token, after_write, Arc::new(|_| None));
+        let _ = deps_cell.set(deps.clone());
+        let colony_id = seed_colony(&deps.conn, "广播窝");
+        let today = crate::colony::today_iso();
+        let handle = block(start(deps, 0)).expect("启动失败");
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+
+        // 建连：hello version=0
+        let mut stream = sse_request(handle.port(), &issue_ticket(&a, &base, &token));
+        assert_eq!(read_sse_data(&mut stream)["type"], "hello");
+
+        // 读命令：不广播
+        let (status, _) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            &json_body("list_colonies", &serde_json::json!({})),
+        );
+        assert_eq!(status, 200);
+        // 写命令：广播 version=1
+        let (status, body) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            &serde_json::json!({
+                "cmd": "log_care",
+                "args": {"input": {"colony_id": colony_id, "action_id": 1,
+                                    "happened_at": today, "food_ids": []}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+
+        let frame = read_sse_data(&mut stream);
+        assert_eq!(frame["type"], "version", "实际：{frame}");
+        assert_eq!(frame["version"], 1, "实际：{frame}");
+        assert!(frame["epoch"].as_str().is_some());
+
+        // 再写一笔：版本继续单调推帧
+        let (status, _) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            &serde_json::json!({
+                "cmd": "save_checkin",
+                "args": {"input": {"colony_id": colony_id, "date": today, "note": "巢况"}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200);
+        let frame = read_sse_data(&mut stream);
+        assert_eq!(frame["type"], "version");
+        assert_eq!(frame["version"], 2, "版本跨写命令单调：{frame}");
+        drop(stream);
+        block(handle.stop());
+    }
+
+    #[test]
+    fn sse_rejects_invalid_ticket_with_401() {
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let handle = block(start(deps, 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+        // 未知票据 / 空票据 → 401 人话
+        let (status, body) = http(&a, "GET", &format!("{base}/api/sse?ticket=deadbeef"), None, "");
+        assert_eq!(status, 401, "未知票据应 401");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("票据"),
+            "实际：{body}"
+        );
+        let (status, _) = http(&a, "GET", &format!("{base}/api/sse"), None, "");
+        assert_eq!(status, 401, "缺 ticket 参数（解析为空票）同样 401");
+        block(handle.stop());
+    }
+
+    #[test]
+    fn sse_ticket_is_single_use_on_connect() {
+        // 验收「票据消费后原生重连不发生」的服务端半边：建连即消费，同票再连
+        // 必 401——EventSource 原生自动重连不带新票据，必然死在这里，前端必须
+        // close 后重取票据（ipc.ts 的实现与测试在前端侧钉）。
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let handle = block(start(deps, 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+        let ticket = issue_ticket(&a, &base, &token);
+        let mut stream = sse_request(handle.port(), &ticket);
+        assert!(read_response_head(&mut stream).starts_with("HTTP/1.1 200"), "首连成功");
+        let (status, _) = http(&a, "GET", &format!("{base}/api/sse?ticket={ticket}"), None, "");
+        assert_eq!(status, 401, "同票二次建连（原生重连形状）必 401");
+        drop(stream);
+        block(handle.stop());
+    }
+
+    #[test]
+    fn sse_fifth_connection_rejected_and_slot_released_on_disconnect() {
+        // 验收「第 5 条 SSE 连接被拒」：SSE 单独计量 ≤4，不挤占普通并发额度；
+        // 断开一条后槽位随流归还，可再连。
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let handle = block(start(deps, 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+        let mut streams = Vec::new();
+        for _ in 0..MAX_CONCURRENT_SSE {
+            let mut s = sse_request(handle.port(), &issue_ticket(&a, &base, &token));
+            assert!(
+                read_response_head(&mut s).starts_with("HTTP/1.1 200"),
+                "前 4 条应放行"
+            );
+            streams.push(s);
+        }
+        // 第 5 条：取票成功但 429
+        let (status, body) = http(
+            &a,
+            "GET",
+            &format!("{base}/api/sse?ticket={}", issue_ticket(&a, &base, &token)),
+            None,
+            "",
+        );
+        assert_eq!(status, 429, "实际：{body}");
+        assert!(body["error"].as_str().unwrap_or("").contains("SSE"), "实际：{body}");
+        // 普通请求额度未被 SSE 挤占
+        let (status, _) = http(&a, "GET", &format!("{base}/api/health"), None, "");
+        assert_eq!(status, 200, "SSE 满员不挤占普通并发");
+
+        // 断开一条 → 槽位随流归还 → 可再连（轮询等 hyper 感知断连）
+        drop(streams.pop());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut reopened = None;
+        while std::time::Instant::now() < deadline {
+            let mut s = sse_request(handle.port(), &issue_ticket(&a, &base, &token));
+            let head = read_response_head(&mut s);
+            if head.starts_with("HTTP/1.1 200") {
+                reopened = Some(s);
+                break;
+            }
+            assert!(head.starts_with("HTTP/1.1 429"), "非 429 的意外响应：{head}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(reopened.is_some(), "断开后槽位应归还并允许新连接");
+        block(handle.stop());
+    }
+
+    #[test]
+    fn bump_and_publish_updates_db_and_hub_in_lockstep() {
+        // 「桌面路径写触发 bump」单测级（票面纪律：桌面窗口级不测）：lib.rs
+        // trigger_after_write → bump_data_version_and_broadcast 的可测核心就是
+        // 本函数（锁内 bump + hub 发布）；AppHandle 事件 emit 不进单测。
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
+        let f1 = bump_and_publish(&deps.conn, &deps.versions).unwrap();
+        let f2 = bump_and_publish(&deps.conn, &deps.versions).unwrap();
+        assert_eq!(f1.version, 1);
+        assert_eq!(f2.version, 2, "连续写版本单调");
+        assert_eq!(f1.epoch, f2.epoch, "同进程 epoch 不变");
+        assert_eq!(deps.versions.current().version, 2, "hub 与库同步");
+        let truth =
+            crate::run_with_conn(&deps.conn, |conn| Ok(crate::data_version::get(conn))).unwrap();
+        assert_eq!(truth, 2, "库内计数真值");
+    }
+
+    #[test]
+    fn restore_bump_and_publish_keeps_version_monotonic_over_rollback() {
+        // 验收「恢复完成→两端无条件刷新」的机制半边：恢复换入计数器更小的旧
+        // 备份时，restore_bump_and_publish 抬到「已广播最大值+1」，已连客户端
+        // 对账必判落后 → 刷新。（桌面端 db-restored 无条件刷新在 lib.rs 并存。）
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
+        for _ in 0..5 {
+            bump_and_publish(&deps.conn, &deps.versions).unwrap();
+        }
+        assert_eq!(deps.versions.current().version, 5);
+        // 模拟恢复：新库换进来，计数器只有 1
+        {
+            let conn = deps.conn.lock().unwrap();
+            crate::data_meta::set(&conn, crate::data_version::DATA_VERSION_KEY, "1").unwrap();
+        }
+        let frame = restore_bump_and_publish(&deps.conn, &deps.versions).unwrap();
+        assert_eq!(frame.version, 6, "抬到 已广播最大值+1，不随备份回退");
+        assert_eq!(deps.versions.current().version, 6);
+        let truth =
+            crate::run_with_conn(&deps.conn, |conn| Ok(crate::data_version::get(conn))).unwrap();
+        assert_eq!(truth, 6, "抬升后的计数落进新库");
+    }
+
+    #[test]
+    fn data_version_endpoint_reports_truth_gated_by_bearer() {
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        bump_and_publish(&deps.conn, &deps.versions).unwrap();
+        let handle = block(start(deps, 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+        // 走闸二：无凭证 401
+        let (status, _) = http(&a, "GET", &format!("{base}/api/data-version"), None, "");
+        assert_eq!(status, 401);
+        // 带凭证：{epoch, version} 与 hub 同源
+        let (status, body) = http(&a, "GET", &format!("{base}/api/data-version"), Some(&token), "");
+        assert_eq!(status, 200);
+        assert_eq!(body["version"], 1);
+        assert!(body["epoch"].as_str().is_some());
+        block(handle.stop());
+    }
+
+    #[test]
+    fn shared_deps_epoch_is_install_id_plus_start_time() {
+        // epoch 的组成钉死：安装 id（数据目录 install-id 文件）+ 进程启动毫秒
+        let (deps, dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
+        let install_id =
+            std::fs::read_to_string(dir.path().join(crate::data_version::INSTALL_ID_FILE)).unwrap();
+        let expected = crate::data_version::epoch_of(
+            install_id.trim(),
+            crate::data_version::process_start_millis(),
+        );
+        assert_eq!(deps.versions.current().epoch, expected);
+        // 重开同一数据目录的依赖（模拟服务重启）：安装 id 稳定，启动毫秒不变
+        //（同进程内 OnceLock），epoch 稳定；跨进程才会变（纯核测试已钉）
+        let conn2 = {
+            let conn = deps.conn.lock().unwrap();
+            crate::data_version::get(&conn)
+        };
+        assert_eq!(conn2, 0);
     }
 
     #[test]

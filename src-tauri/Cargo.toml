@@ -42,9 +42,17 @@ getrandom = "0.3"
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
+# SSE 帧流（票 06）：axum 的 Sse 响应体要 futures_core::Stream——自写 VersionStream
+#（hello 首帧 + watch 变更帧 + Drop 归还 SSE 槽位）只差这个 trait；crate 已在
+# axum 依赖树里（0.3），显式点名零新增编译面
+futures-core = "0.3"
 # tokio 直依赖（票 04）：服务生命周期要 TcpListener/watch/JoinSet/timeout——
 # Tauri 本就带着 tokio（同版本共享），这里只是把已在树里的 crate 显式点名
 tokio = { version = "1", default-features = false, features = ["net", "rt", "sync", "time", "io-util"] }
+# SSE 帧流的 watch 包装（票 06）：VersionStream 用 WatchStream 把「订阅即得当前值
+# + 每次发布一帧」变成 Stream（tokio 自身不带 Stream 实现）；sync feature 只开
+# watch 包装
+tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"
