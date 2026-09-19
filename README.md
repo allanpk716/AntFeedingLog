@@ -34,8 +34,8 @@ Tauri 2（Rust + rusqlite 独占数据层，逐版本迁移链）· Vue 3 + Type
 ```bash
 pnpm install
 pnpm tauri dev          # 开发运行（首次 Rust 编译约 5-10 分钟）
-pnpm test               # 前端测试（339 个）
-cd src-tauri && cargo test   # Rust 测试（332 个）
+pnpm test               # 前端测试（505 个）
+cd src-tauri && cargo test   # Rust 测试（557 个）
 pnpm tauri build        # 打包安装包
 ```
 

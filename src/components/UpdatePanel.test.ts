@@ -2,24 +2,27 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import UpdatePanel from "./UpdatePanel.vue";
 
-// 不依赖 Tauri 运行时：mock 掉 IPC 与事件监听（沿 LogListPage.test.ts 先例）
-const { invokeMock, listenMock, unlistenMock, emitProgress } = vi.hoisted(() => {
+// 不依赖 Tauri 运行时：统一 mock 调用层；subscribe 注入可控桩
+// （记录处理器以便 emitProgress 派发，退订函数可控可断言）
+const { invokeMock, subscribeMock, unlistenMock, emitProgress } = vi.hoisted(() => {
   const invokeMock = vi.fn();
   const unlistenMock = vi.fn();
-  let handler: ((e: { payload: unknown }) => void) | null = null;
-  const listenMock = vi.fn(async (_event: string, h: (e: { payload: unknown }) => void) => {
+  let handler: ((payload: unknown) => void) | null = null;
+  const subscribeMock = vi.fn(async (_event: string, h: (payload: unknown) => void) => {
     handler = h;
     return unlistenMock;
   });
   return {
     invokeMock,
-    listenMock,
+    subscribeMock,
     unlistenMock,
-    emitProgress: (payload: unknown) => handler?.({ payload }),
+    emitProgress: (payload: unknown) => handler?.(payload),
   };
 });
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: listenMock }));
+vi.mock("../lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("../testing/ipcMock");
+  return ipcModuleMock(invokeMock, { subscribe: subscribeMock })(importOriginal);
+});
 
 function baseMock(updateState: object = { status: "idle" }) {
   invokeMock.mockImplementation(async (cmd: string) => {
@@ -43,7 +46,7 @@ async function mountPanel(updateState?: object) {
 
 beforeEach(() => {
   invokeMock.mockReset();
-  listenMock.mockClear();
+  subscribeMock.mockClear();
   unlistenMock.mockClear();
 });
 
@@ -56,7 +59,7 @@ describe("更新面板（票 06）：挂载与启动残留引导", () => {
     expect(wrapper.find(".current-version").text()).toContain("v0.1.0");
     expect(wrapper.find(".update-banner-warn").exists()).toBe(false);
     expect(wrapper.find(".update-banner-ok").exists()).toBe(false);
-    expect(listenMock).toHaveBeenCalledWith("update-download-progress", expect.any(Function));
+    expect(subscribeMock).toHaveBeenCalledWith("update-download-progress", expect.any(Function));
   });
 
   it("update_state 为失败残留 → 顶部出「上次升级未完成」引导（含目标版本与手动下载出口）", async () => {
@@ -88,18 +91,18 @@ describe("更新面板（票 06）：挂载与启动残留引导", () => {
     expect(unlistenMock).toHaveBeenCalledTimes(1);
   });
 
-  it("挂载后 listen 未 resolve 就卸载：resolve 后立即退订，不泄漏监听（评审 R2 Minor-1）", async () => {
-    let resolveListen!: (fn: typeof unlistenMock) => void;
-    listenMock.mockImplementationOnce(
+  it("挂载后订阅未 resolve 就卸载：resolve 后立即退订，不泄漏监听（评审 R2 Minor-1）", async () => {
+    let resolveSubscribe!: (fn: typeof unlistenMock) => void;
+    subscribeMock.mockImplementationOnce(
       () =>
         new Promise<typeof unlistenMock>((resolve) => {
-          resolveListen = resolve;
+          resolveSubscribe = resolve;
         }),
     );
     baseMock();
     const wrapper = mount(UpdatePanel);
-    wrapper.unmount(); // listen 还没 resolve 就卸载
-    resolveListen(unlistenMock);
+    wrapper.unmount(); // subscribe 还没 resolve 就卸载
+    resolveSubscribe(unlistenMock);
     await flushPromises();
     expect(unlistenMock).toHaveBeenCalledTimes(1);
   });

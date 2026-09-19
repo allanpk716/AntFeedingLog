@@ -23,10 +23,13 @@ import {
   retrievalTile,
   type TileView,
 } from "../lib/care";
+import { isTauri } from "../lib/ipc";
+import { checkinCardLine } from "../lib/checkin";
 import { hibernationBanner } from "../lib/hibernation";
 import { todayIso } from "../lib/dates";
 import FeedDialog from "./FeedDialog.vue";
 import HibernationDialog from "./HibernationDialog.vue";
+import NestCheckinDialog from "./NestCheckinDialog.vue";
 import QuickLogDialog from "./QuickLogDialog.vue";
 
 const props = defineProps<{ colony: Colony }>();
@@ -58,6 +61,9 @@ const tiles = computed(() =>
 );
 
 const recentLine = computed(() => formatRecent(props.colony.recent));
+
+/** 巢况摘要行（webui-checkin 票 02）：最新一组数 + 距上次登记天数；从未登记为空串（隐藏）。 */
+const checkinLine = computed(() => checkinCardLine(props.colony.checkin));
 
 // ── 「⋯」菜单（交互第三轮 #7）：开合 + 两路收起 ──
 const menuOpen = ref(false);
@@ -93,6 +99,8 @@ const quickAction = ref<ColonyAction | null>(null);
 const showHibernation = ref(false);
 const hibernationMode = ref<"start" | "wake" | "past" | "edit">("start");
 
+const showCheckin = ref(false);
+
 function openHibernation(mode: "start" | "wake" | "past" | "edit") {
   hibernationMode.value = mode;
   showHibernation.value = true;
@@ -124,6 +132,11 @@ function onQuickSaved() {
 function onFeedSaved() {
   showFeed.value = false;
   feedAction.value = null;
+  emit("saved");
+}
+
+function onCheckinSaved() {
+  showCheckin.value = false;
   emit("saved");
 }
 </script>
@@ -176,6 +189,14 @@ function onFeedSaved() {
       <button class="dots" type="button" title="编辑 / 冬眠等更多操作" @click="toggleMenu">⋯</button>
     </div>
 
+    <div v-if="checkinLine" class="checkin-line" data-testid="checkin-line">{{ checkinLine }}</div>
+
+    <div class="card-actions">
+      <button class="checkin-btn" type="button" title="蚁口 / 换巢 / 备注的时间线" @click="showCheckin = true">
+        巢况
+      </button>
+    </div>
+
     <!-- 交互第三轮 #7：低频操作收进 ⋯ 菜单（v-show 保 DOM，按钮原类名与测试兼容） -->
     <div v-show="menuOpen" class="card-menu" @click.stop>
       <button
@@ -204,7 +225,8 @@ function onFeedSaved() {
       >
         📅 补录冬眠
       </button>
-      <button class="m-item edit-btn" type="button" @click="menuAction(() => emit('edit'))">✏️ 编辑窝信息</button>
+      <!-- 终局评审：窝的编辑是桌面专属（网页端 API 白名单挡住 update_colony 等），浏览器不渲染入口 -->
+      <button v-if="isTauri()" class="m-item edit-btn" type="button" @click="menuAction(() => emit('edit'))">✏️ 编辑窝信息</button>
     </div>
 
     <FeedDialog
@@ -227,6 +249,12 @@ function onFeedSaved() {
       :mode="hibernationMode"
       @close="showHibernation = false"
       @saved="onHibernationSaved"
+    />
+    <NestCheckinDialog
+      v-if="showCheckin"
+      :colony="colony"
+      @close="showCheckin = false"
+      @saved="onCheckinSaved"
     />
   </article>
 </template>
@@ -444,6 +472,33 @@ function onFeedSaved() {
   text-overflow: ellipsis;
 }
 
+/* 巢况摘要行（webui-checkin 票 02）：与最近记录行同字号，紧随其后 */
+.checkin-line {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.card-actions {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* 巢况按钮沿用卡片按钮基样式（其余低频按钮已收进 ⋯ 菜单，样式随菜单） */
+.checkin-btn {
+  border: 1px solid var(--border-strong);
+  background: var(--card);
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  padding: 2px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
 .dots {
   flex: none;
   border: none;
@@ -454,6 +509,11 @@ function onFeedSaved() {
   padding: 0 4px;
   border-radius: 6px;
   line-height: 1;
+}
+
+.checkin-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-deep);
 }
 
 .dots:hover {

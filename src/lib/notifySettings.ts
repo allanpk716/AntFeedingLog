@@ -1,9 +1,8 @@
 /**
- * 通知设置（票 06）：设置弹窗「通知」tab 的纯逻辑。
- * get_settings / set_settings 走 Rust settings::AppSettings，这里只做
- * 表单态 ↔ 设置态转换与提前天数输入校验（type=number 经 v-model 可能给回
- * 数字或半输入状态文本，统一按 string | number 处理）。
- * 票 05：表单加「撤食提醒」独立开关（默认开；总开关关则全静默的闸门在 Rust 侧）。
+ * 通知设置（票 06；票 05 增「撤食提醒」开关，webui-checkin 票 11 增 Pushover
+ * 应用内凭据两字段）：设置弹窗「通知」tab 的纯逻辑。get_settings / set_settings
+ * 走 Rust settings::AppSettings，这里只做表单态 ↔ 设置态转换与提前天数输入校验
+ *（type=number 经 v-model 可能给回数字或半输入状态文本，统一按 string | number 处理）。
  */
 
 import type { AppSettings } from "../types";
@@ -15,12 +14,14 @@ import type { AppSettings } from "../types";
  */
 export type NotifySettingsModel = AppSettings & { notify_retrieval_enabled?: boolean };
 
-/** 通知 tab 的表单态：提前天数保持文本，便于清空重输 */
+/** 通知 tab 的表单态：提前天数保持文本，便于清空重输；凭据两值原样回显（打码在 UI 层） */
 export interface NotifySettingsForm {
   master: boolean;
   /** 撤食提醒开关（票 05）：只闸撤食这一类，不影响其它提醒 */
   retrieval: boolean;
   daysAheadText: string | number;
+  pushoverUser: string;
+  pushoverToken: string;
 }
 
 /** 提前天数输入非法时的报错文案 */
@@ -32,6 +33,8 @@ export function toForm(s: NotifySettingsModel): NotifySettingsForm {
     master: s.notify_master_enabled,
     retrieval: s.notify_retrieval_enabled ?? true,
     daysAheadText: String(s.wake_remind_days_ahead),
+    pushoverUser: s.pushover_user,
+    pushoverToken: s.pushover_token,
   };
 }
 
@@ -49,6 +52,7 @@ export function parseDaysAhead(text: string | number): number | null {
  * autostart 由通知 tab 的「开机自启」开关提供（票 09），随保存一起落库。
  * 分类子开关作废（反馈第二轮 Q7/Q9）：超期/冬眠两键保留在库里，行为由总开关
  * 统一，固定回写 true；撤食开关（票 05）是唯一仍生效的分类开关，原样落库。
+ * 凭据两值原样透传（票 11；trim 在 Rust 保存侧统一做）。
  */
 export function toSettings(f: NotifySettingsForm, autostart: boolean): NotifySettingsModel | null {
   const days = parseDaysAhead(f.daysAheadText);
@@ -60,5 +64,7 @@ export function toSettings(f: NotifySettingsForm, autostart: boolean): NotifySet
     notify_retrieval_enabled: f.retrieval,
     wake_remind_days_ahead: days,
     autostart_enabled: autostart,
+    pushover_user: f.pushoverUser,
+    pushover_token: f.pushoverToken,
   };
 }

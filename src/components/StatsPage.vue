@@ -7,7 +7,8 @@
  * 视觉基线 mocks/mock-b-stats.html；占比归一化/周取数/间隔条布局在 lib/stats.ts。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { earliestLogDate, getStats, listColonies } from "../lib/ipc";
+import { watchDataVersion } from "../lib/versionSync";
 import * as echarts from "echarts";
 import type { Colony, StatsDayDetail, StatsPayload } from "../types";
 import { todayIso } from "../lib/dates";
@@ -38,6 +39,8 @@ const range = ref<StatsRange>("6m");
 const payload = ref<StatsPayload | null>(null);
 const pageError = ref("");
 const loading = ref(false);
+/** 版本广播退订柄（票 06；页签卸载时调用）。 */
+let unwatchVersion: (() => void) | null = null;
 
 const totalLogs = computed(() => payload.value?.daily.reduce((s, d) => s + d.count, 0) ?? 0);
 const foodSlices = computed(() => normalizeFoodShare(payload.value?.food_share ?? []));
@@ -51,12 +54,12 @@ async function refresh() {
   loading.value = true;
   try {
     if (colonies.value.length === 0) {
-      colonies.value = await invoke<Colony[]>("list_colonies");
+      colonies.value = await listColonies();
     }
     // 「全部」下界 = min(最早开始饲养日, 最早记录日)（票 07 停靠①）；分母口径
     // （规则 7）由 range_days 随 payload 带回
-    const earliest = await invoke<string | null>("earliest_log_date");
-    payload.value = await invoke<StatsPayload>("get_stats", {
+    const earliest = await earliestLogDate();
+    payload.value = await getStats({
       colonyId: colonyId.value,
       startDate: rangeStartFor(range.value, today, colonies.value, earliest),
       endDate: today,
@@ -207,9 +210,15 @@ function renderWeekly() {
 
 onMounted(() => {
   void refresh();
+  // 数据版本广播（webui-checkin 票 06）：别端记录后本页开着就重拉（复用
+  // refresh；筛选条件原样保留，数据驱动重算）。页签卸载即退订。
+  unwatchVersion = watchDataVersion(() => void refresh());
 });
 watch(payload, () => void nextTick(renderCharts));
-onBeforeUnmount(disposeCharts);
+onBeforeUnmount(() => {
+  disposeCharts();
+  unwatchVersion?.();
+});
 </script>
 
 <template>

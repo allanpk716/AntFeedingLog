@@ -74,6 +74,8 @@ export interface Colony {
   actions: ColonyAction[];
   recent: RecentLog[];
   hibernation: HibernationPreview | null;
+  /** 巢况摘要（webui-checkin 票 02）：最新一组数 + 基线 + 距上次登记天数 */
+  checkin: CheckinDigest;
 }
 
 /** 新建/编辑窝入参 */
@@ -289,12 +291,17 @@ export interface AppSettings {
   wake_remind_days_ahead: number;
   /** 开机自启（票 09：通知 tab 开关随保存落库，Rust 同步自启插件状态） */
   autostart_enabled: boolean;
+  /** Pushover 用户键（票 11；空串 = 应用内未填，发送侧回落环境变量） */
+  pushover_user: string;
+  /** Pushover 应用令牌（票 11；空串 = 未填） */
+  pushover_token: string;
 }
 
-/** pushover_status 返回体：环境变量在/不在（不含值） */
+/** pushover_status 返回体（票 11 三态）：生效来源 + 是否已配置（不含值） */
+export type PushoverSource = "app" | "env" | "none";
 export interface PushoverStatus {
-  user_found: boolean;
-  token_found: boolean;
+  source: PushoverSource;
+  configured: boolean;
 }
 
 /** send_test_notification 返回体：分渠道结果（pushover=null 表示未配置） */
@@ -359,11 +366,130 @@ export interface RestoreSummary {
   /** 备份内的备份目录设置值（settings 表旧布局才有；null = 备份内无此设置，
    * 备份设置存库外不随恢复回滚——D1） */
   backup_dir_in_backup: string | null;
+  /** 备份内照片张数（webui-checkin 票 10）：数据包 = 包内清单张数；
+   * 0 = 裸库或包内零照片，界面标注「不含照片」 */
+  photo_count: number;
 }
 
 /** restore_apply 返回体：done = 界面当场刷新；done_needs_restart = 新库文件已
  * 就位但重开连接失败，提示「请重启应用」 */
 export type RestoreApplyOutcome = "done" | "done_needs_restart";
+
+// ── 巢况登记（webui-checkin 票 02，Rust nest_checkin.rs）──
+
+/** 照片元数据一行（本票恒空数组：写入随票 07 照片管线接线） */
+export interface NestPhotoMeta {
+  id: number;
+  checkin_id: number;
+  /** photos/ 下相对路径 `<colonyId>/<uuid>.jpg` */
+  rel_path: string;
+  /** 客户端原始文件名，仅备注 */
+  original_name: string | null;
+  note: string;
+}
+
+/** 巢况登记一行（时间线按日期倒序返回） */
+export interface NestCheckin {
+  id: number;
+  colony_id: number;
+  /** 登记日期 YYYY-MM-DD（可补录过去） */
+  date: string;
+  /** null = 未数 */
+  queen_count: number | null;
+  worker_count: number | null;
+  moved_nest: boolean;
+  note: string;
+  created_at: string;
+  photos: NestPhotoMeta[];
+}
+
+/** 新增巢况入参（至少一项非空才可提交，后端兜底校验） */
+export interface CheckinInput {
+  colony_id: number;
+  date: string;
+  queen_count: number | null;
+  worker_count: number | null;
+  moved_nest: boolean;
+  note: string | null;
+}
+
+/** 编辑巢况入参：全量覆盖（数可清回 null，日期必填） */
+export interface CheckinUpdateInput {
+  date: string;
+  queen_count: number | null;
+  worker_count: number | null;
+  moved_nest: boolean;
+  note: string | null;
+}
+
+/** 窝卡片/详情的巢况摘要（Rust 算好；从未登记三者皆 null） */
+export interface CheckinDigest {
+  latest: NestCheckin | null;
+  /** 基线 = 最早一条登记的日期字段 */
+  baseline_date: string | null;
+  /** 距上次登记 = 今天 − 最新登记日期（自然日，当天 0） */
+  days_since_last: number | null;
+}
+
+// ── 巢况照片（webui-checkin 票 07，Rust photo.rs；桌面专属命令）──
+
+/** list_orphan_photos 返回体：photos/.orphan-* 隔离区现状 */
+export interface OrphanPhotoStats {
+  dir_count: number;
+  file_count: number;
+  total_bytes: number;
+}
+
+/** clean_orphan_photos 返回体：删除量与释放字节；errors 非空 = 个别目录删除失败 */
+export interface OrphanCleanOutcome {
+  removed_dirs: number;
+  freed_bytes: number;
+  errors: string[];
+}
+
+// ── 网页端设置（webui-checkin 票 03，Rust netseg.rs / webui_config.rs）──
+
+/** 本机网段一行（NetBird 段已置顶标名；物理网段 encrypted_mesh=false 走硬警示） */
+export interface NetworkSegment {
+  /** 归一后的 CIDR（主机位归零，如 192.168.1.0/24） */
+  cidr: string;
+  /** true = 接口身份已确认是加密 mesh（NetBird）；物理网段（含 CGNAT 地址）恒 false */
+  encrypted_mesh: boolean;
+  /** 置顶标名（仅 NetBird 段有，如「NetBird 虚拟网」） */
+  label: string | null;
+}
+
+/** 网页端配置（数据目录 webui-config.json，库外文件恢复不触碰；token 只程序生成） */
+export interface WebUiConfigInfo {
+  enabled: boolean;
+  /** 受信网段（归一 CIDR，闸一白名单） */
+  segments: string[];
+  /** 服务端口 1024–65535（默认 17321） */
+  port: number;
+  /** 访问凭证（32 位十六进制 = 128bit；空串 = 尚未生成） */
+  token: string;
+  token_generated_at: string | null;
+}
+
+/** save_webui_config 入参：用户可改的三项（凭证不可覆写，只可重生成） */
+export interface WebUiSaveInput {
+  enabled: boolean;
+  segments: string[];
+  port: number;
+}
+
+/** save_webui_config 返回体（半成功语义）：配置已落盘 + 防火墙同步结果与服务
+ * 起停结果分开回传，失败时各自附人话原因（防火墙附现成 netsh 手动命令） */
+export interface WebUiSaveOutcome {
+  config: WebUiConfigInfo;
+  firewall_ok: boolean;
+  firewall_error: string | null;
+  firewall_manual_cmd: string | null;
+  /** 网页端服务按新配置对齐成功（含「停用即关停」） */
+  server_ok: boolean;
+  /** 服务起停失败的人话原因（端口占用等）；null = 正常 */
+  server_error: string | null;
+}
 
 /** 按窝按月记录摘要行（colony_month_records；交互第三轮：日历标记 + 重复提醒数据源） */
 export interface MonthDayRecords {

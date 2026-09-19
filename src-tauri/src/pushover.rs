@@ -1,6 +1,9 @@
-//! Pushover 手机推送（反馈第二轮 F4，Q3/Q4/Q10）：凭证只读环境变量，不进库不进备份。
-//! HTTP 经 `post` 参数注入（cargo test 不真发）；真实发送用 ureq（阻塞式，调度线程可承受）。
+//! Pushover 手机推送（反馈第二轮 F4，Q3/Q4/Q10；webui-checkin 票 11 应用内配置）：
+//! 凭据取值优先级 应用内 settings 键 > 环境变量 > 未启用；应用内值明文入库
+//! （风险已明示接受，规格 G）。HTTP 经 `post` 参数注入（cargo test 不真发）；
+//! 真实发送用 ureq（阻塞式，调度线程可承受）。凭据值永不出现在日志/错误里。
 
+use rusqlite::Connection;
 use serde::Serialize;
 
 pub const API_URL: &str = "https://api.pushover.net/1/messages.json";
@@ -14,15 +17,46 @@ pub struct PushoverConfig {
     pub token: String,
 }
 
-impl PushoverConfig {
-    /// 两个变量都读到非空值才算已配置；缺任一 → None（未配置，不是错误）。
-    pub fn from_env() -> Option<PushoverConfig> {
-        let user = std::env::var(ENV_USER).ok()?.trim().to_string();
-        let token = std::env::var(ENV_TOKEN).ok()?.trim().to_string();
-        if user.is_empty() || token.is_empty() {
-            return None;
+/// 生效来源三态（票 11）：应用内 settings 键 / 系统环境变量 / 未配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PushoverSource {
+    App,
+    Env,
+    None,
+}
+
+/// 三态判定结果：生效配置 + 生效来源（config 为 None 时 source 恒为 [`PushoverSource::None`]）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPushover {
+    pub config: Option<PushoverConfig>,
+    pub source: PushoverSource,
+}
+
+/// 三态优先级纯核（票 11）：应用内两键都非空 → 用应用内；否则环境变量两键都
+/// 非空 → 回落环境；都无 → 未启用（None，不是错误）。应用内两键现值原样传入
+///（settings 读侧缺键回空串），环境变量值由调用方注入（生产读 std::env，测试
+/// 注入）——本函数不碰任何真实环境，可纯测。生效值统一去首尾空白。
+pub fn resolve_pushover_credentials(
+    app_user: &str,
+    app_token: &str,
+    env_user: Option<&str>,
+    env_token: Option<&str>,
+) -> ResolvedPushover {
+    let complete = |user: Option<&str>, token: Option<&str>| {
+        let (u, t) = (user.unwrap_or("").trim(), token.unwrap_or("").trim());
+        if u.is_empty() || t.is_empty() {
+            None
+        } else {
+            Some(PushoverConfig { user: u.to_string(), token: t.to_string() })
         }
-        Some(PushoverConfig { user, token })
+    };
+    if let Some(config) = complete(Some(app_user), Some(app_token)) {
+        return ResolvedPushover { config: Some(config), source: PushoverSource::App };
+    }
+    match complete(env_user, env_token) {
+        Some(config) => ResolvedPushover { config: Some(config), source: PushoverSource::Env },
+        None => ResolvedPushover { config: None, source: PushoverSource::None },
     }
 }
 
@@ -60,22 +94,108 @@ pub fn send(cfg: &PushoverConfig, title: &str, message: &str) -> Result<(), Stri
     })
 }
 
-/// 设置页状态探测：只报在/不在，不回报值。
+/// 设置页状态探测（票 11 三态）：只报生效来源与在/不在，不回报值。
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct PushoverStatus {
-    pub user_found: bool,
-    pub token_found: bool,
+    pub source: PushoverSource,
+    pub configured: bool,
 }
 
-pub fn status_from_env() -> PushoverStatus {
-    let found = |k: &str| std::env::var(k).map(|v| !v.trim().is_empty()).unwrap_or(false);
-    PushoverStatus { user_found: found(ENV_USER), token_found: found(ENV_TOKEN) }
+/// 变量不存在或全空白都算没填（与纯核口径一致）。
+fn env_var(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// 状态探测（生产入口）：库内应用内配置 + 真实环境变量 → 三态。
+/// 借库失败向上传播（command 层统一落日志）。
+pub fn status_from_db(conn: &Connection) -> Result<PushoverStatus, String> {
+    let (app_user, app_token) = crate::settings::get_pushover_credentials(conn)?;
+    let r = resolve_pushover_credentials(
+        &app_user,
+        &app_token,
+        env_var(ENV_USER).as_deref(),
+        env_var(ENV_TOKEN).as_deref(),
+    );
+    Ok(PushoverStatus { source: r.source, configured: r.config.is_some() })
+}
+
+/// 发送取值（生产入口，票 11）：应用内 > 环境变量 > None。
+/// 借库失败向上传播，由调用方落错误流水（凭据值不进日志）。
+pub fn config_from_db(conn: &Connection) -> Result<Option<PushoverConfig>, String> {
+    let (app_user, app_token) = crate::settings::get_pushover_credentials(conn)?;
+    Ok(resolve_pushover_credentials(
+        &app_user,
+        &app_token,
+        env_var(ENV_USER).as_deref(),
+        env_var(ENV_TOKEN).as_deref(),
+    )
+    .config)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    // ── 三态优先级纯核（webui-checkin 票 11）：环境值全部注入，不碰真实进程环境 ──
+
+    #[test]
+    fn app_credentials_win_over_env_when_both_present() {
+        let r = resolve_pushover_credentials("u-app", "t-app", Some("u-env"), Some("t-env"));
+        let cfg = r.config.expect("应用内已填应生效");
+        assert_eq!(cfg.user, "u-app");
+        assert_eq!(cfg.token, "t-app");
+        assert_eq!(r.source, PushoverSource::App);
+    }
+
+    #[test]
+    fn empty_app_falls_back_to_env() {
+        let r = resolve_pushover_credentials("", "", Some("u-env"), Some("t-env"));
+        let cfg = r.config.expect("应用内未填应回落环境变量");
+        assert_eq!(cfg.user, "u-env");
+        assert_eq!(cfg.token, "t-env");
+        assert_eq!(r.source, PushoverSource::Env);
+    }
+
+    #[test]
+    fn both_absent_means_disabled_not_error() {
+        let r = resolve_pushover_credentials("", "", None, None);
+        assert_eq!(r.config, None, "都无 = 未启用（None，不是错误）");
+        assert_eq!(r.source, PushoverSource::None);
+    }
+
+    #[test]
+    fn partial_app_falls_back_to_complete_env() {
+        // 应用内只填一半不算已配置：整套回落环境变量（与 from_env 时代同口径）
+        let r = resolve_pushover_credentials("u-app", "", Some("u-env"), Some("t-env"));
+        assert_eq!(r.source, PushoverSource::Env);
+        assert_eq!(r.config.map(|c| c.token), Some("t-env".into()));
+    }
+
+    #[test]
+    fn partial_env_is_not_configured() {
+        let r = resolve_pushover_credentials("", "", Some("u-env"), None);
+        assert_eq!(r.config, None);
+        assert_eq!(r.source, PushoverSource::None);
+    }
+
+    #[test]
+    fn whitespace_only_values_count_as_empty_and_values_are_trimmed() {
+        // 全空白 = 未填；生效值去首尾空白（粘贴事故防御）
+        let r = resolve_pushover_credentials("  ", "t-app", Some(" u-env "), Some(" t-env "));
+        assert_eq!(r.source, PushoverSource::Env);
+        let cfg = r.config.expect("环境变量齐全应生效");
+        assert_eq!(cfg.user, "u-env");
+        assert_eq!(cfg.token, "t-env");
+    }
+
+    #[test]
+    fn app_credentials_are_trimmed_too() {
+        let r = resolve_pushover_credentials(" u-app ", "t-app", None, None);
+        let cfg = r.config.expect("应用内齐全应生效");
+        assert_eq!(cfg.user, "u-app");
+        assert_eq!(r.source, PushoverSource::App);
+    }
 
     #[test]
     fn send_with_builds_form_with_credentials_and_text() {

@@ -6,12 +6,17 @@ import { shiftMinutes } from "../lib/calendar";
 import { todayIso } from "../lib/dates";
 import type { CareActionItem, Colony, ColonyAction } from "../types";
 
+// 不依赖 Tauri 运行时：统一 mock 调用层（沿 LogListPage.test.ts 先例）
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("../lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("../testing/ipcMock");
+  return ipcModuleMock(invokeMock)(importOriginal);
+});
 
 const colony: Colony = {
   id: 1, name: "大头一号", species: null, location_id: null, start_date: "2026-01-20",
   status: "active", days_raised: 241, actions: [], recent: [], hibernation: null,
+    checkin: { latest: null, baseline_date: null, days_since_last: null },
 };
 // 第二个操作（巢穴保湿）：灰点集成断言的名字来源——弹窗 markers 名字表来自 list_actions 全量
 // （终局评审：含停用操作，与 LogListPage 编辑弹窗口径一致；巢穴保湿置停用以证明停用项不丢名）
@@ -39,6 +44,12 @@ function mountDlg() {
 beforeEach(() => { invokeMock.mockReset(); });
 
 describe("QuickLogDialog", () => {
+  it("手机竖屏断点类：弹窗挂 vp-dialog（≤480px 输入放大/大按钮的媒体查询落点，webui-checkin 票 08）", () => {
+    const w = mountDlg();
+    expect(w.find(".vp-dialog").exists()).toBe(true);
+    expect(w.find(".vp-dialog").classes()).toContain("quick-dialog");
+  });
+
   it("取消：直接关闭，不触发 log_care", async () => {
     invokeMock.mockImplementation(async (cmd: string) => (cmd === "colony_month_records" ? [] : cmd === "list_actions" ? allActions : null));
     const w = mountDlg();

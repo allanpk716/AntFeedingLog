@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde_json::json;
 
 /// UTF-8 BOM：Excel 识别无 BOM 的 CSV 时按本地编码猜，中文必乱码。
@@ -19,6 +19,11 @@ const UTF8_BOM: &str = "\u{FEFF}";
 
 /// CSV 表头（票面口径：id,窝,操作,发生时间,录入时间,备注,食物）。
 const CSV_HEADER: [&str; 7] = ["id", "窝", "操作", "发生时间", "录入时间", "备注", "食物"];
+
+/// 巢况区表头（webui-checkin 票 02）：记录区之后空一行接巢况区，同文件同 BOM。
+const CHECKIN_CSV_HEADER: [&str; 9] = [
+    "巢况id", "窝", "日期", "蚁后数", "工蚁数", "换巢", "备注", "录入时间", "照片数",
+];
 
 // ── CSV ──────────────────────────────────────────────────────────────────
 
@@ -39,8 +44,10 @@ pub fn csv_escape(field: &str) -> String {
     }
 }
 
-/// 记录流水 → CSV 文本：BOM + 表头 + 每记录一行（食物名分号连接，顺序按字典序）。
-pub fn build_csv(rows: &[crate::care::LogRow]) -> String {
+/// 记录流水 → CSV 文本：BOM + 记录区表头 + 每记录一行（食物名分号连接，顺序按
+/// 字典序）+ 空行 + 巢况区表头 + 每登记一行（webui-checkin 票 02）。所有字段过
+/// csv_escape（公式注入防护沿用）。
+pub fn build_csv(rows: &[crate::care::LogRow], checkins: &[CheckinExportRow]) -> String {
     let mut out = String::from(UTF8_BOM);
     out.push_str(&CSV_HEADER.join(","));
     out.push('\n');
@@ -53,6 +60,25 @@ pub fn build_csv(rows: &[crate::care::LogRow]) -> String {
             csv_escape(&r.created_at),
             csv_escape(&r.note),
             csv_escape(&r.food_names.join(";")),
+        ];
+        out.push_str(&line.join(","));
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(&CHECKIN_CSV_HEADER.join(","));
+    out.push('\n');
+    for c in checkins {
+        let count_or_empty = |n: Option<i64>| n.map(|v| v.to_string()).unwrap_or_default();
+        let line: Vec<String> = vec![
+            csv_escape(&c.id.to_string()),
+            csv_escape(&c.colony_name),
+            csv_escape(&c.date),
+            csv_escape(&count_or_empty(c.queen_count)),
+            csv_escape(&count_or_empty(c.worker_count)),
+            csv_escape(if c.moved_nest { "是" } else { "否" }),
+            csv_escape(&c.note),
+            csv_escape(&c.created_at),
+            csv_escape(&c.photo_count.to_string()),
         ];
         out.push_str(&line.join(","));
         out.push('\n');
@@ -97,9 +123,54 @@ pub fn all_log_rows(conn: &Connection) -> Result<Vec<crate::care::LogRow>, Strin
     }
 }
 
+/// 巢况导出一行（附窝名展示值与照片计数，归档自足可读；webui-checkin 票 02）。
+pub struct CheckinExportRow {
+    pub id: i64,
+    pub colony_name: String,
+    pub date: String,
+    pub queen_count: Option<i64>,
+    pub worker_count: Option<i64>,
+    pub moved_nest: bool,
+    pub note: String,
+    pub created_at: String,
+    pub photo_count: i64,
+}
+
+/// 全量巢况登记（日期倒序、同日按 id 倒序），JOIN colony 取窝名、子查询取照片数。
+pub fn all_checkin_rows(conn: &Connection) -> Result<Vec<CheckinExportRow>, String> {
+    let db_err = |e: rusqlite::Error| format!("数据库操作失败: {e}");
+    let mut stmt = conn
+        .prepare(
+            "SELECT nc.id, c.name, nc.date, nc.queen_count, nc.worker_count, nc.moved_nest,
+                    nc.note, nc.created_at,
+                    (SELECT COUNT(*) FROM nest_photo np WHERE np.checkin_id = nc.id)
+             FROM nest_checkin nc JOIN colony c ON c.id = nc.colony_id
+             ORDER BY nc.date DESC, nc.id DESC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(CheckinExportRow {
+                id: row.get(0)?,
+                colony_name: row.get(1)?,
+                date: row.get(2)?,
+                queen_count: row.get(3)?,
+                worker_count: row.get(4)?,
+                moved_nest: row.get::<_, i64>(5)? != 0,
+                note: row.get(6)?,
+                created_at: row.get(7)?,
+                photo_count: row.get(8)?,
+            })
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+    Ok(rows)
+}
+
 /// 全库数据结构化（JSON 导出主体）：
-/// `{colonies, actions, foods, locations, logs, hibernations, settings}`。
-/// 行取库内原始数据（logs 附带窝名/操作名/食物名展示值，归档自足可读）。
+/// `{colonies, actions, foods, locations, logs, checkins, hibernations, settings}`。
+/// 行取库内原始数据（logs/checkins 附带窝名等展示值，归档自足可读）。
 pub fn json_dump(conn: &Connection) -> Result<serde_json::Value, String> {
     let db_err = |e: rusqlite::Error| format!("数据库操作失败: {e}");
 
@@ -162,6 +233,68 @@ pub fn json_dump(conn: &Connection) -> Result<serde_json::Value, String> {
     let logs: Vec<crate::care::LogRow> = all_log_rows(conn)?;
     let settings: crate::settings::AppSettings = crate::settings::get_settings(conn)?;
 
+    // 巢况登记（webui-checkin 票 02）：带窝名展示值与照片元数据（本票照片恒空数组）
+    let mut checkins = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT nc.id, nc.colony_id, c.name, nc.date, nc.queen_count, nc.worker_count,
+                        nc.moved_nest, nc.note, nc.created_at
+                 FROM nest_checkin nc JOIN colony c ON c.id = nc.colony_id
+                 ORDER BY nc.date DESC, nc.id DESC",
+            )
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, i64>(6)? != 0,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            })
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        for (id, colony_id, colony_name, date, queen_count, worker_count, moved_nest, note, created_at) in rows
+        {
+            let mut ps = conn
+                .prepare(
+                    "SELECT rel_path, original_name, note FROM nest_photo
+                     WHERE checkin_id = ?1 ORDER BY id",
+                )
+                .map_err(db_err)?;
+            let photos = ps
+                .query_map(params![id], |row| {
+                    Ok(json!({
+                        "rel_path": row.get::<_, String>(0)?,
+                        "original_name": row.get::<_, Option<String>>(1)?,
+                        "note": row.get::<_, String>(2)?,
+                    }))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            checkins.push(json!({
+                "id": id,
+                "colony_id": colony_id,
+                "colony_name": colony_name,
+                "date": date,
+                "queen_count": queen_count,
+                "worker_count": worker_count,
+                "moved_nest": moved_nest,
+                "note": note,
+                "created_at": created_at,
+                "photos": photos,
+            }));
+        }
+    }
+
     fn to_value<T: serde::Serialize>(v: &T) -> Result<serde_json::Value, String> {
         serde_json::to_value(v).map_err(|e| format!("序列化导出数据失败: {e}"))
     }
@@ -172,6 +305,7 @@ pub fn json_dump(conn: &Connection) -> Result<serde_json::Value, String> {
         "foods": to_value(&foods)?,
         "locations": to_value(&locations)?,
         "logs": to_value(&logs)?,
+        "checkins": checkins,
         "hibernations": hibernations,
         "settings": to_value(&settings)?,
     }))
@@ -181,7 +315,7 @@ pub fn json_dump(conn: &Connection) -> Result<serde_json::Value, String> {
 
 /// 导出 CSV 到目标路径，返回写入路径。父目录不存在时自动创建。
 pub fn export_csv_to(conn: &Connection, path: &Path) -> Result<String, String> {
-    let csv = build_csv(&all_log_rows(conn)?);
+    let csv = build_csv(&all_log_rows(conn)?, &all_checkin_rows(conn)?);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建导出目录失败: {e}"))?;
     }
@@ -406,7 +540,10 @@ mod tests {
         let header = lines.next().unwrap().trim_start_matches(UTF8_BOM);
         assert_eq!(header, "id,窝,操作,发生时间,录入时间,备注,食物");
         let body: Vec<&str> = lines.collect();
-        assert_eq!(body.len(), 3, "CSV 数据行数 = 记录数");
+        assert_eq!(body.len(), 5, "3 条记录 + 空行分隔 + 巢况区表头（本测试无巢况数据）");
+        assert_eq!(body[3], "", "记录区与巢况区空一行分隔");
+        assert!(body[4].starts_with("巢况id,窝,日期"), "巢况区表头");
+        let log_rows = &body[..3];
 
         // 喂食那行：食物分号连接（顺序按字典序）
         let feeding = body
@@ -424,21 +561,143 @@ mod tests {
         assert!(noted.contains("\"补录,含逗号\""), "实际：{noted}");
 
         // 每行都可按 RFC 4180 还原成 7 列；含逗号备注还原后原样
-        for line in &body {
+        for line in log_rows {
             let fields = split_csv_line(line);
             assert_eq!(fields.len(), 7, "应为 7 列，实际：{fields:?}");
         }
-        let noted_fields = split_csv_line(body.iter().find(|l| l.contains("2026-09-10")).unwrap());
+        let noted_fields = split_csv_line(log_rows.iter().find(|l| l.contains("2026-09-10")).unwrap());
         assert_eq!(noted_fields[5], "补录,含逗号", "转义还原后备注原样");
     }
 
     #[test]
-    fn export_csv_of_empty_db_has_header_only() {
+    fn export_csv_of_empty_db_has_both_section_headers_only() {
         let (conn, _db_path, dir) = file_conn();
         let path = dir.path().join("empty.csv");
         export_csv_to(&conn, &path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(text.trim_start_matches(UTF8_BOM).trim_end(), "id,窝,操作,发生时间,录入时间,备注,食物");
+        assert_eq!(
+            text.trim_start_matches(UTF8_BOM).trim_end(),
+            "id,窝,操作,发生时间,录入时间,备注,食物\n\n巢况id,窝,日期,蚁后数,工蚁数,换巢,备注,录入时间,照片数"
+        );
+    }
+
+    // ── 导出 CSV/JSON · 巢况区（webui-checkin 票 02）──
+
+    /// 在 seed 之外加两条巢况：一条常规（蚁后+工蚁）、一条备注以 = 开头的换巢登记。
+    fn seed_checkins(conn: &Connection, colony_id: i64) {
+        crate::nest_checkin::save_checkin(
+            conn,
+            &crate::nest_checkin::CheckinInput {
+                colony_id,
+                date: "2026-09-15".into(),
+                queen_count: Some(2),
+                worker_count: Some(3000),
+                moved_nest: false,
+                note: Some("数量稳定".into()),
+            },
+            "2026-09-18",
+            "2026-09-18 21:00:00",
+        )
+        .unwrap();
+        crate::nest_checkin::save_checkin(
+            conn,
+            &crate::nest_checkin::CheckinInput {
+                colony_id,
+                date: "2026-09-17".into(),
+                queen_count: None,
+                worker_count: None,
+                moved_nest: true,
+                note: Some("=cmd|' /C calc'!A0".into()),
+            },
+            "2026-09-18",
+            "2026-09-18 21:05:00",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn export_csv_includes_checkin_section_with_injection_guard() {
+        let (conn, _db_path, dir) = file_conn();
+        let c = seed(&conn);
+        seed_checkins(&conn, c);
+
+        let path = dir.path().join("with-checkins.csv");
+        export_csv_to(&conn, &path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+
+        // 巢况区表头存在，且在记录区之后
+        let header_pos = text.find("巢况id,窝,日期,蚁后数,工蚁数,换巢,备注,录入时间,照片数")
+            .expect("巢况区表头");
+        let log_header_pos = text.find("id,窝,操作,发生时间").expect("记录区表头");
+        assert!(header_pos > log_header_pos, "巢况区在记录区之后");
+
+        let body_start = text.trim_start_matches(UTF8_BOM);
+        let section = &body_start[body_start.find("巢况id,").unwrap()..];
+        let lines: Vec<&str> = section.trim_end_matches('\n').split('\n').collect();
+        assert_eq!(lines.len(), 3, "表头 + 两行巢况");
+
+        // 每行 9 列（RFC 4180 还原）
+        for line in &lines[1..] {
+            assert_eq!(split_csv_line(line).len(), 9, "巢况行应为 9 列：{line}");
+        }
+
+        // 换巢是/否；空数留空；公式注入防护沿用（= 开头加 ' 前缀）
+        let guarded = split_csv_line(lines[1]);
+        assert_eq!(guarded[1], "大头一号", "窝名展示值");
+        assert_eq!(guarded[2], "2026-09-17", "日期倒序在前");
+        assert_eq!(guarded[3], "", "未数为空");
+        assert_eq!(guarded[4], "");
+        assert_eq!(guarded[5], "是");
+        assert_eq!(guarded[6], "'=cmd|' /C calc'!A0", "公式前缀防护沿用");
+        assert_eq!(guarded[8], "0", "照片数本票恒 0");
+
+        let normal = split_csv_line(lines[2]);
+        assert_eq!(normal[2], "2026-09-15");
+        assert_eq!(normal[3], "2");
+        assert_eq!(normal[4], "3000");
+        assert_eq!(normal[5], "否");
+        assert_eq!(normal[6], "数量稳定");
+    }
+
+    #[test]
+    fn export_json_includes_checkins_with_colony_name_and_photo_meta() {
+        let (conn, _db_path, dir) = file_conn();
+        let c = seed(&conn);
+        seed_checkins(&conn, c);
+        // 手工插一张照片元数据（模拟库内既有引用；文件清理随票 07）
+        conn.execute(
+            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+             VALUES (1, '1/uuid-a.jpg', 'IMG_0001.jpg', '全景')",
+            [],
+        )
+        .unwrap();
+
+        let path = dir.path().join("with-checkins.json");
+        export_json_to(&conn, &path).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).expect("JSON 可解析");
+
+        let checkins = v["checkins"].as_array().expect("checkins 数组");
+        assert_eq!(checkins.len(), 2);
+        let first = &checkins[0];
+        for key in [
+            "id", "colony_id", "colony_name", "date", "queen_count", "worker_count",
+            "moved_nest", "note", "created_at", "photos",
+        ] {
+            assert!(first.get(key).is_some(), "checkin 缺 {key}");
+        }
+        assert_eq!(first["colony_name"], "大头一号", "归档自足可读");
+        assert_eq!(first["date"], "2026-09-17", "日期倒序");
+        assert_eq!(first["moved_nest"], true);
+        assert!(first["queen_count"].is_null(), "未数为 JSON null");
+        assert_eq!(checkins[1]["queen_count"], 2);
+        assert_eq!(checkins[1]["worker_count"], 3000);
+        // 照片元数据随行（本票无写入路径，这里手工插行验证读取链）
+        let older_photos = checkins[1]["photos"].as_array().unwrap();
+        assert_eq!(older_photos.len(), 1);
+        assert_eq!(older_photos[0]["rel_path"], "1/uuid-a.jpg");
+        assert_eq!(older_photos[0]["original_name"], "IMG_0001.jpg");
+        assert_eq!(checkins[0]["photos"].as_array().unwrap().len(), 0);
     }
 
     // ── 导出 JSON（票面验收 4：可解析且结构完整）──
@@ -460,6 +719,7 @@ mod tests {
             "foods",
             "locations",
             "logs",
+            "checkins",
             "hibernations",
         ] {
             assert!(v.get(key).and_then(|x| x.as_array()).is_some(), "缺 {key} 数组");

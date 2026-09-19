@@ -5,10 +5,11 @@
 import type { RestoreSummary } from "../types";
 
 /**
- * 确认弹窗固定文案（spec D5/D1：替换语义 + 备份设置不回滚，两者都要点明）。
+ * 确认弹窗固定文案（spec D5/D1：替换语义 + 备份设置不回滚，两者都要点明；
+ * 评审 R1 补第三点：恢复期间新产生的记录不会保留——如实告知覆盖丢弃语义）。
  */
 export const RESTORE_CONFIRM_TEXT =
-  "恢复将整体替换当前全部数据；备份设置保持当前值，不随恢复回滚";
+  "恢复将整体替换当前全部数据；备份设置保持当前值，不随恢复回滚；恢复期间新产生的记录不会保留";
 
 /**
  * 备份内备份目录设置值的展示：有旧值回显（点明恢复后备份将流向旧位置的风险）；
@@ -24,15 +25,22 @@ export function formatBackupDate(date: string | null): string {
   return date ?? "未知（备份内没有记录）";
 }
 
+/** 照片张数展示（票 10）：0 = 裸库或包内零照片，标注「不含照片」。 */
+export function formatPhotoCount(count: number): string {
+  if (count > 0) return `${count} 张`;
+  return "不含照片";
+}
+
 /**
- * 摘要预览的展示行（顺序固定：备份日期 / 窝数 / 记录数 / 备份内目录设置值）。
- * 每行 [标签, 值]；0 窝 0 条如实展示——那是选错文件的最后防线信号（D6）。
+ * 摘要预览的展示行（顺序固定：备份日期 / 窝数 / 记录数 / 照片 / 备份内目录
+ * 设置值）。每行 [标签, 值]；0 窝 0 条如实展示——那是选错文件的最后防线信号（D6）。
  */
 export function summaryRows(s: RestoreSummary): Array<[string, string]> {
   return [
     ["备份日期", formatBackupDate(s.backup_date)],
     ["窝数", String(s.colony_count)],
     ["记录数", String(s.log_count)],
+    ["照片", formatPhotoCount(s.photo_count)],
     ["备份内备份目录设置", formatBackupDirInBackup(s.backup_dir_in_backup)],
   ];
 }

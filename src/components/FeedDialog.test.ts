@@ -9,11 +9,15 @@ import DateTimeField from "./DateTimeField.vue";
 import type { Colony, ColonyAction, FoodItem } from "../types";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+vi.mock("../lib/ipc", async (importOriginal) => {
+  const { ipcModuleMock } = await import("../testing/ipcMock");
+  return ipcModuleMock(invokeMock)(importOriginal);
+});
 
 const colony: Colony = {
   id: 1, name: "大头一号", species: null, location_id: null, start_date: "2026-01-20",
   status: "active", days_raised: 241, actions: [], recent: [], hibernation: null,
+  checkin: { latest: null, baseline_date: null, days_since_last: null },
 };
 const action: ColonyAction = {
   action_id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true,

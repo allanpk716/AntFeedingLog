@@ -655,6 +655,19 @@ pub struct TestNotifyOutcome {
     pub pushover: Option<PushoverTestResult>,
 }
 
+/// 当前生效的 Pushover 配置（webui-checkin 票 11）：应用内 settings 键 > 环境
+/// 变量 > None。借库失败落错误流水并按未配置处理（推送静默缺位不可见，错误
+/// 要留痕）；凭据值永不进日志。
+fn pushover_config(conn: &rusqlite::Connection) -> Option<crate::pushover::PushoverConfig> {
+    match crate::pushover::config_from_db(conn) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            crate::applog::log_error(&format!("读取 Pushover 配置失败（本轮按未配置处理）: {e}"));
+            None
+        }
+    }
+}
+
 pub fn send_test_notification_dual(handle: &tauri::AppHandle) -> TestNotifyOutcome {
     let desktop = handle
         .notification()
@@ -663,7 +676,13 @@ pub fn send_test_notification_dual(handle: &tauri::AppHandle) -> TestNotifyOutco
         .body("蚂蚁饲养记录：桌面通道正常。")
         .show()
         .map_err(|e| format!("发送测试通知失败: {e}"));
-    let pushover = crate::pushover::PushoverConfig::from_env().map(|cfg| {
+    // 票 11：短暂借锁读生效配置（应用内 > 环境变量），网络发送在锁外
+    let pushover = (|| {
+        let state = handle.try_state::<crate::DbState>()?;
+        let conn = state.0.lock().ok()?;
+        pushover_config(&conn)
+    })()
+    .map(|cfg| {
         match crate::pushover::send(&cfg, "测试通知", "蚂蚁饲养记录：手机通道正常。") {
             Ok(()) => PushoverTestResult { ok: true, error: None },
             Err(e) => PushoverTestResult { ok: false, error: Some(e) },
@@ -711,7 +730,11 @@ pub fn check_and_notify(handle: &tauri::AppHandle) {
         send_notification(handle, r);
     }
     if !outcome.push_jobs.is_empty() {
-        let cfg = crate::pushover::PushoverConfig::from_env();
+        // 票 11：生效配置短暂借锁读出（应用内 > 环境变量），发送全程在锁外
+        let cfg = {
+            let Ok(conn) = state.0.lock() else { return };
+            pushover_config(&conn)
+        };
         let mut settled: Vec<i64> = Vec::new();
         for job in &outcome.push_jobs {
             if let Some(cfg) = &cfg {
@@ -1596,6 +1619,11 @@ mod tests {
             actions,
             recent: vec![],
             hibernation: None,
+            checkin: crate::nest_checkin::CheckinDigest {
+                latest: None,
+                baseline_date: None,
+                days_since_last: None,
+            },
         }
     }
 
