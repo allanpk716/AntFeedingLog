@@ -91,11 +91,15 @@ pub fn validate_port(port: i64) -> Result<u16, String> {
     Ok(port as u16)
 }
 
-/// 网段列表校验：逐项 CIDR（IPv4）校验并归一（主机位归零）、去重保序。
+/// 网段列表校验：逐项 CIDR（IPv4）校验并归一（主机位归零）、去重保序；
+/// /0（覆盖全部地址）拒绝——受信白名单不能放行全网（评审 R1 Minor）。
 pub fn validate_segments(segments: &[String]) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     for s in segments {
         let cidr = validate_cidr(s)?;
+        if cidr.ends_with("/0") {
+            return Err("不能选择覆盖全部地址的网段（0.0.0.0/0）".into());
+        }
         if !out.contains(&cidr) {
             out.push(cidr);
         }
@@ -160,6 +164,10 @@ pub fn sanitize(config: WebUiConfig) -> WebUiConfig {
     let mut segments: Vec<String> = Vec::new();
     for s in &config.segments {
         if let Ok(cidr) = validate_cidr(s) {
+            // /0 = 放行全网（评审 R1）：手改文件塞进来的也照丢，防火墙联动绝不拿到
+            if cidr.ends_with("/0") {
+                continue;
+            }
             if !segments.contains(&cidr) {
                 segments.push(cidr);
             }
@@ -327,6 +335,31 @@ mod tests {
         assert!(validate_segments(&["垃圾".into()]).is_err(), "非法 CIDR 整体拒绝");
         assert!(validate_segments(&["fe80::/64".into()]).is_err(), "IPv6 拒绝");
         assert!(validate_segments(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn segments_reject_zero_prefix_allinternet() {
+        // 评审 R1 Minor：/0 = 放行全网，白名单形同虚设，明确拒绝
+        let err = validate_segments(&["0.0.0.0/0".into()]).unwrap_err();
+        assert!(err.contains("覆盖全部地址"), "人话提示，实际：{err}");
+        // 写成主机位非零（1.2.3.4/0）归一后同样是 /0，一样拒绝
+        assert!(validate_segments(&["1.2.3.4/0".into()]).is_err());
+        // 混在合法列表里整体拒绝，不让它溜进受信列表
+        assert!(validate_segments(&["10.0.0.0/8".into(), "0.0.0.0/0".into()]).is_err());
+        // /10 不是 /0，不受牵连
+        assert!(validate_segments(&["100.66.0.0/10".into()]).is_ok());
+    }
+
+    #[test]
+    fn sanitize_drops_zero_prefix_segment() {
+        // 手改文件塞 /0：读取即丢，防火墙联动绝不能拿到全网段（评审 R1 防线兜底）
+        let dir = temp_data_dir();
+        std::fs::write(
+            dir.path().join(WEBUI_CONFIG_FILE),
+            r#"{"enabled":true,"segments":["0.0.0.0/0","10.0.0.0/8"]}"#,
+        )
+        .unwrap();
+        assert_eq!(load(dir.path()).segments, vec!["10.0.0.0/8"]);
     }
 
     // ── 合并保存入参（save_webui 核心）──

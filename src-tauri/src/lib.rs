@@ -728,6 +728,10 @@ async fn list_network_segments() -> Result<Vec<netseg::NetworkSegment>, String> 
 }
 
 /// 读网页端配置；凭证为空顺路补生成并落盘（首次打开设置页即有凭证可用）。
+///
+/// ⚠ **严禁注册进网页端 HTTP 白名单**（票 05）：本命令响应含**访问凭证明文**，
+/// 只允许桌面 Tauri IPC 调用。票 05 实现白名单注册表时须对本命令加显式禁入
+/// 断言——网页端 API 一旦暴露它，凭证即泄漏给页面侧脚本。
 #[tauri::command]
 fn get_webui_config() -> Result<webui_config::WebUiConfig, String> {
     let data_dir = current_data_dir()?;
@@ -748,6 +752,10 @@ pub struct WebUiSaveOutcome {
 /// 绕过前端的直调在此兜底拦下）。成功后同步防火墙规则：开 = 先删后建（幂等），
 /// 关 = 删规则；提权 UAC 弹窗等待用户响应，丢阻塞线程池跑、不冻 UI（async command）。
 /// 防火墙成败都落流水（D7）。
+///
+/// ⚠ **严禁注册进网页端 HTTP 白名单**（票 05）：本命令可改受信网段/端口/开关
+/// （闸一安全配置），只能由桌面设置页发起；网页端的功能面不含任何设置操作
+///（规格 H），票 05 白名单注册表须对本命令加显式禁入断言。
 #[tauri::command]
 async fn save_webui_config(input: webui_config::WebUiSaveInput) -> Result<WebUiSaveOutcome, String> {
     let data_dir = current_data_dir()?;
@@ -790,6 +798,10 @@ async fn save_webui_config(input: webui_config::WebUiSaveInput) -> Result<WebUiS
 }
 
 /// 重生成访问凭证（旧地址即刻作废 = 覆盖写）。成功记一条动作流水（D7）。
+///
+/// ⚠ **严禁注册进网页端 HTTP 白名单**（票 05）：本命令返回**新凭证明文**且可
+/// 直接作废全部旧地址（安全管理操作），只允许桌面设置页调用；票 05 白名单注册表
+/// 须对本命令加显式禁入断言。
 #[tauri::command]
 fn regenerate_token() -> Result<webui_config::WebUiConfig, String> {
     let data_dir = current_data_dir()?;
@@ -801,6 +813,10 @@ fn regenerate_token() -> Result<webui_config::WebUiConfig, String> {
 /// 完整访问地址 `http://<IP>:<端口>/#token=<凭证>`：按配置第一个受信网段上的
 /// 本机 IP 拼（多段取第一个）。网段当前不在线报错（如拔掉 NetBird 后）。
 /// async：网卡枚举不能占主线程。
+///
+/// ⚠ **严禁注册进网页端 HTTP 白名单**（票 05）：本命令响应就是**含凭证的完整
+/// 访问地址**，只允许桌面设置页/向导调用；票 05 白名单注册表须对本命令加显式
+/// 禁入断言——经网页端 API 取到它等于把进门凭证递给页面侧。
 #[tauri::command]
 async fn get_access_url() -> Result<String, String> {
     let data_dir = current_data_dir()?;

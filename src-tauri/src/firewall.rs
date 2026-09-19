@@ -5,8 +5,9 @@
 //!
 //! 真机执行 [`sync`] 不进单测——UAC 提权弹窗只能人工冒烟（进晨报清单），纯核只
 //! 保证命令文本正确。执行语义：
-//! - **幂等**：启用 = 先删同名规则（「无匹配规则」不算失败）再建，重复启用不重复
-//!   建规则；停用 = 只删（enabled=false → 删规则，规格 User Story 16）；
+//! - **幂等**：启用 = 先删同名规则（「无匹配规则」不算失败；删除因其他原因失败
+//!   则整体报失败——netsh 允许同名多规则，旧范围规则残留是真实风险，评审 R1）再建；
+//!   停用 = 只删（enabled=false → 删规则，规格 User Story 16）；
 //! - **UAC 提权一次**：删+建两条 netsh 打进同一个提权 PowerShell 里跑
 //!   （`Start-Process -Verb RunAs`），不是两次弹窗；
 //! - 内层脚本以 `-EncodedCommand`（UTF-16LE base64，[`base64_utf16le`] 纯核）
@@ -48,9 +49,14 @@ pub fn manual_hint(segments: &[String], port: u16) -> String {
     )
 }
 
-/// 内层提权脚本（启用）：先删（输出丢弃，规则不存在也无所谓）再建，退出码取建规则的。
+/// 内层提权脚本（启用）：先删同名规则——删除阶段退出码非 0 且不是「无匹配规则」
+/// 时整体报失败（netsh 允许同名多规则，删除失败 = 旧范围规则残留 = 白名单被旧网段
+/// 绕过，评审 R1：删规则失败必须可见）；「无匹配规则」（中英两态）不算失败（幂等
+/// 的前提）。删除放行后才建，退出码取建规则的。
 pub fn enable_script(delete_cmd: &str, add_cmd: &str) -> String {
-    format!("$null = {delete_cmd} 2>$null\n{add_cmd}\nexit $LASTEXITCODE")
+    format!(
+        "$d = {delete_cmd} 2>&1\nif ($LASTEXITCODE -ne 0 -and (($d -join ' ') -notmatch 'match the specified|没有与指定的标准相匹配')) {{ exit $LASTEXITCODE }}\n{add_cmd}\nexit $LASTEXITCODE"
+    )
 }
 
 /// 内层提权脚本（停用）：只删；netsh「无匹配规则」（中英两态）不算失败。
@@ -175,6 +181,20 @@ mod tests {
         let add = s.find(&add_rule_cmd(&segs(), 17321)).expect("含建命令");
         assert!(del < add, "先删后建（重复启用不重复建规则的基础）");
         assert!(s.contains("exit $LASTEXITCODE"), "退出码取建规则的");
+    }
+
+    #[test]
+    fn enable_script_surfaces_delete_failure() {
+        // 评审 R1：netsh 允许同名多规则，删除阶段失败（旧范围规则残留）必须整体报
+        // 失败——守卫夹在删与建之间，add 只在删除阶段放行后才执行
+        let s = enable_script(&delete_rule_cmd(), &add_rule_cmd(&segs(), 17321));
+        assert!(s.contains("2>&1"), "删除阶段要捕获输出判别失败原因，实际：{s}");
+        assert!(s.contains("match the specified"), "「无匹配规则」不算失败（幂等的前提）");
+        assert!(s.contains("没有与指定的标准相匹配"), "中文系统同判");
+        let del = s.find(&delete_rule_cmd()).expect("含删命令");
+        let guard = s.find("exit $LASTEXITCODE").expect("删除失败出口");
+        let add = s.find(&add_rule_cmd(&segs(), 17321)).expect("含建命令");
+        assert!(del < guard && guard < add, "守卫夹在删与建之间，实际：{s}");
     }
 
     #[test]
