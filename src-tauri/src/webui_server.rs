@@ -663,7 +663,15 @@ pub fn dispatch_command(
             },
         )),
         "delete_checkin" => Some(write_cmd(deps, args, false, |conn, a: webui_args::IdArgs| {
-            crate::nest_checkin::delete_checkin(conn, a.id)
+            // 票 07：与桌面 delete_checkin 同序——先库事务删元数据提交，再删照片
+            // 文件；文件删失败仅孤儿（下轮巡检隔离），不回滚库。巢况写命令不刷托盘。
+            let rel_paths = crate::photo::collect_checkin_photo_paths(conn, a.id)?;
+            crate::nest_checkin::delete_checkin(conn, a.id)?;
+            let photos_root = deps.data_dir.join(crate::photo::PHOTOS_DIR_NAME);
+            for f in crate::photo::delete_photo_files(&photos_root, &rel_paths) {
+                crate::applog::log_error(&format!("照片文件删除失败（遗留孤儿，待巡检隔离）: {f}"));
+            }
+            Ok(())
         })),
         "get_checkin_digest" => Some(read_cmd(deps, args, |conn, a: webui_args::ColonyIdArgs| {
             crate::nest_checkin::digest_for_colony(conn, a.colony_id, &crate::colony::today_iso())
@@ -1715,6 +1723,60 @@ mod tests {
             other => panic!("health_check 应成功，实际 {other:?}"),
         };
         assert_eq!(out["schema_version"], schema, "HTTP 派发与桌面 health_check 同源");
+    }
+
+    #[test]
+    fn http_delete_checkin_removes_photo_files_same_order() {
+        // 票 07：HTTP 侧删登记与桌面同序——元数据行删干净，照片文件连带删掉
+        //（不是留成孤儿等巡检；文件删失败才留孤儿）
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join(crate::db::DB_FILE_NAME);
+        let conn = crate::db::open_and_migrate(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, status) VALUES ('大头一号', '2026-01-20', 'active')",
+            [],
+        )
+        .unwrap();
+        let checkin_id = crate::nest_checkin::save_checkin(
+            &conn,
+            &crate::nest_checkin::CheckinInput {
+                colony_id: 1,
+                date: "2026-09-18".into(),
+                queen_count: None,
+                worker_count: None,
+                moved_nest: false,
+                note: Some("带照片".into()),
+            },
+            "2026-09-18",
+            "2026-09-18 21:00:00",
+        )
+        .unwrap()
+        .id;
+        let photos_root = dir.path().join(crate::photo::PHOTOS_DIR_NAME);
+        let uploads = vec![crate::photo::PhotoUpload {
+            original_name: Some("a.jpg".into()),
+            bytes: vec![1, 2, 3],
+        }];
+        let saved = crate::photo::attach_photos(&conn, &photos_root, checkin_id, &uploads).unwrap();
+        let rel = saved[0].rel_path.clone();
+        assert!(photos_root.join(&rel).exists(), "前置：照片文件在盘上");
+
+        let deps = SharedDeps::new(Arc::new(Mutex::new(conn)), dir.path().to_path_buf());
+        let out = dispatch_command(
+            &deps,
+            "delete_checkin",
+            &serde_json::json!({"id": checkin_id}),
+        )
+        .unwrap();
+        assert!(matches!(out, CmdOutcome::Ok(_)), "实际：{out:?}");
+        assert!(!photos_root.join(&rel).exists(), "HTTP 删除登记连带删照片文件");
+        let count: i64 = deps
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM nest_photo", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "元数据行一并删除");
     }
 
     // ── 集成：真监听（127.0.0.1 随机端口）+ ureq 真请求 ──

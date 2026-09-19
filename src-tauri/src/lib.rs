@@ -11,6 +11,7 @@ mod firewall;
 mod hibernation;
 mod nest_checkin;
 mod netseg;
+mod photo;
 mod pushover;
 mod reminder;
 mod restore;
@@ -215,7 +216,15 @@ fn delete_checkin(
     app: tauri::AppHandle,
     id: i64,
 ) -> Result<(), String> {
-    let result = with_conn(state, |conn| nest_checkin::delete_checkin(conn, id));
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let result = with_conn(state, |conn| {
+        // 删除顺序（票 07，规格 E）：先库事务删元数据提交，再删文件；
+        // 文件删失败仅产生孤儿（下轮巡检隔离），不回滚库。
+        let rel_paths = photo::collect_checkin_photo_paths(conn, id)?;
+        nest_checkin::delete_checkin(conn, id)?;
+        report_photo_orphans(&photo::delete_photo_files(&photos_root, &rel_paths));
+        Ok(())
+    });
     if result.is_ok() {
         trigger_after_write(&app);
     }
@@ -230,6 +239,103 @@ fn get_checkin_digest(
     with_conn(state, |conn| {
         nest_checkin::digest_for_colony(conn, colony_id, &colony::today_iso())
     })
+}
+
+// ── 巢况照片（webui-checkin 票 07）：上传校验重编码 / 写入协议 / 孤儿治理 ──
+// 纯核全在 photo.rs；这里只是 Tauri 薄包装。桌面 5 命令均**不入网页端白名单**
+//（照片上传/读取的 HTTP 通路随票 08 单独登记，pick/get_photo_abs_dir 这类
+// 桌面专属出口永不出网）。
+
+/// 照片文件清理的孤儿记账：失败仅遗留孤儿（下轮巡检隔离），绝不回滚库（规格 E）。
+fn report_photo_orphans(failures: &[String]) {
+    for f in failures {
+        applog::log_error(&format!("照片文件删除失败（遗留孤儿，待巡检隔离）: {f}"));
+    }
+}
+
+/// rfd 系统文件选择框多选巢况照片（取消返回 None）。async command：对话框
+/// 不能占主线程（评审 R1-2，与 pick_backup_dir 同理）。图片过滤器只是少让
+/// 用户选错——白名单真闸在 Rust 校验链（按魔数探测，不信扩展名）。
+#[tauri::command]
+async fn pick_photo_files() -> Result<Option<Vec<String>>, String> {
+    let picked = rfd::AsyncFileDialog::new()
+        .set_title("选择巢况照片")
+        .add_filter("图片（JPEG/PNG/WebP）", &["jpg", "jpeg", "png", "webp"])
+        .pick_files()
+        .await
+        .map(|files| {
+            files
+                .iter()
+                .map(|handle| handle.path().to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+        });
+    Ok(picked)
+}
+
+/// 上传巢况照片：读盘 → 校验链重编码（格式白名单/尺寸/解码炸弹头/缩放/JPEG
+/// 重编码清 EXIF）→ 写入协议落盘插库。解码/编码是 CPU 重活且不碰库，放在
+/// spawn_blocking 且库锁外做（锁内只留写入协议的几条小 IO + 插行）；成功 =
+/// 元数据已提交（「照片写库即算当日新数据」的自动备份语义以它为准），走
+/// trigger_after_write 与其他写命令同一咽喉。
+#[tauri::command]
+async fn attach_photos(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    checkin_id: i64,
+    paths: Vec<String>,
+) -> Result<Vec<nest_checkin::NestPhotoMeta>, String> {
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let conn_handle = state.inner().conn_handle();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let uploads = photo::read_photo_files(&paths)?;
+        let uploads = photo::process_uploads(uploads)?;
+        run_with_conn(&conn_handle, |conn| {
+            photo::attach_photos(conn, &photos_root, checkin_id, &uploads)
+        })
+    })
+    .await
+    .map_err(|e| format!("照片上传任务异常退出: {e}"))?;
+    if outcome.is_ok() {
+        trigger_after_write(&app);
+    }
+    outcome
+}
+
+/// 照片根目录绝对路径：桌面显示本地图用——前端 convertFileSrc 把
+/// `<数据目录>/photos/<relPath>` 变成 asset 协议 URL（scope 限定 photos/
+/// 的配置在 tauri.conf.json app.security.assetProtocol）。
+#[tauri::command]
+fn get_photo_abs_dir() -> Result<String, String> {
+    let dir = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    Ok(dir.to_string_lossy().to_string())
+}
+
+/// 孤儿照片隔离区现状（设置页数据 tab「巢况照片孤儿」区）。
+#[tauri::command]
+fn list_orphan_photos() -> Result<photo::OrphanPhotoStats, String> {
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    Ok(photo::orphan_stats(&photos_root))
+}
+
+/// 一键清理孤儿照片（删除 photos/.orphan-* 隔离目录；前端两段确认后调用）。
+/// 成败落流水（D7）。
+#[tauri::command]
+fn clean_orphan_photos() -> Result<photo::OrphanCleanOutcome, String> {
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let outcome = photo::clean_orphans(&photos_root);
+    if outcome.errors.is_empty() {
+        applog::log_action(&format!(
+            "孤儿照片清理完成：删除 {} 个隔离目录，释放 {} 字节",
+            outcome.removed_dirs, outcome.freed_bytes
+        ));
+    } else {
+        applog::log_error(&format!(
+            "孤儿照片清理部分失败（已删 {} 个目录）: {}",
+            outcome.removed_dirs,
+            outcome.errors.join("；")
+        ));
+    }
+    Ok(outcome)
 }
 
 // ── 字典管理与操作性质设置（票 04）──
@@ -401,7 +507,14 @@ fn delete_colony(
     app: tauri::AppHandle,
     id: i64,
 ) -> Result<(), String> {
-    let result = with_conn(state, |conn| colony::delete_colony(conn, id));
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let result = with_conn(state, |conn| {
+        // 删窝级联（票 07）：库事务删行提交后清照片文件；失败仅孤儿，不回滚库
+        let rel_paths = photo::collect_colony_photo_paths(conn, id)?;
+        colony::delete_colony(conn, id)?;
+        report_photo_orphans(&photo::delete_photo_files(&photos_root, &rel_paths));
+        Ok(())
+    });
     reminder::refresh_tray_tooltip(&app);
     if result.is_ok() {
         trigger_after_write(&app);
@@ -1050,6 +1163,48 @@ fn bump_data_version_and_broadcast(app: &tauri::AppHandle) {
     }
 }
 
+/// 孤儿照片巡检（票 07，规格 E/F）：库无引用文件移入 `photos/.orphan-<时间戳>/`
+/// （移动非删除），`.tmp-` 残留直接删。启动时与恢复完成后各跑一轮；有动作才落
+/// 流水（干净不刷屏）。
+fn run_orphan_scan(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<DbState>() else {
+        return;
+    };
+    let Ok(photos_root) = current_data_dir().map(|d| d.join(photo::PHOTOS_DIR_NAME)) else {
+        return;
+    };
+    let outcome = run_with_conn(&state.0, |conn| {
+        Ok::<photo::OrphanScanOutcome, String>(photo::scan_orphans(
+            conn,
+            &photos_root,
+            &photo::stamp_now(),
+        ))
+    });
+    match outcome {
+        Ok(o) if !o.moved.is_empty() || !o.removed_tmp.is_empty() || !o.errors.is_empty() => {
+            applog::log_action(&format!(
+                "孤儿照片巡检：隔离 {} 个无引用文件，清理 {} 个 .tmp- 残留{}",
+                o.moved.len(),
+                o.removed_tmp.len(),
+                if o.errors.is_empty() {
+                    String::new()
+                } else {
+                    format!("，失败 {} 个：{}", o.errors.len(), o.errors.join("；"))
+                }
+            ));
+        }
+        Ok(_) => {}
+        // run_with_conn 已落过失败日志；这里只补巡检语境
+        Err(_) => {}
+    }
+}
+
+/// 启动巡检放后台线程：照片多时扫盘不挡启动。
+fn spawn_orphan_scan(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || run_orphan_scan(&app));
+}
+
 /// 启动触发点（D2 ②）与写入触发点共用的后台执行入口：判定（含时钟回拨钳制）
 /// → 需要才真备份，谓词不满足时线程空转一次即退。
 fn spawn_auto_backup(app: &tauri::AppHandle) {
@@ -1167,6 +1322,9 @@ fn restore_apply(
             }
             // 托盘 tooltip 是库内超期摘要的投影，恢复后立即重算
             reminder::refresh_tray_tooltip(&app);
+            // 孤儿照片巡检（票 07）：换入的库/照片集合可能不一致（旧裸库恢复
+            // 后照片场景按孤儿治理，规格 F），恢复完成立即扫一轮
+            run_orphan_scan(&app);
         }
         Err(e) => {
             applog::log_error(&format!("恢复执行失败（来源 {path}）: {e}"));
@@ -1371,6 +1529,9 @@ pub fn run() {
             // 序列后，后台判定（含时钟回拨钳制）→ 有未备份的新数据才补跑
             // （跨日空启动不备；备份失败留给本触发点下次启动补）。
             spawn_auto_backup(app.handle());
+            // 孤儿照片巡检（票 07）：启动后扫 photos/，库无引用文件移入隔离区。
+            // 后台线程跑，扫盘不挡启动。
+            spawn_orphan_scan(app.handle());
             // 关窗 = 最小化到托盘（票 09 验收 1）：拦截关闭请求只隐藏，托盘「退出」才真退。
             if let Some(window) = app.get_webview_window("main") {
                 let win = window.clone();
@@ -1416,6 +1577,11 @@ pub fn run() {
             update_checkin,
             delete_checkin,
             get_checkin_digest,
+            pick_photo_files,
+            attach_photos,
+            get_photo_abs_dir,
+            list_orphan_photos,
+            clean_orphan_photos,
             list_actions,
             save_action,
             set_action_enabled,

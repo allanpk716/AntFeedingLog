@@ -18,7 +18,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+# protocol-asset（webui-checkin 票 07）：tauri.conf.json 启用了 assetProtocol
+#（scope 限定 $APPDATA/photos/**），桌面缩略图/大图经 asset 协议读照片文件
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-opener = "2"
@@ -53,6 +55,12 @@ tokio = { version = "1", default-features = false, features = ["net", "rt", "syn
 # + 每次发布一帧」变成 Stream（tokio 自身不带 Stream 实现）；sync feature 只开
 # watch 包装
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
+# 照片管线（webui-checkin 票 07）：上传照片解码→缩放→重编码 JPEG。选型 image：
+# 纯 Rust、格式白名单三样（JPEG/PNG/WebP 静态解码）齐备；能先只读头部宽高
+#（ImageReader::into_dimensions，不解码像素）做解码炸弹前置拦截，再配 Limits
+#（max_image_width/height/max_alloc）解码双保险；重编码 JPEG 天然不携带 APP1
+#（EXIF/GPS 所在段），输出即干净图。只开三个编解码 feature，不拖其余格式。
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [dev-dependencies]
 tempfile = "3"
