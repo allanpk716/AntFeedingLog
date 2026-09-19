@@ -18,6 +18,7 @@ mod stats;
 mod system;
 mod updater;
 mod webui_config;
+mod webui_args;
 mod webui_server;
 
 /// 全链冒烟（数据安全二期票 05）：造数据 → 自动备份 → 改数据 → 恢复 的端到端
@@ -1270,9 +1271,36 @@ pub fn run() {
             // 网页端服务（票 04）：共享依赖（与桌面 IPC 同一把库锁的柄）+ 运行时
             // 槽位先就位；配置 enabled 即拉起。启动失败只落日志不挡启动（不弹窗
             // 不崩溃；设置页保存时会对齐并回显错误，用户可当场看到原因）。
-            let webui_deps = Arc::new(webui_server::SharedDeps::new(
+            // 票 05 接线两个钩子：
+            // - after_write：写命令成功后的桌面同款收尾（按命令性质刷托盘 tooltip
+            //   + trigger_after_write 自动备份记账/后台判定）；HTTP 写命令不再另
+            //   起一条对齐路径，桌面/网页共用同一套触发点。
+            // - frontend_assets：打包后的 frontendDist 产物嵌在二进制里，经
+            //   asset resolver 取出托管（浏览器打开 / 即完整前端）；tauri dev 期
+            //   嵌入资源为空，静态路由 404（开发期浏览器走 devUrl）。
+            let webui_after_write: webui_server::AfterWriteHook = {
+                let handle = app.handle().clone();
+                Arc::new(move |with_tray| {
+                    if with_tray {
+                        reminder::refresh_tray_tooltip(&handle);
+                    }
+                    trigger_after_write(&handle);
+                })
+            };
+            let webui_assets: webui_server::AssetLookup = {
+                let handle = app.handle().clone();
+                Arc::new(move |path| {
+                    handle
+                        .asset_resolver()
+                        .get(path.to_string())
+                        .map(|asset| asset.bytes().to_vec())
+                })
+            };
+            let webui_deps = Arc::new(webui_server::SharedDeps::with_hooks(
                 db_state.conn_handle(),
                 data_dir.clone(),
+                webui_after_write,
+                webui_assets,
             ));
             app.manage(webui_deps);
             app.manage(webui_server::WebUiRuntime::new());

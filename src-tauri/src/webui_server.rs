@@ -17,8 +17,20 @@
 //!   （[`SseTicketStore`]，建连即消费；消费/过期纯核可测，SSE 端点票 06 挂上）。
 //!
 //! 白名单默认拒绝：`POST /api/cmd` 只派发注册表 [`WEBUI_COMMANDS`] 里登记的
-//! 命令（本票仅 `health_check`），其余一律 404；四个网页端配置命令（凭证明文/
-//! 安全配置面）**永久禁入**，由 `registry_excludes_forbidden_commands` 钉死。
+//! 命令，其余一律 404；四个网页端配置命令（凭证明文/安全配置面）**永久禁入**，
+//! 由 `registry_excludes_forbidden_commands` 钉死。
+//!
+//! 命令派发（票 05）：白名单≠校验——每个登记命令在 [`crate::webui_args`] 有
+//! 类型化参数 schema（顶层键 camelCase 与桌面 Tauri invoke 映射同款），反序列
+//! 化 + 取值校验不过即 `400 {"error":人话}`，不进库；过校验的命令经
+//! [`crate::run_with_conn`] 与桌面同一把库锁执行（与桌面纯核同源，不复制业务）。
+//! 写命令成功后按桌面语义触发 [`AfterWriteHook`]（自动备份记账 + 按命令性质刷
+//! 托盘 tooltip；巢况写命令不刷托盘——巢况永不参与提醒/催促）。
+//!
+//! 前端静态资源（票 05）：打包后的 frontendDist 产物经 [`AssetLookup`] 托管，
+//! 浏览器打开 `http://<IP>:<端口>/` 即得完整前端。静态路由只豁免闸二（页面要
+//! 先加载才能执行 `#token=` 入库的入口 JS，带不了 Authorization 头；产物是
+//! 公开构建物、无敏感内容），闸一照拦；并保留限额与超时。
 //!
 //! 请求限制（规格 A）：请求体 ≤1MB（照片上传端点票 08 自行放宽到 15MB，框架层
 //! 预留按路径 `DefaultBodyLimit::max` 的口子）、普通并发 ≤8、SSE 连接单独计量
@@ -41,6 +53,7 @@ use axum::extract::{ConnectInfo, State};
 use axum::middleware::Next;
 use axum::response::IntoResponse;
 
+use crate::webui_args;
 use crate::webui_config;
 
 // ── 常量：请求限制（规格 A）─────────────────────────────────────────────────
@@ -316,8 +329,8 @@ pub fn header_limit_error(headers: &axum::http::HeaderMap) -> Option<&'static st
 
 /// 网页端命令白名单注册表：**不登记即 404**。
 ///
-/// 本票（04）只登记 `health_check`；票 05 起按网页端功能面（规格 H：首页/打卡/
-/// 历史/冬眠/巢况）逐个加入，设置/管理/备份/更新**永不入表**。
+/// 票 05 登记记录类命令（规格 H 功能面：首页/打卡/历史/冬眠/巢况）；设置/
+/// 管理/备份/更新**永不入表**。
 ///
 /// ⚠ **永久禁入清单**（不得加入本表，测试 [`tests::registry_excludes_forbidden_commands`]
 /// 钉死，票 03 评审 Important 的落点）：
@@ -327,25 +340,249 @@ pub fn header_limit_error(headers: &axum::http::HeaderMap) -> Option<&'static st
 /// - `get_access_url`——响应就是含凭证的完整访问地址。
 ///
 /// 与 lib.rs 各命令 doc 注释的禁入标记同源；网页端的功能面不含任何设置操作（规格 H）。
-pub const WEBUI_COMMANDS: &[&str] = &["health_check"];
+pub const WEBUI_COMMANDS: &[&str] = &[
+    "health_check",
+    // 首页：窝卡片墙（含超期投影）+ 地点下拉
+    "list_colonies",
+    "list_locations",
+    // 打卡：字典读 + 提交
+    "list_actions",
+    "list_foods",
+    "log_care",
+    // 历史记录：查 / 改 / 删
+    "list_logs",
+    "update_log",
+    "delete_log",
+    // 冬眠操作
+    "start_hibernation",
+    "confirm_wake",
+    "add_past_hibernation",
+    "update_expected_end",
+    // 巢况登记：查 / 改 / 删 / 摘要（照片上传随票 08）
+    "save_checkin",
+    "list_checkins",
+    "update_checkin",
+    "delete_checkin",
+    "get_checkin_digest",
+];
 
-/// 注册表派发：登记且有实现 → Some(命令结果)；登记了但没实现 → None（404）。
-/// 未登记的命令根本不会走到这（handler 先查 [`WEBUI_COMMANDS`]）。
+/// 写命令成功后的副作用钩子（票 05）：参数 = 是否同时刷新托盘 tooltip。
+/// 生产在 lib.rs setup 接线（`refresh_tray_tooltip` + `trigger_after_write`，
+/// 与桌面写命令收尾两件套同一语义）；测试注入计数器断言。
+pub type AfterWriteHook = std::sync::Arc<dyn Fn(bool) + std::marker::Send + std::marker::Sync>;
+
+/// 前端静态资源查找（票 05）：dist 产物相对路径 → 字节；None = 无此资源。
+/// 生产 = Tauri 嵌入资源（frontendDist 打进二进制，asset resolver 取出）；
+/// 测试 = 临时目录注入；`tauri dev` 期嵌入资源为空 → 静态路由 404（开发期
+/// 浏览器走 devUrl，本路径仅为打包后场景服务）。
+pub type AssetLookup = std::sync::Arc<dyn Fn(&str) -> Option<Vec<u8>> + std::marker::Send + std::marker::Sync>;
+
+/// 命令派发结果（票 05 起三态分明）：
+/// - [`CmdOutcome::Ok`] → 200（返回体 = 命令返回值，与桌面 invoke 同形）；
+/// - [`CmdOutcome::Rejected`] → 400（schema/输入校验层拒绝，**未进库**——
+///   「越权/畸形参数一律 400」验收口径）；
+/// - [`CmdOutcome::Failed`] → 500（执行失败，桌面 invoke 的同款人话错误串）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum CmdOutcome {
+    Ok(serde_json::Value),
+    Rejected(String),
+    Failed(String),
+}
+
+/// 注册表派发：登记且有实现 → Some(结果)；未登记 → None（404）。
 /// 命令执行与桌面 IPC 同一把库锁（[`crate::run_with_conn`]），单连接串行。
+/// 入参 `args` 是请求体里的 args 对象（键 camelCase，schema 层映射）。
 pub fn dispatch_command(
     deps: &SharedDeps,
     cmd: &str,
-) -> Option<Result<serde_json::Value, String>> {
+    args: &serde_json::Value,
+) -> Option<CmdOutcome> {
+    use crate::webui_args::ValidatedArgs;
+
+    /// 读命令：解析 schema（400）→ 同一把库锁执行（500）。
+    fn read_cmd<A, T, F>(deps: &SharedDeps, args: &serde_json::Value, f: F) -> CmdOutcome
+    where
+        A: ValidatedArgs,
+        T: serde::Serialize,
+        F: FnOnce(&Connection, A) -> Result<T, String>,
+    {
+        let parsed = match parse_validated::<A>(args) {
+            Ok(a) => a,
+            Err(msg) => return CmdOutcome::Rejected(msg),
+        };
+        to_outcome(crate::run_with_conn(&deps.conn, |conn| f(conn, parsed)))
+    }
+
+    /// 写命令：同读命令，成功后触发桌面语义的写后副作用（托盘 + 自动备份）。
+    fn write_cmd<A, T, F>(
+        deps: &SharedDeps,
+        args: &serde_json::Value,
+        with_tray: bool,
+        f: F,
+    ) -> CmdOutcome
+    where
+        A: ValidatedArgs,
+        T: serde::Serialize,
+        F: FnOnce(&Connection, A) -> Result<T, String>,
+    {
+        let parsed = match parse_validated::<A>(args) {
+            Ok(a) => a,
+            Err(msg) => return CmdOutcome::Rejected(msg),
+        };
+        let outcome = crate::run_with_conn(&deps.conn, |conn| f(conn, parsed));
+        match outcome {
+            Ok(v) => {
+                // 桌面语义（lib.rs 写命令收尾）：成功才触发；钩子在库锁释放后
+                // 调用（trigger_after_write 的后台备份要重新拿锁，持锁调会自锁）
+                (deps.after_write)(with_tray);
+                CmdOutcome::Ok(serde_json::to_value(v).unwrap_or(serde_json::Value::Null))
+            }
+            Err(e) => CmdOutcome::Failed(e),
+        }
+    }
+
     match cmd {
         // 健康检查与桌面 `health_check` 命令同源：同一把库锁里查 schema 版本
-        "health_check" => Some(crate::run_with_conn(&deps.conn, |conn| {
+        "health_check" => Some(to_outcome(crate::run_with_conn(&deps.conn, |conn| {
             crate::db::schema_version_of(conn)
                 .map(|schema_version| serde_json::json!({ "schema_version": schema_version }))
                 .map_err(|e| e.to_string())
+        }))),
+        // ── 首页 ──
+        "list_colonies" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
+            crate::colony::list_colonies(conn, &crate::colony::today_iso())
+        })),
+        "list_locations" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
+            crate::colony::list_locations(conn)
+        })),
+        // ── 打卡 ──
+        "list_actions" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
+            crate::dict::list_actions(conn)
+        })),
+        "list_foods" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
+            crate::care::list_foods(conn)
+        })),
+        "log_care" => Some(write_cmd(
+            deps,
+            args,
+            true,
+            |conn, a: webui_args::LogCareArgs| crate::care::log_care(conn, &a.input.into_core(), &crate::care::now_local()),
+        )),
+        // ── 历史记录 ──
+        "list_logs" => Some(read_cmd(deps, args, |conn, a: webui_args::ListLogsArgs| {
+            crate::care::list_logs(conn, &a.filter.into_core())
+        })),
+        "update_log" => Some(write_cmd(
+            deps,
+            args,
+            true,
+            |conn, a: webui_args::UpdateLogArgs| {
+                crate::care::update_log(conn, a.id, &a.input.into_core(), &crate::care::now_local())
+            },
+        )),
+        "delete_log" => Some(write_cmd(deps, args, true, |conn, a: webui_args::IdArgs| {
+            crate::care::delete_log(conn, a.id)
+        })),
+        // ── 冬眠 ──
+        "start_hibernation" => Some(write_cmd(
+            deps,
+            args,
+            true,
+            |conn, a: webui_args::StartHibernationArgs| {
+                crate::hibernation::start_hibernation(
+                    conn,
+                    a.colony_id,
+                    &a.start_date,
+                    &a.expected_end_date,
+                    &crate::colony::today_iso(),
+                )
+            },
+        )),
+        "confirm_wake" => Some(write_cmd(
+            deps,
+            args,
+            true,
+            |conn, a: webui_args::ConfirmWakeArgs| {
+                crate::hibernation::confirm_wake(
+                    conn,
+                    a.colony_id,
+                    &a.actual_end_date,
+                    &crate::colony::today_iso(),
+                )
+            },
+        )),
+        "add_past_hibernation" => Some(write_cmd(
+            deps,
+            args,
+            true,
+            |conn, a: webui_args::AddPastHibernationArgs| {
+                crate::hibernation::add_past_hibernation(conn, a.colony_id, &a.start_date, &a.end_date)
+            },
+        )),
+        "update_expected_end" => Some(write_cmd(
+            deps,
+            args,
+            true,
+            |conn, a: webui_args::UpdateExpectedEndArgs| {
+                crate::hibernation::update_expected_end(conn, a.colony_id, &a.new_expected_end_date)
+            },
+        )),
+        // ── 巢况登记（永不参与提醒/催促：写命令不刷托盘，只触发自动备份）──
+        "save_checkin" => Some(write_cmd(
+            deps,
+            args,
+            false,
+            |conn, a: webui_args::SaveCheckinArgs| {
+                crate::nest_checkin::save_checkin(
+                    conn,
+                    &a.input.into_core(),
+                    &crate::colony::today_iso(),
+                    &crate::care::now_local(),
+                )
+            },
+        )),
+        "list_checkins" => Some(read_cmd(deps, args, |conn, a: webui_args::ColonyIdArgs| {
+            crate::nest_checkin::list_checkins(conn, a.colony_id)
+        })),
+        "update_checkin" => Some(write_cmd(
+            deps,
+            args,
+            false,
+            |conn, a: webui_args::UpdateCheckinArgs| {
+                crate::nest_checkin::update_checkin(
+                    conn,
+                    a.id,
+                    &a.input.into_core(),
+                    &crate::colony::today_iso(),
+                )
+            },
+        )),
+        "delete_checkin" => Some(write_cmd(deps, args, false, |conn, a: webui_args::IdArgs| {
+            crate::nest_checkin::delete_checkin(conn, a.id)
+        })),
+        "get_checkin_digest" => Some(read_cmd(deps, args, |conn, a: webui_args::ColonyIdArgs| {
+            crate::nest_checkin::digest_for_colony(conn, a.colony_id, &crate::colony::today_iso())
         })),
         // 不存在「注册表里有但这里没有」的分支——registry_entries_all_have_real_dispatch
         // 钉住两边同步；走到这等于调用方没先查注册表
         _ => None,
+    }
+}
+
+/// schema 解析 + 取值校验（两段都过才进库；任一失败 = 400 人话）。
+fn parse_validated<A: webui_args::ValidatedArgs>(
+    args: &serde_json::Value,
+) -> Result<A, String> {
+    let a: A = webui_args::parse(args)?;
+    a.validate()?;
+    Ok(a)
+}
+
+/// 纯核 Result → 派发结果（序列化失败理论外，兜底 null）。
+fn to_outcome<T: serde::Serialize>(result: Result<T, String>) -> CmdOutcome {
+    match result {
+        Ok(v) => CmdOutcome::Ok(serde_json::to_value(v).unwrap_or(serde_json::Value::Null)),
+        Err(e) => CmdOutcome::Failed(e),
     }
 }
 
@@ -363,16 +600,39 @@ pub struct SharedDeps {
     pub limiter: ConnLimiter,
     /// 连接层 header 读超时（默认 30 秒；测试注入短值）。
     pub read_timeout: Duration,
+    /// 写命令成功后的副作用钩子（票 05，桌面语义；默认空操作，生产 lib.rs 接线）。
+    pub after_write: AfterWriteHook,
+    /// 前端静态资源查找（票 05；默认无资源=静态路由 404，生产 lib.rs 接线）。
+    pub frontend_assets: AssetLookup,
 }
 
 impl SharedDeps {
+    /// 空钩子构造（测试用；生产走 [`Self::with_hooks`] 接真实副作用与静态资源）。
+    #[allow(dead_code)] // 测试构建在用；生产构造见 lib.rs setup 的 with_hooks
     pub fn new(conn: Arc<Mutex<Connection>>, data_dir: PathBuf) -> Self {
+        SharedDeps::with_hooks(
+            conn,
+            data_dir,
+            Arc::new(|_with_tray| {}),
+            Arc::new(|_path| None),
+        )
+    }
+
+    /// 带钩子构造（生产接线用：写后副作用 + 前端静态资源）。
+    pub fn with_hooks(
+        conn: Arc<Mutex<Connection>>,
+        data_dir: PathBuf,
+        after_write: AfterWriteHook,
+        frontend_assets: AssetLookup,
+    ) -> Self {
         SharedDeps {
             conn,
             data_dir,
             tickets: SseTicketStore::new(),
             limiter: ConnLimiter::new(MAX_CONCURRENT_REQUESTS, MAX_CONCURRENT_SSE),
             read_timeout: READ_TIMEOUT,
+            after_write,
+            frontend_assets,
         }
     }
 }
@@ -494,16 +754,17 @@ async fn auth_mw(
 /// 响应只有 schema 版本，无敏感信息）。闸一照拦（连接准入在前），限额与超时
 /// 照挂（普通并发上限 8 无端点豁免——免凭证端点更要防洪泛，见 build_router）。
 async fn health_handler(State(deps): State<Shared>) -> axum::response::Response {
-    respond_dispatch(dispatch_command(&deps, "health_check"))
+    respond_dispatch(dispatch_command(&deps, "health_check", &serde_json::json!({})))
 }
 
-fn respond_dispatch(
-    outcome: Option<Result<serde_json::Value, String>>,
-) -> axum::response::Response {
+fn respond_dispatch(outcome: Option<CmdOutcome>) -> axum::response::Response {
     use axum::http::StatusCode;
     match outcome {
-        Some(Ok(v)) => json_response(StatusCode::OK, &v),
-        Some(Err(e)) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
+        Some(CmdOutcome::Ok(v)) => json_response(StatusCode::OK, &v),
+        // 输入校验层拒绝：畸形参数一律 400（验收口径），错误体 = 人话
+        Some(CmdOutcome::Rejected(msg)) => json_error(StatusCode::BAD_REQUEST, &msg),
+        // 执行失败：桌面 invoke 同款人话错误串（业务拒绝/库错误）
+        Some(CmdOutcome::Failed(e)) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &e),
         None => json_error(StatusCode::NOT_FOUND, "unknown command"),
     }
 }
@@ -533,15 +794,19 @@ async fn cmd_handler(
             "请求体缺少 cmd 字段（应为 {\"cmd\":命令名,\"args\":{}}）",
         );
     };
-    // args 键名与桌面 invoke 入参对象一致（camelCase 原样）；票 05 命令接入时
-    // 在派发层做 Tauri 同款 camelCase → snake_case 映射
-    let _args = parsed.get("args").cloned().unwrap_or(serde_json::Value::Null);
+    // args 键名与桌面 invoke 入参对象一致（顶层 camelCase）；缺省/null 按 {}
+    // 处理，交给 schema 层判定缺字段
+    let args = parsed
+        .get("args")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .unwrap_or_else(|| serde_json::json!({}));
     if !WEBUI_COMMANDS.contains(&cmd) {
         // deny-by-default 的常态 404，不刷日志（网段外根本进不来，段内探测
         // 不构成安全事件；真正的准入拒绝在闸一/闸二层记流水）
         return json_error(StatusCode::NOT_FOUND, "unknown command");
     }
-    respond_dispatch(dispatch_command(&deps, cmd))
+    respond_dispatch(dispatch_command(&deps, cmd, &args))
 }
 
 /// `POST /api/sse-ticket`：主凭证换 60 秒一次性票据（闸二已在此路径生效）。
@@ -557,13 +822,83 @@ async fn sse_ticket_handler(State(deps): State<Shared>) -> axum::response::Respo
     }
 }
 
+// ── HTTP 层：前端静态资源（票 05，规格「浏览器打开即完整前端」）────────────
+
+/// 静态资源响应的附加头：nosniff 防 MIME 嗅探（规格 E 精神，照片路由票 08 同款）。
+fn static_headers(mime: &'static str) -> [(&'static str, &'static str); 2] {
+    [("Content-Type", mime), ("X-Content-Type-Options", "nosniff")]
+}
+
+/// dist 产物扩展名 → MIME（vite 产出的有限集合，未知一律 octet-stream）。
+fn mime_for(path: &str) -> &'static str {
+    let ext = path.rsplit('.').next().unwrap_or("");
+    match ext {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "map" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "txt" => "text/plain; charset=utf-8",
+        "webmanifest" => "application/manifest+json",
+        _ => "application/octet-stream",
+    }
+}
+
+/// 静态资源取用：路径安全检查 → 资源查找 → 带类型回包。
+/// 路径只放行 dist 产物形态（相对路径，vite hash 文件名全部落在
+/// `[A-Za-z0-9._-/]`）；盘符/反斜杠/上跳/百分号编码一律 404——闸一网段内也
+/// 不给路径花样试探留口子。
+fn serve_asset(deps: &SharedDeps, raw_path: &str) -> axum::response::Response {
+    use axum::http::StatusCode;
+    let path = raw_path.trim_start_matches('/');
+    let suspicious = path.is_empty()
+        || path.contains('\\')
+        || path.contains("..")
+        || path.contains(':')
+        || path.contains('%');
+    if suspicious {
+        return json_error(StatusCode::NOT_FOUND, "资源不存在");
+    }
+    match (deps.frontend_assets)(path) {
+        Some(bytes) => (
+            StatusCode::OK,
+            static_headers(mime_for(path)),
+            bytes,
+        )
+            .into_response(),
+        // 开发期（tauri dev 前端走 devUrl）嵌入资源为空：404 人话，不阻塞
+        None => json_error(StatusCode::NOT_FOUND, "资源不存在"),
+    }
+}
+
+/// `GET /`：前端入口页（dist 产物 index.html）。
+async fn index_handler(State(deps): State<Shared>) -> axum::response::Response {
+    serve_asset(&deps, "index.html")
+}
+
+/// `GET /{*path}`：前端其余静态资源（vite hash 文件名 / 图标 / 字体）。
+async fn static_handler(
+    State(deps): State<Shared>,
+    axum::extract::Path(path): axum::extract::Path<String>,
+) -> axum::response::Response {
+    serve_asset(&deps, &path)
+}
+
 // ── HTTP 层：路由组装 ───────────────────────────────────────────────────────
 
 /// 路由（自外向内）：全局体上限 → [限额 → 超时 → 闸二 → 端点]。
 /// `/api/health` 挂同一套限额/超时、**仅豁免闸二**（唯一免凭证端点：若连并发
 /// 上限都无，段内无凭证者可连接洪泛，把并发任务全堵在库锁上占满 tokio worker
 /// ——恢复校验/备份持锁窗口期尤甚。规格 A「普通并发上限 8」没有端点豁免授权）。
-/// 其余一切路径 404（axum 无路由默认）。
+/// 前端静态资源（票 05）同 health：**豁免闸二**（页面要先加载才能跑 `#token=`
+/// 入库的入口 JS，带不了 Authorization 头；产物是公开构建物无敏感内容），
+/// 限额/超时照挂。其余一切路径 404（axum 无路由默认）。
 fn build_router(deps: Shared) -> axum::Router {
     use axum::extract::DefaultBodyLimit;
     use axum::middleware as mw;
@@ -580,8 +915,14 @@ fn build_router(deps: Shared) -> axum::Router {
         .route("/api/health", get(health_handler))
         .layer(mw::from_fn(timeout_mw))
         .layer(mw::from_fn_with_state(deps.clone(), limits_mw))
+        .with_state(deps.clone());
+    let assets = axum::Router::new()
+        .route("/", get(index_handler))
+        .route("/{*path}", get(static_handler))
+        .layer(mw::from_fn(timeout_mw))
+        .layer(mw::from_fn_with_state(deps.clone(), limits_mw))
         .with_state(deps);
-    health.merge(api).layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+    health.merge(api).merge(assets).layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 }
 
 // ── 服务生命周期：accept 循环 / 起停 ────────────────────────────────────────
@@ -1073,16 +1414,10 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join(crate::db::DB_FILE_NAME);
         let conn = crate::db::open_and_migrate(&db_path).unwrap();
-        let deps = SharedDeps {
-            conn: Arc::new(Mutex::new(conn)),
-            data_dir: dir.path().to_path_buf(),
-            tickets: SseTicketStore::new(),
-            limiter: ConnLimiter::new(2, 2),
-            read_timeout: Duration::from_secs(1),
-        };
+        let deps = SharedDeps::new(Arc::new(Mutex::new(conn)), dir.path().to_path_buf());
         for cmd in WEBUI_COMMANDS {
             assert!(
-                dispatch_command(&deps, cmd).is_some(),
+                dispatch_command(&deps, cmd, &serde_json::json!({})).is_some(),
                 "注册表里的 {cmd} 没有派发分支"
             );
         }
@@ -1098,14 +1433,11 @@ mod tests {
         drop(conn);
         // 重开成共享形态（模拟运行态 DbState 的 Arc 锁）
         let conn = crate::db::open_and_migrate(&db_path).unwrap();
-        let deps = SharedDeps {
-            conn: Arc::new(Mutex::new(conn)),
-            data_dir: dir.path().to_path_buf(),
-            tickets: SseTicketStore::new(),
-            limiter: ConnLimiter::new(2, 2),
-            read_timeout: Duration::from_secs(1),
+        let deps = SharedDeps::new(Arc::new(Mutex::new(conn)), dir.path().to_path_buf());
+        let out = match dispatch_command(&deps, "health_check", &serde_json::json!({})).unwrap() {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("health_check 应成功，实际 {other:?}"),
         };
-        let out = dispatch_command(&deps, "health_check").unwrap().unwrap();
         assert_eq!(out["schema_version"], schema, "HTTP 派发与桌面 health_check 同源");
     }
 
@@ -1113,9 +1445,21 @@ mod tests {
 
     /// 组装测试依赖：临时数据目录 + 配置文件（token/网段可注入）+ 真库连接 +
     /// 1 秒读超时（慢速请求防挂秒级可验证）。返回 (deps, dir)。
+    /// `after_write`/`frontend_assets` 可注入（票 05：副作用断言 / 静态托管）。
     fn test_deps(
         segments: &[&str],
         token: &str,
+    ) -> (Arc<SharedDeps>, tempfile::TempDir) {
+        let (deps, dir) = test_deps_with(segments, token, Arc::new(|_| {}), Arc::new(|_| None));
+        (deps, dir)
+    }
+
+    /// 同 [`test_deps`]，另注入写后副作用钩子与前端静态资源查找。
+    fn test_deps_with(
+        segments: &[&str],
+        token: &str,
+        after_write: AfterWriteHook,
+        frontend_assets: AssetLookup,
     ) -> (Arc<SharedDeps>, tempfile::TempDir) {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join(crate::db::DB_FILE_NAME);
@@ -1131,13 +1475,15 @@ mod tests {
             },
         )
         .unwrap();
-        let deps = Arc::new(SharedDeps {
-            conn: Arc::new(Mutex::new(conn)),
-            data_dir: dir.path().to_path_buf(),
-            tickets: SseTicketStore::new(),
-            limiter: ConnLimiter::new(MAX_CONCURRENT_REQUESTS, MAX_CONCURRENT_SSE),
-            read_timeout: Duration::from_secs(1),
-        });
+        let mut shared = SharedDeps::with_hooks(
+            Arc::new(Mutex::new(conn)),
+            dir.path().to_path_buf(),
+            after_write,
+            frontend_assets,
+        );
+        // 测试注入短读超时（慢速请求秒级断开可验证），与票 04 行为一致
+        shared.read_timeout = Duration::from_secs(1);
+        let deps = Arc::new(shared);
         (deps, dir)
     }
 
@@ -1229,13 +1575,14 @@ mod tests {
         );
         assert_eq!(status, 401);
 
-        // 未登记命令 → 404 {"error":"unknown command"}（deny-by-default）
+        // 未登记命令 → 404 {"error":"unknown command"}（deny-by-default；
+        // get_settings 是桌面专属设置命令，规格 H 永不入表）
         let (status, body) = http(
             &a,
             "POST",
             &format!("{base}/api/cmd"),
             Some(&token),
-            r#"{"cmd":"list_colonies","args":{}}"#,
+            r#"{"cmd":"get_settings","args":{}}"#,
         );
         assert_eq!(status, 404);
         assert_eq!(body["error"], "unknown command");
@@ -1493,5 +1840,632 @@ mod tests {
         off.enabled = false;
         block(runtime.sync(deps, &off)).unwrap();
         assert_eq!(block(runtime.running_port()), None);
+    }
+
+    // ── 票 05：记录类命令端到端（ureq 真请求 + 校验层 + 写后副作用）─────────
+
+    /// 种子一个活跃窝（今天开始），返回其 id。预设字典已由 v1 迁移播种
+    /// （操作 1 = 喂食（喂食类）、食物 1 = 种子），打卡测试直接引用。
+    fn seed_colony(conn: &Arc<Mutex<Connection>>, name: &str) -> i64 {
+        let conn = conn.lock().unwrap();
+        let today = crate::colony::today_iso();
+        let colony = crate::colony::create_colony(
+            &conn,
+            &crate::colony::ColonyInput {
+                name: name.to_string(),
+                species: None,
+                location_id: None,
+                start_date: today.clone(),
+                status: "active".to_string(),
+            },
+            &today,
+        )
+        .expect("种子窝失败");
+        colony.id
+    }
+
+    #[test]
+    fn record_commands_serve_full_flow_end_to_end() {
+        // User Stories 4/5/6/7 的 HTTP 版全流程：读首页 → 打卡 → 历史（改/删）
+        // → 冬眠（开/改/出眠）→ 巢况（登/改/删/摘要）。SSE 未接线（票 06），
+        // 每步读回即「切页刷新兜底」语义。
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let colony_id = seed_colony(&deps.conn, "网页端窝");
+        let today = crate::colony::today_iso();
+        let handle = block(start(deps, 0)).expect("启动失败");
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+        let post = |body: String| -> (u16, serde_json::Value) {
+            http(&a, "POST", &format!("{base}/api/cmd"), Some(&token), &body)
+        };
+
+        // 首页：list_colonies 返回这窝（桌面同形数组投影）
+        let (status, body) = post(json_body("list_colonies", &serde_json::json!({})));
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(body.as_array().expect("数组").len(), 1);
+        assert_eq!(body[0]["name"], "网页端窝");
+        assert_eq!(body[0]["status"], "active");
+
+        // 下拉字典：list_locations / list_actions / list_foods 非空
+        for cmd in ["list_locations", "list_actions", "list_foods"] {
+            let (status, body) = post(json_body(cmd, &serde_json::json!({})));
+            assert_eq!(status, 200, "{cmd} 实际：{body}");
+            assert!(!body.as_array().expect("数组").is_empty(), "{cmd} 应有预置项");
+        }
+
+        // 打卡：喂食 + 种子 → 返回新记录 id
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "log_care",
+                "args": {"input": {"colony_id": colony_id, "action_id": 1,
+                                    "happened_at": today, "note": "网页端打卡", "food_ids": [1]}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        let log_id = body.as_i64().expect("新记录 id");
+
+        // 历史查：list_logs 看得到（食物名字典序投影）
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "list_logs",
+                "args": {"filter": {"colony_id": colony_id, "limit": 50, "offset": 0}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(body["total"], 1);
+        assert_eq!(body["rows"][0]["id"], log_id);
+        assert_eq!(body["rows"][0]["note"], "网页端打卡");
+        assert_eq!(body["rows"][0]["food_names"], serde_json::json!(["种子"]));
+
+        // 历史改：update_log 改备注 → 读回确认
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "update_log",
+                "args": {"id": log_id, "input": {"note": "改过的备注"}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "list_logs",
+                "args": {"filter": {"colony_id": colony_id}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["rows"][0]["note"], "改过的备注");
+
+        // 历史删：delete_log → total 归零
+        let (status, _) = post(
+            serde_json::json!({"cmd": "delete_log", "args": {"id": log_id}}).to_string(),
+        );
+        assert_eq!(status, 200);
+        let (status, body) = post(
+            serde_json::json!({"cmd": "list_logs", "args": {"filter": {}}}).to_string(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], 0, "删除后归零，实际：{body}");
+
+        // 冬眠开段：start_hibernation → 窝状态投影 hibernating + 横幅数据
+        let plus30 = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
+            .unwrap()
+            .checked_add_days(chrono::Days::new(30))
+            .unwrap()
+            .to_string();
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "start_hibernation",
+                "args": {"colonyId": colony_id, "startDate": today, "expectedEndDate": plus30}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(body["colony_id"], colony_id);
+        assert_eq!(body["actual_end_date"], serde_json::Value::Null);
+        let (status, body) = post(json_body("list_colonies", &serde_json::json!({})));
+        assert_eq!(status, 200);
+        assert_eq!(body[0]["status"], "hibernating", "实际：{body}");
+        assert_eq!(body[0]["hibernation"]["start_date"], today);
+
+        // 改预计出眠日：update_expected_end（票 09 停靠 D 同款语义）
+        let plus60 = chrono::NaiveDate::parse_from_str(&today, "%Y-%m-%d")
+            .unwrap()
+            .checked_add_days(chrono::Days::new(60))
+            .unwrap()
+            .to_string();
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "update_expected_end",
+                "args": {"colonyId": colony_id, "newExpectedEndDate": plus60}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(body["expected_end_date"], plus60);
+
+        // 出眠：confirm_wake → 窝回到 active
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "confirm_wake",
+                "args": {"colonyId": colony_id, "actualEndDate": today}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(body["actual_end_date"], today);
+        let (status, body) = post(json_body("list_colonies", &serde_json::json!({})));
+        assert_eq!(status, 200);
+        assert_eq!(body[0]["status"], "active", "实际：{body}");
+
+        // 补录冬眠期：add_past_hibernation（不冲突的历史段）
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "add_past_hibernation",
+                "args": {"colonyId": colony_id,
+                          "startDate": "2025-12-01", "endDate": "2026-02-20"}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+
+        // 巢况登记：save_checkin（至少一项非空业务规则由纯核管）
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "save_checkin",
+                "args": {"input": {"colony_id": colony_id, "date": today,
+                                    "queen_count": 1, "worker_count": 42,
+                                    "moved_nest": false, "note": "初登记"}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        let checkin_id = body["id"].as_i64().expect("登记 id");
+        assert_eq!(body["photos"], serde_json::json!([]), "本票 photos 恒空（票 08 接线）");
+
+        // 巢况摘要：get_checkin_digest（卡片投影）
+        let (status, body) = post(
+            serde_json::json!({"cmd": "get_checkin_digest", "args": {"colonyId": colony_id}})
+                .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(body["latest"]["id"], checkin_id);
+        assert_eq!(body["days_since_last"], 0, "当天登记 = 0 天");
+
+        // 巢况改：update_checkin 全量覆盖（数可清回 null）
+        let (status, body) = post(
+            serde_json::json!({
+                "cmd": "update_checkin",
+                "args": {"id": checkin_id, "input": {"date": today, "queen_count": null,
+                                                      "worker_count": 50, "moved_nest": true,
+                                                      "note": null}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(body["worker_count"], 50);
+        assert_eq!(body["queen_count"], serde_json::Value::Null);
+        assert_eq!(body["moved_nest"], true);
+
+        // 巢况查：list_checkins 时间线（照片元数据恒空数组）
+        let (status, body) = post(
+            serde_json::json!({"cmd": "list_checkins", "args": {"colonyId": colony_id}})
+                .to_string(),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(body.as_array().expect("数组").len(), 1);
+        assert_eq!(body[0]["photos"], serde_json::json!([]));
+
+        // 巢况删：delete_checkin → 摘要回到从未登记
+        let (status, _) = post(
+            serde_json::json!({"cmd": "delete_checkin", "args": {"id": checkin_id}}).to_string(),
+        );
+        assert_eq!(status, 200);
+        let (status, body) = post(
+            serde_json::json!({"cmd": "get_checkin_digest", "args": {"colonyId": colony_id}})
+                .to_string(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["latest"], serde_json::Value::Null, "实际：{body}");
+
+        block(handle.stop());
+    }
+
+    /// 构造 `{"cmd":..,"args":..}` 请求体（帮助类型推断的小工具）。
+    fn json_body(cmd: &str, args: &serde_json::Value) -> String {
+        serde_json::json!({ "cmd": cmd, "args": args }).to_string()
+    }
+
+    #[test]
+    fn validation_layer_rejects_garbage_with_400_without_touching_db() {
+        // 白名单≠校验：每个 case 都是真请求打在校验层；断言 400 + 人话 + 库未污染
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let colony_id = seed_colony(&deps.conn, "校验窝");
+        let today = crate::colony::today_iso();
+        let handle = block(start(deps, 0)).expect("启动失败");
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            // 缺字段
+            ("缺 input", serde_json::json!({"cmd": "log_care", "args": {}})),
+            ("缺嵌套字段", serde_json::json!({
+                "cmd": "log_care",
+                "args": {"input": {"colony_id": colony_id}}
+            })),
+            // 错型
+            ("id 错型", serde_json::json!({
+                "cmd": "log_care",
+                "args": {"input": {"colony_id": "abc", "action_id": 1, "happened_at": today}}
+            })),
+            ("布尔错型", serde_json::json!({
+                "cmd": "save_checkin",
+                "args": {"input": {"colony_id": colony_id, "date": today, "moved_nest": "是"}}
+            })),
+            // 未知字段（顶层与嵌套）
+            ("顶层未知字段", serde_json::json!({"cmd": "list_colonies", "args": {"foo": 1}})),
+            ("嵌套未知字段", serde_json::json!({
+                "cmd": "save_checkin",
+                "args": {"input": {"colony_id": colony_id, "date": today, "bogus": true}}
+            })),
+            // ID 非正整数
+            ("负数 id", serde_json::json!({"cmd": "delete_log", "args": {"id": -1}})),
+            ("零 id", serde_json::json!({"cmd": "delete_checkin", "args": {"id": 0}})),
+            ("负 colonyId", serde_json::json!({
+                "cmd": "list_checkins", "args": {"colonyId": -3}
+            })),
+            // 日期垃圾与超范围
+            ("日期垃圾", serde_json::json!({
+                "cmd": "save_checkin",
+                "args": {"input": {"colony_id": colony_id, "date": "不是日期", "queen_count": 1}}
+            })),
+            ("日期超年段", serde_json::json!({
+                "cmd": "start_hibernation",
+                "args": {"colonyId": colony_id, "startDate": "1800-01-01", "expectedEndDate": "1800-03-01"}
+            })),
+            // 字符串超长
+            ("备注超长", serde_json::json!({
+                "cmd": "log_care",
+                "args": {"input": {"colony_id": colony_id, "action_id": 1,
+                                    "happened_at": today, "note": "长".repeat(2001)}}
+            })),
+            // 分页上限
+            ("分页超上限", serde_json::json!({
+                "cmd": "list_logs", "args": {"filter": {"limit": 501}}
+            })),
+            ("分页负偏移", serde_json::json!({
+                "cmd": "list_logs", "args": {"filter": {"offset": -5}}
+            })),
+            // 数值范围
+            ("负数蚁后", serde_json::json!({
+                "cmd": "save_checkin",
+                "args": {"input": {"colony_id": colony_id, "date": today, "queen_count": -1}}
+            })),
+            // 冬眠缺字段
+            ("冬眠缺字段", serde_json::json!({
+                "cmd": "start_hibernation",
+                "args": {"colonyId": colony_id, "startDate": today}
+            })),
+        ];
+
+        for (label, body) in cases {
+            let (status, resp) = http(
+                &a,
+                "POST",
+                &format!("{base}/api/cmd"),
+                Some(&token),
+                &body.to_string(),
+            );
+            assert_eq!(status, 400, "{label} 应 400，实际：{resp}");
+            let msg = resp["error"].as_str().unwrap_or_default();
+            assert!(!msg.is_empty(), "{label} 错误体应带人话，实际：{resp}");
+        }
+
+        // 库未污染：合法读命令确认没有任何写入落地
+        let (status, body) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"list_logs","args":{"filter":{}}}"#,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["total"], 0, "畸形请求一律不落库");
+
+        // 业务拒绝（形状合法但引用不存在）走 500 + 桌面同款错误串，不误标 400
+        let (status, resp) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"delete_log","args":{"id":99999}}"#,
+        );
+        assert_eq!(status, 500);
+        assert_eq!(resp["error"], "记录不存在");
+
+        block(handle.stop());
+    }
+
+    #[test]
+    fn write_commands_fire_after_write_hook_with_desktop_semantics() {
+        // 写命令成功后按桌面语义触发写后副作用（lib.rs trigger_after_write 同款：
+        // 记账 last_data_write_date）；读命令与失败写（业务拒绝/校验拒）不触发。
+        let token = "a".repeat(32);
+        let fired = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let data_dir_holder = Arc::new(Mutex::new(None::<std::path::PathBuf>));
+        let after_write: AfterWriteHook = {
+            let fired = fired.clone();
+            let holder = data_dir_holder.clone();
+            Arc::new(move |with_tray| {
+                fired.lock().unwrap().push(with_tray);
+                // 模拟生产钩子的记账动作（record_data_write 写 backup-config.json）
+                if let Some(dir) = holder.lock().unwrap().as_ref() {
+                    crate::auto_backup::record_data_write(
+                        dir,
+                        chrono::Local::now().date_naive(),
+                    )
+                    .unwrap();
+                }
+            })
+        };
+        let (deps, dir) = test_deps_with(
+            &["127.0.0.0/8"],
+            &token,
+            after_write,
+            Arc::new(|_| None),
+        );
+        // 把真实数据目录喂给钩子（SharedDeps 持有同一目录）
+        *data_dir_holder.lock().unwrap() = Some(deps.data_dir.clone());
+        let colony_id = seed_colony(&deps.conn, "副作用窝");
+        let today = crate::colony::today_iso();
+        let handle = block(start(deps, 0)).expect("启动失败");
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+        let post = |body: String| -> (u16, serde_json::Value) {
+            http(&a, "POST", &format!("{base}/api/cmd"), Some(&token), &body)
+        };
+        let fired_count = || fired.lock().unwrap().len();
+
+        // 读命令不触发
+        let (status, _) = post(json_body("list_colonies", &serde_json::json!({})));
+        assert_eq!(status, 200);
+        assert_eq!(fired_count(), 0, "读命令不触发写后副作用");
+
+        // 打卡（带托盘语义）成功 → 触发一次 with_tray=true + 记账已落
+        let (status, _) = post(
+            serde_json::json!({
+                "cmd": "log_care",
+                "args": {"input": {"colony_id": colony_id, "action_id": 1,
+                                    "happened_at": today, "food_ids": []}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(fired_count(), 1, "写命令成功应触发一次");
+        assert_eq!(*fired.lock().unwrap().last().unwrap(), true, "打卡带托盘刷新语义");
+        assert_eq!(
+            crate::backup_config::load(&dir.path().to_path_buf()).last_data_write_date,
+            Some(today.clone()),
+            "自动备份记账已按桌面语义落账"
+        );
+
+        // 巢况写（永不参与提醒/催促）→ 触发但 with_tray=false
+        let (status, _) = post(
+            serde_json::json!({
+                "cmd": "save_checkin",
+                "args": {"input": {"colony_id": colony_id, "date": today, "note": "巢况"}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(fired_count(), 2);
+        assert_eq!(*fired.lock().unwrap().last().unwrap(), false, "巢况不刷托盘");
+
+        // 业务拒绝写（窝不存在）→ 500 且不触发
+        let (status, _) = post(
+            serde_json::json!({
+                "cmd": "log_care",
+                "args": {"input": {"colony_id": 999_999, "action_id": 1,
+                                    "happened_at": today, "food_ids": []}}
+            })
+            .to_string(),
+        );
+        assert_eq!(status, 500);
+        assert_eq!(fired_count(), 2, "失败写不触发");
+
+        // 校验拒（缺字段）→ 400 且不触发
+        let (status, _) = post(r#"{"cmd":"log_care","args":{}}"#.to_string());
+        assert_eq!(status, 400);
+        assert_eq!(fired_count(), 2, "校验拒不触发");
+
+        block(handle.stop());
+    }
+
+    #[test]
+    fn static_serving_delivers_frontend_and_bypasses_bearer_only() {
+        // 打包后场景：dist 产物由服务托管，浏览器打开 / 即得完整前端；
+        // 静态资源豁免闸二（页面加载带不了 Authorization 头）但保留闸一与限额。
+        let token = "a".repeat(32);
+        let dist = tempfile::TempDir::new().unwrap();
+        std::fs::write(dist.path().join("index.html"), "<!doctype html><html>喂蚁</html>").unwrap();
+        std::fs::create_dir_all(dist.path().join("assets")).unwrap();
+        std::fs::write(dist.path().join("assets").join("app-1a2b3c.js"), "console.log(1)").unwrap();
+        let dist_root = dist.path().to_path_buf();
+        let assets: AssetLookup = Arc::new(move |p| std::fs::read(dist_root.join(p)).ok());
+
+        let (deps, _dir) = test_deps_with(
+            &["127.0.0.0/8"],
+            &token,
+            Arc::new(|_| {}),
+            assets,
+        );
+        let handle = block(start(deps, 0)).expect("启动失败");
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+
+        // 入口页：不带凭证（闸二豁免）→ 200 text/html
+        let resp = a
+            .get(&format!("{base}/"))
+            .call()
+            .expect("入口页应可达");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.header("content-type"),
+            Some("text/html; charset=utf-8")
+        );
+        assert!(resp.into_string().unwrap().contains("喂蚁"));
+
+        // hash 资源：200 + js 类型
+        let resp = a.get(&format!("{base}/assets/app-1a2b3c.js")).call().unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            resp.header("content-type"),
+            Some("text/javascript; charset=utf-8")
+        );
+
+        // 未知资源 404
+        let (status, _) = http(&a, "GET", &format!("{base}/missing.js"), None, "");
+        assert_eq!(status, 404);
+
+        // 路径花样（.. 上跳）：404。ureq/url 客户端会把点段规整掉，用原始 socket 打
+        use std::io::{Read, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", handle.port())).unwrap();
+        stream
+            .write_all(b"GET /../secret.txt HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        assert!(raw.starts_with("HTTP/1.1 404"), "上跳路径应 404，实际：{raw}");
+
+        // API 面不受影响：health 照常；/api/xxx 未登记路径仍 404（不落静态兜底泄漏）
+        let (status, _) = http(&a, "GET", &format!("{base}/api/health"), None, "");
+        assert_eq!(status, 200);
+        let (status, _) = http(&a, "GET", &format!("{base}/api/nothing"), Some(&token), "");
+        assert_eq!(status, 404);
+
+        block(handle.stop());
+    }
+
+    #[test]
+    fn http_return_shape_matches_desktop_invoke_for_record_commands() {
+        // 返回值序列化与桌面 IPC 同形（前端 types.ts 单一契约）：同一库、同一参，
+        // 桌面形态 = 纯核调用 serde_json::to_value；HTTP 形态 = 派发 Ok 值。逐字段
+        // 相等（含 snake_case 键名），至少覆盖首页/历史/巢况三面 + 一个写命令返回。
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
+        let colony_id = seed_colony(&deps.conn, "同形窝");
+        let today = crate::colony::today_iso();
+        {
+            let conn = deps.conn.lock().unwrap();
+            // 桌面同源种子：一条记录 + 一条巢况
+            crate::care::log_care(
+                &conn,
+                &crate::care::CareLogInput {
+                    colony_id,
+                    action_id: 1,
+                    happened_at: today.clone(),
+                    note: Some("同形".into()),
+                    food_ids: vec![1],
+                },
+                &crate::care::now_local(),
+            )
+            .unwrap();
+            crate::nest_checkin::save_checkin(
+                &conn,
+                &crate::nest_checkin::CheckinInput {
+                    colony_id,
+                    date: today.clone(),
+                    queen_count: Some(1),
+                    worker_count: Some(7),
+                    moved_nest: false,
+                    note: Some("同形巢况".into()),
+                },
+                &today,
+                &crate::care::now_local(),
+            )
+            .unwrap();
+        }
+
+        /// 桌面形态 = 纯核调用结果的 serde 序列化（Tauri invoke 返回值同款）。
+        fn desktop_of<T: serde::Serialize>(v: Result<T, String>) -> serde_json::Value {
+            serde_json::to_value(v.unwrap()).unwrap()
+        }
+
+        // 读命令一：list_colonies（首页投影，含 actions/recent/checkin 嵌套）
+        let desktop = {
+            let conn = deps.conn.lock().unwrap();
+            desktop_of(crate::colony::list_colonies(&conn, &today))
+        };
+        assert_eq!(
+            dispatch_command(&deps, "list_colonies", &serde_json::json!({})),
+            Some(CmdOutcome::Ok(desktop)),
+        );
+
+        // 读命令二：list_logs（历史行，含 food_ids/food_names/created_at）
+        let filter = crate::care::LogFilter {
+            colony_id: Some(colony_id),
+            ..Default::default()
+        };
+        let desktop = {
+            let conn = deps.conn.lock().unwrap();
+            desktop_of(crate::care::list_logs(&conn, &filter))
+        };
+        assert_eq!(
+            dispatch_command(
+                &deps,
+                "list_logs",
+                &serde_json::json!({"filter": {"colony_id": colony_id}})
+            ),
+            Some(CmdOutcome::Ok(desktop)),
+        );
+
+        // 读命令三：list_checkins + get_checkin_digest（巢况时间线与卡片摘要）
+        let desktop = {
+            let conn = deps.conn.lock().unwrap();
+            desktop_of(crate::nest_checkin::list_checkins(&conn, colony_id))
+        };
+        assert_eq!(
+            dispatch_command(
+                &deps,
+                "list_checkins",
+                &serde_json::json!({"colonyId": colony_id})
+            ),
+            Some(CmdOutcome::Ok(desktop)),
+        );
+        let desktop = {
+            let conn = deps.conn.lock().unwrap();
+            desktop_of(crate::nest_checkin::digest_for_colony(&conn, colony_id, &today))
+        };
+        assert_eq!(
+            dispatch_command(
+                &deps,
+                "get_checkin_digest",
+                &serde_json::json!({"colonyId": colony_id})
+            ),
+            Some(CmdOutcome::Ok(desktop)),
+        );
+
+        // 写命令返回同形：HTTP save_checkin 的返回体 == 桌面 get_checkin 的序列化
+        let outcome = dispatch_command(
+            &deps,
+            "save_checkin",
+            &serde_json::json!({
+                "input": {"colony_id": colony_id, "date": today, "worker_count": 9,
+                           "moved_nest": false, "note": null}
+            }),
+        )
+        .unwrap();
+        let http_row = match outcome {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("save_checkin 应成功，实际 {other:?}"),
+        };
+        let desktop = {
+            let conn = deps.conn.lock().unwrap();
+            desktop_of(crate::nest_checkin::get_checkin(&conn, http_row["id"].as_i64().unwrap()))
+        };
+        assert_eq!(http_row, desktop);
     }
 }
