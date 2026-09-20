@@ -7,9 +7,17 @@
  *
  * 行级操作（停用/启用/删除）只抛 changed 让外层静默刷新数据，面板保持打开，
  * 行内未保存的改名/排序不受影响（行状态在本地维护，不因外层刷新重建）。
+ *
+ * 轻提示接线（保湿方式+轻提示票 04，判定原则见 CLAUDE.md「操作反馈规范」）：
+ * 批量「保存」（原成功静默，窗不关、视图不变）与行级停用/启用/删除（与票 03
+ * 字典行级操作同型）成败走全局轻提示（src/lib/toast.ts）。内联红字保留两用：
+ * 字段级校验（空名/重名）只进内联；IPC 失败在轻提示之外保留行内上下文
+ * （如删除被窝引用的"可改为停用"指引，App.test.ts 钉死该通道）。
+ * 新增行/上下移是纯本地操作不落库，不弹。
  */
 import { ref } from "vue";
 import { eraseLocation, saveLocation, setLocationEnabled } from "../lib/ipc";
+import { showError, showSuccess } from "../lib/toast";
 import type { LocationItem } from "../types";
 
 interface Row {
@@ -74,9 +82,11 @@ async function save() {
       const row = rows.value[i]!;
       await saveLocation({ input: { id: row.id, name: row.name, sort: i } });
     }
+    showSuccess("已保存");
     emit("saved");
   } catch (e) {
     error.value = String(e);
+    showError("保存失败", String(e));
   } finally {
     busy.value = false;
   }
@@ -89,9 +99,11 @@ async function setEnabled(row: Row, enabled: boolean) {
   try {
     await setLocationEnabled({ id: row.id, enabled });
     row.enabled = enabled;
+    showSuccess(enabled ? `已启用「${row.name}」` : `已停用「${row.name}」`);
     emit("changed");
   } catch (e) {
     error.value = String(e);
+    showError(enabled ? "启用失败" : "停用失败", String(e));
   } finally {
     busy.value = false;
   }
@@ -104,9 +116,11 @@ async function erase(row: Row) {
   try {
     await eraseLocation({ id: row.id });
     rows.value = rows.value.filter((r) => r !== row);
+    showSuccess(`已删除「${row.name}」`);
     emit("changed");
   } catch (e) {
     error.value = String(e);
+    showError("删除失败", String(e));
   } finally {
     busy.value = false;
   }
