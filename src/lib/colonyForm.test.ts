@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
-import type { Colony, ColonyAction } from "../types";
+import type { Colony, ColonyAction, HydrationMethod } from "../types";
 import {
+  HYDRATION_ACTION_NAME,
+  HYDRATION_DEFAULT_DAYS,
   emptyForm,
   formFromColony,
   formToInput,
+  hydrationAfterClear,
+  hydrationAfterPick,
   intervalRowsFromColony,
+  parseHydrationDays,
   parseIntervalDays,
   planIntervalSaves,
   validateColonyForm,
@@ -207,5 +212,109 @@ describe("「周期提醒」小节纯逻辑（每窝周期票 04）", () => {
   it("planIntervalSaves：全部未动一行都不发", () => {
     const rows = [{ actionId: 12, actionName: "加水", raw: "7" }];
     expect(planIntervalSaves(rows, rows)).toEqual({ saves: [], error: null });
+  });
+});
+
+// ── 保湿方式交互纯函数（保湿方式票 02，规格状态矩阵四态九规则）─────────────
+
+describe("保湿方式：锚与默认值", () => {
+  it("锚点名与后端同名锚一致（colony.rs HYDRATION_ACTION_NAME）", () => {
+    expect(HYDRATION_ACTION_NAME).toBe("巢穴保湿");
+  });
+
+  it("默认天数写死：手动加水 7 / 水塔 15（spec 钉死，不做配置项）", () => {
+    expect(HYDRATION_DEFAULT_DAYS).toEqual({ manual: 7, tower: 15 });
+  });
+});
+
+describe("保湿方式：选/切方式的天数框状态（规则 2/3/7 + F5 空框切换）", () => {
+  const methodOf = (m: HydrationMethod) => m;
+
+  it("规则 2：A 态空框显式选方式 → 预填该方式默认（手动 7 / 水塔 15）", () => {
+    expect(hydrationAfterPick({ raw: "", prefill: null }, methodOf("manual"))).toEqual({
+      raw: "7",
+      prefill: 7,
+    });
+    expect(hydrationAfterPick({ raw: "", prefill: null }, methodOf("tower"))).toEqual({
+      raw: "15",
+      prefill: 15,
+    });
+  });
+
+  it("规则 2：B 态已有库内周期（框非空、非会话预填）→ 选方式不动，绝不覆盖", () => {
+    expect(hydrationAfterPick({ raw: "5", prefill: null }, methodOf("manual"))).toEqual({
+      raw: "5",
+      prefill: null,
+    });
+  });
+
+  it("规则 3：框内是本次会话预填值（未手工改）→ 切换方式跟随新方式默认", () => {
+    expect(hydrationAfterPick({ raw: "7", prefill: 7 }, methodOf("tower"))).toEqual({
+      raw: "15",
+      prefill: 15,
+    });
+    expect(hydrationAfterPick({ raw: "15", prefill: 15 }, methodOf("manual"))).toEqual({
+      raw: "7",
+      prefill: 7,
+    });
+  });
+
+  it("规则 3：手工改过的值切换方式 → 不动", () => {
+    expect(hydrationAfterPick({ raw: "9", prefill: null }, methodOf("tower"))).toEqual({
+      raw: "9",
+      prefill: null,
+    });
+  });
+
+  it("F5：D 态空周期框直接手动↔水塔切换 → 空框即预填新方式默认", () => {
+    expect(hydrationAfterPick({ raw: "", prefill: null }, methodOf("tower"))).toEqual({
+      raw: "15",
+      prefill: 15,
+    });
+    expect(hydrationAfterPick({ raw: "", prefill: null }, methodOf("manual"))).toEqual({
+      raw: "7",
+      prefill: 7,
+    });
+  });
+});
+
+describe("保湿方式：显式清回未设的天数框状态（规则 4 + F4 净零）", () => {
+  it("库内 C 态（方式已设）显式清回未设 → 框清空（后端同事务删周期行，置灰由组件管）", () => {
+    expect(hydrationAfterClear({ raw: "7", prefill: null }, "manual")).toEqual({
+      raw: "",
+      prefill: null,
+    });
+    expect(hydrationAfterClear({ raw: "9", prefill: null }, "tower")).toEqual({
+      raw: "",
+      prefill: null,
+    });
+  });
+
+  it("F4 净零：库内 B 态（未设+周期 N）会话内选了又改回 → 库内值原样保留（B 仍 B）", () => {
+    expect(hydrationAfterClear({ raw: "5", prefill: null }, null)).toEqual({
+      raw: "5",
+      prefill: null,
+    });
+  });
+
+  it("F4 净零：会话预填值随「选了又改回」一起消失，不构成落库值（净效果为零）", () => {
+    expect(hydrationAfterClear({ raw: "7", prefill: 7 }, null)).toEqual({
+      raw: "",
+      prefill: null,
+    });
+  });
+});
+
+describe("保湿方式：天数框整组校验（口径同其余行，报错带锚名）", () => {
+  it("空 = 未设，1..365 整数合法", () => {
+    expect(parseHydrationDays("")).toBeNull();
+    expect(parseHydrationDays(" 7 ")).toBe(7);
+  });
+
+  it("非法值报人话错并带上「巢穴保湿」操作名", () => {
+    const err = parseHydrationDays("400");
+    expect(typeof err).toBe("string");
+    expect(err as string).toContain("巢穴保湿");
+    expect(err as string).toContain("1–365");
   });
 });

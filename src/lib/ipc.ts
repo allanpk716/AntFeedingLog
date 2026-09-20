@@ -316,6 +316,9 @@ export const listColonies = cmdFn<void, Colony[]>("list_colonies");
 export const listLocations = cmdFn<void, LocationItem[]>("list_locations");
 
 // ── 窝的新建/编辑（ColonyFormDialog）──
+// 整窗单命令（保湿方式票 01/02）：input 含基础字段 + hydration_method +
+// interval_changes（只传变化行），后端同事务落库——保湿方式的写入不再走
+// create-then-set 两步。
 
 export const createColony = cmdFn<{ input: ColonyInput }, void>("create_colony");
 export const updateColony = cmdFn<{ id: number; input: ColonyInput }, void>("update_colony");

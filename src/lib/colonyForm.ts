@@ -4,9 +4,12 @@
  * 开始日期必须 YYYY-MM-DD。前端先拦一道给出即时反馈，Rust 仍是权威校验。
  * 「周期提醒」小节（每窝周期票 04）的行构造与整组校验也在此：周期 1..365
  * 整数天，留空 = 未设；前端先拦一道，Rust set_colony_action_interval 仍权威。
+ * 保湿方式（保湿方式票 02）的锚名/默认天数与「选/切方式 → 天数框」会话状态
+ * 矩阵纯函数也在此；保湿行的落库走 create/update_colony 整窗新通道（非逐行
+ * set_colony_action_interval），见 ColonyFormDialog。
  */
 
-import type { Colony, ColonyInput, ColonyStatus } from "../types";
+import type { Colony, ColonyInput, ColonyStatus, HydrationMethod } from "../types";
 import { isValidIsoDate } from "./dates";
 
 export interface ColonyForm {
@@ -134,4 +137,71 @@ export function planIntervalSaves(
     }
   }
   return { saves, error: null };
+}
+
+// ── 保湿方式（保湿方式票 02，规格状态矩阵四态九规则）─────────────────────
+
+/**
+ * 巢穴保湿操作的锚点名（与 Rust colony.rs HYDRATION_ACTION_NAME 同名锚）。
+ * 改名/停用后匹配不到为已知边界（同 v4/v6/v8 按名回填先例）：编辑退回纯
+ * 数字行、方式原样往返；新建只能设方式标签、不落初始周期。
+ */
+export const HYDRATION_ACTION_NAME = "巢穴保湿";
+
+/** 方式默认天数（spec D2 钉死：手动加水 7 / 水塔 15，不做全局配置项）。 */
+export const HYDRATION_DEFAULT_DAYS: Record<HydrationMethod, number> = {
+  manual: 7,
+  tower: 15,
+};
+
+/**
+ * 保湿行天数框的会话态：raw = 输入框文本；prefill 非 null 表示框内是本次会话
+ * 预填的建议值且未被手工编辑过——方式切换是否跟随以此判定（规格规则 3）。
+ */
+export interface HydrationSessionState {
+  raw: string;
+  prefill: number | null;
+}
+
+/**
+ * 显式选择/切换到某方式后的天数框状态（规则 2/3 + F5 空框切换）：
+ * - 空框（含 D 态空框直接切换）→ 预填新方式默认；
+ * - 框内是本次会话预填值（未手工改）→ 跟随换新方式默认；
+ * - 库内已有周期或手工改过 → 不动，绝不覆盖（规则 2「永不覆盖」）。
+ */
+export function hydrationAfterPick(
+  state: HydrationSessionState,
+  method: HydrationMethod,
+): HydrationSessionState {
+  if (state.raw.trim() === "" || state.prefill !== null) {
+    const days = HYDRATION_DEFAULT_DAYS[method];
+    return { raw: String(days), prefill: days };
+  }
+  return state;
+}
+
+/**
+ * 显式清回未设后的天数框状态（规则 4 + F4 净零）：
+ * - 库内方式原值非未设（C 态）→ 框清空（后端同事务删周期行，置灰由组件按
+ *   locked 派生）；会话预填值一并消失；
+ * - 库内原值 = 未设（B/A 态会话内「选了又改回」）→ 净效果为零：库内值/手工
+ *   值原样保留，预填值随方式选择一起消失、不构成落库值。
+ */
+export function hydrationAfterClear(
+  state: HydrationSessionState,
+  storedMethod: HydrationMethod | null,
+): HydrationSessionState {
+  if (storedMethod !== null || state.prefill !== null) {
+    return { raw: "", prefill: null };
+  }
+  return state;
+}
+
+/**
+ * 保湿行天数的整组校验（口径同 parseIntervalDays，报错带上锚名操作名）：
+ * 合法返回天数或 null（未设），非法返回人话报错——调用方见字符串就整组不发。
+ */
+export function parseHydrationDays(raw: string): number | null | string {
+  const parsed = parseIntervalDays(raw);
+  return typeof parsed === "string" ? `「${HYDRATION_ACTION_NAME}」${parsed}` : parsed;
 }
