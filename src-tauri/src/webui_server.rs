@@ -2593,6 +2593,8 @@ mod tests {
                 location_id: None,
                 start_date: today.clone(),
                 status: "active".to_string(),
+                hydration_method: None,
+                interval_changes: Vec::new(),
             },
             &today,
         )

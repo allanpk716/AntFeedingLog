@@ -1759,6 +1759,7 @@ mod tests {
             location_id: None,
             start_date: "2026-01-20".into(),
             status: status.into(),
+            hydration_method: None, // 保湿方式票 01 新字段；托盘概要测试用不到
             days_raised: 241,
             actions,
             recent: vec![],
