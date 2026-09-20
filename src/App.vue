@@ -16,6 +16,7 @@ import ColonyFormDialog from "./components/ColonyFormDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import StatsPage from "./components/StatsPage.vue";
 import LogListPage from "./components/LogListPage.vue";
+import ToastHost from "./components/ToastHost.vue";
 import WebUiWizard from "./components/WebUiWizard.vue";
 
 /** 顶栏三页 nav（票 08 接活「记录」） */
@@ -203,6 +204,8 @@ onMounted(() => {
       @changed="onSettingsChanged"
     />
     <WebUiWizard v-if="showWebUiWizard" @close="showWebUiWizard = false" />
+    <!-- 轻提示宿主（保湿方式+轻提示票 03）：全局唯一出口挂应用根，桌面端与网页端同一前端同享 -->
+    <ToastHost />
   </div>
 </template>
 
