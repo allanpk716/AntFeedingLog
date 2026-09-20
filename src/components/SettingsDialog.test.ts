@@ -11,6 +11,17 @@ vi.mock("../lib/ipc", async (importOriginal) => {
   return ipcModuleMock(invokeMock)(importOriginal);
 });
 
+// 轻提示接线（保湿方式+轻提示票 03）：toast 模块整体 mock 掉，断言调用点
+// 弹没弹、弹的什么；store/宿主自身行为在 toast.test.ts / ToastHost.test.ts
+const { showErrorMock, showSuccessMock } = vi.hoisted(() => ({
+  showErrorMock: vi.fn(),
+  showSuccessMock: vi.fn(),
+}));
+vi.mock("../lib/toast", () => ({
+  showSuccess: showSuccessMock,
+  showError: showErrorMock,
+}));
+
 function baseMock(updateState: object = { status: "idle" }) {
   invokeMock.mockImplementation(async (cmd: string) => {
     switch (cmd) {
@@ -99,6 +110,8 @@ async function openUpdateTab(updateState?: object) {
 
 beforeEach(() => {
   invokeMock.mockReset();
+  showErrorMock.mockClear();
+  showSuccessMock.mockClear();
 });
 
 describe("设置弹窗通知 tab Pushover 应用内配置（webui-checkin 票 11）", () => {
@@ -1114,5 +1127,343 @@ describe("设置弹窗「数据」页签巢况照片孤儿区（webui-checkin �
     await wrapper.find(".orphan-refresh-btn").trigger("click");
     await flushPromises();
     expect(wrapper.find(".orphan-error").text()).toContain("数据目录未初始化");
+  });
+});
+
+// ── 轻提示接线（保湿方式+轻提示票 03）──
+// 判定原则（CLAUDE.md「操作反馈规范」）：操作完成后界面没有天然反馈的写操作
+// 必须弹；字段级校验错误维持内联；非校验类失败走失败轻提示（error.value 通道
+// 迁移）。审计结论（接线/不接的理由都写在这里）：
+// - 接：字典「保存」（原成功静默）、行级停用/启用/删除（原成功静默）、
+//   安全备份/导出 CSV/JSON/清理孤儿照片（导出走后端落文件，无浏览器下载类
+//   即时可见反馈，弹窗内只有一行结果回显——按判定原则接）、弹窗加载失败。
+// - 不接：「发送测试通知」（双通道回显即天然反馈）、通知/自动备份区「保存」
+//   （自身有「已保存」回显）、恢复（摘要+结果回显+重拉）、打开文件夹类
+//   （OS 层有反馈）；打卡/删除记录（关窗/列表即变）不在本弹窗，本票未触碰。
+
+function toastActionsFixture(): CareActionItem[] {
+  return [
+    ...actionsFixture(),
+    { id: 8, name: "已停操作", icon: null, kind: "log_only", is_feeding: false, suggested_interval_days: null, enabled: false, sort: 8, is_preset: false, referenced: false },
+    { id: 9, name: "自定义操作", icon: null, kind: "reminding", is_feeding: false, suggested_interval_days: 2, enabled: true, sort: 9, is_preset: false, referenced: false },
+  ];
+}
+
+function toastFoodsFixture(): FoodItem[] {
+  return [
+    ...foodsFixture(),
+    foodFixture({ id: 8, name: "已停食物", enabled: false, sort: 8, is_preset: false, referenced: false, perishable: false, retrieval_hours: null }),
+    foodFixture({ id: 9, name: "自定义食物", enabled: true, sort: 9, is_preset: false, referenced: false, perishable: false, retrieval_hours: null }),
+  ];
+}
+
+async function openDataTabForToast(
+  extra: {
+    backupTo?: string;
+    backupError?: string;
+    exportTo?: string;
+    exportError?: string;
+    cleanOutcome?: { removed_dirs: number; freed_bytes: number; errors: string[] };
+    cleanError?: string;
+  } = {},
+) {
+  baseMock();
+  invokeMock.mockImplementation(async (cmd: string) => {
+    switch (cmd) {
+      case "list_actions":
+      case "list_foods":
+      case "list_locations":
+        return [];
+      case "get_settings":
+        return settingsFixture();
+      case "get_recent_errors":
+        return [];
+      case "get_last_abnormal_exit":
+        return null;
+      case "list_orphan_photos":
+        return orphanFixture();
+      case "clean_orphan_photos":
+        if (extra.cleanError) throw extra.cleanError;
+        return extra.cleanOutcome ?? { removed_dirs: 0, freed_bytes: 0, errors: [] };
+      case "backup_to":
+        if (extra.backupError) throw extra.backupError;
+        return extra.backupTo ?? "D:\\ant-bk\\manual-20260920.db";
+      case "export_data":
+        if (extra.exportError) throw extra.exportError;
+        return extra.exportTo ?? "D:\\exports\\logs.csv";
+      default:
+        return null;
+    }
+  });
+  const wrapper = mount(SettingsDialog);
+  await flushPromises();
+  await wrapper.find(".tab-data").trigger("click");
+  await flushPromises();
+  return wrapper;
+}
+
+describe("设置弹窗轻提示接线（保湿方式+轻提示票 03）", () => {
+  it("操作「保存」成功 → 弹「已保存」成功轻提示（原成功静默就是要接的点）", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), actionsFixture());
+
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (cmd: string) => dictMock(cmd, foodsFixture(), actionsFixture()));
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(showSuccessMock).toHaveBeenCalledWith("已保存");
+    expect(showErrorMock).not.toHaveBeenCalled();
+    expect(wrapper.find(".form-error").exists()).toBe(false);
+  });
+
+  it("操作「保存」失败 → 失败轻提示带原因，旧内联失败红字不再出现", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), actionsFixture());
+
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "save_action") throw "库被锁住";
+      return dictMock(cmd, foodsFixture(), actionsFixture());
+    });
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(showErrorMock).toHaveBeenCalledWith("保存失败", "库被锁住");
+    expect(showSuccessMock).not.toHaveBeenCalled();
+    expect(wrapper.find(".form-error").exists()).toBe(false);
+  });
+
+  it("字段级校验错误仍走内联红字，不进轻提示（F3 例外）", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), actionsFixture());
+
+    await rowsOf(wrapper)[0]!.find(".name-input").setValue("");
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".form-error").text()).toContain("操作名字不能为空");
+    expect(showErrorMock).not.toHaveBeenCalled();
+    expect(showSuccessMock).not.toHaveBeenCalled();
+  });
+
+  it("食物「保存」成功 → 弹「已保存」；失败 → 失败轻提示带原因", async () => {
+    const wrapper = await openDictTab("foods", foodsFixture(), actionsFixture());
+
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (cmd: string) => dictMock(cmd, foodsFixture(), actionsFixture()));
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+    expect(showSuccessMock).toHaveBeenCalledWith("已保存");
+
+    showSuccessMock.mockClear();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "save_food") throw "库被锁住";
+      return dictMock(cmd, foodsFixture(), actionsFixture());
+    });
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+    expect(showErrorMock).toHaveBeenCalledWith("保存失败", "库被锁住");
+    expect(showSuccessMock).not.toHaveBeenCalled();
+  });
+
+  it("操作行级 停用/启用/删除 成功各弹成功轻提示", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), toastActionsFixture());
+    invokeMock.mockImplementation(async (cmd: string) => dictMock(cmd, foodsFixture(), toastActionsFixture()));
+
+    // 停用喂食（id=1）
+    await rowsOf(wrapper)[0]!.find(".row-btn").trigger("click");
+    await flushPromises();
+    expect(showSuccessMock).toHaveBeenLastCalledWith("已停用「喂食」");
+
+    // 启用已停操作（id=8）
+    await rowsOf(wrapper)[3]!.find(".row-btn").trigger("click");
+    await flushPromises();
+    expect(showSuccessMock).toHaveBeenLastCalledWith("已启用「已停操作」");
+
+    // 删除自定义操作（id=9，非预置未被引用）
+    await rowsOf(wrapper)[4]!.find(".erase-btn").trigger("click");
+    await flushPromises();
+    expect(showSuccessMock).toHaveBeenLastCalledWith("已删除「自定义操作」");
+    expect(showErrorMock).not.toHaveBeenCalled();
+  });
+
+  it("操作行级 停用/启用/删除 失败各弹失败轻提示带原因，旧内联红字不再出现", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), toastActionsFixture());
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "set_action_enabled" || cmd === "erase_action") throw "库被锁住";
+      return dictMock(cmd, foodsFixture(), toastActionsFixture());
+    });
+
+    await rowsOf(wrapper)[0]!.find(".row-btn").trigger("click"); // 停用喂食
+    await flushPromises();
+    expect(showErrorMock).toHaveBeenLastCalledWith("停用失败", "库被锁住");
+
+    await rowsOf(wrapper)[3]!.find(".row-btn").trigger("click"); // 启用已停操作
+    await flushPromises();
+    expect(showErrorMock).toHaveBeenLastCalledWith("启用失败", "库被锁住");
+
+    await rowsOf(wrapper)[4]!.find(".erase-btn").trigger("click"); // 删除自定义操作
+    await flushPromises();
+    expect(showErrorMock).toHaveBeenLastCalledWith("删除失败", "库被锁住");
+    expect(showSuccessMock).not.toHaveBeenCalled();
+    expect(wrapper.find(".form-error").exists()).toBe(false);
+  });
+
+  it("食物行级 停用/启用/删除 成功各弹成功轻提示", async () => {
+    const wrapper = await openDictTab("foods", toastFoodsFixture(), actionsFixture());
+    invokeMock.mockImplementation(async (cmd: string) => dictMock(cmd, toastFoodsFixture(), actionsFixture()));
+
+    await rowsOf(wrapper)[0]!.find(".row-btn").trigger("click"); // 停用种子
+    await flushPromises();
+    expect(showSuccessMock).toHaveBeenLastCalledWith("已停用「种子」");
+
+    await rowsOf(wrapper)[3]!.find(".row-btn").trigger("click"); // 启用已停食物
+    await flushPromises();
+    expect(showSuccessMock).toHaveBeenLastCalledWith("已启用「已停食物」");
+
+    await rowsOf(wrapper)[4]!.find(".erase-btn").trigger("click"); // 删除自定义食物
+    await flushPromises();
+    expect(showSuccessMock).toHaveBeenLastCalledWith("已删除「自定义食物」");
+    expect(showErrorMock).not.toHaveBeenCalled();
+  });
+
+  it("食物行级 停用/启用/删除 失败各弹失败轻提示带原因", async () => {
+    const wrapper = await openDictTab("foods", toastFoodsFixture(), actionsFixture());
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "set_food_enabled" || cmd === "erase_food") throw "库被锁住";
+      return dictMock(cmd, toastFoodsFixture(), actionsFixture());
+    });
+
+    await rowsOf(wrapper)[0]!.find(".row-btn").trigger("click"); // 停用种子
+    await flushPromises();
+    expect(showErrorMock).toHaveBeenLastCalledWith("停用失败", "库被锁住");
+
+    await rowsOf(wrapper)[3]!.find(".row-btn").trigger("click"); // 启用已停食物
+    await flushPromises();
+    expect(showErrorMock).toHaveBeenLastCalledWith("启用失败", "库被锁住");
+
+    await rowsOf(wrapper)[4]!.find(".erase-btn").trigger("click"); // 删除自定义食物
+    await flushPromises();
+    expect(showErrorMock).toHaveBeenLastCalledWith("删除失败", "库被锁住");
+  });
+
+  it("安全备份成功 → 成功轻提示，路径结果回显保留（toast 给即时反馈，路径留在回显里）", async () => {
+    const wrapper = await openDataTabForToast({ backupTo: "D:\\ant-bk\\manual-20260920.db" });
+
+    await wrapper.find(".backup-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("backup_to");
+    expect(showSuccessMock).toHaveBeenCalledWith("已备份");
+    expect(wrapper.find(".data-result").text()).toContain("已备份到：D:\\ant-bk\\manual-20260920.db");
+  });
+
+  it("安全备份失败 → 失败轻提示带原因", async () => {
+    const wrapper = await openDataTabForToast({ backupError: "磁盘没有空间" });
+
+    await wrapper.find(".backup-btn").trigger("click");
+    await flushPromises();
+
+    expect(showErrorMock).toHaveBeenCalledWith("备份失败", "磁盘没有空间");
+    expect(showSuccessMock).not.toHaveBeenCalled();
+  });
+
+  it("导出 CSV / JSON 成功 → 各弹成功轻提示（后端落文件，无浏览器下载类即时反馈，故接线）", async () => {
+    const wrapper = await openDataTabForToast({ exportTo: "D:\\exports\\logs.csv" });
+
+    await wrapper.find(".export-csv-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("export_data", { format: "csv" });
+    expect(showSuccessMock).toHaveBeenCalledWith("已导出 CSV");
+
+    await wrapper.find(".export-json-btn").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("export_data", { format: "json" });
+    expect(showSuccessMock).toHaveBeenCalledWith("已导出 JSON");
+    expect(showErrorMock).not.toHaveBeenCalled();
+  });
+
+  it("导出失败 → 失败轻提示带原因", async () => {
+    const wrapper = await openDataTabForToast({ exportError: "导出目录不可写" });
+
+    await wrapper.find(".export-csv-btn").trigger("click");
+    await flushPromises();
+
+    expect(showErrorMock).toHaveBeenCalledWith("导出失败", "导出目录不可写");
+  });
+
+  it("清理孤儿照片成功（两段确认后）→ 成功轻提示，数量/释放回显保留", async () => {
+    const wrapper = await openDataTabForToast({
+      cleanOutcome: { removed_dirs: 1, freed_bytes: 15 * 1024 * 1024, errors: [] },
+    });
+
+    await wrapper.find(".orphan-clean-btn").trigger("click");
+    await flushPromises();
+    await wrapper.find(".orphan-clean-btn").trigger("click");
+    await flushPromises();
+
+    expect(showSuccessMock).toHaveBeenCalledWith("孤儿照片已清理");
+    expect(wrapper.find(".orphan-result").text()).toContain("已清理 1 个隔离目录");
+  });
+
+  it("清理孤儿照片失败 → 失败轻提示带原因", async () => {
+    const wrapper = await openDataTabForToast({ cleanError: "删除隔离目录失败" });
+
+    await wrapper.find(".orphan-clean-btn").trigger("click");
+    await flushPromises();
+    await wrapper.find(".orphan-clean-btn").trigger("click");
+    await flushPromises();
+
+    expect(showErrorMock).toHaveBeenCalledWith("清理失败", "删除隔离目录失败");
+  });
+
+  it("判定原则审计：「发送测试通知」有双通道回显即天然反馈，不接轻提示", async () => {
+    const wrapper = await openNotifyTab({ status: { source: "env", configured: true } });
+
+    invokeMock.mockClear();
+    invokeMock.mockResolvedValueOnce({ desktop_ok: true, desktop_error: null, pushover: { ok: true, error: null } });
+    await wrapper.find(".tab-body .dlg-btns .btn:not(.primary)").trigger("click");
+    await flushPromises();
+
+    expect(showSuccessMock).not.toHaveBeenCalled();
+    expect(showErrorMock).not.toHaveBeenCalled();
+    expect(wrapper.find(".saved-hint").text()).toContain("手机 ✓");
+  });
+
+  it("弹窗加载失败 → 失败轻提示带原因，不再走内联红字（非校验失败通道迁移）", async () => {
+    baseMock();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_actions") throw "库打不开";
+      switch (cmd) {
+        case "list_foods":
+        case "list_locations":
+          return [];
+        case "get_settings":
+          return settingsFixture();
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+
+    expect(showErrorMock).toHaveBeenCalledWith("设置加载失败", "库打不开");
+    expect(wrapper.find(".form-error").exists()).toBe(false);
+  });
+
+  it("操作 tab 顶部常驻提示行：每窝可单独设周期且优先于全局设置", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), actionsFixture());
+
+    const hint = wrapper.find(".per-colony-hint");
+    expect(hint.exists()).toBe(true);
+    expect(hint.text()).toContain("单独设「每窝周期」");
+    expect(hint.text()).toContain("优先于此处的全局设置");
+  });
+
+  it("「仅登记」下拉 tooltip 补全：含单个窝仍可在窝编辑里设周期提醒", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), actionsFixture());
+
+    // 活动区换水是 log_only 行，走「仅登记」分支标题
+    const select = rowsOf(wrapper)[2]!.find(".kind-select");
+    expect(select.exists()).toBe(true);
+    expect(select.attributes("title")).toContain("只记录，本页不催促");
+    expect(select.attributes("title")).toContain("单个窝仍可在窝编辑里设周期提醒");
   });
 });

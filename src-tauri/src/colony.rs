@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 /// 窝状态三选一（schema CHECK 同款）。
@@ -27,6 +27,9 @@ pub struct Colony {
     pub location_id: Option<i64>,
     pub start_date: String,
     pub status: String,
+    /// 保湿方式（保湿方式票 01，spec D1）：'manual'=手动加水 | 'tower'=水塔 |
+    /// None=未设。纯标签属性，不参与提醒判定（周期语义原样走每窝周期）。
+    pub hydration_method: Option<String>,
     pub days_raised: i64,
     /// 每个启用中操作一块（care::ActionTile，按字典顺序）。
     pub actions: Vec<crate::care::ActionTile>,
@@ -40,6 +43,13 @@ pub struct Colony {
 }
 
 /// 新建/编辑窝的入参。
+///
+/// 保湿方式写入（保湿方式票 01，spec F2/F6 原子性）与基础字段同命令同事务：
+/// - `hydration_method`：'manual' | 'tower' | None=未设。前端整窗提交（下拉框
+///   恒有值），后端按「库内原值 vs 提交值」比较判定落库语义（不收前端旗标）；
+/// - `interval_changes`：本次保存要增删的每窝周期行（只提交变化的行，未列出的
+///   行零改动）。历史 create-then-set 两步 IPC（set_colony_action_interval）
+///   不再用于窝表单的保湿写入，但该命令本身原样保留（其余读写维持现状）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ColonyInput {
     pub name: String,
@@ -47,6 +57,18 @@ pub struct ColonyInput {
     pub location_id: Option<i64>,
     pub start_date: String,
     pub status: String,
+    #[serde(default)]
+    pub hydration_method: Option<String>,
+    #[serde(default)]
+    pub interval_changes: Vec<ColonyIntervalChange>,
+}
+
+/// 整窗提交里的一行每窝周期增删：`interval_days = Some(1..=365)` 设/改一行，
+/// `None` 删行（未设）。删行是否被净零语义拦截由后端按库内原值判定（F4）。
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ColonyIntervalChange {
+    pub action_id: i64,
+    pub interval_days: Option<i64>,
 }
 
 /// 地点。
@@ -160,7 +182,8 @@ fn friendly_unique_err(e: rusqlite::Error, what: &str, name: &str) -> String {
 
 fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String> {
     conn.query_row(
-        "SELECT id, name, species, location_id, start_date, status FROM colony WHERE id = ?1",
+        "SELECT id, name, species, location_id, start_date, status, hydration_method
+         FROM colony WHERE id = ?1",
         params![id],
         |row| {
             Ok(Colony {
@@ -170,6 +193,7 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
                 location_id: row.get(3)?,
                 start_date: row.get(4)?,
                 status: row.get(5)?,
+                hydration_method: row.get(6)?,
                 days_raised: 0,
                 actions: Vec::new(),
                 recent: Vec::new(),
@@ -231,14 +255,143 @@ pub fn list_colonies(conn: &Connection, today: &str) -> Result<Vec<Colony>, Stri
     ids.iter().map(|&id| get_colony(conn, id, today)).collect()
 }
 
+// ── 保湿方式写入（保湿方式票 01）─────────────────────────────────────────
+// 状态矩阵落库语义（spec F1/F4，判定提示钉死）：方式是否被触碰**不由前端传
+// 旗标**，后端按「库内原值 vs 提交值」比较——
+// - 库内∈{manual,tower} 且 提交=未设 → 清回未设：方式置 NULL 并删该窝保湿
+//   周期行（唯一由方式动作触发删周期的路径，与基础字段同事务）；
+// - 库内=未设 且 提交=未设 → 净零：会话内「选了又改回」净效果为零，此时
+//   丢弃提交里针对巢穴保湿行的清除，库内已有周期行原样保留（B 仍 B）；
+// - 其余组合方式照抄提交值、不经由此路径删行（只清天数的 C→D 走
+//   interval_changes 的删行通道，库内原值非未设时照常生效）。
+
+/// 保湿方式合法域（spec：'manual'=手动加水 | 'tower'=水塔 | NULL=未设）。
+const HYDRATION_METHODS: [&str; 2] = ["manual", "tower"];
+
+/// 巢穴保湿操作的锚点名（预置名）。「清回未设删周期行」与净零守卫都要定位
+/// 该窝的保湿周期行。改名后匹配不到为已知边界（同 v4/v6/v8 按名回填先例：
+/// 单人工具可接受，此时清回未设不删行、方式照常切换）。
+const HYDRATION_ACTION_NAME: &str = "巢穴保湿";
+
+fn validate_hydration_method(method: Option<&str>) -> Result<Option<String>, String> {
+    match method {
+        None => Ok(None),
+        Some(m) if HYDRATION_METHODS.contains(&m) => Ok(Some(m.to_string())),
+        Some(other) => Err(format!(
+            "无效的保湿方式：{other}（应为 未设/手动加水/水塔）"
+        )),
+    }
+}
+
+/// 按锚点名解析巢穴保湿操作的 id；改名/不存在为 None（调用方按边界降级）。
+fn hydration_action_id(conn: &Connection) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT id FROM care_action WHERE name = ?1",
+        params![HYDRATION_ACTION_NAME],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+/// 整窗提交里的周期增删预检（写前人话报错，事务内写失败兜底回滚）：
+/// 天数 1..=365（与 set_colony_action_interval 同口径）、操作必须存在。
+/// 窝的存在性不在此查——新建时同事务先插窝、编辑时更新目标本就须存在。
+fn validate_interval_changes(conn: &Connection, input: &ColonyInput) -> Result<(), String> {
+    for change in &input.interval_changes {
+        if let Some(days) = change.interval_days {
+            if !INTERVAL_DAYS_RANGE.contains(&days) {
+                return Err(format!("每窝周期应是 1–365 的整数天（收到 {days}）"));
+            }
+        }
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM care_action WHERE id = ?1",
+                params![change.action_id],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        if found == 0 {
+            return Err(format!("操作不存在（id={}）", change.action_id));
+        }
+    }
+    Ok(())
+}
+
+/// 在事务上应用整窗提交的每窝周期增删（写前校验见 [`validate_interval_changes`]）。
+/// `drop_hydration_clears` = 净零守卫（库内与提交方式都为未设）：丢弃针对巢穴
+/// 保湿行的清除，其余行照常处理。
+fn apply_interval_changes(
+    tx: &Connection,
+    colony_id: i64,
+    changes: &[ColonyIntervalChange],
+    drop_hydration_clears: bool,
+) -> Result<(), String> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let hydration_id = if drop_hydration_clears {
+        hydration_action_id(tx)?
+    } else {
+        None
+    };
+    for change in changes {
+        match change.interval_days {
+            Some(days) => {
+                tx.execute(
+                    "INSERT INTO colony_action_interval (colony_id, action_id, interval_days)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(colony_id, action_id)
+                     DO UPDATE SET interval_days = excluded.interval_days",
+                    params![colony_id, change.action_id, days],
+                )
+                .map_err(db_err)?;
+            }
+            None => {
+                if drop_hydration_clears && hydration_id == Some(change.action_id) {
+                    continue; // 净零（F4）：未设往返不删库内已有周期行
+                }
+                tx.execute(
+                    "DELETE FROM colony_action_interval
+                     WHERE colony_id = ?1 AND action_id = ?2",
+                    params![colony_id, change.action_id],
+                )
+                .map_err(db_err)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 清回未设：删该窝保湿周期行（锚点名定位；改名匹配不到时按已知边界跳过）。
+fn delete_hydration_interval_row(tx: &Connection, colony_id: i64) -> Result<(), String> {
+    if let Some(hydrate_id) = hydration_action_id(tx)? {
+        tx.execute(
+            "DELETE FROM colony_action_interval WHERE colony_id = ?1 AND action_id = ?2",
+            params![colony_id, hydrate_id],
+        )
+        .map_err(db_err)?;
+    }
+    Ok(())
+}
+
 pub fn create_colony(conn: &Connection, input: &ColonyInput, today: &str) -> Result<Colony, String> {
     let (name, species, start_date) = normalize_colony_input(conn, input, None)?;
-    conn.execute(
-        "INSERT INTO colony (name, species, location_id, start_date, status) VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![name, species, input.location_id, start_date, input.status],
+    let hydration_method = validate_hydration_method(input.hydration_method.as_deref())?;
+    validate_interval_changes(conn, input)?;
+    // 原子性（spec F2）：建窝 + 方式 + 初始周期同一条命令、同一事务，任一步
+    // 失败整体回滚——绝无「窝建了但周期没落」的半截状态。
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO colony (name, species, location_id, start_date, status, hydration_method)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![name, species, input.location_id, start_date, input.status, hydration_method],
     )
     .map_err(|e| friendly_unique_err(e, "colony.name", &name))?;
-    get_colony(conn, conn.last_insert_rowid(), today)
+    let id = tx.last_insert_rowid();
+    apply_interval_changes(&tx, id, &input.interval_changes, false)?;
+    tx.commit().map_err(db_err)?;
+    get_colony(conn, id, today)
 }
 
 pub fn update_colony(
@@ -248,15 +401,45 @@ pub fn update_colony(
     today: &str,
 ) -> Result<Colony, String> {
     let (name, species, start_date) = normalize_colony_input(conn, input, Some(id))?;
-    let changed = conn
+    let hydration_method = validate_hydration_method(input.hydration_method.as_deref())?;
+    validate_interval_changes(conn, input)?;
+    // 库内方式原值（状态矩阵判定基准，spec 判定提示：不收前端旗标）
+    let stored_method: Option<String> = conn
+        .query_row(
+            "SELECT hydration_method FROM colony WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => "窝不存在".to_string(),
+            other => db_err(other),
+        })?;
+    // 清回未设：库内原值非未设（manual/tower）且提交=未设 → 删保湿周期行
+    let clear_hydration = stored_method.is_some() && hydration_method.is_none();
+    // 净零守卫：库内与提交都为未设 → 会话内「选了又改回」不删周期行（B 仍 B）
+    let net_zero = stored_method.is_none() && hydration_method.is_none();
+
+    // 整窗单事务（spec F6）：基础字段 + 方式变更 + 周期增删一次提交，任一步
+    // 失败整体回滚——名字等基础字段绝不先落库。
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    let changed = tx
         .execute(
-            "UPDATE colony SET name = ?1, species = ?2, location_id = ?3, start_date = ?4, status = ?5 WHERE id = ?6",
-            params![name, species, input.location_id, start_date, input.status, id],
+            "UPDATE colony SET name = ?1, species = ?2, location_id = ?3, start_date = ?4,
+             status = ?5, hydration_method = ?6 WHERE id = ?7",
+            params![name, species, input.location_id, start_date, input.status, hydration_method, id],
         )
         .map_err(|e| friendly_unique_err(e, "colony.name", &name))?;
     if changed == 0 {
+        // tx 在此 drop，自动回滚
         return Err("窝不存在".into());
     }
+    apply_interval_changes(&tx, id, &input.interval_changes, net_zero)?;
+    // 清回未设的删行放在周期增删之后（同事务）：方式动作是删行的最终裁决，
+    // 矛盾提交（既清方式又带保湿 upsert）落成「未设+无周期」的 A 态。
+    if clear_hydration {
+        delete_hydration_interval_row(&tx, id)?;
+    }
+    tx.commit().map_err(db_err)?;
     get_colony(conn, id, today)
 }
 
@@ -536,6 +719,8 @@ mod tests {
             location_id,
             start_date: "2026-01-20".into(),
             status: "active".into(),
+            hydration_method: None,
+            interval_changes: Vec::new(),
         }
     }
 
@@ -994,6 +1179,331 @@ mod tests {
         let map_b = intervals_for_colony(&conn, b.id).unwrap();
         assert_eq!(map_b.len(), 1);
         assert_eq!(map_b.get(&hydrate), Some(&9));
+    }
+
+    // ── 保湿方式（保湿方式票 01）：状态矩阵落库语义 + 写入原子性 ──
+
+    /// 读某窝当前保湿方式（None = 未设）。
+    fn hydration_method_of(conn: &Connection, colony_id: i64) -> Option<String> {
+        conn.query_row(
+            "SELECT hydration_method FROM colony WHERE id = ?1",
+            params![colony_id],
+            |row| row.get(0),
+        )
+        .expect("读保湿方式失败")
+    }
+
+    fn change(action_id: i64, interval_days: Option<i64>) -> ColonyIntervalChange {
+        ColonyIntervalChange { action_id, interval_days }
+    }
+
+    #[test]
+    fn create_colony_carries_method_and_initial_interval_atomically() {
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let mut inp = input("水塔窝", Some(1));
+        inp.hydration_method = Some("tower".into());
+        inp.interval_changes = vec![change(hydrate, Some(15))];
+
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+        assert_eq!(c.hydration_method.as_deref(), Some("tower"));
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(15));
+    }
+
+    #[test]
+    fn create_colony_without_method_stays_unset_and_rowless() {
+        let conn = mem_conn();
+        let c = create_colony(&conn, &input("安静窝", None), TODAY).unwrap();
+        assert_eq!(c.hydration_method, None);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM colony_action_interval WHERE colony_id = ?1", c.id),
+            0
+        );
+        // 方式设了、周期不带 = D 态（有标签不提醒），合法落库
+        let mut inp = input("空周期窝", None);
+        inp.hydration_method = Some("manual".into());
+        let d = create_colony(&conn, &inp, TODAY).unwrap();
+        assert_eq!(d.hydration_method.as_deref(), Some("manual"));
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM colony_action_interval WHERE colony_id = ?1", d.id),
+            0
+        );
+    }
+
+    #[test]
+    fn create_colony_rejects_bad_interval_and_unknown_method_without_colony() {
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+
+        // 非法天数：整体失败，窝不落库（验收 2）
+        let mut inp = input("甲", None);
+        inp.hydration_method = Some("manual".into());
+        inp.interval_changes = vec![change(hydrate, Some(0))];
+        assert!(create_colony(&conn, &inp, TODAY).is_err());
+        // 幽灵操作同样整体失败
+        let mut inp = input("乙", None);
+        inp.interval_changes = vec![change(999, Some(7))];
+        assert!(create_colony(&conn, &inp, TODAY).is_err());
+        // 枚举外方式被拒
+        let mut inp = input("丙", None);
+        inp.hydration_method = Some("sprinkler".into());
+        assert!(create_colony(&conn, &inp, TODAY).is_err());
+
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM colony", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 0, "任一步失败窝整体不落库");
+    }
+
+    #[test]
+    fn create_colony_interval_write_failure_rolls_back_colony() {
+        // 事务性硬验收：周期写入在事务内被打断（触发器模拟）→ 已插入的窝回滚
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        conn.execute(
+            "CREATE TRIGGER block_interval_insert BEFORE INSERT ON colony_action_interval
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+            [],
+        )
+        .unwrap();
+        let mut inp = input("倒霉窝", None);
+        inp.hydration_method = Some("manual".into());
+        inp.interval_changes = vec![change(hydrate, Some(7))];
+
+        assert!(create_colony(&conn, &inp, TODAY).is_err());
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM colony", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 0, "周期写失败时窝必须整体回滚");
+    }
+
+    #[test]
+    fn update_colony_full_window_single_transaction() {
+        // 整窗单事务（spec F6）：基础字段 + 方式变更 + 周期增删一次提交全部生效
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let feed = action_id_by_name(&conn, "喂食");
+        let c = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        set_colony_action_interval(&conn, c.id, feed, Some(3)).unwrap();
+
+        let mut inp = input("大头壹号", Some(2));
+        inp.hydration_method = Some("manual".into());
+        inp.interval_changes = vec![change(hydrate, Some(7)), change(feed, None)];
+        let updated = update_colony(&conn, c.id, &inp, TODAY).unwrap();
+
+        assert_eq!(updated.name, "大头壹号");
+        assert_eq!(updated.location_id, Some(2));
+        assert_eq!(updated.hydration_method.as_deref(), Some("manual"));
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(7));
+        assert_eq!(interval_days(&conn, c.id, feed), None, "未列出的删行照常生效");
+    }
+
+    #[test]
+    fn update_colony_hydration_failure_keeps_base_fields() {
+        // 验收 3：保湿部分失败（周期写入被打断）→ 名字等基础字段也不落库
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let mut seed = input("原名", Some(1));
+        seed.hydration_method = Some("tower".into());
+        let c = create_colony(&conn, &seed, TODAY).unwrap();
+
+        conn.execute(
+            "CREATE TRIGGER block_interval_insert BEFORE INSERT ON colony_action_interval
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+            [],
+        )
+        .unwrap();
+        let mut inp = input("新名", Some(2));
+        inp.hydration_method = Some("manual".into());
+        inp.interval_changes = vec![change(hydrate, Some(7))];
+        assert!(update_colony(&conn, c.id, &inp, TODAY).is_err());
+
+        // 整窗回滚：名字/地点/方式/周期全部原样
+        assert_eq!(hydration_method_of(&conn, c.id).as_deref(), Some("tower"));
+        assert_eq!(interval_days(&conn, c.id, hydrate), None);
+        let row: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT name, location_id FROM colony WHERE id = ?1",
+                params![c.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("原名".into(), Some(1)));
+    }
+
+    #[test]
+    fn update_colony_clear_to_unset_deletes_hydration_interval_row() {
+        // 验收 5 前半：库内=manual/tower 且保存清回未设 → 方式置 NULL 且周期行被删
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let mut inp = input("水塔窝", None);
+        inp.hydration_method = Some("tower".into());
+        inp.interval_changes = vec![change(hydrate, Some(15))];
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+
+        let mut clear = input("水塔窝", None);
+        clear.hydration_method = None; // 清回未设
+        let updated = update_colony(&conn, c.id, &clear, TODAY).unwrap();
+
+        assert_eq!(updated.hydration_method, None);
+        assert_eq!(
+            interval_days(&conn, c.id, hydrate),
+            None,
+            "清回未设必须删掉该窝保湿周期行"
+        );
+    }
+
+    #[test]
+    fn update_colony_net_zero_unset_journey_keeps_interval_row() {
+        // 验收 4（净零语义，F4）：库内=未设+已有周期（存量 B 态），保存把方式
+        // 「选了又改回未设」——即使前端把清行请求一并提交，库内周期行仍在
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let c = create_colony(&conn, &input("存量窝", None), TODAY).unwrap();
+        set_colony_action_interval(&conn, c.id, hydrate, Some(12)).unwrap();
+
+        // 模拟会话内 未设→手动→未设：提交值=未设，且带上会话期间产生的清行
+        let mut inp = input("存量窝", None);
+        inp.hydration_method = None;
+        inp.interval_changes = vec![change(hydrate, None)];
+        let updated = update_colony(&conn, c.id, &inp, TODAY).unwrap();
+
+        assert_eq!(updated.hydration_method, None, "方式仍为未设");
+        assert_eq!(
+            interval_days(&conn, c.id, hydrate),
+            Some(12),
+            "净零：库内已有周期行原样保留（B 仍 B）"
+        );
+    }
+
+    #[test]
+    fn update_colony_stored_unset_keeps_interval_row_on_any_edit_save() {
+        // 验收 5 后半：库内=未设时任何编辑保存不删周期行（此处只改名字）
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let c = create_colony(&conn, &input("存量窝", None), TODAY).unwrap();
+        set_colony_action_interval(&conn, c.id, hydrate, Some(12)).unwrap();
+
+        let mut inp = input("改名窝", Some(1));
+        inp.hydration_method = None;
+        update_colony(&conn, c.id, &inp, TODAY).unwrap();
+
+        assert_eq!(hydration_method_of(&conn, c.id), None);
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(12));
+    }
+
+    #[test]
+    fn update_colony_days_only_clear_keeps_method() {
+        // 规则 6（C→D）：只清天数删周期行，方式保留
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let mut inp = input("手动窝", None);
+        inp.hydration_method = Some("manual".into());
+        inp.interval_changes = vec![change(hydrate, Some(7))];
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+
+        let mut clear_days = input("手动窝", None);
+        clear_days.hydration_method = Some("manual".into());
+        clear_days.interval_changes = vec![change(hydrate, None)];
+        let updated = update_colony(&conn, c.id, &clear_days, TODAY).unwrap();
+
+        assert_eq!(updated.hydration_method.as_deref(), Some("manual"), "方式保留");
+        assert_eq!(interval_days(&conn, c.id, hydrate), None, "周期行被删（D 态）");
+    }
+
+    #[test]
+    fn update_colony_method_switch_keeps_existing_interval_row() {
+        // 规则 3 库内侧：手动↔水塔切换不动库内已有周期行
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let mut inp = input("手动窝", None);
+        inp.hydration_method = Some("manual".into());
+        inp.interval_changes = vec![change(hydrate, Some(7))];
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+
+        let mut switch = input("手动窝", None);
+        switch.hydration_method = Some("tower".into());
+        let updated = update_colony(&conn, c.id, &switch, TODAY).unwrap();
+
+        assert_eq!(updated.hydration_method.as_deref(), Some("tower"));
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(7), "切方式不删不覆盖周期行");
+    }
+
+    #[test]
+    fn update_colony_unset_to_method_keeps_existing_interval_untouched() {
+        // 规则 2 库内侧：未设→选方式时已有周期非空不动（B→C，值原样）
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let c = create_colony(&conn, &input("存量窝", None), TODAY).unwrap();
+        set_colony_action_interval(&conn, c.id, hydrate, Some(12)).unwrap();
+
+        let mut inp = input("存量窝", None);
+        inp.hydration_method = Some("manual".into()); // 周期框非空 → 前端不提交该行
+        let updated = update_colony(&conn, c.id, &inp, TODAY).unwrap();
+
+        assert_eq!(updated.hydration_method.as_deref(), Some("manual"));
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(12));
+    }
+
+    #[test]
+    fn update_colony_untouched_round_trip_preserves_hydration_config() {
+        // 规则 5：改名字等无关编辑绝不影响保湿配置（C 态往返）
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let mut inp = input("原名", None);
+        inp.hydration_method = Some("tower".into());
+        inp.interval_changes = vec![change(hydrate, Some(15))];
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+
+        let mut rename = input("新名", None);
+        rename.hydration_method = Some("tower".into());
+        update_colony(&conn, c.id, &rename, TODAY).unwrap();
+
+        assert_eq!(hydration_method_of(&conn, c.id).as_deref(), Some("tower"));
+        assert_eq!(interval_days(&conn, c.id, hydrate), Some(15));
+    }
+
+    #[test]
+    fn update_colony_rejects_unknown_method_value_without_changes() {
+        let conn = mem_conn();
+        let c = create_colony(&conn, &input("甲", None), TODAY).unwrap();
+        let mut inp = input("甲", None);
+        inp.hydration_method = Some("drip".into());
+        assert!(update_colony(&conn, c.id, &inp, TODAY).is_err());
+        assert_eq!(hydration_method_of(&conn, c.id), None, "拒绝时库内原样");
+    }
+
+    #[test]
+    fn hydration_writes_do_not_disturb_interval_from_colony_semantics() {
+        // 回归（验收 6）：interval_from_colony 既有语义原样——设了每窝周期时
+        // effective_interval_days 即原始值；清回未设删行后回到操作层性质。
+        let conn = mem_conn();
+        let hydrate = action_id_by_name(&conn, "巢穴保湿");
+        let mut inp = input("水塔窝", None);
+        inp.hydration_method = Some("tower".into());
+        inp.interval_changes = vec![change(hydrate, Some(15))];
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+
+        let tiles = crate::care::tiles_for_colony(&conn, c.id, TODAY).unwrap();
+        let tile = tiles.iter().find(|t| t.name == "巢穴保湿").unwrap();
+        assert!(tile.interval_from_colony, "设了每窝周期 → 标记来自每窝");
+        assert_eq!(tile.effective_interval_days, Some(15), "有效周期即原始每窝周期值");
+
+        // 清回未设：删行后该窝该操作回到「未设沿操作层」——登记类无建议间隔，
+        // effective 回 None、标记回 false；独立设/清命令（其余读写维持现状）照常可用
+        let mut clear = input("水塔窝", None);
+        clear.hydration_method = None;
+        update_colony(&conn, c.id, &clear, TODAY).unwrap();
+        let tiles = crate::care::tiles_for_colony(&conn, c.id, TODAY).unwrap();
+        let tile = tiles.iter().find(|t| t.name == "巢穴保湿").unwrap();
+        assert!(!tile.interval_from_colony);
+        assert_eq!(tile.effective_interval_days, None);
+
+        set_colony_action_interval(&conn, c.id, hydrate, Some(30)).unwrap();
+        let tiles = crate::care::tiles_for_colony(&conn, c.id, TODAY).unwrap();
+        let tile = tiles.iter().find(|t| t.name == "巢穴保湿").unwrap();
+        assert!(tile.interval_from_colony);
+        assert_eq!(tile.effective_interval_days, Some(30));
     }
 
     // ── 地点 ──

@@ -35,7 +35,11 @@ use rusqlite::{params, Connection};
 ///     外键沿库内惯例裸 REFERENCES、应用层守卫。读写命令见 colony.rs，本版只建表。
 /// v10：垃圾清理顺带撤食（ADR 0006）——care_action 加 implies_retrieval 标记位，
 ///     迁移只给预置「垃圾清理」置 1（锚点：名字或 预置+reminding+非喂食）。
-pub const SCHEMA_VERSION: i64 = 10;
+/// v11：保湿方式（保湿方式票 01，spec D1）——colony 加 hydration_method 可空
+///     枚举列（'manual'=手动加水 | 'tower'=水塔 | NULL=未设，默认 NULL）；
+///     只加列，不回填、不触碰 colony_action_interval 任何行——升级前已设保湿
+///     每窝周期的窝自然形成「未设+已有周期」的存量 B 态（规格状态矩阵）。
+pub const SCHEMA_VERSION: i64 = 11;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -130,6 +134,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             7 => migrate_v7_to_v8(conn, start == 0)?,
             8 => migrate_v8_to_v9(conn)?,
             9 => migrate_v9_to_v10(conn)?,
+            10 => migrate_v10_to_v11(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -490,6 +495,36 @@ fn migrate_v9_to_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
     tx.commit()
 }
 
+/// v11（保湿方式票 01，spec D1）：`colony.hydration_method` 可空枚举列——
+/// 'manual'=手动加水 | 'tower'=水塔 | NULL=未设（默认 NULL）。只加列、不回填、
+/// **不触碰 colony_action_interval 任何行**：升级前已设保湿每窝周期的窝升级后
+/// 原样保留周期行，方式为 NULL——即状态矩阵的存量 B 态（未设+有周期，提醒照常）。
+/// 单事务原子完成；列已存在则跳过 ALTER（幂等：v9→v10 同款防重复加列）。
+fn migrate_v10_to_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_col = {
+        let mut stmt = conn.prepare("PRAGMA table_info(colony)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == "hydration_method" {
+                found = true;
+            }
+        }
+        found
+    };
+    let tx = conn.unchecked_transaction()?;
+    if !has_col {
+        // CHECK 拦非枚举值；存量行该列皆为 NULL（CHECK 对 NULL 放行）
+        tx.execute(
+            "ALTER TABLE colony ADD COLUMN hydration_method TEXT
+             CHECK (hydration_method IN ('manual', 'tower'))",
+            [],
+        )?;
+    }
+    tx.pragma_update(None, "user_version", 11)?;
+    tx.commit()
+}
+
 /// v1 预置数据：四操作（喂食/活动区换水/巢穴保湿/垃圾清理）、三食物、两地点、五项设置默认值。
 /// pub(crate)：restore.rs 的旧 schema 备份测试要搭真实 v1 库（票 04 验收 3）。
 pub(crate) fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -686,7 +721,7 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 10);
+        assert_eq!(SCHEMA_VERSION, 11);
     }
 
     /// 按真实迁移函数链手工搭到 v7 的库（票 01 v8 迁移测试地基；含 webui-checkin
@@ -1139,6 +1174,201 @@ mod tests {
         assert_eq!(others, 0, "自建 reminding 操作与其余预置不误标");
     }
 
+    /// 保湿方式票 01 验收 1（迁移）：真实 v10 库 + 用户数据（窝 + 已设的每窝
+    /// 周期行），migrate() 升 v11——hydration_method 列存在且存量全 NULL（未设），
+    /// colony_action_interval 行逐行原样保留（升级前后快照一致），再 migrate 幂等。
+    #[test]
+    fn v10_db_upgrades_to_v11_keeps_interval_rows_and_colonies_intact() {
+        let conn = v7_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('针毛一号', '2026-02-01')",
+            [],
+        )
+        .unwrap();
+        migrate_v7_to_v8(&conn, false).unwrap();
+        migrate_v8_to_v9(&conn).unwrap();
+        migrate_v9_to_v10(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), 10);
+
+        // 存量用户数据：升级前已设的每窝周期（含巢穴保湿）+ 历史记录；
+        // 升级后这些窝应为「未设+已有周期」的存量 B 态
+        conn.execute(
+            "INSERT INTO colony_action_interval (colony_id, action_id, interval_days)
+             VALUES (1, 3, 12)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony_action_interval (colony_id, action_id, interval_days)
+             VALUES (2, 1, 5)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (1, 1, '2026-09-01 08:00:00', '', '2026-09-01 08:00:00')",
+            [],
+        )
+        .unwrap();
+
+        let intervals_before: Vec<(i64, i64, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT colony_id, action_id, interval_days
+                     FROM colony_action_interval ORDER BY colony_id, action_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let colonies_before: Vec<(i64, String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, name, status FROM colony ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+
+        // 周期行逐行原样保留（验收硬杠：迁移不动 colony_action_interval 任何行）
+        let intervals_after: Vec<(i64, i64, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT colony_id, action_id, interval_days
+                     FROM colony_action_interval ORDER BY colony_id, action_id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(intervals_after, intervals_before, "升级不得增删改周期行");
+        let colonies_after: Vec<(i64, String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT id, name, status FROM colony ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(colonies_after, colonies_before, "窝基础字段原样");
+
+        // 新列存在，存量全为 NULL（未设）——自然形成存量 B 态
+        let methods: Vec<Option<String>> = {
+            let mut stmt = conn
+                .prepare("SELECT hydration_method FROM colony ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(methods, vec![None, None]);
+
+        // 幂等：再 migrate 不重跑、数据不动
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"),
+            2
+        );
+    }
+
+    /// v11 列约束：'manual'/'tower'/NULL（缺省）放行，枚举外值被 CHECK 拒。
+    #[test]
+    fn hydration_method_accepts_enum_and_rejects_other_values() {
+        let (conn, _dir) = fresh_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, hydration_method)
+             VALUES ('甲', '2026-01-20', 'manual')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, hydration_method)
+             VALUES ('乙', '2026-01-20', 'tower')",
+            [],
+        )
+        .unwrap();
+        // 不带列 = NULL = 未设
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('丙', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        let methods: Vec<Option<String>> = {
+            let mut stmt = conn
+                .prepare("SELECT hydration_method FROM colony ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            methods,
+            vec![Some("manual".into()), Some("tower".into()), None]
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO colony (name, start_date, hydration_method)
+                 VALUES ('丁', '2026-01-20', 'sprinkler')",
+                [],
+            )
+            .is_err(),
+            "枚举外值应被 CHECK 拒绝"
+        );
+    }
+
+    /// v11 幂等（v9→v10 同款锚）：库已带 hydration_method 列但版本停在 10
+    /// （降版本打开后再升级的情形），migrate 跳过重复加列、照常升到最新。
+    #[test]
+    fn v11_migration_skips_add_when_column_already_exists() {
+        let conn = v7_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        migrate_v7_to_v8(&conn, false).unwrap();
+        migrate_v8_to_v9(&conn).unwrap();
+        migrate_v9_to_v10(&conn).unwrap();
+        conn.execute("ALTER TABLE colony ADD COLUMN hydration_method TEXT", [])
+            .unwrap();
+        conn.pragma_update(None, "user_version", 10).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+        let col_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('colony')
+                 WHERE name = 'hydration_method'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(col_count, 1, "hydration_method 不得被重复加列");
+        // 列可正常读写
+        conn.execute(
+            "UPDATE colony SET hydration_method = 'tower' WHERE name = '大头一号'",
+            [],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn v7_upgrade_preserves_rows_and_backfills_perishable_presets() {
         // 真实 v6 库：历史记录 + 台账 + 自建操作/食物齐全，升 v7 后数据原样、
@@ -1459,6 +1689,18 @@ mod tests {
                     "care_action 旧列序被改动：{new_sql}"
                 );
                 assert!(new_sql.contains("implies_retrieval"), "care_action 未追加 implies_retrieval：{new_sql}");
+                continue;
+            }
+            if name == "colony" {
+                // v11（保湿方式票 01）合法改动：ALTER 追加 hydration_method 列，
+                // 断言口径同 care_action（旧列序原样 + 新列追加）
+                let old_sql = sql.as_deref().unwrap_or("");
+                let new_sql = found.1.as_deref().unwrap_or("");
+                assert!(
+                    new_sql.starts_with(old_sql.trim_end_matches(')')),
+                    "colony 旧列序被改动：{new_sql}"
+                );
+                assert!(new_sql.contains("hydration_method"), "colony 未追加 hydration_method：{new_sql}");
                 continue;
             }
             assert_eq!(found.1, *sql, "旧对象 {name} 的 DDL 被改动");

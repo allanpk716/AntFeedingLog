@@ -88,6 +88,24 @@ describe("桌面路由（透传 Tauri invoke，命令名/参数/返回逐字等�
     expect(invokeMock).toHaveBeenCalledWith("create_colony", { input });
   });
 
+  it("create_colony：整窗入参含保湿方式与每窝周期增删（保湿方式票 02），字段名 snake_case 逐字透传", async () => {
+    asTauri();
+    invokeMock.mockResolvedValue(undefined);
+    const input = {
+      name: "新窝",
+      species: null,
+      location_id: null,
+      start_date: "2026-09-20",
+      status: "active" as const,
+      hydration_method: "manual" as const,
+      interval_changes: [{ action_id: 15, interval_days: 7 }],
+    };
+
+    await createColony({ input });
+
+    expect(invokeMock).toHaveBeenCalledWith("create_colony", { input });
+  });
+
   it("camelCase 入参键保持原样（冬眠/统计命令现状即此形状）", async () => {
     asTauri();
     invokeMock.mockResolvedValue(null);

@@ -5,6 +5,15 @@
 
 export type ColonyStatus = "active" | "hibernating" | "ended";
 
+/** 保湿方式（保湿方式票 01，spec D1）：'manual'=手动加水 | 'tower'=水塔 |
+ *  null=未设。纯标签属性，不参与提醒判定（周期语义原样走每窝周期）。 */
+export type HydrationMethod = "manual" | "tower";
+
+export const HYDRATION_METHOD_LABELS: Record<HydrationMethod, string> = {
+  manual: "手动加水",
+  tower: "水塔",
+};
+
 /** 维护操作性质：reminding=提醒（超期标红可通知）/ log_only=仅登记（永不催促）/
  *  follow=跟随喂食（票 01：撤食预置专属性质，由易腐喂食派生「该撤食」，
  *  不参与提醒/登记切换、无建议间隔） */
@@ -82,6 +91,9 @@ export interface Colony {
   start_date: string;
   status: ColonyStatus;
   days_raised: number;
+  /** 保湿方式（保湿方式票 01）：'manual'|'tower'|null=未设。可选仅为旧测试
+   *  载荷兜底——真实 IPC（Rust Colony）恒有值。 */
+  hydration_method?: HydrationMethod | null;
   actions: ColonyAction[];
   recent: RecentLog[];
   hibernation: HibernationPreview | null;
@@ -89,13 +101,25 @@ export interface Colony {
   checkin: CheckinDigest;
 }
 
-/** 新建/编辑窝入参 */
+/** 新建/编辑窝入参。保湿方式写入与基础字段同命令同事务（spec F2/F6 整窗单事务）：
+ *  后端按「库内原值 vs 提交值」比较判定落库语义，不收前端旗标。 */
 export interface ColonyInput {
   name: string;
   species: string | null;
   location_id: number | null;
   start_date: string;
   status: ColonyStatus;
+  /** 保湿方式：'manual'|'tower'|null=未设；缺省=未设（serde default） */
+  hydration_method?: HydrationMethod | null;
+  /** 本次保存要增删的每窝周期行（只传变化行，未列出的行零改动）；缺省=空 */
+  interval_changes?: ColonyIntervalChange[];
+}
+
+/** 整窗提交里的一行每窝周期增删（票 01）：interval_days 数字 = 设/改一行，
+ *  null = 清除删行；删行是否被净零语义拦截由后端按库内原值判定（F4）。 */
+export interface ColonyIntervalChange {
+  action_id: number;
+  interval_days: number | null;
 }
 
 /** 地点（含停用的：首页分组仍按它排） */

@@ -301,6 +301,8 @@ describe("新建窝", () => {
         location_id: 1,
         start_date: "2026-09-18",
         status: "active",
+        hydration_method: null,
+        interval_changes: [],
       },
     });
     expect(wrapper.find(".dialog").exists()).toBe(false);
@@ -349,6 +351,8 @@ describe("编辑窝", () => {
         location_id: 1,
         start_date: "2026-01-20",
         status: "ended",
+        hydration_method: null,
+        interval_changes: [],
       },
     });
   });
@@ -1483,5 +1487,22 @@ describe("浏览器模式隐藏桌面专属入口（终局评审 Important）", 
     expect(wrapper.find(".settings-btn").exists()).toBe(true);
     expect(wrapper.find(".new-top-btn").exists()).toBe(true);
     expect(wrapper.find(".card .edit-btn").exists()).toBe(true);
+  });
+});
+
+// ── 轻提示宿主挂应用根（保湿方式+轻提示票 03）──
+
+describe("轻提示宿主挂应用根（票 03）", () => {
+  it("桌面形态：App 根渲染 .toast-host（全局唯一轻提示出口）", async () => {
+    const wrapper = await mountApp();
+
+    expect(wrapper.find(".toast-host").exists()).toBe(true);
+  });
+
+  it("网页端与桌面端同一前端：浏览器形态同样渲染 .toast-host（断言挂载即可）", async () => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    const wrapper = await mountApp();
+
+    expect(wrapper.find(".toast-host").exists()).toBe(true);
   });
 });

@@ -38,6 +38,13 @@
  * 行级 停用/启用/删除 即时落库并抛 changed（外层刷新首页，卡片红/灰随之变化）；
  * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
  * 成功后重拉字典并抛 changed。停用项整行置灰。
+ *
+ * 轻提示接线（保湿方式+轻提示票 03，判定原则见 CLAUDE.md「操作反馈规范」）：
+ * 操作/食物「保存」、行级停用/启用/删除、数据 tab 的安全备份/导出/清理孤儿照片、
+ * 弹窗加载失败——这些"改了不关窗"的写操作成败走全局轻提示（src/lib/toast.ts），
+ * 旧的内联失败红字（error.value）只留给字段级校验；「发送测试通知」（双通道回显）、
+ * 通知/自动备份区「保存」（自身「已保存」回显）、恢复（摘要+结果回显+重拉）、
+ * 打开文件夹类（OS 层反馈）有天然反馈，不接。
  */
 import { computed, onMounted, ref } from "vue";
 import {
@@ -116,6 +123,7 @@ import {
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
 import WebUiPanel from "./WebUiPanel.vue";
+import { showError, showSuccess } from "../lib/toast";
 
 type Tab = "actions" | "foods" | "locations" | "notify" | "webui" | "data" | "update";
 
@@ -169,7 +177,8 @@ onMounted(async () => {
   try {
     await load();
   } catch (e) {
-    error.value = String(e);
+    // 非校验失败走轻提示（票 03 通道迁移），不再占内联红字
+    showError("设置加载失败", String(e));
   }
   // 日志区（票 01）加载失败静默：日志区是辅助信息，不值得为它报错打扰
   await loadLogSection();
@@ -226,9 +235,10 @@ async function setActionEnabled(row: ActionRow, enabled: boolean) {
   try {
     await setActionEnabledCmd({ id: row.id, enabled });
     row.enabled = enabled;
+    showSuccess(enabled ? `已启用「${row.name}」` : `已停用「${row.name}」`);
     emit("changed");
   } catch (e) {
-    error.value = String(e);
+    showError(enabled ? "启用失败" : "停用失败", String(e));
   } finally {
     busy.value = false;
   }
@@ -244,9 +254,10 @@ async function eraseAction(row: ActionRow) {
   try {
     await eraseActionCmd({ id: row.id });
     actionRows.value = actionRows.value.filter((r) => r !== row);
+    showSuccess(`已删除「${row.name}」`);
     emit("changed");
   } catch (e) {
-    error.value = String(e);
+    showError("删除失败", String(e));
   } finally {
     busy.value = false;
   }
@@ -259,9 +270,10 @@ async function setFoodEnabled(row: FoodRow, enabled: boolean) {
   try {
     await setFoodEnabledCmd({ id: row.id, enabled });
     row.enabled = enabled;
+    showSuccess(enabled ? `已启用「${row.name}」` : `已停用「${row.name}」`);
     emit("changed");
   } catch (e) {
-    error.value = String(e);
+    showError(enabled ? "启用失败" : "停用失败", String(e));
   } finally {
     busy.value = false;
   }
@@ -277,9 +289,10 @@ async function eraseFood(row: FoodRow) {
   try {
     await eraseFoodCmd({ id: row.id });
     foodRows.value = foodRows.value.filter((r) => r !== row);
+    showSuccess(`已删除「${row.name}」`);
     emit("changed");
   } catch (e) {
-    error.value = String(e);
+    showError("删除失败", String(e));
   } finally {
     busy.value = false;
   }
@@ -290,7 +303,7 @@ async function eraseFood(row: FoodRow) {
 async function saveActions() {
   const invalid = validateActionRows(actionRows.value);
   if (invalid) {
-    error.value = invalid;
+    error.value = invalid; // 字段级校验维持内联红字（F3 例外），不进轻提示
     return;
   }
   busy.value = true;
@@ -301,8 +314,9 @@ async function saveActions() {
     }
     await load();
     emit("changed");
+    showSuccess("已保存");
   } catch (e) {
-    error.value = String(e);
+    showError("保存失败", String(e));
   } finally {
     busy.value = false;
   }
@@ -311,7 +325,7 @@ async function saveActions() {
 async function saveFoods() {
   const invalid = validateFoodRows(foodRows.value);
   if (invalid) {
-    error.value = invalid;
+    error.value = invalid; // 字段级校验维持内联红字（F3 例外），不进轻提示
     return;
   }
   busy.value = true;
@@ -322,8 +336,9 @@ async function saveFoods() {
     }
     await load();
     emit("changed");
+    showSuccess("已保存");
   } catch (e) {
-    error.value = String(e);
+    showError("保存失败", String(e));
   } finally {
     busy.value = false;
   }
@@ -399,8 +414,10 @@ async function runBackup() {
   try {
     const path = await backupTo();
     dataResult.value = path ? `已备份到：${path}` : "";
+    if (path) showSuccess("已备份");
   } catch (e) {
     dataError.value = String(e);
+    showError("备份失败", String(e));
   } finally {
     dataBusy.value = false;
   }
@@ -413,8 +430,10 @@ async function exportData(format: "csv" | "json") {
   try {
     const path = await exportDataCmd({ format });
     dataResult.value = path ? `已导出到：${path}` : "";
+    if (path) showSuccess(format === "csv" ? "已导出 CSV" : "已导出 JSON");
   } catch (e) {
     dataError.value = String(e);
+    showError("导出失败", String(e));
   } finally {
     dataBusy.value = false;
   }
@@ -626,9 +645,11 @@ async function requestCleanOrphans() {
   try {
     const outcome = await cleanOrphanPhotos();
     orphanResult.value = `已清理 ${outcome.removed_dirs} 个隔离目录，释放 ${formatBytes(outcome.freed_bytes)}`;
+    showSuccess("孤儿照片已清理");
     await loadOrphanSection(true);
   } catch (e) {
     orphanError.value = String(e);
+    showError("清理失败", String(e));
   } finally {
     orphanBusy.value = false;
   }
@@ -671,6 +692,10 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
 
       <!-- 操作 -->
       <div v-if="activeTab === 'actions'" class="tab-body">
+        <!-- 轻提示票 03：常驻提示行，让「每窝周期」优先于全局设置的能力被看见 -->
+        <p class="hint per-colony-hint">
+          同一操作各窝节奏不同时，编辑某个窝可单独设「每窝周期」，优先于此处的全局设置
+        </p>
         <div v-for="(row, index) in actionRows" :key="row.id ?? `new-${index}`" class="dict-row" :class="{ 'row-disabled': !row.enabled }">
           <span class="movers">
             <button type="button" :disabled="index === 0" @click="moveRow(actionRows, index, -1)">↑</button>
@@ -681,7 +706,7 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
             v-if="row.kind !== 'follow'"
             v-model="row.kind"
             class="kind-select"
-            :title="row.kind === 'reminding' ? '提醒类：超期标红并通知' : '仅登记：只记录，永不催促'"
+            :title="row.kind === 'reminding' ? '提醒类：超期标红并通知' : '仅登记：只记录，本页不催促；单个窝仍可在窝编辑里设周期提醒'"
           >
             <option value="reminding">提醒</option>
             <option value="log_only">仅登记</option>
@@ -1044,6 +1069,7 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         </div>
       </div>
 
+      <!-- 只剩字段级校验错误走这里（票 03 通道迁移）：非校验失败一律走轻提示 -->
       <p v-if="error && activeTab !== 'locations'" class="form-error">{{ error }}</p>
 
       <div class="dlg-btns close-row">
