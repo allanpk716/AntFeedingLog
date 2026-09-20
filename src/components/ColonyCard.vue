@@ -177,9 +177,11 @@ function onCheckinSaved() {
         :title="a.is_feeding && a.foods.length > 0 ? feedingTooltip(a.foods) : undefined"
         @click="onTile(a)"
       >
-        <span v-if="a.icon" class="t-ico">{{ a.icon }}</span>
-        <span class="t-name">{{ a.name }}</span>
-        <span v-if="a.kind === 'log_only'" class="t-tag">仅登记</span>
+        <span class="t-top">
+          <span v-if="a.icon" class="t-ico">{{ a.icon }}</span>
+          <span class="t-name">{{ a.name }}</span>
+          <span v-if="a.kind === 'log_only'" class="t-tag">仅登记</span>
+        </span>
         <span class="pill">{{ view.text }}</span>
       </button>
     </div>
@@ -278,6 +280,7 @@ function onCheckinSaved() {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap; /* 超长窝名/物种折行不截断（mock-d 治理，随变体 A 一并落地） */
 }
 
 .cname {
@@ -363,7 +366,9 @@ function onCheckinSaved() {
   color: var(--text);
 }
 
-/* ── 操作块：单行 chip，2 列（mock C1）── */
+/* ── 操作块：两行格（mock-d 变体 A）——上行名字/标签，下行状态。
+   单行两列在 ~117px 格宽装不下 0.5.0「距上次 N 天 / 周期 M 天」，实测溢出；
+   两行结构 + 药丸自然折行，零截断。2 列网格（mock C1）维持。 */
 .tiles {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -380,8 +385,8 @@ function onCheckinSaved() {
   font: inherit;
   color: var(--text);
   display: flex;
-  align-items: center;
-  gap: 6px;
+  flex-direction: column;
+  gap: 3px;
   font-size: 13px;
   transition: 0.12s;
   min-width: 0;
@@ -389,6 +394,15 @@ function onCheckinSaved() {
 
 .tile:hover {
   border-color: var(--accent);
+}
+
+/* 上行：图标 + 名字 + 仅登记标签；挤不下时标签折到名下，不截断 */
+.t-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex-wrap: wrap;
 }
 
 .tile .t-ico {
@@ -410,12 +424,14 @@ function onCheckinSaved() {
   white-space: nowrap;
 }
 
+/* 下行状态药丸：左对齐独立一行；长清单（该喂X、Y了）自然折行 */
 .pill {
-  margin-left: auto;
+  align-self: flex-start;
+  max-width: 100%;
   font-size: 11px;
   padding: 0 8px;
   border-radius: 999px;
-  white-space: nowrap;
+  white-space: normal;
 }
 
 .tile.reg .pill,

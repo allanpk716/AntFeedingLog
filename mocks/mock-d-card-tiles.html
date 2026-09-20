@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mock-d · 卡片操作块布局变体（原型，用完即弃）</title>
+<!--
+  ⚠ THROWAWAY PROTOTYPE（prototype 技能产物，决策后整体删除或挪走，绝不并入正式代码）
+  问题：主页窝卡片操作块单行两列（~117px/格）装不下 0.5.0 的「距上次 N 天 / 周期 M 天」，
+  内容溢出格子。用户裁定：不做省略号截断，从布局源头解决。
+  三个结构级变体，浮动条（或 ←/→ 键、URL #v=a|b|c）切换：
+    A 两行格   —— 格子内部上下两行：上行名字、下行状态；保持两列网格
+    B 整行列表 —— 每个操作占卡片整行；单列
+    C 紧凑单行 —— 保持现有单行两列，状态文案源头瘦身（数字优先，细节进 tooltip）
+  卡头（窝名/物种）溢出是另一处旧账：三个变体统一用「换行不截断」治，一并评审。
+  卡宽固定为最差情形 300px 上下（主页网格 minmax(300px,1fr) 多列时的下限）。
+  决议（2026-09-20）：A 落地——ColonyCard.vue 两行格 + 卡头 flex-wrap，真实组件 300px 卡
+  实测卡片/卡头/全部格子 0 溢出；C 实测仍溢 4~23px，单行两列装不下周期文案，留档为反面证据。
+-->
+<style>
+:root{
+  --bg:#f6f4f1; --card:#ffffff; --tile:#faf8f5; --text:#2c2822; --muted:#8f887d;
+  --border:#e8e2d8; --border-strong:#d8d1c4;
+  --accent:#d97706; --accent-deep:#b45309; --accent-soft:#fdf1de;
+  --ok:#188a4b; --ok-soft:#e7f5ec; --bad:#d13d3d; --bad-soft:#fcebeb;
+  --hib:#5b6472; --hib-soft:#eef0f3;
+  --shadow:0 1px 2px rgba(60,50,30,.05),0 4px 14px rgba(60,50,30,.06);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden}
+body{font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.55;display:flex;flex-direction:column}
+
+header{flex:none;background:var(--card);border-bottom:1px solid var(--border)}
+.hbar{max-width:960px;width:100%;margin:0 auto;padding:8px 20px;display:flex;align-items:center;gap:18px}
+.brand{font-size:16px;font-weight:700;white-space:nowrap}
+.today{font-size:12px;color:var(--muted);white-space:nowrap}
+.vhint{margin-left:auto;font-size:11px;color:var(--muted)}
+
+main{flex:1;overflow-y:auto;min-height:0}
+.wrap{max-width:960px;margin:0 auto;padding:14px 20px 80px}
+.group-title{font-size:13px;color:var(--muted);margin:4px 0 8px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
+
+/* ── 卡片外壳（各变体共用；卡头为「换行不截断」治理版） ── */
+.card{position:relative;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 12px;box-shadow:var(--shadow)}
+.card.hib{background:linear-gradient(180deg,var(--hib-soft),var(--card) 60%)}
+.chead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}       /* ★ 源头治理：允许折行 */
+.cname{font-size:15px;font-weight:700}
+.chip{font-size:11px;padding:0 8px;border-radius:999px;border:1px solid transparent;white-space:nowrap}
+.chip.sp{background:var(--accent-soft);color:var(--accent-deep)}
+.chip.st{background:var(--ok-soft);color:var(--ok)}
+.chip.st.hib{background:var(--hib-soft);color:var(--hib)}
+.daysbox{margin-left:auto;white-space:nowrap}
+.daysbox .n{font-size:16px;font-weight:800}
+.daysbox .l{font-size:10px;color:var(--muted)}
+.banner{margin-top:8px;padding:4px 10px;border-radius:8px;background:var(--hib-soft);color:var(--hib);font-size:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.chip.wake{background:var(--accent-soft);color:var(--accent-deep);font-weight:600}
+.foot{margin-top:8px;display:flex;align-items:center;gap:8px}
+.recent{flex:1;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dots{flex:none;border:none;background:transparent;color:var(--muted);font-size:16px;cursor:pointer;padding:0 4px}
+.cbtn-row{margin-top:10px;display:flex;justify-content:flex-end}
+.cbtn{border:1px solid var(--border-strong);background:var(--card);color:var(--muted);font:inherit;font-size:12px;padding:2px 12px;border-radius:8px;cursor:pointer}
+
+/* ── 状态药丸（各变体复用的着色） ── */
+.pill{font-size:11px;padding:0 8px;border-radius:999px;white-space:nowrap;display:inline-block}
+.pill.ok{background:var(--ok-soft);color:var(--ok)}
+.pill.bad{background:#fff;color:var(--bad);font-weight:600}
+.pill.reg,.pill.none{background:var(--tile);color:var(--muted)}
+.pill.mute{background:var(--hib-soft);color:var(--hib)}
+
+/* ════ 变体 A：两行格（上行名字 / 下行状态），保持两列 ════ */
+.va .tiles{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+.va .tile{border:1px solid var(--border);background:var(--tile);border-radius:9px;padding:5px 9px;cursor:pointer;font:inherit;color:var(--text);font-size:13px;display:flex;flex-direction:column;gap:3px;min-width:0}
+.va .tile:hover{border-color:var(--accent)}
+.va .t-top{display:flex;align-items:center;gap:6px;min-width:0;flex-wrap:wrap}  /* 「仅登记」标签挤不下时折到名下，不截断 */
+.va .t-ico{font-size:14px}
+.va .t-name{font-weight:600;white-space:nowrap}
+.va .t-tag{font-size:10px;font-weight:400;color:var(--muted);border:1px solid var(--border);padding:0 5px;border-radius:999px;white-space:nowrap}
+.va .pill{white-space:normal;align-self:flex-start;max-width:100%}  /* 长食物清单允许自然折行，不截断 */
+.va .tile.bad{border-color:var(--bad);background:var(--bad-soft)}
+
+/* ════ 变体 B：整行列表，单列 ════ */
+.vb .tiles{display:flex;flex-direction:column;gap:5px;margin-top:8px}
+.vb .tile{border:1px solid var(--border);background:var(--tile);border-radius:9px;padding:5px 9px;cursor:pointer;font:inherit;color:var(--text);font-size:13px;display:flex;align-items:center;gap:6px;min-width:0}
+.vb .tile:hover{border-color:var(--accent)}
+.vb .t-ico{font-size:14px}
+.vb .t-name{font-weight:600;white-space:nowrap}
+.vb .t-tag{font-size:10px;font-weight:400;color:var(--muted);border:1px solid var(--border);padding:0 5px;border-radius:999px;white-space:nowrap}
+.vb .pill{margin-left:auto}
+.vb .tile.bad{border-color:var(--bad);background:var(--bad-soft)}
+
+/* ════ 变体 C：紧凑单行（保两列），状态文案源头瘦身 ════ */
+.vc .tiles{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+.vc .tile{border:1px solid var(--border);background:var(--tile);border-radius:9px;padding:5px 7px;cursor:pointer;font:inherit;color:var(--text);font-size:13px;display:flex;align-items:center;gap:4px;min-width:0}
+.vc .tile:hover{border-color:var(--accent)}
+.vc .t-name{font-weight:600;white-space:nowrap;font-size:12.5px}
+.vc .pill{margin-left:auto;padding:0 6px;font-size:10.5px}
+.vc .tile.bad{border-color:var(--bad);background:var(--bad-soft)}
+.vc .t-tag{display:none}  /* 「仅登记」让位：进 title 提示，不上屏 */
+
+/* ── 浮动变体切换条（原型专属，非设计一部分） ── */
+.switcher{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);display:flex;align-items:center;gap:10px;background:#2c2822;color:#fff;border-radius:999px;padding:6px 14px;box-shadow:0 8px 30px rgba(0,0,0,.35);z-index:99;font-size:13px}
+.switcher button{border:none;background:#fff;color:#2c2822;border-radius:999px;width:26px;height:26px;cursor:pointer;font-size:14px;line-height:1}
+.switcher .vlabel{min-width:120px;text-align:center;font-weight:600}
+.switcher .q{font-size:11px;opacity:.75}
+</style>
+</head>
+<body>
+
+<header><div class="hbar">
+  <span class="brand">🐜 蚂蚁饲养记录</span>
+  <span class="today">2026-09-20 周日</span>
+  <span class="vhint">卡宽 = 主页网格最差情形（~300px）；←/→ 键或按钮切换变体</span>
+</div></header>
+
+<main><div class="wrap">
+  <p class="group-title">家 · 3 窝</p>
+  <div class="cards" id="cards"></div>
+</div></main>
+
+<div class="switcher">
+  <button id="prev" type="button" title="上一个变体">←</button>
+  <span class="vlabel" id="vlabel"></span>
+  <button id="next" type="button" title="下一个变体">→</button>
+  <span class="q">原型 · 用完即弃</span>
+</div>
+
+<script>
+/* ── 演示数据：覆盖会撑爆格子的全部真实状态 ──
+   c1：0.5.0 触发情形（周期后缀）+ 多食物超期 + 撤食逾期 —— 最坏内容
+   c2：超长窝名/物种（卡头旧账）+ 冬眠静音 + 周期后缀叠加
+   c3：全新窝，全部「尚未记录」 */
+const COLONIES = [
+  {
+    name:"大头一号", species:"大头收获蚁", status:"active", days:234, hib:false,
+    actions:[
+      {ico:"🍞", name:"喂食",        tag:"",  pill:"⚠ 该喂干虾仁、面包虫了", tone:"bad",   title:"距上次：干虾仁 9 天（超期 2 天）、面包虫 4 天（超期 1 天）、种子 2 天"},
+      {ico:"💧", name:"活动区换水",  tag:"仅登记", pill:"距上次 2 天",           tone:"reg"},
+      {ico:"💦", name:"巢穴保湿",    tag:"仅登记", pill:"距上次 4 天",           tone:"reg"},
+      {ico:"🗑", name:"垃圾清理",    tag:"",  pill:"距上次 3 天 / 周期 7 天", tone:"ok"},
+      {ico:"🥢", name:"撤食",        tag:"",  pill:"⚠ 该撤食了",               tone:"bad"},
+    ],
+    recent:"最近：09-18 喂食 · 干虾仁、面包虫",
+  },
+  {
+    name:"针毛收获蚁二号窝（公司窗台）", species:"针毛收获蚁·卡什米尔种群", status:"hibernating", days:511, hib:true,
+    banner:"❄ 冬眠中 · 预计 2027-03-15 出眠",
+    actions:[
+      {ico:"🍞", name:"喂食",        tag:"",  pill:"距上次 12 天（静音）",            tone:"mute"},
+      {ico:"💧", name:"活动区换水",  tag:"仅登记", pill:"距上次 12 天（静音）",      tone:"mute"},
+      {ico:"💦", name:"巢穴保湿",    tag:"仅登记", pill:"距上次 15 天（静音）",      tone:"mute"},
+      {ico:"🗑", name:"垃圾清理",    tag:"",  pill:"距上次 6 天 / 周期 10 天（静音）", tone:"mute"},
+      {ico:"🥢", name:"撤食",        tag:"",  pill:"无待撤",                          tone:"mute"},
+    ],
+    recent:"最近：09-08 垃圾清理",
+  },
+  {
+    name:"新生窝", species:"", status:"active", days:3, hib:false,
+    actions:[
+      {ico:"🍞", name:"喂食",        tag:"",  pill:"尚未记录", tone:"none"},
+      {ico:"💧", name:"活动区换水",  tag:"仅登记", pill:"尚未记录", tone:"none"},
+      {ico:"💦", name:"巢穴保湿",    tag:"仅登记", pill:"尚未记录", tone:"none"},
+      {ico:"🗑", name:"垃圾清理",    tag:"",  pill:"尚未记录", tone:"none"},
+      {ico:"🥢", name:"撤食",        tag:"",  pill:"无待撤",   tone:"none"},
+    ],
+    recent:"暂无记录",
+  },
+];
+
+/* 变体 C 的状态文案瘦身表：数字优先，细节进 title（喂食多食物、仅登记性质） */
+const C_COPY = {
+  "⚠ 该喂干虾仁、面包虫了":{t:"⚠ 该喂 2 种", title:"超期：干虾仁 9 天、面包虫 4 天"},
+  "距上次 3 天 / 周期 7 天":{t:"3天 · 周期7天", title:"距上次 3 天；本窝周期 7 天"},
+  "距上次 6 天 / 周期 10 天（静音）":{t:"6天 · 周期10天", title:"距上次 6 天；本窝周期 10 天；冬眠静音"},
+  "距上次 2 天":{t:"已 2 天"},
+  "距上次 4 天":{t:"已 4 天"},
+  "距上次 12 天（静音）":{t:"已 12 天 · 静音"},
+  "距上次 15 天（静音）":{t:"已 15 天 · 静音"},
+  "⚠ 该撤食了":{t:"⚠ 该撤食了"},
+  "无待撤":{t:"无待撤"},
+  "尚未记录":{t:"未记录"},
+};
+
+const VARIANTS = [
+  {key:"a", label:"A · 两行格", cls:"va"},
+  {key:"b", label:"B · 整行列表", cls:"vb"},
+  {key:"c", label:"C · 紧凑单行", cls:"vc"},
+];
+
+function tilesHTML(c, v){
+  return c.actions.map(a=>{
+    const tag = a.tag ? `<span class="t-tag">${a.tag}</span>` : "";
+    const cTitle = v.key==="c" ? ` title="${(C_COPY[a.pill]?.title||a.title||"") + (a.tag?"；仅登记":"")}"` : (a.title?` title="${a.title}"`:"");
+    if(v.key==="a"){
+      return `<button class="tile ${a.tone}" type="button"${cTitle}>
+        <span class="t-top"><span class="t-ico">${a.ico}</span><span class="t-name">${a.name}</span>${tag}</span>
+        <span class="pill ${a.tone}">${a.pill}</span></button>`;
+    }
+    if(v.key==="b"){
+      return `<button class="tile ${a.tone}" type="button"${cTitle}>
+        <span class="t-ico">${a.ico}</span><span class="t-name">${a.name}</span>${tag}
+        <span class="pill ${a.tone}">${a.pill}</span></button>`;
+    }
+    /* C：瘦身后文案 */
+    const cp = C_COPY[a.pill]?.t ?? a.pill;
+    return `<button class="tile ${a.tone}" type="button"${cTitle}>
+      <span class="t-name">${a.name}</span><span class="pill ${a.tone}">${cp}</span></button>`;
+  }).join("");
+}
+
+function cardHTML(c, v){
+  const stText = c.status==="active" ? "活跃" : "冬眠";
+  return `<article class="card ${c.hib?"hib":""}">
+    <div class="chead">
+      <span class="cname">${c.name}</span>
+      ${c.species?`<span class="chip sp">${c.species}</span>`:""}
+      <span class="chip st ${c.hib?"hib":""}">${stText}</span>
+      <span class="daysbox"><span class="n">${c.days}</span> <span class="l">天</span></span>
+    </div>
+    ${c.banner?`<div class="banner">${c.banner}<span class="chip wake">临近出眠</span></div>`:""}
+    <div class="tiles">${tilesHTML(c,v)}</div>
+    <div class="foot"><span class="recent">${c.recent}</span><button class="dots" type="button">⋯</button></div>
+    <div class="cbtn-row"><button class="cbtn" type="button">巢况</button></div>
+  </article>`;
+}
+
+let cur = Math.max(0, VARIANTS.findIndex(v=>v.key===(location.hash||"").replace("#v=","")));
+function render(){
+  const v = VARIANTS[cur];
+  document.getElementById("cards").className = `cards ${v.cls}`;
+  document.getElementById("cards").innerHTML = COLONIES.map(c=>cardHTML(c,v)).join("");
+  document.getElementById("vlabel").textContent = v.label;
+  location.hash = "#v="+v.key;
+}
+document.getElementById("prev").onclick = ()=>{cur=(cur+VARIANTS.length-1)%VARIANTS.length;render()};
+document.getElementById("next").onclick = ()=>{cur=(cur+1)%VARIANTS.length;render()};
+document.addEventListener("keydown",e=>{
+  if(e.target.matches("input,textarea,[contenteditable]"))return;
+  if(e.key==="ArrowLeft")document.getElementById("prev").click();
+  if(e.key==="ArrowRight")document.getElementById("next").click();
+});
+render();
+</script>
+</body>
+</html>
