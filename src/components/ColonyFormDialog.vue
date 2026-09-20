@@ -353,6 +353,7 @@ async function remove() {
               inputmode="numeric"
               placeholder="未设"
               aria-label="巢穴保湿的每窝周期（天）"
+              @input="hydrationPrefill = null"
             />
             <span class="interval-unit">天</span>
           </template>

@@ -467,6 +467,24 @@ describe("保湿方式：新建（D3 随建随落，create_colony 原子）", ()
     expect((hydrationInput(w).element as HTMLInputElement).value).toBe("15");
   });
 
+  it("规则 3：手工改过的天数 → 切换方式不覆盖（新建同款），保存载荷带手工值", async () => {
+    const w = await mountCreate();
+
+    await pickMethod(w, "manual");
+    expect((hydrationInput(w).element as HTMLInputElement).value).toBe("7");
+    await hydrationInput(w).setValue("9");
+    await pickMethod(w, "tower");
+    expect((hydrationInput(w).element as HTMLInputElement).value).toBe("9");
+
+    await w.find("input.name-input").setValue("新窝");
+    await w.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    const input = colonyInputPayload(w, "create_colony");
+    expect(input.hydration_method).toBe("tower");
+    expect(input.interval_changes).toEqual([{ action_id: 15, interval_days: 9 }]);
+  });
+
   it("保湿天数非法同样被整组校验拦下（不落库）", async () => {
     const w = await mountCreate();
 
