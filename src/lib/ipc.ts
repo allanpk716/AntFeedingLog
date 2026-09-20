@@ -335,7 +335,16 @@ export const setColonyActionInterval = cmdFn<
 // ── 记账（ColonyCard → FeedDialog / QuickLogDialog）──
 
 export const listFoods = cmdFn<void, FoodItem[]>("list_foods");
-export const logCare = cmdFn<{ input: CareLogInput }, void>("log_care");
+/** alsoRetrieval = 垃圾清理顺带撤食（ADR 0006）：true 时后端同事务再插一条
+ *  同时刻撤食记录（面板勾选行，见 QuickLogDialog）。 */
+export const logCare = cmdFn<{ input: CareLogInput; alsoRetrieval?: boolean }, void>("log_care");
+/** 垃圾清理面板的顺带撤食联动三态（ADR 0006）：none=不可附带 / pending=可附带
+ *  未到期（默认不勾）/ overdue=已到期（默认勾）；at = 面板所选发生时刻。 */
+export type RetrievalLinkState = "none" | "pending" | "overdue";
+export const retrievalLinkState = cmdFn<
+  { colonyId: number; at: string },
+  RetrievalLinkState
+>("retrieval_link_state");
 
 // ── 巢况登记（webui-checkin 票 02；时间线弹窗 NestCheckinDialog）──
 

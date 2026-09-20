@@ -115,14 +115,28 @@ fn log_care(
     state: tauri::State<'_, DbState>,
     app: tauri::AppHandle,
     input: care::CareLogInput,
+    also_retrieval: Option<bool>,
 ) -> Result<i64, String> {
-    let result = with_conn(state, |conn| care::log_care(conn, &input, &care::now_local()));
+    let result = with_conn(state, |conn| {
+        care::log_care_linked(conn, &input, also_retrieval.unwrap_or(false), &care::now_local())
+    });
     // 停靠 C：数据变了 → 托盘 tooltip 即时重算（在锁释放后调用，避免自锁）
     reminder::refresh_tray_tooltip(&app);
     if result.is_ok() {
         trigger_after_write(&app); // 票 03：业务写入成功 → 自动备份触发点
     }
     result
+}
+
+/// 垃圾清理打卡面板的顺带撤食联动判定（ADR 0006）：给定面板所选发生时刻，
+/// 返回 none / pending / overdue（撤食停用不影响判定，只影响提交侧可用性）。
+#[tauri::command]
+fn retrieval_link_state(
+    state: tauri::State<DbState>,
+    colony_id: i64,
+    at: String,
+) -> Result<String, String> {
+    with_conn(state, |conn| care::retrieval_link_state(conn, colony_id, &at))
 }
 
 #[tauri::command]
@@ -1699,6 +1713,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             health_check,
             log_care,
+            retrieval_link_state,
             list_foods,
             list_logs,
             colony_month_records,

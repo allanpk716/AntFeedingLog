@@ -125,6 +125,100 @@ describe("QuickLogDialog", () => {
   });
 });
 
+describe("顺带撤食（ADR 0006：仅垃圾清理面板、有待撤时出行）", () => {
+  const trashAction: ColonyAction = {
+    action_id: 4, name: "垃圾清理", icon: null, kind: "reminding", is_feeding: false,
+    suggested_interval_days: null, interval_from_colony: true, effective_interval_days: 7,
+    days_since_last: 3, overdue: false, foods: [], implies_retrieval: true,
+  };
+
+  function mountTrash(link: "none" | "pending" | "overdue") {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "colony_month_records" ? []
+      : cmd === "list_actions" ? allActions
+      : cmd === "retrieval_link_state" ? link
+      : cmd === "log_care" ? 9
+      : null,
+    );
+    return mount(QuickLogDialog, {
+      props: { colony: { ...colony, actions: [trashAction, retrievalAction] }, action: trashAction },
+    });
+  }
+
+  function logCareArgs() {
+    const call = invokeMock.mock.calls.find(([cmd]) => cmd === "log_care");
+    return call![1] as { input: Record<string, unknown>; alsoRetrieval?: boolean };
+  }
+
+  it("已逾期：勾选行出现且默认勾选，提交带 alsoRetrieval=true，提示已到撤食时间", async () => {
+    const w = await mountTrash("overdue");
+    await flushPromises();
+    const row = w.find('[data-testid="retrieval-link"]');
+    expect(row.exists()).toBe(true);
+    expect((row.find("input[type=checkbox]").element as HTMLInputElement).checked).toBe(true);
+    expect(row.text()).toContain("已到撤食时间");
+    await w.find(".record-btn").trigger("click");
+    await flushPromises();
+    expect(logCareArgs().alsoRetrieval).toBe(true);
+  });
+
+  it("未到期：行出现默认不勾，手动勾上后提交 alsoRetrieval=true", async () => {
+    const w = await mountTrash("pending");
+    await flushPromises();
+    const box = w.find('[data-testid="retrieval-link"] input[type=checkbox]');
+    expect((box.element as HTMLInputElement).checked).toBe(false);
+    expect(w.find('[data-testid="retrieval-link"]').text()).toContain("未到撤食间隔");
+    await box.setValue(true);
+    await w.find(".record-btn").trigger("click");
+    await flushPromises();
+    expect(logCareArgs().alsoRetrieval).toBe(true);
+  });
+
+  it("无待撤（none）：不出行、不调判定外的联动，提交 alsoRetrieval=false", async () => {
+    const w = await mountTrash("none");
+    await flushPromises();
+    expect(w.find('[data-testid="retrieval-link"]').exists()).toBe(false);
+    await w.find(".record-btn").trigger("click");
+    await flushPromises();
+    expect(logCareArgs().alsoRetrieval).toBe(false);
+  });
+
+  it("非 linkage 操作（换水）：不调 retrieval_link_state、不出行", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "colony_month_records" ? [] : cmd === "list_actions" ? allActions : cmd === "log_care" ? 10 : null,
+    );
+    const w = mountDlg(); // 默认 action = 活动区换水（无旗标）
+    await flushPromises();
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "retrieval_link_state")).toBe(false);
+    expect(w.find('[data-testid="retrieval-link"]').exists()).toBe(false);
+  });
+
+  it("改时间重拉判定；态变化（pending→overdue）默认勾重新生效", async () => {
+    let link: "pending" | "overdue" = "pending";
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "colony_month_records" ? []
+      : cmd === "list_actions" ? allActions
+      : cmd === "retrieval_link_state" ? link
+      : cmd === "log_care" ? 11
+      : null,
+    );
+    const w = mount(QuickLogDialog, {
+      props: { colony: { ...colony, actions: [trashAction, retrievalAction] }, action: trashAction },
+    });
+    await flushPromises();
+    expect((w.find('[data-testid="retrieval-link"] input[type=checkbox]').element as HTMLInputElement).checked).toBe(false);
+
+    // 改时间 → 用新时刻重拉；判定翻成 overdue → 默认勾重新套用
+    link = "overdue";
+    await w.findComponent(DateTimeField).vm.$emit("update:modelValue", "2026-09-18T21:30");
+    await flushPromises();
+    const calls = invokeMock.mock.calls.filter(([cmd]) => cmd === "retrieval_link_state");
+    expect(calls.length).toBe(2); // 开面板一次 + 改时间一次
+    expect((calls[1][1] as { at: string }).at).toBe("2026-09-18T21:30");
+    expect((w.find('[data-testid="retrieval-link"] input[type=checkbox]').element as HTMLInputElement).checked).toBe(true);
+  });
+});
+
 describe("重复提醒（交互第三轮 #8）", () => {
   it("选中日已有同操作记录 → 黄条提醒，但仍可提交", async () => {
     invokeMock.mockImplementation(async (cmd: string) => {

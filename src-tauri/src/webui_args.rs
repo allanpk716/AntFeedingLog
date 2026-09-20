@@ -225,9 +225,12 @@ impl ValidatedArgs for ColonyMonthRecordsArgs {
 // ── 打卡：log_care ───────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LogCareArgs {
     pub input: CareLogInputArgs,
+    /// 垃圾清理顺带撤食（ADR 0006）：与桌面命令顶参数同名同义（camelCase）
+    #[serde(default)]
+    pub also_retrieval: bool,
 }
 
 impl ValidatedArgs for LogCareArgs {
@@ -271,6 +274,24 @@ impl CareLogInputArgs {
 }
 
 // ── 历史：list_logs / update_log / delete_log ────────────────────────────
+
+/// `retrieval_link_state`（垃圾清理顺带撤食联动判定，ADR 0006）：
+/// colonyId + 面板所选发生时刻；形状校验与纯核 normalize 权威分层同 LogCareArgs。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetrievalLinkStateArgs {
+    pub colony_id: i64,
+    pub at: String,
+}
+
+impl ValidatedArgs for RetrievalLinkStateArgs {
+    fn validate(&self) -> Result<(), String> {
+        check_id(self.colony_id, "colonyId")?;
+        check_happened_at(&self.at)?;
+        Ok(())
+    }
+}
+
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -665,6 +686,42 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("最多挂"), "实际：{err}");
+    }
+
+    #[test]
+    fn log_care_accepts_optional_also_retrieval_flag() {
+        // ADR 0006：顶参数 camelCase，缺省 false（不带联动 = 原行为逐字节不变）
+        let a = checked::<LogCareArgs>(&json!({
+            "input": {"colony_id": 1, "action_id": 4, "happened_at": "2026-09-19 09:00"}
+        }))
+        .unwrap();
+        assert!(!a.also_retrieval);
+        let a = checked::<LogCareArgs>(&json!({
+            "input": {"colony_id": 1, "action_id": 4, "happened_at": "2026-09-19 09:00"},
+            "alsoRetrieval": true
+        }))
+        .unwrap();
+        assert!(a.also_retrieval);
+    }
+
+    #[test]
+    fn retrieval_link_state_args_shape_validation() {
+        // ADR 0006：colonyId + 面板所选时刻；形状校验与 LogCareArgs 的发生时间同口径
+        let a = checked::<RetrievalLinkStateArgs>(&json!({"colonyId": 2, "at": "2026-09-19T21:30"}))
+            .unwrap();
+        assert_eq!(a.colony_id, 2);
+        assert_eq!(a.at, "2026-09-19T21:30");
+
+        let err = checked::<RetrievalLinkStateArgs>(&json!({"colonyId": 0, "at": "2026-09-19"}))
+            .unwrap_err();
+        assert_eq!(err, "colonyId 必须是正整数（收到 0）");
+        let err = checked::<RetrievalLinkStateArgs>(&json!({"colonyId": 2, "at": "垃圾"}))
+            .unwrap_err();
+        assert!(err.contains("发生时间"), "实际：{err}");
+        // 未知字段照旧拒绝
+        let err = checked::<RetrievalLinkStateArgs>(&json!({"colonyId": 2, "at": "2026-09-19", "bogus": 1}))
+            .unwrap_err();
+        assert_eq!(err, "参数包含未知字段：bogus");
     }
 
     #[test]

@@ -37,6 +37,10 @@ export interface ColonyAction {
   effective_interval_days?: number | null;
   /** true = 该窝设了每窝周期（此时 effective_interval_days 即原始每窝周期值）；缺省 = 未设 */
   interval_from_colony?: boolean;
+  /** 垃圾清理顺带撤食旗标（ADR 0006，schema v10 implies_retrieval）：true = 该
+   *  操作的打卡面板可附带撤食。仅预置「垃圾清理」为 true；可选为旧测试载荷兜底，
+   *  真实 IPC 恒有值。 */
+  implies_retrieval?: boolean;
   /** 今天 − 最近一次发生日期（自然日）；从未记录为 null */
   days_since_last: number | null;
   /** 操作层超期（Rust is_overdue_effective）：设了每窝周期 = 严格大于有效周期（设了即提醒，

@@ -5,9 +5,13 @@
  * 喂食不弹这里（FeedDialog 自带食物多选）。后端 log_care 已拒未来时间。
  * 交互第三轮：换 DateTimeField（标记日历：橙点=当前操作/灰点=其它/悬停明细）+
  * 选中日已有同操作记录出黄条（不拦提交）。
+ * 顺带撤食（ADR 0006）：仅 implies_retrieval 操作（预置「垃圾清理」）出行——
+ * 已逾期默认勾、未到期默认不勾、无待撤/所选时刻早于易腐喂食不出行；
+ * 态随所选时刻动态重算，态变化才重置勾选（用户改过且态没变时不打扰）。
  */
 import { computed, onMounted, ref, watch } from "vue";
-import { colonyMonthRecords, listActions, logCare } from "../lib/ipc";
+import { colonyMonthRecords, listActions, logCare, retrievalLinkState } from "../lib/ipc";
+import type { RetrievalLinkState } from "../lib/ipc";
 import type { CareActionItem, Colony, ColonyAction, MonthDayRecords } from "../types";
 import { nowLocalDateTime } from "../lib/care";
 import { todayIso } from "../lib/dates";
@@ -63,6 +67,34 @@ watch(
   },
 );
 
+// ── 顺带撤食（ADR 0006）──────────────────────────────────────────────
+const linkState = ref<RetrievalLinkState>("none");
+const alsoRetrieval = ref(false);
+let linkSeq = 0;
+let lastApplied: RetrievalLinkState | null = null;
+
+const linkEligible = computed(() => props.action.implies_retrieval === true);
+const linkVisible = computed(() => linkEligible.value && linkState.value !== "none");
+
+async function refreshLink() {
+  if (!linkEligible.value) return;
+  const seq = ++linkSeq;
+  try {
+    const state = await retrievalLinkState({ colonyId: props.colony.id, at: time.value });
+    if (seq !== linkSeq) return; // 过期响应丢弃（快速改时间的竞态）
+    linkState.value = state;
+    if (state !== lastApplied) {
+      // 默认值只在态变化时重置：逾期勾、未到期不勾；态没变时保留用户手选
+      alsoRetrieval.value = state === "overdue";
+      lastApplied = state;
+    }
+  } catch {
+    if (seq === linkSeq) linkState.value = "none"; // 判定是增强：失败不出行，提交侧后端权威
+  }
+}
+onMounted(() => void refreshLink());
+watch(time, () => void refreshLink());
+
 /** DatePickerPop/DateTimeField 的 month 事件 → 拉该月数据（显式类型，模板内联箭头在 vue-tsc 下推断不稳） */
 function onMonth(view: { year: number; month: number }) {
   void loadMonth(view.year, view.month);
@@ -94,6 +126,7 @@ async function submit() {
         note: note.value.trim() === "" ? null : note.value.trim(),
         food_ids: [],
       },
+      alsoRetrieval: linkVisible.value && alsoRetrieval.value,
     });
     emit("saved");
   } catch (e) {
@@ -112,6 +145,12 @@ async function submit() {
       <div class="field-label">时间（默认现在，可补录）</div>
       <DateTimeField v-model="time" :markers="markers" @month="onMonth" />
       <p v-if="dupText !== ''" class="dup-warn">⚠ {{ dupText }}<span class="why">确属再次操作可直接记录</span></p>
+
+      <label v-if="linkVisible" class="link-row" data-testid="retrieval-link">
+        <input v-model="alsoRetrieval" type="checkbox" />
+        <span>顺带撤走易腐食物</span>
+        <span class="link-hint">{{ linkState === "overdue" ? "已到撤食时间" : "未到撤食间隔" }}</span>
+      </label>
 
       <div class="field-label">备注（可选）</div>
       <textarea v-model="note" class="note-input" placeholder="如：顺手检查了垃圾区"></textarea>
@@ -177,6 +216,15 @@ async function submit() {
   font-size: 12px; display: flex; gap: 6px; align-items: baseline;
 }
 .dup-warn .why { margin-left: auto; font-size: 11px; opacity: 0.8; white-space: nowrap; }
+
+/* 顺带撤食勾选行（ADR 0006）：仅垃圾清理面板、有待撤时出现 */
+.link-row {
+  margin-top: 10px; padding: 7px 10px; border-radius: 9px;
+  background: var(--tile); border: 1px solid var(--border);
+  font-size: 13px; display: flex; align-items: center; gap: 8px; cursor: pointer;
+}
+.link-row input { accent-color: var(--accent); }
+.link-hint { margin-left: auto; font-size: 11px; color: var(--muted); white-space: nowrap; }
 
 .dialog textarea {
   height: 56px;

@@ -491,6 +491,7 @@ pub const WEBUI_COMMANDS: &[&str] = &[
     "list_actions",
     "list_foods",
     "log_care",
+    "retrieval_link_state",
     "colony_month_records",
     // 历史记录：查 / 改 / 删
     "list_logs",
@@ -609,7 +610,22 @@ pub fn dispatch_command(
             deps,
             args,
             true,
-            |conn, a: webui_args::LogCareArgs| crate::care::log_care(conn, &a.input.into_core(), &crate::care::now_local()),
+            |conn, a: webui_args::LogCareArgs| {
+                crate::care::log_care_linked(
+                    conn,
+                    &a.input.into_core(),
+                    a.also_retrieval,
+                    &crate::care::now_local(),
+                )
+            },
+        )),
+        // 垃圾清理顺带撤食联动判定（ADR 0006）：纯读，与卡片撤食三态同一派生源
+        "retrieval_link_state" => Some(read_cmd(
+            deps,
+            args,
+            |conn, a: webui_args::RetrievalLinkStateArgs| {
+                crate::care::retrieval_link_state(conn, a.colony_id, &a.at)
+            },
         )),
         "colony_month_records" => Some(read_cmd(
             deps,

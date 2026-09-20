@@ -1747,6 +1747,7 @@ mod tests {
             overdue,
             foods: vec![],
             retrieval_state: "none".into(), // 票 02 新字段；托盘概要测试用不到三态
+            implies_retrieval: false,        // ADR 0006 新字段；提醒引擎不消费
         }
     }
 
@@ -1859,6 +1860,7 @@ mod tests {
             overdue: false,
             foods: vec![],
             retrieval_state: retrieval_state.into(),
+            implies_retrieval: false,
         }
     }
 

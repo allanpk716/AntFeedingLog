@@ -33,7 +33,9 @@ use rusqlite::{params, Connection};
 /// v9：每窝周期（每窝周期票 01，spec D1）——只加一张 colony_action_interval
 ///     （窝 × 操作 → 周期天数，CHECK 1..365，复合主键），不预置任何行；
 ///     外键沿库内惯例裸 REFERENCES、应用层守卫。读写命令见 colony.rs，本版只建表。
-pub const SCHEMA_VERSION: i64 = 9;
+/// v10：垃圾清理顺带撤食（ADR 0006）——care_action 加 implies_retrieval 标记位，
+///     迁移只给预置「垃圾清理」置 1（锚点：名字或 预置+reminding+非喂食）。
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -127,6 +129,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             // 存量基线只属于"升级库"：全新安装从 v0 起步，不写 retrieval_baseline_at（F4）
             7 => migrate_v7_to_v8(conn, start == 0)?,
             8 => migrate_v8_to_v9(conn)?,
+            9 => migrate_v9_to_v10(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -453,6 +456,40 @@ fn migrate_v8_to_v9(conn: &Connection) -> Result<(), rusqlite::Error> {
     tx.commit()
 }
 
+/// v10（垃圾清理顺带撤食，ADR 0006）：`care_action.implies_retrieval` 标记位——
+/// 该操作的打卡面板可附带撤食。只落在预置「垃圾清理」上。锚点双保险：
+/// `name='垃圾清理'` 或（预置 且 reminding 且 非喂食）——后者兜住已改名的情形
+/// （预置五操作里 reminding+非喂食只有垃圾清理一个）；已知边界：改名后又把
+/// 性质切成登记类的迁移不中，联动静默关闭（撤食打卡照常可用，可接受）。
+/// 列已存在则跳过 ALTER（幂等：防降版本打开后再升级的重复加列）。
+fn migrate_v9_to_v10(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_col = {
+        let mut stmt = conn.prepare("PRAGMA table_info(care_action)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == "implies_retrieval" {
+                found = true;
+            }
+        }
+        found
+    };
+    let tx = conn.unchecked_transaction()?;
+    if !has_col {
+        tx.execute(
+            "ALTER TABLE care_action ADD COLUMN implies_retrieval INTEGER NOT NULL DEFAULT 0 CHECK (implies_retrieval IN (0, 1))",
+            [],
+        )?;
+    }
+    tx.execute(
+        "UPDATE care_action SET implies_retrieval = 1
+         WHERE is_preset = 1 AND (name = '垃圾清理' OR (kind = 'reminding' AND is_feeding = 0))",
+        [],
+    )?;
+    tx.pragma_update(None, "user_version", 10)?;
+    tx.commit()
+}
+
 /// v1 预置数据：四操作（喂食/活动区换水/巢穴保湿/垃圾清理）、三食物、两地点、五项设置默认值。
 /// pub(crate)：restore.rs 的旧 schema 备份测试要搭真实 v1 库（票 04 验收 3）。
 pub(crate) fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -649,7 +686,7 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 9);
+        assert_eq!(SCHEMA_VERSION, 10);
     }
 
     /// 按真实迁移函数链手工搭到 v7 的库（票 01 v8 迁移测试地基；含 webui-checkin
@@ -1071,6 +1108,38 @@ mod tests {
     }
 
     #[test]
+    fn v10_flags_trash_cleanup_by_kind_anchor_after_rename() {
+        // v9→v10：implies_retrieval 只落预置「垃圾清理」。改名后按
+        // 预置+reminding+非喂食 兜底锚中；其他预置/自建项不误标。
+        // （预置五操作里 reminding+非喂食只有垃圾清理一个，不歧义）
+        let (conn, _tmp) = fresh_conn();
+        conn.execute("UPDATE care_action SET name = '清垃圾' WHERE name = '垃圾清理'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO care_action (name, kind, is_feeding, enabled, is_preset, sort)
+             VALUES ('降温', 'reminding', 0, 1, 0, 9)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+        let flagged: i64 = conn
+            .query_row("SELECT implies_retrieval FROM care_action WHERE name = '清垃圾'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(flagged, 1, "改名后按 kind 锚点仍置位");
+        let others: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM care_action WHERE implies_retrieval = 1 AND name != '清垃圾'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(others, 0, "自建 reminding 操作与其余预置不误标");
+    }
+
+    #[test]
     fn v7_upgrade_preserves_rows_and_backfills_perishable_presets() {
         // 真实 v6 库：历史记录 + 台账 + 自建操作/食物齐全，升 v7 后数据原样、
         // 预置食物按名回填易腐 24h、撤食预置插入且其余顺延（票 01 验收 1）
@@ -1379,6 +1448,19 @@ mod tests {
                 .iter()
                 .find(|(n, _)| n == name)
                 .unwrap_or_else(|| panic!("升级后旧对象 {name} 消失"));
+            if name == "care_action" {
+                // v10（ADR 0006）合法改动：ALTER 追加 implies_retrieval 列——
+                // SQLite 的 ALTER ADD COLUMN 会把新列拼在 DDL 尾部，逐字符比对
+                // 必不等，改为断言「旧列序原样 + 新列追加」
+                let old_sql = sql.as_deref().unwrap_or("");
+                let new_sql = found.1.as_deref().unwrap_or("");
+                assert!(
+                    new_sql.starts_with(old_sql.trim_end_matches(')')),
+                    "care_action 旧列序被改动：{new_sql}"
+                );
+                assert!(new_sql.contains("implies_retrieval"), "care_action 未追加 implies_retrieval：{new_sql}");
+                continue;
+            }
             assert_eq!(found.1, *sql, "旧对象 {name} 的 DDL 被改动");
         }
         let new_names: Vec<&str> = after

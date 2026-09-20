@@ -80,6 +80,9 @@ pub struct ActionTile {
     /// （正常可点）/ `overdue`=已超到期时刻（前端红）。仅 kind=follow（撤食）块
     /// 非 "none"；不占用 days_since/overdue 通道（follow 的 overdue 恒 false）。
     pub retrieval_state: String,
+    /// 垃圾清理顺带撤食标记（ADR 0006，schema v10 implies_retrieval）：
+    /// true = 该操作的打卡面板可附带撤食（仅预置「垃圾清理」）。
+    pub implies_retrieval: bool,
 }
 
 impl ActionTile {
@@ -204,6 +207,20 @@ fn db_err(e: rusqlite::Error) -> String {
 /// 记一笔：插入 care_log（occurred_at 规整后落库，created_at = now），喂食多选食物
 /// 写 log_food，与主记录同事务，任一失败整体回滚。返回新记录 id。
 pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i64, String> {
+    log_care_linked(conn, input, false, now)
+}
+
+/// [`log_care`] 的顺带撤食版（ADR 0006，垃圾清理打卡面板用）：
+/// `also_retrieval` = true 时同事务再插一条撤食（follow）记录——同一发生
+/// 时刻、备注自动「随{操作名}一并撤除」。守卫：操作必须带 implies_retrieval
+/// 旗标；撤食停用 = 联动不可用（_err）；所选发生时刻必须真清得掉待撤
+/// （晚于或同刻于基准易腐喂食），否则 _err 不落库。
+pub fn log_care_linked(
+    conn: &Connection,
+    input: &CareLogInput,
+    also_retrieval: bool,
+    now: &str,
+) -> Result<i64, String> {
     let colony_exists: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM colony WHERE id = ?1",
@@ -215,11 +232,11 @@ pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i6
         return Err("窝不存在".into());
     }
 
-    let (action_name, enabled, is_feeding): (String, i64, i64) = conn
+    let (action_name, enabled, is_feeding, implies): (String, i64, i64, i64) = conn
         .query_row(
-            "SELECT name, enabled, is_feeding FROM care_action WHERE id = ?1",
+            "SELECT name, enabled, is_feeding, implies_retrieval FROM care_action WHERE id = ?1",
             params![input.action_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => "操作不存在".to_string(),
@@ -232,6 +249,31 @@ pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i6
     let happened_at = normalize_happened_at(&input.happened_at)?;
     ensure_not_future(&happened_at, now)?;
     let note = input.note.as_deref().map(str::trim).unwrap_or("").to_string();
+
+    // 顺带撤食前置判定（全在事务外查，插人在事务内）：停用/无旗标/时刻无效都拒绝
+    let linked_follow: Option<i64> = if also_retrieval {
+        if implies == 0 {
+            return Err(format!("操作「{action_name}」不支持顺带撤食"));
+        }
+        let follow: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM care_action WHERE kind = 'follow' AND enabled = 1 ORDER BY id LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        let Some(follow_id) = follow else {
+            return Err("撤食已停用，顺带撤食不可用".into());
+        };
+        match retrieval_due_for_colony(conn, input.colony_id)? {
+            // 同刻也清（喂食 <= 撤食即清空），所以 >= 基准喂食就可附带
+            Some(d) if d.fed_at.as_str() <= happened_at.as_str() => Some(follow_id),
+            _ => return Err("该时刻没有待撤的易腐食物，无需顺带撤".into()),
+        }
+    } else {
+        None
+    };
 
     // 食物关联仅喂食类操作可带（is_feeding 标记位，与名字无关）
     if is_feeding == 0 && !input.food_ids.is_empty() {
@@ -268,6 +310,22 @@ pub fn log_care(conn: &Connection, input: &CareLogInput, now: &str) -> Result<i6
         tx.execute(
             "INSERT INTO log_food (log_id, food_id) VALUES (?1, ?2)",
             params![log_id, food_id],
+        )
+        .map_err(db_err)?;
+    }
+    // 顺带撤食（ADR 0006）：同事务插撤食记录——同一发生时刻、自动备注；
+    // 两条记录事后各自独立删除（单删撤食后待撤状态自然重算回来）
+    if let Some(follow_id) = linked_follow {
+        tx.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                input.colony_id,
+                follow_id,
+                happened_at,
+                format!("随{action_name}一并撤除"),
+                now
+            ],
         )
         .map_err(db_err)?;
     }
@@ -721,6 +779,28 @@ pub fn retrieval_due_for_colony(
     Ok(Some(RetrievalDue { fed_at, created_at, due_at }))
 }
 
+/// 垃圾清理顺带撤食的联动判定（ADR 0006）：给定打卡面板所选的发生时刻，
+/// 返回该时刻的联动三态——`none`=不可附带（无待撤，或所选时刻早于基准喂食、
+/// 记了也清不掉待撤）/ `pending`=可附带但未到撤食间隔（面板默认不勾）/
+/// `overdue`=可附带且已到期（面板默认勾）。与卡片撤食三态同一派生源
+/// （[`retrieval_due_for_colony`]），到期边界同口径：at >= due_at 即 overdue。
+pub fn retrieval_link_state(
+    conn: &Connection,
+    colony_id: i64,
+    at: &str,
+) -> Result<String, String> {
+    let at = normalize_happened_at(at)?;
+    let Some(due) = retrieval_due_for_colony(conn, colony_id)? else {
+        return Ok("none".into());
+    };
+    // 撤食记录清掉待撤的条件是 基准喂食 <= 撤食时刻（同刻也清），所以
+    // 所选时刻早于基准喂食 → 附带记录无效 → 不可附带
+    if at.as_str() < due.fed_at.as_str() {
+        return Ok("none".into());
+    }
+    Ok(if at.as_str() >= due.due_at.as_str() { "overdue" } else { "pending" }.into())
+}
+
 /// 某窝每个「启用中」操作一块，按 sort、id 排序（字典新增操作自动出现）。
 /// 「距上次」基线（规则 5）：有出眠史的窝取 max(最近一次记录日期, 最近出眠日期)，
 /// 出眠当天全窝 0 天、不会一睁眼全红；登记类显示同样基准（只影响文案，永不红的性质不变）。
@@ -749,7 +829,7 @@ fn tiles_for_colony_at(
     let per_colony = crate::colony::intervals_for_colony(conn, colony_id)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, icon, kind, is_feeding, suggested_interval_days
+            "SELECT id, name, icon, kind, is_feeding, suggested_interval_days, implies_retrieval
              FROM care_action WHERE enabled = 1 ORDER BY sort, id",
         )
         .map_err(db_err)?;
@@ -762,6 +842,7 @@ fn tiles_for_colony_at(
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, Option<i64>>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })
         .map_err(db_err)?
@@ -790,7 +871,7 @@ fn tiles_for_colony_at(
     };
 
     // 撤食三态基准（票 02）：有 follow 块才算一次派生，其余块恒 "none"
-    let has_follow = rows.iter().any(|(_, _, _, kind, _, _)| kind == "follow");
+    let has_follow = rows.iter().any(|(_, _, _, kind, _, _, _)| kind == "follow");
     let due = if has_follow {
         retrieval_due_for_colony(conn, colony_id)?
     } else {
@@ -798,7 +879,7 @@ fn tiles_for_colony_at(
     };
 
     let mut tiles = Vec::with_capacity(rows.len());
-    for (action_id, name, icon, kind, is_feeding, interval) in rows {
+    for (action_id, name, icon, kind, is_feeding, interval, implies_retrieval) in rows {
         // 票 02：有效周期 = 每窝周期(若有)否则操作层建议间隔（spec 钉死 F3）
         let colony_interval = per_colony.get(&action_id).copied();
         let effective = colony_interval.or(interval);
@@ -907,6 +988,7 @@ fn tiles_for_colony_at(
             overdue,
             foods,
             retrieval_state: retrieval_state.to_string(),
+            implies_retrieval: implies_retrieval != 0,
         });
     }
     Ok(tiles)
@@ -2614,6 +2696,105 @@ mod tests {
             .unwrap()
             .expect("回退最近一条有效易腐喂食");
         assert_eq!(due.fed_at, "2026-09-19 08:00:00", "11:00 一喂只有无效易腐，视同不存在");
+    }
+
+    // ── 垃圾清理顺带撤食（ADR 0006）──
+
+    #[test]
+    fn retrieval_link_state_three_states_and_boundaries() {
+        // 验收：联动三态与卡片撤食三态同源同口径——早于基准喂食 none（记了也
+        // 清不掉）、同刻 pending、到期前 pending、恰在到期时刻 overdue、已撤 none
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        assert_eq!(retrieval_link_state(&conn, c, "2026-09-19 12:00").unwrap(), "none", "无易腐喂食");
+
+        feed_foods(&conn, c, "2026-09-18 08:00:00", &[food_id(&conn, "面包虫")]); // 24h → 09-19 08:00 到期
+        assert_eq!(retrieval_link_state(&conn, c, "2026-09-18 07:59:59").unwrap(), "none", "早于基准喂食");
+        assert_eq!(retrieval_link_state(&conn, c, "2026-09-18 08:00:00").unwrap(), "pending", "同刻喂食可撤（同刻即清）");
+        assert_eq!(retrieval_link_state(&conn, c, "2026-09-19 07:59:59").unwrap(), "pending", "到期前未逾期");
+        assert_eq!(retrieval_link_state(&conn, c, "2026-09-19 08:00:00").unwrap(), "overdue", "恰在到期时刻即逾期");
+
+        retrieval_log(&conn, c, "2026-09-19 09:00:00");
+        assert_eq!(retrieval_link_state(&conn, c, "2026-09-19 10:00:00").unwrap(), "none", "已撤清空");
+        assert!(retrieval_link_state(&conn, c, "不是时间").is_err(), "垃圾时间报错");
+    }
+
+    #[test]
+    fn log_care_linked_logs_retrieval_alongside_and_clears_pending() {
+        // 验收：勾选顺带 → 同事务两条记录、同一发生时刻、撤食自动备注、待撤清空
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        feed_foods(&conn, c, "2026-09-18 08:00:00", &[food_id(&conn, "面包虫")]);
+        let trash = action_id(&conn, "垃圾清理");
+        let input = CareLogInput {
+            colony_id: c,
+            action_id: trash,
+            happened_at: "2026-09-19 09:30:00".into(),
+            note: Some("顺手清了".into()),
+            food_ids: vec![],
+        };
+        log_care_linked(&conn, &input, true, "2026-09-19 23:00:00").expect("联动记账失败");
+
+        let rows: Vec<(String, String, String)> = conn
+            .prepare("SELECT a.kind, l.occurred_at, l.note FROM care_log l JOIN care_action a ON a.id = l.action_id ORDER BY l.id")
+            .expect("查流水失败")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("遍历失败")
+            .collect::<Result<_, _>>()
+            .expect("收集失败");
+        assert_eq!(rows.len(), 3, "喂食 + 垃圾清理 + 联动撤食");
+        assert_eq!(rows[2], ("follow".into(), "2026-09-19 09:30:00".into(), "随垃圾清理一并撤除".into()));
+        assert_eq!(rows[1].2, "顺手清了", "主记录备注不被联动覆盖");
+
+        let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", "2026-09-19 23:00:00").unwrap();
+        assert_eq!(retrieval_state_of(&tiles), "none", "联动撤食清空待撤");
+    }
+
+    #[test]
+    fn log_care_linked_rejects_invalid_link_cases() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let trash = action_id(&conn, "垃圾清理");
+        let water = action_id(&conn, "活动区换水");
+        let input_for = |action: i64, at: &str| CareLogInput {
+            colony_id: c,
+            action_id: action,
+            happened_at: at.into(),
+            note: None,
+            food_ids: vec![],
+        };
+
+        // 无易腐喂食：不存在可附带时刻
+        let err = log_care_linked(&conn, &input_for(trash, "2026-09-19 09:00:00"), true, "2026-09-19 23:00:00").unwrap_err();
+        assert!(err.contains("没有待撤"), "实际：{err}");
+
+        feed_foods(&conn, c, "2026-09-19 08:00:00", &[food_id(&conn, "面包虫")]);
+        // 非 linkage 操作（未插旗标）
+        let err = log_care_linked(&conn, &input_for(water, "2026-09-19 09:00:00"), true, "2026-09-19 23:00:00").unwrap_err();
+        assert!(err.contains("不支持顺带撤食"), "实际：{err}");
+        // 所选时刻早于基准喂食 → 记了清不掉，拒
+        let err = log_care_linked(&conn, &input_for(trash, "2026-09-19 07:00:00"), true, "2026-09-19 23:00:00").unwrap_err();
+        assert!(err.contains("没有待撤"), "实际：{err}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 1, "被拒的联动不落任何记录");
+
+        // 撤食停用 = 联动整体关闭（ADR 0006）；主记录照常
+        conn.execute("UPDATE care_action SET enabled = 0 WHERE kind = 'follow'", [])
+            .expect("停用撤食失败");
+        let err = log_care_linked(&conn, &input_for(trash, "2026-09-19 09:00:00"), true, "2026-09-19 23:00:00").unwrap_err();
+        assert!(err.contains("撤食已停用"), "实际：{err}");
+        assert!(log_care_linked(&conn, &input_for(trash, "2026-09-19 09:00:00"), false, "2026-09-19 23:00:00").is_ok());
+    }
+
+    #[test]
+    fn tiles_expose_implies_retrieval_flag_on_trash_cleanup_only() {
+        // 验收：schema v10 旗标只落在预置「垃圾清理」块上，喂食/撤食/登记类恒 false
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let tiles = tiles_for_colony(&conn, c, "2026-09-20").unwrap();
+        assert!(tile(&tiles, "垃圾清理").implies_retrieval);
+        assert!(!tile(&tiles, "喂食").implies_retrieval);
+        assert!(!tile(&tiles, "撤食").implies_retrieval);
+        assert!(!tile(&tiles, "巢穴保湿").implies_retrieval);
     }
 
     #[test]
