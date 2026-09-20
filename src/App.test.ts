@@ -301,6 +301,8 @@ describe("新建窝", () => {
         location_id: 1,
         start_date: "2026-09-18",
         status: "active",
+        hydration_method: null,
+        interval_changes: [],
       },
     });
     expect(wrapper.find(".dialog").exists()).toBe(false);
@@ -349,6 +351,8 @@ describe("编辑窝", () => {
         location_id: 1,
         start_date: "2026-01-20",
         status: "ended",
+        hydration_method: null,
+        interval_changes: [],
       },
     });
   });
