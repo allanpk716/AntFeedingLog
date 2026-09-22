@@ -474,8 +474,17 @@ describe("浏览器 SSE（data-version 订阅，票 06）", () => {
 describe("命令包装的导出面（测试 mock 工厂的路由依据）", () => {
   it("除 subscribe/isTauri 外的函数导出都挂 cmdName（按命令名路由给唯一 invokeMock）", () => {
     for (const [name, value] of Object.entries(ipc)) {
-      // subscribe/isTauri/resetBrowserSseForTests 是环境/测试设施，不是命令包装
-      if (name === "subscribe" || name === "isTauri" || name === "resetBrowserSseForTests") {
+      // subscribe/isTauri/resetBrowserSseForTests 是环境/测试设施,不是命令包装;
+      // 票 03 形状偏好四件是镜像/状态辅助(纯内存无 IO、不经 mock 路由),同属豁免
+      if (
+        name === "subscribe" ||
+        name === "isTauri" ||
+        name === "resetBrowserSseForTests" ||
+        name === "normalizeAvatarShape" ||
+        name === "claimAvatarShapePrefLoad" ||
+        name === "saveAvatarShapePref" ||
+        name === "resetAvatarShapeForTests"
+      ) {
         continue;
       }
       if (typeof value !== "function") continue; // WEBUI_TOKEN_KEY 等常量

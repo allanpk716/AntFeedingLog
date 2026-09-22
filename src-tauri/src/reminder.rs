@@ -1769,6 +1769,7 @@ mod tests {
                 baseline_date: None,
                 days_since_last: None,
             },
+            avatar: None, // 窝头像票 01 新字段；托盘概要测试用不到
         }
     }
 

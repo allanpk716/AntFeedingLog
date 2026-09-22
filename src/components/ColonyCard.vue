@@ -10,9 +10,17 @@
  * 冬眠横幅瘦成一条，「改期」入口保留。记账/冬眠成功抛 saved 让外层 refresh（数据驱动重算）。
  * 票 02：撤食块（follow）走三态——无待撤置灰禁点 / 待撤可点 / 逾期红，点击开通用
  * 打卡面板（QuickLogDialog）走 log_care 闭环；派生态随数据刷新自动重算。
+ * 窝头像票 02：头部左侧头像（票 01 的 Colony.avatar 投影载荷），方形裁剪框按
+ * crop 坐标定位 + 形状遮罩（默认圆形，全局偏好在票 03 接线）；点击 = 打开该窝
+ * 巢况时间线（与「巢况」按钮同一弹窗）。取图双通路：桌面 asset 协议
+ * （photoSrc + getPhotoAbsDir），网页 loadPhotoBlobUrl blob（凭证不进 URL，
+ * 换头像/卸载释放）；加载失败回退 🐜 占位，不崩溃。
+ * 窝头像票 03：形状接全局偏好——shape prop 缺省时跟随 ipc.ts 的全局镜像
+ * （首个挂载的卡片经 get_avatar_shape 拉一次，多实例共享；设置页保存成功后
+ * 镜像更新，已挂载卡片经响应性立即切换），显式传入的 prop 仍优先（票 02 契约）。
  */
-import { computed, onBeforeUnmount, onMounted, ref } from "vue";
-import type { Colony, ColonyAction } from "../types";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import type { Colony, ColonyAction, PhotoCrop } from "../types";
 import {
   actionTile,
   feedingTooltip,
@@ -23,7 +31,16 @@ import {
   retrievalTile,
   type TileView,
 } from "../lib/care";
-import { isTauri } from "../lib/ipc";
+import {
+  avatarShape,
+  claimAvatarShapePrefLoad,
+  getAvatarShape,
+  getPhotoAbsDir,
+  isTauri,
+  normalizeAvatarShape,
+  saveAvatarShapePref,
+} from "../lib/ipc";
+import { loadPhotoBlobUrl, photoSrc, revokeObjectUrl } from "../lib/photos";
 import { checkinCardLine } from "../lib/checkin";
 import { hibernationBanner } from "../lib/hibernation";
 import { todayIso } from "../lib/dates";
@@ -32,8 +49,19 @@ import HibernationDialog from "./HibernationDialog.vue";
 import NestCheckinDialog from "./NestCheckinDialog.vue";
 import QuickLogDialog from "./QuickLogDialog.vue";
 
-const props = defineProps<{ colony: Colony }>();
+const props = withDefaults(
+  defineProps<{
+    colony: Colony;
+    /** 头像显示形状（窝头像票 02）：circle=圆形遮罩 / square=方形；缺省 =
+     *  跟随全局偏好（窝头像票 03），显式传入优先于全局（票 02 契约不破）。 */
+    shape?: "circle" | "square";
+  }>(),
+  { shape: undefined },
+);
 const emit = defineEmits<{ edit: []; saved: [] }>();
+
+/** 实际渲染形状（窝头像票 03）：显式 prop 优先，否则跟随全局偏好镜像。 */
+const shapeClass = computed(() => props.shape ?? avatarShape.value);
 
 const STATUS_TEXT: Record<Colony["status"], string> = {
   active: "● 活跃",
@@ -65,6 +93,108 @@ const recentLine = computed(() => formatRecent(props.colony.recent));
 /** 巢况摘要行（webui-checkin 票 02）：最新一组数 + 距上次登记天数；从未登记为空串（隐藏）。 */
 const checkinLine = computed(() => checkinCardLine(props.colony.checkin));
 
+// ── 窝头像（窝头像票 02）──────────────────────────────────────
+// 头像引用 = 票 01 投影载荷 Colony.avatar（前端不重复推导）。跟随按 rel_path：
+// 首页刷新会重建 colony 对象，同一张照片不重取不重挂；裁剪改了（rel 不变）由
+// 下面的样式 computed 直接响应。取图双通路沿 NestCheckinDialog 先例：桌面
+// asset 协议（getPhotoAbsDir 一次 + photoSrc），网页 loadPhotoBlobUrl blob
+// （凭证不进 URL）；换头像与卸载经 revokeObjectUrl 释放，失败回退 🐜 占位。
+const avatarUrl = ref("");
+const avatarBroken = ref(false);
+/** 图片 natural 尺寸（load 后可得；裁剪定位的输入，happy-dom/真实浏览器一致） */
+const avatarImgSize = ref<{ w: number; h: number } | null>(null);
+const avatarRel = computed(() => props.colony.avatar?.rel_path ?? null);
+/** 竞态守卫：连换头像/卸载时只让最后一轮取图落地 */
+let avatarSeq = 0;
+
+const photoAbsDir = ref("");
+
+async function loadAvatar(rel: string | null): Promise<void> {
+  const seq = ++avatarSeq;
+  if (avatarUrl.value !== "") {
+    revokeObjectUrl(avatarUrl.value);
+    avatarUrl.value = "";
+  }
+  avatarBroken.value = false;
+  avatarImgSize.value = null;
+  if (rel === null) return;
+  if (isTauri()) {
+    if (photoAbsDir.value === "") {
+      try {
+        photoAbsDir.value = await getPhotoAbsDir();
+      } catch {
+        // 根目录拿不到：占位兜底（下次头像变化再试）
+        if (seq === avatarSeq) avatarBroken.value = true;
+        return;
+      }
+    }
+    if (seq !== avatarSeq) return;
+    const src = photoSrc(rel, photoAbsDir.value);
+    if (src === "") {
+      avatarBroken.value = true;
+      return;
+    }
+    avatarUrl.value = src;
+    return;
+  }
+  try {
+    const url = await loadPhotoBlobUrl(rel);
+    if (seq !== avatarSeq) {
+      revokeObjectUrl(url); // 期间头像已换/组件已卸载：立即释放
+      return;
+    }
+    avatarUrl.value = url;
+  } catch {
+    if (seq === avatarSeq) avatarBroken.value = true;
+  }
+}
+
+watch(
+  avatarRel,
+  (rel) => {
+    void loadAvatar(rel);
+  },
+  { immediate: true },
+);
+
+/**
+ * 裁剪定位样式（规格：方形裁剪框按裁剪坐标缩放定位，形状只是遮罩）。
+ * crop 语义：size = 边长 / 图片长边，x/y = 裁剪左上角各按宽/高归一化——与
+ * 「整图 cover 进方框取中心最大方形」的默认公式自洽（size = 短边/长边、x/y
+ * 使区域居中）。渲染：img 绝对定位铺满 sidePx 的放大倍数，再负偏移裁剪原点。
+ */
+const avatarImgStyle = computed<Record<string, string>>(() => {
+  const nat = avatarImgSize.value;
+  const style: Record<string, string> = {};
+  if (nat === null) return style;
+  const crop: PhotoCrop =
+    props.colony.avatar?.crop ?? {
+      // 默认居中：中心最大方形
+      size: Math.min(nat.w, nat.h) / Math.max(nat.w, nat.h),
+      x: Math.max(0, 1 - Math.min(nat.w, nat.h) / nat.w) / 2,
+      y: Math.max(0, 1 - Math.min(nat.w, nat.h) / nat.h) / 2,
+    };
+  const sidePx = crop.size * Math.max(nat.w, nat.h);
+  if (!(sidePx > 0)) return style;
+  style.width = `${(nat.w / sidePx) * 100}%`;
+  style.height = `${(nat.h / sidePx) * 100}%`;
+  style.left = `${((-crop.x * nat.w) / sidePx) * 100}%`;
+  style.top = `${((-crop.y * nat.h) / sidePx) * 100}%`;
+  return style;
+});
+
+function onAvatarLoad(e: Event): void {
+  const el = e.target as HTMLImageElement;
+  if (el.naturalWidth > 0 && el.naturalHeight > 0) {
+    avatarImgSize.value = { w: el.naturalWidth, h: el.naturalHeight };
+  }
+}
+
+/** 文件缺失/解码失败（img error 事件）：占位兜底，不显示破图 */
+function onAvatarError(): void {
+  avatarBroken.value = true;
+}
+
 // ── 「⋯」菜单（交互第三轮 #7）：开合 + 两路收起 ──
 const menuOpen = ref(false);
 const cardRef = ref<HTMLElement | null>(null);
@@ -87,8 +217,25 @@ function onDocClick(e: MouseEvent) {
   menuOpen.value = false;
 }
 
-onMounted(() => document.addEventListener("click", onDocClick));
-onBeforeUnmount(() => document.removeEventListener("click", onDocClick));
+onMounted(() => {
+  document.addEventListener("click", onDocClick);
+  // 全局形状偏好启动读取（窝头像票 03）：首个挂载的卡片拉一次，后续卡片共享
+  // （含失败，不逐卡重试）；读不出保默认圆形——外观偏好失败不惊动、不挡头像渲染
+  if (claimAvatarShapePrefLoad()) return;
+  void (async () => {
+    try {
+      saveAvatarShapePref(normalizeAvatarShape(await getAvatarShape()));
+    } catch {
+      /* 保持默认 circle；镜像未被污染，冷启动再试 */
+    }
+  })();
+});
+onBeforeUnmount(() => {
+  document.removeEventListener("click", onDocClick);
+  // 头像收尾：在途取图作废 + 释放网页端 blob（桌面 asset URL 会被放过）
+  avatarSeq += 1;
+  revokeObjectUrl(avatarUrl.value);
+});
 
 const showFeed = ref(false);
 const feedAction = ref<ColonyAction | null>(null);
@@ -144,6 +291,28 @@ function onCheckinSaved() {
 <template>
   <article ref="cardRef" class="card" :class="{ hib: hibernating }" :data-colony-id="colony.id">
     <div class="chead">
+      <!-- 窝头像（窝头像票 02）：点击 = 打开巢况时间线，与「巢况」按钮同一弹窗 -->
+      <button
+        class="avatar"
+        :class="shapeClass"
+        type="button"
+        data-testid="colony-avatar"
+        title="查看巢况时间线"
+        aria-label="查看该窝的巢况时间线"
+        @click="showCheckin = true"
+      >
+        <img
+          v-if="avatarUrl !== '' && !avatarBroken"
+          class="avatar-img"
+          :class="{ loaded: avatarImgSize !== null }"
+          :src="avatarUrl"
+          alt=""
+          :style="avatarImgStyle"
+          @load="onAvatarLoad"
+          @error="onAvatarError"
+        />
+        <span v-else class="avatar-ph" data-testid="avatar-ph">🐜</span>
+      </button>
       <span class="cname">{{ colony.name }}</span>
       <span v-if="colony.species" class="chip sp">{{ colony.species }}</span>
       <span class="chip st" :class="{ hib: colony.status === 'hibernating' }">
@@ -281,6 +450,48 @@ function onCheckinSaved() {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap; /* 超长窝名/物种折行不截断（mock-d 治理，随变体 A 一并落地） */
+}
+
+/* ── 窝头像（窝头像票 02）：方形裁剪框 + 形状遮罩（默认圆形），点击开巢况时间线 ── */
+.avatar {
+  position: relative;
+  flex: none;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  border: 1px solid var(--border);
+  background: var(--tile);
+  overflow: hidden;
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  border-radius: 50%; /* 默认形状 circle：圆形遮罩挖角，裁剪数据不受影响 */
+}
+
+.avatar.square {
+  border-radius: 8px;
+}
+
+.avatar:hover {
+  border-color: var(--accent);
+}
+
+/* 裁剪定位 img：绝对定位 + 百分比宽高/偏移（style 由 avatarImgStyle 计算）；
+   载入拿到 natural 尺寸前不显示，避免闪一帧未缩放的原图 */
+.avatar-img {
+  position: absolute;
+  max-width: none; /* 放大裁剪超出方框属预期，不受全局 img 宽度约束 */
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.avatar-img.loaded {
+  opacity: 1;
+}
+
+.avatar-ph {
+  font-size: 22px;
+  line-height: 1;
 }
 
 .cname {

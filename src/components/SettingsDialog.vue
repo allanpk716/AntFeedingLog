@@ -34,6 +34,10 @@
  *   置顶标名，勾物理网段强制明文确认）/ 端口（1024–65535）/ 凭证（打码可看、
  *   只可重生成）/ 完整地址复制 + 风险提示；保存落 webui-config.json 并联动防火墙
  *   （失败给现成 netsh 手动命令）。面板本体在 WebUiPanel（首启向导复用其子组件）。
+ * - 外观 tab（窝头像票 03）：窝卡片头像形状全局偏好（圆形/方形单选），选择即
+ *   存即效——写 set_avatar_shape 落库（桌面专属命令）+ 更新 ipc.ts 全局镜像，
+ *   已渲染头像立即切换；打开弹窗时 get_avatar_shape 回显，读不出保默认圆形。
+ *   成败走轻提示（设置保存属「改了不关窗」写操作）。
  *
  * 行级 停用/启用/删除 即时落库并抛 changed（外层刷新首页，卡片红/灰随之变化）；
  * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
@@ -53,6 +57,7 @@ import {
   eraseAction as eraseActionCmd,
   eraseFood as eraseFoodCmd,
   exportData as exportDataCmd,
+  getAvatarShape,
   getBackupConfig,
   getLastAbnormalExit,
   getRecentErrors,
@@ -72,9 +77,14 @@ import {
   saveFood,
   sendTestNotification,
   setActionEnabled as setActionEnabledCmd,
+  setAvatarShape,
   setBackupConfig,
   setFoodEnabled as setFoodEnabledCmd,
   setSettings,
+  avatarShape,
+  normalizeAvatarShape,
+  saveAvatarShapePref,
+  type AvatarShape,
 } from "../lib/ipc";
 import type {
   BackupConfigInput,
@@ -125,7 +135,7 @@ import UpdatePanel from "./UpdatePanel.vue";
 import WebUiPanel from "./WebUiPanel.vue";
 import { showError, showSuccess } from "../lib/toast";
 
-type Tab = "actions" | "foods" | "locations" | "notify" | "webui" | "data" | "update";
+type Tab = "actions" | "foods" | "locations" | "appearance" | "notify" | "webui" | "data" | "update";
 
 const emit = defineEmits<{ close: []; changed: [] }>();
 
@@ -149,6 +159,37 @@ const pushoverStatus = ref<PushoverStatus | null>(null);
 const revealPushoverUser = ref(false);
 const revealPushoverToken = ref(false);
 
+// ── 外观 tab（窝头像票 03）：头像形状全局偏好，选择即存即效 ──
+const avatarShapeChoice = ref<AvatarShape>("circle");
+const shapeBusy = ref(false);
+
+/** 回显：读库内当前值进全局镜像（ColonyCard 消费同一镜像）与单选；
+ *  读不出保持现状（默认圆形）——外观偏好加载失败不惊动、不挡其他功能区。 */
+async function refreshAvatarShape() {
+  try {
+    saveAvatarShapePref(normalizeAvatarShape(await getAvatarShape()));
+  } catch {
+    // 静默：镜像维持原值
+  }
+  avatarShapeChoice.value = avatarShape.value;
+}
+
+/** 单选切换即保存（桌面专属命令 set_avatar_shape）：成功更新全局镜像并轻提示
+ *  （设置保存属「改了不关窗」写操作）；失败红色轻提示带原因，单选回弹已生效值。 */
+async function onAvatarShapeChange() {
+  if (shapeBusy.value) return;
+  shapeBusy.value = true;
+  try {
+    saveAvatarShapePref(normalizeAvatarShape(await setAvatarShape({ shape: avatarShapeChoice.value })));
+    showSuccess("头像形状已保存");
+  } catch (e) {
+    avatarShapeChoice.value = avatarShape.value;
+    showError("头像形状保存失败", String(e));
+  } finally {
+    shapeBusy.value = false;
+  }
+}
+
 async function load() {
   const [actions, foods, locs, s] = await Promise.all([
     listActions(),
@@ -162,6 +203,7 @@ async function load() {
   notifyForm.value = toForm(s);
   autostart.value = s.autostart_enabled;
   await refreshPushoverStatus();
+  await refreshAvatarShape();
 }
 
 /** 生效来源三态（票 11）：读取失败静默降级为「读取失败」标注，不打扰其他功能区 */
@@ -676,6 +718,9 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         <button class="tab tab-locations" :class="{ active: activeTab === 'locations' }" type="button" @click="activeTab = 'locations'">
           地点
         </button>
+        <button class="tab tab-appearance" :class="{ active: activeTab === 'appearance' }" type="button" @click="activeTab = 'appearance'">
+          外观
+        </button>
         <button class="tab tab-notify" :class="{ active: activeTab === 'notify' }" type="button" @click="activeTab = 'notify'">
           通知
         </button>
@@ -796,6 +841,36 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
       <!-- 地点 -->
       <div v-else-if="activeTab === 'locations'" class="tab-body">
         <LocationManagerPanel :locations="locations" @saved="onPanelSaved" @changed="onPanelChanged" />
+      </div>
+
+      <!-- 外观（窝头像票 03）：头像形状全局偏好，选择即存即效（读写与轻提示见 script） -->
+      <div v-else-if="activeTab === 'appearance'" class="tab-body">
+        <div class="notify-row">
+          <span>窝卡片头像形状：</span>
+          <label class="shape-choice" title="圆形 = 方形裁剪框挖圆角显示">
+            <input
+              v-model="avatarShapeChoice"
+              class="shape-radio shape-radio-circle"
+              type="radio"
+              value="circle"
+              :disabled="shapeBusy"
+              @change="onAvatarShapeChange"
+            />
+            圆形
+          </label>
+          <label class="shape-choice" title="方形 = 圆角方框显示">
+            <input
+              v-model="avatarShapeChoice"
+              class="shape-radio shape-radio-square"
+              type="radio"
+              value="square"
+              :disabled="shapeBusy"
+              @change="onAvatarShapeChange"
+            />
+            方形
+          </label>
+        </div>
+        <p class="hint">全局生效：桌面与网页端所有窝卡片头像立即切换；已有头像裁剪不重算，只换遮罩形状。</p>
       </div>
 
       <!-- 通知（票 06 + 票 09 + 票 05 撤食开关）+ Pushover 双通道（反馈第二轮 F4） -->
@@ -1197,6 +1272,18 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   font: inherit;
   background: var(--card);
   color: var(--text);
+}
+
+/* 外观 tab（窝头像票 03）：形状单选标签，与既有 checkbox 标签同款手感 */
+.shape-choice {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.shape-choice input:disabled {
+  cursor: default;
 }
 
 .saved-hint {

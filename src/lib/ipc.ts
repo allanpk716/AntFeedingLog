@@ -22,6 +22,7 @@
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
+import { readonly, ref } from "vue";
 import type {
   AbnormalExitInfo,
   ActionInput,
@@ -47,6 +48,8 @@ import type {
   NestPhotoMeta,
   OrphanCleanOutcome,
   OrphanPhotoStats,
+  PhotoCrop,
+  PhotoWallColony,
   PushoverStatus,
   RestoreApplyOutcome,
   RestoreSummary,
@@ -371,6 +374,68 @@ export const attachPhotos = cmdFn<
 export const getPhotoAbsDir = cmdFn<void, string>("get_photo_abs_dir");
 export const listOrphanPhotos = cmdFn<void, OrphanPhotoStats>("list_orphan_photos");
 export const cleanOrphanPhotos = cmdFn<void, OrphanCleanOutcome>("clean_orphan_photos");
+
+// ── 窝头像与照片墙（窝头像票 01）：裁剪更新 + 照片墙只读；桌面与网页同构
+//（photo_wall 在网页端只读白名单、update_photo_crop 为其唯一新写路径）──
+
+/** 更新照片裁剪：crop = 合法归一化区域（x/y/size ∈ [0,1] 且 x+size ≤ 1、
+ *  y+size ≤ 1，服务端校验越界拒绝）落库；null = 重置默认居中。返回更新后的
+ *  照片元数据。 */
+export const updatePhotoCrop = cmdFn<
+  { photoId: number; crop: PhotoCrop | null },
+  NestPhotoMeta
+>("update_photo_crop");
+
+/** 照片墙只读载荷：全部窝的照片——窝按 sort/id、窝内按登记日期倒序、同日期
+ *  按登记全序、登记内照片按上传序；分组带窝名与日期，照片带元数据（含裁剪）。 */
+export const photoWall = cmdFn<void, PhotoWallColony[]>("photo_wall");
+
+// ── 头像形状偏好（窝头像票 03）：双端读、桌面设置页写；网页端白名单只登记
+// get_avatar_shape 这条只读，写入只在桌面设置页 ──
+
+/** 头像显示形状（全局偏好）：circle=圆形遮罩（默认）/ square=方形。 */
+export type AvatarShape = "circle" | "square";
+
+export const AVATAR_SHAPE_CIRCLE: AvatarShape = "circle";
+export const AVATAR_SHAPE_SQUARE: AvatarShape = "square";
+
+export const getAvatarShape = cmdFn<void, string>("get_avatar_shape");
+/** 桌面设置页专用写命令（不入网页端白名单）。返回落库的规范值。 */
+export const setAvatarShape = cmdFn<{ shape: AvatarShape }, string>("set_avatar_shape");
+
+/** 收敛任意原始值为合法形状：只有字面 "square" 算方形，其余（缺行/脏值/读取
+ *  失败占位）一律回退 circle——与 Rust 读侧同口径。 */
+export function normalizeAvatarShape(raw: unknown): AvatarShape {
+  return raw === AVATAR_SHAPE_SQUARE ? AVATAR_SHAPE_SQUARE : AVATAR_SHAPE_CIRCLE;
+}
+
+// 全局形状状态镜像（沿 toast.ts 的 lib 模块持有 ref 先例）：ColonyCard 渲染
+// 消费、SettingsDialog 保存成功后更新——已挂载卡片经 Vue 响应性立即切换，无需
+// 刷新页面。模块级状态只有这一处可写（saveAvatarShapePref），对外只读。
+const avatarShapeState = ref<AvatarShape>(AVATAR_SHAPE_CIRCLE);
+let avatarShapeLoadClaimed = false;
+
+/** 只读视图：头像形状全局偏好（ColonyCard 渲染消费；保存后全卡立即响应）。 */
+export const avatarShape = readonly(avatarShapeState);
+
+/** 启动读取去重（首页窝卡片多实例共享一次 IPC）：返回 true = 已有调用者认领
+ *  （含失败——失败保默认 circle，不逐卡重试，冷启动再试）。 */
+export function claimAvatarShapePrefLoad(): boolean {
+  const claimed = avatarShapeLoadClaimed;
+  avatarShapeLoadClaimed = true;
+  return claimed;
+}
+
+/** 更新本地镜像（IPC 成功或读取收敛后由调用方调；纯内存，无 IO）。 */
+export function saveAvatarShapePref(shape: AvatarShape): void {
+  avatarShapeState.value = normalizeAvatarShape(shape);
+}
+
+/** 测试专用：复位镜像/读取标志（模块级状态不跨测试泄漏；运行时不接）。 */
+export function resetAvatarShapeForTests(shape: AvatarShape = AVATAR_SHAPE_CIRCLE): void {
+  avatarShapeLoadClaimed = false;
+  avatarShapeState.value = shape;
+}
 
 // ── 冬眠（HibernationDialog；入参键沿用现状 camelCase，Tauri 侧自行映射）──
 

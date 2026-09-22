@@ -39,7 +39,11 @@ use rusqlite::{params, Connection};
 ///     枚举列（'manual'=手动加水 | 'tower'=水塔 | NULL=未设，默认 NULL）；
 ///     只加列，不回填、不触碰 colony_action_interval 任何行——升级前已设保湿
 ///     每窝周期的窝自然形成「未设+已有周期」的存量 B 态（规格状态矩阵）。
-pub const SCHEMA_VERSION: i64 = 11;
+/// v12：窝头像与照片墙（窝头像票 01，spec F3）——nest_photo 加裁剪三列
+///     crop_x/crop_y/crop_size（归一化方形区域 x/y/边长，REAL 可空，NULL = 默认
+///     居中）；只加列不回填，存量行保持 NULL；头像投影与照片墙载荷是纯查询，
+///     不落库、无迁移动作。
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -135,6 +139,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             8 => migrate_v8_to_v9(conn)?,
             9 => migrate_v9_to_v10(conn)?,
             10 => migrate_v10_to_v11(conn)?,
+            11 => migrate_v11_to_v12(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -525,6 +530,37 @@ fn migrate_v10_to_v11(conn: &Connection) -> Result<(), rusqlite::Error> {
     tx.commit()
 }
 
+/// v12（窝头像票 01，spec F3）：`nest_photo` 裁剪三列——归一化方形区域
+/// `crop_x`/`crop_y`/`crop_size`（REAL 可空；NULL = 默认居中）。只加列、
+/// **不回填**：存量行保持 NULL 即「未调过裁剪」的居中语义，照片数据零触碰。
+/// 单事务原子完成；列已存在则跳过 ALTER（幂等：v9→v10/v10→v11 同款，防降
+/// 版本打开后再升级的重复加列）。
+fn migrate_v11_to_v12(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_col = {
+        let mut stmt = conn.prepare("PRAGMA table_info(nest_photo)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == "crop_x" {
+                found = true;
+            }
+        }
+        found
+    };
+    let tx = conn.unchecked_transaction()?;
+    if !has_col {
+        tx.execute_batch(
+            r#"
+            ALTER TABLE nest_photo ADD COLUMN crop_x REAL;
+            ALTER TABLE nest_photo ADD COLUMN crop_y REAL;
+            ALTER TABLE nest_photo ADD COLUMN crop_size REAL;
+            "#,
+        )?;
+    }
+    tx.pragma_update(None, "user_version", 12)?;
+    tx.commit()
+}
+
 /// v1 预置数据：四操作（喂食/活动区换水/巢穴保湿/垃圾清理）、三食物、两地点、五项设置默认值。
 /// pub(crate)：restore.rs 的旧 schema 备份测试要搭真实 v1 库（票 04 验收 3）。
 pub(crate) fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -721,7 +757,7 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 11);
+        assert_eq!(SCHEMA_VERSION, 12);
     }
 
     /// 按真实迁移函数链手工搭到 v7 的库（票 01 v8 迁移测试地基；含 webui-checkin
@@ -1369,6 +1405,161 @@ mod tests {
         .unwrap();
     }
 
+    /// 真实迁移链搭到 v11 的库（窝头像票 01 v12 迁移测试地基）。
+    fn v11_conn() -> Connection {
+        let conn = v7_conn();
+        migrate_v7_to_v8(&conn, false).expect("升 v8 失败");
+        migrate_v8_to_v9(&conn).expect("升 v9 失败");
+        migrate_v9_to_v10(&conn).expect("升 v10 失败");
+        migrate_v10_to_v11(&conn).expect("升 v11 失败");
+        conn
+    }
+
+    /// 窝头像票 01 验收 1（迁移）：真实 v11 库 + 存量照片行，migrate() 升 v12——
+    /// 裁剪三列存在、REAL、可空；存量行保持 NULL（= 默认居中，不回填）且照片
+    /// 数据原样；旧列序不动、新列追加；新行可写裁剪；再 migrate 幂等不重复加列。
+    #[test]
+    fn v11_db_upgrades_to_v12_crop_columns_nullable_without_backfill() {
+        let conn = v11_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nest_checkin (colony_id, date, queen_count, worker_count, moved_nest, note, created_at)
+             VALUES (1, '2026-09-18', 2, 300, 0, '', '2026-09-18 08:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+             VALUES (1, '1/old-a.jpg', 'a.jpg', ''), (1, '1/old-b.jpg', 'b.jpg', '')",
+            [],
+        )
+        .unwrap();
+        let ddl_before: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nest_photo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), 11);
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+
+        // 裁剪三列存在、类型 REAL、可空（pragma notnull = 0）
+        let cols: Vec<(String, String, i64)> = {
+            let mut stmt = conn
+                .prepare("SELECT name, type, \"notnull\" FROM pragma_table_info('nest_photo')")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        for name in ["crop_x", "crop_y", "crop_size"] {
+            let col = cols
+                .iter()
+                .find(|(n, _, _)| n == name)
+                .unwrap_or_else(|| panic!("nest_photo 缺列 {name}"));
+            assert_eq!(col.1, "REAL", "{name} 应为 REAL");
+            assert_eq!(col.2, 0, "{name} 应可空");
+        }
+
+        // 存量行不回填：裁剪列全 NULL（居中语义），照片数据原样
+        let rows: Vec<(String, Option<f64>, Option<f64>, Option<f64>)> = {
+            let mut stmt = conn
+                .prepare("SELECT rel_path, crop_x, crop_y, crop_size FROM nest_photo ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("1/old-a.jpg".into(), None, None, None),
+                ("1/old-b.jpg".into(), None, None, None),
+            ],
+            "存量照片行裁剪列保持 NULL，其余数据原样"
+        );
+
+        // 旧列序原样 + 裁剪列追加（care_action/colony 同款断言口径）
+        let ddl_after: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'nest_photo'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            ddl_after.starts_with(ddl_before.trim_end_matches(')')),
+            "nest_photo 旧列序被改动：{ddl_after}"
+        );
+        assert!(ddl_after.contains("crop_x"), "nest_photo 未追加裁剪列：{ddl_after}");
+
+        // 新行可写裁剪值（可空列照常收数）
+        conn.execute(
+            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note, crop_x, crop_y, crop_size)
+             VALUES (1, '1/new.jpg', NULL, '', 0.1, 0.2, 0.5)",
+            [],
+        )
+        .unwrap();
+        let crop: (f64, f64, f64) = conn
+            .query_row(
+                "SELECT crop_x, crop_y, crop_size FROM nest_photo WHERE rel_path = '1/new.jpg'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(crop, (0.1, 0.2, 0.5));
+
+        // 幂等：再 migrate 版本门卫放行、不重复加列、数据不动
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+        let crop_col_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('nest_photo') WHERE name = 'crop_x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(crop_col_count, 1, "幂等：crop_x 不得被重复加列");
+    }
+
+    /// v12 幂等锚（v9→v10/v10→v11 同款）：库已带裁剪列但版本停在 11（降版本
+    /// 打开后再升级的情形），migrate 跳过重复加列、照常升到最新。
+    #[test]
+    fn v12_migration_skips_add_when_crop_columns_already_exist() {
+        let conn = v11_conn();
+        conn.execute_batch(
+            "ALTER TABLE nest_photo ADD COLUMN crop_x REAL;
+             ALTER TABLE nest_photo ADD COLUMN crop_y REAL;
+             ALTER TABLE nest_photo ADD COLUMN crop_size REAL;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 11).unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+        for name in ["crop_x", "crop_y", "crop_size"] {
+            let n: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM pragma_table_info('nest_photo') WHERE name = '{name}'"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "{name} 不得被重复加列");
+        }
+    }
+
     #[test]
     fn v7_upgrade_preserves_rows_and_backfills_perishable_presets() {
         // 真实 v6 库：历史记录 + 台账 + 自建操作/食物齐全，升 v7 后数据原样、
@@ -1701,6 +1892,17 @@ mod tests {
                     "colony 旧列序被改动：{new_sql}"
                 );
                 assert!(new_sql.contains("hydration_method"), "colony 未追加 hydration_method：{new_sql}");
+                continue;
+            }
+            if name == "nest_photo" {
+                // v12（窝头像票 01）合法改动：ALTER 追加裁剪三列，断言口径同上
+                let old_sql = sql.as_deref().unwrap_or("");
+                let new_sql = found.1.as_deref().unwrap_or("");
+                assert!(
+                    new_sql.starts_with(old_sql.trim_end_matches(')')),
+                    "nest_photo 旧列序被改动：{new_sql}"
+                );
+                assert!(new_sql.contains("crop_x"), "nest_photo 未追加裁剪列：{new_sql}");
                 continue;
             }
             assert_eq!(found.1, *sql, "旧对象 {name} 的 DDL 被改动");

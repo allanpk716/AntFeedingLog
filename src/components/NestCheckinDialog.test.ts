@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import NestCheckinDialog from "./NestCheckinDialog.vue";
+import PhotoCropEditor from "./PhotoCropEditor.vue";
 import type { Colony, NestCheckin } from "../types";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（沿 QuickLogDialog.test.ts 先例）
@@ -428,6 +429,126 @@ describe("NestCheckinDialog 巢况照片（webui-checkin 票 07）", () => {
 
     await w.find(".photo-viewer").trigger("click");
     expect(w.find(".photo-viewer").exists()).toBe(false);
+  });
+});
+
+// ── 头像裁剪编辑器入口（窝头像票 04）：大图内「调整头像裁剪」→ 编辑器 ───────
+
+describe("NestCheckinDialog 头像裁剪编辑器（窝头像票 04）", () => {
+  const PHOTO_DIR = "C:\\data\\photos";
+  const photoMeta = {
+    id: 11,
+    checkin_id: 7,
+    rel_path: "1/6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg",
+    original_name: "IMG_001.jpg",
+    note: "",
+  };
+
+  /** 桌面形态挂载并打开大图查看器（复用票 07 的 Tauri 打桩形态）。 */
+  async function mountWithViewerOpen() {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      convertFileSrc: (p: string) => `http://asset.localhost/${encodeURIComponent(p)}`,
+    };
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7, photos: [photoMeta] })];
+      if (cmd === "get_photo_abs_dir") return PHOTO_DIR;
+      return null;
+    });
+    const w = mount(NestCheckinDialog, { props: { colony } });
+    await flushPromises();
+    await w.find("img.photo-thumb").trigger("click");
+    return w;
+  }
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+  });
+
+  it("「调整头像裁剪」入口只在大图查看器打开时渲染", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      convertFileSrc: (p: string) => `http://asset.localhost/${encodeURIComponent(p)}`,
+    };
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7, photos: [photoMeta] })];
+      if (cmd === "get_photo_abs_dir") return PHOTO_DIR;
+      return null;
+    });
+    const w = mount(NestCheckinDialog, { props: { colony } });
+    await flushPromises();
+
+    expect(w.find(".photo-viewer").exists()).toBe(false);
+    expect(w.find(".viewer-crop-btn").exists()).toBe(false);
+
+    await w.find("img.photo-thumb").trigger("click");
+    expect(w.find(".viewer-crop-btn").exists()).toBe(true);
+    expect(w.find(".viewer-crop-btn").text()).toBe("调整头像裁剪");
+  });
+
+  it("点入口打开 PhotoCropEditor（传大图照片与取图 URL）；编辑器关闭回到大图", async () => {
+    const w = await mountWithViewerOpen();
+    expect(w.findComponent(PhotoCropEditor).exists()).toBe(false);
+
+    await w.find(".viewer-crop-btn").trigger("click");
+    const editor = w.findComponent(PhotoCropEditor);
+    expect(editor.exists()).toBe(true);
+    expect(editor.props("photo")).toEqual(photoMeta);
+    expect(editor.props("src")).toBe(
+      `http://asset.localhost/${encodeURIComponent("C:\\data\\photos/1/6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg")}`,
+    );
+
+    // 编辑器关闭（取消）：回到大图查看器
+    await editor.vm.$emit("close");
+    expect(w.findComponent(PhotoCropEditor).exists()).toBe(false);
+    expect(w.find(".photo-viewer").exists()).toBe(true);
+  });
+
+  it("编辑器保存回调：返回元数据更新进本地时间线与大图状态，并抛 saved 通知外层", async () => {
+    const w = await mountWithViewerOpen();
+    await w.find(".viewer-crop-btn").trigger("click");
+    const editor = w.findComponent(PhotoCropEditor);
+
+    const updated = { ...photoMeta, crop: { x: 0.2, y: 0.3, size: 0.5 } };
+    await editor.vm.$emit("saved", updated);
+
+    // 大图状态（编辑器 photo prop）跟上新裁剪
+    expect(w.findComponent(PhotoCropEditor).props("photo").crop).toEqual({
+      x: 0.2,
+      y: 0.3,
+      size: 0.5,
+    });
+    // 通知外层刷新（首页头像经既有 saved→refresh 通路跟上）
+    expect(w.emitted("saved")).toHaveLength(1);
+
+    await editor.vm.$emit("close");
+    expect(w.findComponent(PhotoCropEditor).exists()).toBe(false);
+    // 重新打开：时间线本地状态已带新裁剪（照片对象被替换而非原地遗留）
+    await w.find("img.photo-thumb").trigger("click");
+    await w.find(".viewer-crop-btn").trigger("click");
+    expect(w.findComponent(PhotoCropEditor).props("photo").crop).toEqual({
+      x: 0.2,
+      y: 0.3,
+      size: 0.5,
+    });
+  });
+
+  it("上传照片成功后不自动弹裁剪编辑器（上传流程零变化，新照片默认居中）", async () => {
+    const w = await mountWithViewerOpen();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7, photos: [photoMeta] })];
+      if (cmd === "pick_photo_files") return ["C:/pics/a.jpg"];
+      if (cmd === "get_photo_abs_dir") return PHOTO_DIR;
+      if (cmd === "attach_photos") return [photoMeta];
+      return null;
+    });
+
+    await w.find(".photo-add-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("attach_photos", {
+      checkinId: 7,
+      paths: ["C:/pics/a.jpg"],
+    });
+    expect(w.findComponent(PhotoCropEditor).exists()).toBe(false); // 不自动弹编辑器
   });
 });
 

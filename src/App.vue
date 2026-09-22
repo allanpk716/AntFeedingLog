@@ -19,11 +19,12 @@ import ColonyFormDialog from "./components/ColonyFormDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
 import StatsPage from "./components/StatsPage.vue";
 import LogListPage from "./components/LogListPage.vue";
+import PhotoWallPage from "./components/PhotoWallPage.vue";
 import ToastHost from "./components/ToastHost.vue";
 import WebUiWizard from "./components/WebUiWizard.vue";
 
-/** 顶栏三页 nav（票 08 接活「记录」） */
-type Page = "home" | "stats" | "logs";
+/** 顶栏 nav（票 08 接活「记录」；窝头像票 05 接活「照片」，双端都有） */
+type Page = "home" | "stats" | "photos" | "logs";
 const page = ref<Page>("home");
 
 const colonies = ref<Colony[]>([]);
@@ -140,6 +141,14 @@ onBeforeUnmount(() => stopTodayClock());
         </button>
         <button
           class="tab"
+          :class="{ active: page === 'photos' }"
+          type="button"
+          @click="page = 'photos'"
+        >
+          照片
+        </button>
+        <button
+          class="tab"
           :class="{ active: page === 'logs' }"
           type="button"
           @click="page = 'logs'"
@@ -199,6 +208,9 @@ onBeforeUnmount(() => stopTodayClock());
     </main>
 
     <StatsPage v-if="page === 'stats'" />
+
+    <!-- 照片墙（窝头像票 05）：只读回看页，离开再进按 v-if 重挂载自然重拉 -->
+    <PhotoWallPage v-if="page === 'photos'" />
 
     <!-- 记录流水（票 08）：任何编辑/删除抛 changed → refresh，首页红绿态即时重算 -->
     <LogListPage v-if="page === 'logs'" @changed="void refresh()" />
@@ -282,7 +294,7 @@ onBeforeUnmount(() => stopTodayClock());
   white-space: nowrap;
 }
 
-/* 三页 nav（视觉基线 mocks/mock-b-stats.html 的 .nav/.tab） */
+/* 顶栏 nav（视觉基线 mocks/mock-b-stats.html 的 .nav/.tab） */
 .nav {
   display: flex;
   gap: 4px;

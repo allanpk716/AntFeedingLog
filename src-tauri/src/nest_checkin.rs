@@ -8,8 +8,10 @@
 //! - 至少一项非空才可提交（蚁后数/工蚁数/换巢/备注全空拒绝）；
 //! - 基线 = 最早一条登记的日期字段，纯查询侧投影（首条日期可改；删首条后
 //!   下一条最早者自然接任）；
-//! - 照片元数据（nest_photo）本票只读不写（写入随票 07 照片管线），读取侧照常
-//!   JOIN，无照片即空数组；
+//! - 照片元数据（nest_photo）：写入走 photo::attach_photos（票 07），本模块管
+//!   读取与裁剪更新（update_photo_crop，窝头像票 01）；无照片即空数组；
+//! - 头像投影（窝头像票 01）：avatar_photo_for_colony 按排序契约取「第一条含
+//!   照片的登记的第一张照片」，纯查询不落库；photo_wall 照片墙只读载荷同契约；
 //! - 巢况永不参与提醒/催促（reminder.rs 不引用本模块，不进维护操作清单）。
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -17,7 +19,18 @@ use serde::{Deserialize, Serialize};
 
 // ── DTO ──────────────────────────────────────────────────────────────────
 
-/// 照片元数据一行（本票恒空：无写入路径，票 07 接管线后生效）。
+/// 头像裁剪（窝头像票 01）：归一化方形区域——`x`/`y` = 左上角坐标、`size` = 边长，
+/// 各 ∈ [0,1] 且 x+size ≤ 1、y+size ≤ 1（校验权威 [`validate_crop`]）。
+/// None（库内三列 NULL）= 默认居中（未调过/存量行）；圆形显示只是方形区域挖角，
+/// 裁剪数据与显示形状无关。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PhotoCrop {
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+}
+
+/// 照片元数据一行（写入走 photo::attach_photos；裁剪列 NULL = 居中）。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct NestPhotoMeta {
     pub id: i64,
@@ -27,6 +40,8 @@ pub struct NestPhotoMeta {
     /// 客户端原始文件名，仅备注、不参与路径。
     pub original_name: Option<String>,
     pub note: String,
+    /// 头像裁剪（归一化区域）；None = 默认居中。
+    pub crop: Option<PhotoCrop>,
 }
 
 /// 巢况登记一行（时间线/列表通用）。
@@ -196,28 +211,55 @@ pub fn save_checkin(
     get_checkin(conn, conn.last_insert_rowid())
 }
 
-/// 照片元数据（按 id 序；本票恒空数组）。
+/// 照片元数据（按 id 序）。
 fn load_photos(conn: &Connection, checkin_id: i64) -> Result<Vec<NestPhotoMeta>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, checkin_id, rel_path, original_name, note
+            "SELECT id, checkin_id, rel_path, original_name, note, crop_x, crop_y, crop_size
              FROM nest_photo WHERE checkin_id = ?1 ORDER BY id",
         )
         .map_err(db_err)?;
     let rows = stmt
-        .query_map(params![checkin_id], |row| {
-            Ok(NestPhotoMeta {
-                id: row.get(0)?,
-                checkin_id: row.get(1)?,
-                rel_path: row.get(2)?,
-                original_name: row.get(3)?,
-                note: row.get(4)?,
-            })
-        })
+        .query_map(params![checkin_id], row_to_photo_meta)
         .map_err(db_err)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(db_err)?;
     Ok(rows)
+}
+
+/// 一行 nest_photo → 照片元数据（读取链路共用：时间线 / 上传回读 / 头像 / 照片墙）。
+fn row_to_photo_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<NestPhotoMeta> {
+    Ok(NestPhotoMeta {
+        id: row.get(0)?,
+        checkin_id: row.get(1)?,
+        rel_path: row.get(2)?,
+        original_name: row.get(3)?,
+        note: row.get(4)?,
+        crop: crop_from_cols(row.get(5)?, row.get(6)?, row.get(7)?),
+    })
+}
+
+/// 裁剪三列 → Option：写入侧（update_photo_crop）三列同进同出；残缺行按
+/// 「未调过」的居中语义处理（None），不做半截裁剪。
+fn crop_from_cols(x: Option<f64>, y: Option<f64>, size: Option<f64>) -> Option<PhotoCrop> {
+    match (x, y, size) {
+        (Some(x), Some(y), Some(size)) => Some(PhotoCrop { x, y, size }),
+        _ => None,
+    }
+}
+
+/// 单张照片元数据（按 id；update_photo_crop 成功后的回读）。
+fn get_photo_meta(conn: &Connection, photo_id: i64) -> Result<NestPhotoMeta, String> {
+    conn.query_row(
+        "SELECT id, checkin_id, rel_path, original_name, note, crop_x, crop_y, crop_size
+         FROM nest_photo WHERE id = ?1",
+        params![photo_id],
+        row_to_photo_meta,
+    )
+    .map_err(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => "照片不存在".to_string(),
+        other => db_err(other),
+    })
 }
 
 fn row_to_checkin(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, String, Option<i64>, Option<i64>, bool, String, String)> {
@@ -385,6 +427,176 @@ pub fn digest_for_colony(
         baseline_date,
         days_since_last,
     })
+}
+
+// ── 裁剪更新 / 头像投影 / 照片墙（窝头像票 01）──────────────────────────────
+// 排序契约（spec Implementation Decisions，全链唯一依据，与既有实现一致）：
+// 登记全序 = 登记日期倒序、同日期按登记创建序号倒序（后建的在前）；
+// 照片列表全序 = 按照片序号正序（先传的在前）。头像与照片墙必须复用同一契约。
+
+/// 裁剪校验（权威在纯核；桌面 IPC 与网页端镜像同口径调用）：
+/// x/y/边长各 ∈ [0,1]（NaN/∞ 落在范围判定外自然被拒），且 x+边长 ≤ 1、y+边长 ≤ 1。
+pub fn validate_crop(crop: &PhotoCrop) -> Result<(), String> {
+    for (label, v) in [("x", crop.x), ("y", crop.y), ("边长", crop.size)] {
+        if !(0.0..=1.0).contains(&v) {
+            return Err(format!("裁剪{label}应在 0–1 之间（收到 {v}）"));
+        }
+    }
+    if crop.x + crop.size > 1.0 {
+        return Err(format!(
+            "裁剪区域超出照片（x+边长 = {}，最大 1）",
+            crop.x + crop.size
+        ));
+    }
+    if crop.y + crop.size > 1.0 {
+        return Err(format!(
+            "裁剪区域超出照片（y+边长 = {}，最大 1）",
+            crop.y + crop.size
+        ));
+    }
+    Ok(())
+}
+
+/// 更新照片裁剪：`Some(合法区域)` 落库；`None` = 重置居中（三列置 NULL）。
+/// 校验失败或照片不存在时不落库；成功回读返回完整照片元数据（裁剪随之可读回）。
+pub fn update_photo_crop(
+    conn: &Connection,
+    photo_id: i64,
+    crop: Option<PhotoCrop>,
+) -> Result<NestPhotoMeta, String> {
+    if let Some(c) = crop.as_ref() {
+        validate_crop(c)?;
+    }
+    let (cx, cy, cs) = match crop {
+        Some(c) => (Some(c.x), Some(c.y), Some(c.size)),
+        None => (None, None, None),
+    };
+    let changed = conn
+        .execute(
+            "UPDATE nest_photo SET crop_x = ?1, crop_y = ?2, crop_size = ?3 WHERE id = ?4",
+            params![cx, cy, cs, photo_id],
+        )
+        .map_err(db_err)?;
+    if changed == 0 {
+        return Err("照片不存在".into());
+    }
+    get_photo_meta(conn, photo_id)
+}
+
+/// 头像照片引用（纯投影，不落库）：按排序契约取**第一条含照片的登记**的第一张
+/// 照片——纯文字登记无照片行自然跳过（spec F6）；该窝从无照片则 None（前端显示
+/// 占位）。删登记后投影重算自然回退到更早照片，裁剪随照片行原样生效。
+pub fn avatar_photo_for_colony(
+    conn: &Connection,
+    colony_id: i64,
+) -> Result<Option<NestPhotoMeta>, String> {
+    conn.query_row(
+        "SELECT np.id, np.checkin_id, np.rel_path, np.original_name, np.note,
+                np.crop_x, np.crop_y, np.crop_size
+         FROM nest_photo np
+         JOIN nest_checkin nc ON np.checkin_id = nc.id
+         WHERE nc.colony_id = ?1
+         ORDER BY nc.date DESC, nc.id DESC, np.id ASC
+         LIMIT 1",
+        params![colony_id],
+        row_to_photo_meta,
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+/// 照片墙一窝载荷：窝 id/名 + 按登记日期倒序的日期分组（无照片的窝不占分组）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PhotoWallColony {
+    pub colony_id: i64,
+    pub colony_name: String,
+    pub groups: Vec<PhotoWallDayGroup>,
+}
+
+/// 照片墙一个日期分组：该日期的全部登记（按登记全序，创建序号倒序）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PhotoWallDayGroup {
+    pub date: String,
+    pub checkins: Vec<PhotoWallCheckin>,
+}
+
+/// 分组内一条登记：登记 id + 该登记的照片（按上传序号正序）。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PhotoWallCheckin {
+    pub checkin_id: i64,
+    pub photos: Vec<NestPhotoMeta>,
+}
+
+/// 照片墙只读载荷：全部窝的照片——窝按 sort/id（与首页窝列表同序）、窝内按
+/// 登记日期倒序、同日期按登记全序、登记内照片按上传序（排序契约全链同源）。
+/// 照片带完整元数据（含裁剪）；只读，无任何写路径。
+pub fn photo_wall(conn: &Connection) -> Result<Vec<PhotoWallColony>, String> {
+    let colony_ids: Vec<(i64, String)> = {
+        let mut stmt = conn
+            .prepare("SELECT id, name FROM colony ORDER BY sort, id")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(db_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_err)?;
+        rows
+    };
+    let mut out = Vec::new();
+    for (colony_id, colony_name) in colony_ids {
+        // 行序即分组序：日期倒序、同日期登记全序、登记内照片序号正序——
+        // 相邻同日期/同登记的行在 Rust 侧折叠成分组与登记条目。
+        // 列序：照片元数据占 0..7（与 row_to_photo_meta 对齐），date 在末位。
+        let rows: Vec<(String, NestPhotoMeta)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT np.id, np.checkin_id, np.rel_path, np.original_name, np.note,
+                            np.crop_x, np.crop_y, np.crop_size, nc.date
+                     FROM nest_checkin nc
+                     JOIN nest_photo np ON np.checkin_id = nc.id
+                     WHERE nc.colony_id = ?1
+                     ORDER BY nc.date DESC, nc.id DESC, np.id ASC",
+                )
+                .map_err(db_err)?;
+            let rows = stmt
+                .query_map(params![colony_id], |row| {
+                    Ok((row.get::<_, String>(8)?, row_to_photo_meta(row)?))
+                })
+                .map_err(db_err)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(db_err)?;
+            rows
+        };
+        if rows.is_empty() {
+            continue; // 无照片的窝不进照片墙
+        }
+        let mut groups: Vec<PhotoWallDayGroup> = Vec::new();
+        for (date, meta) in rows {
+            let group = match groups.last_mut() {
+                Some(g) if g.date == date => g,
+                _ => {
+                    groups.push(PhotoWallDayGroup {
+                        date: date.clone(),
+                        checkins: Vec::new(),
+                    });
+                    groups.last_mut().expect("刚 push 必有")
+                }
+            };
+            match group.checkins.last_mut() {
+                Some(c) if c.checkin_id == meta.checkin_id => c.photos.push(meta),
+                _ => group.checkins.push(PhotoWallCheckin {
+                    checkin_id: meta.checkin_id,
+                    photos: vec![meta],
+                }),
+            }
+        }
+        out.push(PhotoWallColony {
+            colony_id,
+            colony_name,
+            groups,
+        });
+    }
+    Ok(out)
 }
 
 // ── 测试：只测外部行为（spec「Testing Decisions」）────────────────────────
@@ -790,5 +1002,248 @@ mod tests {
 
         crate::colony::delete_colony(&conn, c).unwrap();
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM nest_checkin"), 0, "删窝连带清巢况");
+    }
+
+    // ── 裁剪更新 / 头像投影 / 照片墙（窝头像票 01）───────────────────────────
+
+    /// 直插一行照片元数据（读取/投影测试夹具；写入管线本身在 photo.rs 有专测）。
+    fn photo(conn: &Connection, checkin_id: i64, rel: &str) -> i64 {
+        conn.execute(
+            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+             VALUES (?1, ?2, NULL, '')",
+            params![checkin_id, rel],
+        )
+        .expect("插照片元数据失败");
+        conn.last_insert_rowid()
+    }
+
+    /// 一条只有备注的合法登记（照片挂靠点），返回登记 id。
+    fn checkin_on(conn: &Connection, colony_id: i64, date: &str, note: &str) -> i64 {
+        save_checkin(
+            conn,
+            &CheckinInput {
+                colony_id,
+                date: date.into(),
+                queen_count: None,
+                worker_count: None,
+                moved_nest: false,
+                note: Some(note.into()),
+            },
+            TODAY,
+            NOW,
+        )
+        .expect("建登记失败")
+        .id
+    }
+
+    #[test]
+    fn update_photo_crop_persists_legal_and_resets_to_center() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let ck = checkin_on(&conn, c, "2026-09-18", "带照片");
+        let p = photo(&conn, ck, "1/a.jpg");
+
+        // 合法区域落库并可读回
+        let updated =
+            update_photo_crop(&conn, p, Some(PhotoCrop { x: 0.25, y: 0.5, size: 0.5 })).unwrap();
+        assert_eq!(updated.crop, Some(PhotoCrop { x: 0.25, y: 0.5, size: 0.5 }));
+        assert_eq!(updated.id, p);
+        assert_eq!(updated.rel_path, "1/a.jpg");
+
+        // 元数据贯通：时间线/摘要读到的同一份照片也带裁剪
+        let row = get_checkin(&conn, ck).unwrap();
+        assert_eq!(row.photos[0].crop, Some(PhotoCrop { x: 0.25, y: 0.5, size: 0.5 }));
+
+        // 边界：整幅（0,0,1）合法
+        update_photo_crop(&conn, p, Some(PhotoCrop { x: 0.0, y: 0.0, size: 1.0 })).unwrap();
+
+        // None 重置 = 居中语义（三列回 NULL），幂等
+        let reset = update_photo_crop(&conn, p, None).unwrap();
+        assert_eq!(reset.crop, None, "重置后读回 None（居中）");
+        update_photo_crop(&conn, p, None).unwrap();
+    }
+
+    #[test]
+    fn update_photo_crop_rejects_out_of_range_and_missing_photo() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let ck = checkin_on(&conn, c, "2026-09-18", "带照片");
+        let p = photo(&conn, ck, "1/a.jpg");
+
+        // 越界/非法：单值出 [0,1]、x+边长>1、y+边长>1
+        for bad in [
+            PhotoCrop { x: -0.1, y: 0.0, size: 0.5 },
+            PhotoCrop { x: 0.0, y: 1.5, size: 0.5 },
+            PhotoCrop { x: 0.6, y: 0.0, size: 0.5 }, // x+边长 = 1.1
+            PhotoCrop { x: 0.0, y: 0.7, size: 0.4 }, // y+边长 = 1.1
+            PhotoCrop { x: 0.0, y: 0.0, size: 1.2 },
+        ] {
+            let err = update_photo_crop(&conn, p, Some(bad)).unwrap_err();
+            assert!(err.contains("裁剪"), "crop={bad:?} 实际错误：{err}");
+        }
+        // 越界值一个都没落库
+        let stored: Option<f64> = conn
+            .query_row(
+                "SELECT crop_x FROM nest_photo WHERE id = ?1",
+                params![p],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, None);
+
+        // 幽灵照片：设与重置都报不存在（不静默成功）
+        let err = update_photo_crop(&conn, 999, Some(PhotoCrop { x: 0.1, y: 0.1, size: 0.5 }))
+            .unwrap_err();
+        assert!(err.contains("照片不存在"), "实际错误：{err}");
+        assert!(update_photo_crop(&conn, 999, None)
+            .unwrap_err()
+            .contains("照片不存在"));
+    }
+
+    #[test]
+    fn avatar_takes_first_photo_of_latest_checkin_with_photos() {
+        // 排序契约：最新登记的第一张（序号最小）照片
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let older = checkin_on(&conn, c, "2026-09-10", "早");
+        let latest = checkin_on(&conn, c, "2026-09-15", "晚");
+        let _older_photo = photo(&conn, older, "1/old.jpg");
+        let p1 = photo(&conn, latest, "1/new-1.jpg");
+        let _p2 = photo(&conn, latest, "1/new-2.jpg");
+
+        let avatar = avatar_photo_for_colony(&conn, c)
+            .unwrap()
+            .expect("最新登记有照片，应有头像");
+        assert_eq!(avatar.id, p1, "最新登记的照片里取序号最小者");
+        assert_eq!(avatar.rel_path, "1/new-1.jpg");
+    }
+
+    #[test]
+    fn avatar_skips_text_only_latest_checkin() {
+        // 最新登记是纯文字（无照片）→ 跳过取更早含照片登记（spec F6）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let older = checkin_on(&conn, c, "2026-09-10", "有照片");
+        let older_photo = photo(&conn, older, "1/old.jpg");
+        checkin_on(&conn, c, "2026-09-15", "纯文字");
+
+        let avatar = avatar_photo_for_colony(&conn, c)
+            .unwrap()
+            .expect("跳过纯文字登记后应回退到更早照片");
+        assert_eq!(avatar.id, older_photo);
+    }
+
+    #[test]
+    fn avatar_same_date_takes_latest_created_checkin() {
+        // 同日期多条登记 → 登记全序取创建序号最大者（后建的在前）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let first = checkin_on(&conn, c, "2026-09-15", "先建");
+        let second = checkin_on(&conn, c, "2026-09-15", "后建");
+        let _fp = photo(&conn, first, "1/first.jpg");
+        let sp = photo(&conn, second, "1/second.jpg");
+
+        let avatar = avatar_photo_for_colony(&conn, c).unwrap().unwrap();
+        assert_eq!(avatar.id, sp, "同日期取创建序号最大者的照片");
+    }
+
+    #[test]
+    fn avatar_falls_back_after_delete_and_is_none_without_photos() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let older = checkin_on(&conn, c, "2026-09-10", "早");
+        let older_photo = photo(&conn, older, "1/old.jpg");
+        let latest = checkin_on(&conn, c, "2026-09-15", "晚");
+        let lp = photo(&conn, latest, "1/new.jpg");
+
+        assert_eq!(avatar_photo_for_colony(&conn, c).unwrap().unwrap().id, lp);
+
+        // 更早照片先调过裁剪 → 删最新登记后投影回退，裁剪仍随照片生效
+        update_photo_crop(&conn, older_photo, Some(PhotoCrop { x: 0.1, y: 0.1, size: 0.4 }))
+            .unwrap();
+        delete_checkin(&conn, latest).unwrap();
+        let avatar = avatar_photo_for_colony(&conn, c).unwrap().unwrap();
+        assert_eq!(avatar.id, older_photo, "删登记后投影重算自然回退");
+        assert_eq!(
+            avatar.crop,
+            Some(PhotoCrop { x: 0.1, y: 0.1, size: 0.4 }),
+            "回退照片调过的裁剪仍生效"
+        );
+
+        // 无照片窝 → None；从未登记/幽灵窝同样 None（与 digest 的空语义同口径）
+        let bare = colony(&conn, "无照窝");
+        checkin_on(&conn, bare, "2026-09-15", "纯文字");
+        assert!(avatar_photo_for_colony(&conn, bare).unwrap().is_none());
+        assert!(avatar_photo_for_colony(&conn, 999).unwrap().is_none());
+    }
+
+    #[test]
+    fn photo_wall_groups_by_colony_date_and_checkin_order() {
+        // 排序契约验收：跨窝（按 sort/id）、窝内日期倒序、同日期多登记按登记全序、
+        // 登记内多照片按上传序；载荷带窝名与日期；照片带裁剪。
+        let conn = mem_conn();
+        let a = colony(&conn, "大头一号");
+        let b = colony(&conn, "针毛一号");
+        let bare = colony(&conn, "无照窝"); // 无照片窝不进照片墙
+        checkin_on(&conn, bare, "2026-09-18", "纯文字");
+
+        // 窝 A：09-10 一条两照片（上传序）、09-15 同日两条登记（登记全序）
+        let a_old = checkin_on(&conn, a, "2026-09-10", "早");
+        let a_1st = checkin_on(&conn, a, "2026-09-15", "同日先建");
+        let a_2nd = checkin_on(&conn, a, "2026-09-15", "同日后建");
+        let a_old_p1 = photo(&conn, a_old, "1/old-1.jpg");
+        let _a_old_p2 = photo(&conn, a_old, "1/old-2.jpg");
+        let _a_1st_p = photo(&conn, a_1st, "1/same-1.jpg");
+        let _a_2nd_p1 = photo(&conn, a_2nd, "1/same-2a.jpg");
+        let _a_2nd_p2 = photo(&conn, a_2nd, "1/same-2b.jpg");
+
+        // 窝 B：日期更晚（验证窝间按窝序而非日期；不得晚于 TODAY）
+        let b_ck = checkin_on(&conn, b, "2026-09-17", "B 窝");
+        let _b_p = photo(&conn, b_ck, "2/b.jpg");
+
+        update_photo_crop(&conn, a_old_p1, Some(PhotoCrop { x: 0.2, y: 0.2, size: 0.6 })).unwrap();
+
+        let wall = photo_wall(&conn).unwrap();
+        assert_eq!(wall.len(), 2, "无照片窝不占分组，共两窝");
+        assert_eq!(wall[0].colony_id, a, "窝按 sort/id 序（先建的在前）");
+        assert_eq!(wall[0].colony_name, "大头一号");
+        assert_eq!(wall[1].colony_id, b);
+        assert_eq!(wall[1].colony_name, "针毛一号");
+
+        let a_groups = &wall[0].groups;
+        let dates: Vec<&str> = a_groups.iter().map(|g| g.date.as_str()).collect();
+        assert_eq!(dates, vec!["2026-09-15", "2026-09-10"], "窝内按登记日期倒序");
+
+        // 同日两条登记按登记全序（创建序号倒序：后建在前）
+        let same_day = &a_groups[0];
+        let ck_ids: Vec<i64> = same_day.checkins.iter().map(|c| c.checkin_id).collect();
+        assert_eq!(ck_ids, vec![a_2nd, a_1st]);
+        // 登记内照片按上传序（序号正序）
+        let second_paths: Vec<&str> = same_day.checkins[0]
+            .photos
+            .iter()
+            .map(|p| p.rel_path.as_str())
+            .collect();
+        assert_eq!(second_paths, vec!["1/same-2a.jpg", "1/same-2b.jpg"]);
+
+        // 早日期分组：单登记两照片按上传序，首张带刚调过的裁剪
+        let old_group = &a_groups[1];
+        assert_eq!(old_group.checkins.len(), 1);
+        let old_paths: Vec<&str> = old_group.checkins[0]
+            .photos
+            .iter()
+            .map(|p| p.rel_path.as_str())
+            .collect();
+        assert_eq!(old_paths, vec!["1/old-1.jpg", "1/old-2.jpg"]);
+        assert_eq!(
+            old_group.checkins[0].photos[0].crop,
+            Some(PhotoCrop { x: 0.2, y: 0.2, size: 0.6 }),
+            "照片墙照片带裁剪元数据"
+        );
+
+        // 窝 B：单组单登记
+        assert_eq!(wall[1].groups.len(), 1);
+        assert_eq!(wall[1].groups[0].date, "2026-09-17");
+        assert_eq!(wall[1].groups[0].checkins[0].checkin_id, b_ck);
     }
 }

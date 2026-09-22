@@ -508,6 +508,12 @@ pub const WEBUI_COMMANDS: &[&str] = &[
     "update_checkin",
     "delete_checkin",
     "get_checkin_digest",
+    // 窝头像与照片墙（窝头像票 01）：photo_wall 只读载荷；update_photo_crop
+    // 是本票唯一新写路径（校验与既有写命令同档）
+    "photo_wall",
+    "update_photo_crop",
+    // 头像形状偏好（窝头像票 03）：只读生效（网页无设置页，写路径不开放）
+    "get_avatar_shape",
 ];
 
 /// 写命令成功后的副作用钩子（票 05）：参数 = 是否同时刷新托盘 tooltip。
@@ -742,6 +748,30 @@ pub fn dispatch_command(
         })),
         "get_checkin_digest" => Some(read_cmd(deps, args, |conn, a: webui_args::ColonyIdArgs| {
             crate::nest_checkin::digest_for_colony(conn, a.colony_id, &crate::colony::today_iso())
+        })),
+        // ── 窝头像与照片墙（窝头像票 01）──
+        // 照片墙只读：全部窝照片的排序契约载荷（分组带窝名与日期），无写副作用。
+        "photo_wall" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
+            crate::nest_checkin::photo_wall(conn)
+        })),
+        // 裁剪更新：本票唯一新写路径；巢况系命令不刷托盘（永不参与提醒），只
+        // 触发自动备份。取值校验 schema 层与纯核双层同口径（越界 400 不进库）。
+        "update_photo_crop" => Some(write_cmd(
+            deps,
+            args,
+            false,
+            |conn, a: webui_args::UpdatePhotoCropArgs| {
+                crate::nest_checkin::update_photo_crop(
+                    conn,
+                    a.photo_id,
+                    a.crop.map(|c| c.into_core()),
+                )
+            },
+        )),
+        // 头像形状只读（窝头像票 03）：网页端跟随全局偏好渲染遮罩；写入只在
+        // 桌面设置页（本白名单不登记 set_avatar_shape，deny-by-default 兜底）。
+        "get_avatar_shape" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
+            crate::settings::get_avatar_shape(conn)
         })),
         // 不存在「注册表里有但这里没有」的分支——registry_entries_all_have_real_dispatch
         // 钉住两边同步；走到这等于调用方没先查注册表
@@ -2175,6 +2205,160 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM nest_photo", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "元数据行一并删除");
+    }
+
+    // ── 头像形状偏好（窝头像票 03）：网页端只读接入，写命令永不入表 ──
+
+    #[test]
+    fn avatar_shape_web_read_only_follows_desktop_write() {
+        // 读：EmptyArgs 派发回库内真值，缺键回默认 circle；桌面侧写 square 后
+        // 网页读跟随同一设置（持久化跨端一致）。写命令不入白名单——形状只有
+        // 桌面设置页能改（deny-by-default 落 404）。
+        assert!(
+            WEBUI_COMMANDS.contains(&"get_avatar_shape"),
+            "读命令应入白名单"
+        );
+        assert!(
+            !WEBUI_COMMANDS.contains(&"set_avatar_shape"),
+            "写命令不得入白名单（网页端只读）"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join(crate::db::DB_FILE_NAME);
+        let conn = crate::db::open_and_migrate(&db_path).unwrap();
+        let deps = SharedDeps::with_hooks(
+            Arc::new(Mutex::new(conn)),
+            dir.path().to_path_buf(),
+            Arc::new(|_with_tray| {}),
+            Arc::new(|_path| None),
+        );
+
+        let out = dispatch_command(&deps, "get_avatar_shape", &serde_json::json!({})).unwrap();
+        match out {
+            CmdOutcome::Ok(v) => assert_eq!(v, serde_json::json!("circle"), "缺键回默认 circle"),
+            other => panic!("get_avatar_shape 应成功，实际 {other:?}"),
+        }
+
+        {
+            let conn = deps.conn.lock().unwrap();
+            crate::settings::set_avatar_shape(&conn, crate::settings::AVATAR_SHAPE_SQUARE).unwrap();
+        }
+        let out = dispatch_command(&deps, "get_avatar_shape", &serde_json::json!({})).unwrap();
+        match out {
+            CmdOutcome::Ok(v) => assert_eq!(v, serde_json::json!("square"), "跟随桌面写入的值"),
+            other => panic!("get_avatar_shape 应成功，实际 {other:?}"),
+        }
+
+        // 带参也拒（EmptyArgs 严格 schema）：读命令不接受任何键
+        let out = dispatch_command(&deps, "get_avatar_shape", &serde_json::json!({"x": 1}));
+        assert!(
+            matches!(out, Some(CmdOutcome::Rejected(_))),
+            "多余参数应 400 拒绝，实际 {out:?}"
+        );
+    }
+
+    // ── 窝头像与照片墙（票 01）：photo_wall 只读 + update_photo_crop 唯一新写 ──
+
+    #[test]
+    fn dispatch_photo_wall_read_and_update_photo_crop_write() {
+        // 照片墙走只读白名单（不触发写副作用）；裁剪更新是本票唯一新写路径
+        //（触发写副作用）；越界裁剪 400 Rejected 不进库。
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join(crate::db::DB_FILE_NAME);
+        let conn = crate::db::open_and_migrate(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, status) VALUES ('大头一号', '2026-01-20', 'active')",
+            [],
+        )
+        .unwrap();
+        let checkin_id = crate::nest_checkin::save_checkin(
+            &conn,
+            &crate::nest_checkin::CheckinInput {
+                colony_id: 1,
+                date: "2026-09-18".into(),
+                queen_count: None,
+                worker_count: None,
+                moved_nest: false,
+                note: Some("带照片".into()),
+            },
+            "2026-09-18",
+            "2026-09-18 21:00:00",
+        )
+        .unwrap()
+        .id;
+        conn.execute(
+            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+             VALUES ((SELECT id FROM nest_checkin LIMIT 1), '1/a.jpg', NULL, '')",
+            [],
+        )
+        .unwrap();
+
+        // 写后副作用计数钩子：photo_wall 只读不触发；update_photo_crop 成功触发一次
+        let writes = Arc::new(AtomicUsize::new(0));
+        let counter = writes.clone();
+        let deps = SharedDeps::with_hooks(
+            Arc::new(Mutex::new(conn)),
+            dir.path().to_path_buf(),
+            Arc::new(move |_with_tray| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            Arc::new(|_path| None),
+        );
+
+        // photo_wall：与桌面纯核同形 + 载荷结构正确 + 不触发写副作用
+        let desktop = {
+            let conn = deps.conn.lock().unwrap();
+            serde_json::to_value(crate::nest_checkin::photo_wall(&conn).unwrap()).unwrap()
+        };
+        let out = dispatch_command(&deps, "photo_wall", &serde_json::json!({})).unwrap();
+        assert_eq!(out, CmdOutcome::Ok(desktop), "HTTP 派发与桌面纯核同形");
+        let wall = match out {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("photo_wall 应成功，实际 {other:?}"),
+        };
+        assert_eq!(wall[0]["colony_id"], 1);
+        assert_eq!(wall[0]["colony_name"], "大头一号");
+        assert_eq!(wall[0]["groups"][0]["date"], "2026-09-18");
+        assert_eq!(wall[0]["groups"][0]["checkins"][0]["checkin_id"], checkin_id);
+        assert_eq!(wall[0]["groups"][0]["checkins"][0]["photos"][0]["rel_path"], "1/a.jpg");
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            0,
+            "photo_wall 只读，不得触发写副作用"
+        );
+
+        // 合法裁剪：落库、返回体带裁剪、触发写副作用一次
+        let out = dispatch_command(
+            &deps,
+            "update_photo_crop",
+            &serde_json::json!({"photoId": 1, "crop": {"x": 0.2, "y": 0.3, "size": 0.5}}),
+        )
+        .unwrap();
+        let updated = match out {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("合法裁剪应成功，实际 {other:?}"),
+        };
+        assert_eq!(updated["crop"]["x"], 0.2);
+        assert_eq!(updated["crop"]["size"], 0.5);
+        assert_eq!(writes.load(Ordering::SeqCst), 1, "update_photo_crop 成功触发写副作用");
+
+        // 越界裁剪：400 Rejected（校验层拦下，未进库、不再触发写副作用）
+        let out = dispatch_command(
+            &deps,
+            "update_photo_crop",
+            &serde_json::json!({"photoId": 1, "crop": {"x": 0.8, "y": 0.0, "size": 0.5}}),
+        )
+        .unwrap();
+        assert!(matches!(out, CmdOutcome::Rejected(_)), "实际：{out:?}");
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+
+        // photo_wall 读回：仍是合法值（越界没落）
+        let out = dispatch_command(&deps, "photo_wall", &serde_json::json!({})).unwrap();
+        let wall = match out {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(wall[0]["groups"][0]["checkins"][0]["photos"][0]["crop"]["x"], 0.2);
     }
 
     // ── 集成：真监听（127.0.0.1 随机端口）+ ureq 真请求 ──
