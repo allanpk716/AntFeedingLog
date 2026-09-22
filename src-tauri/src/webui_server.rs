@@ -512,6 +512,8 @@ pub const WEBUI_COMMANDS: &[&str] = &[
     // 是本票唯一新写路径（校验与既有写命令同档）
     "photo_wall",
     "update_photo_crop",
+    // 头像形状偏好（窝头像票 03）：只读生效（网页无设置页，写路径不开放）
+    "get_avatar_shape",
 ];
 
 /// 写命令成功后的副作用钩子（票 05）：参数 = 是否同时刷新托盘 tooltip。
@@ -766,6 +768,11 @@ pub fn dispatch_command(
                 )
             },
         )),
+        // 头像形状只读（窝头像票 03）：网页端跟随全局偏好渲染遮罩；写入只在
+        // 桌面设置页（本白名单不登记 set_avatar_shape，deny-by-default 兜底）。
+        "get_avatar_shape" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
+            crate::settings::get_avatar_shape(conn)
+        })),
         // 不存在「注册表里有但这里没有」的分支——registry_entries_all_have_real_dispatch
         // 钉住两边同步；走到这等于调用方没先查注册表
         _ => None,
@@ -2198,6 +2205,56 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM nest_photo", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "元数据行一并删除");
+    }
+
+    // ── 头像形状偏好（窝头像票 03）：网页端只读接入，写命令永不入表 ──
+
+    #[test]
+    fn avatar_shape_web_read_only_follows_desktop_write() {
+        // 读：EmptyArgs 派发回库内真值，缺键回默认 circle；桌面侧写 square 后
+        // 网页读跟随同一设置（持久化跨端一致）。写命令不入白名单——形状只有
+        // 桌面设置页能改（deny-by-default 落 404）。
+        assert!(
+            WEBUI_COMMANDS.contains(&"get_avatar_shape"),
+            "读命令应入白名单"
+        );
+        assert!(
+            !WEBUI_COMMANDS.contains(&"set_avatar_shape"),
+            "写命令不得入白名单（网页端只读）"
+        );
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join(crate::db::DB_FILE_NAME);
+        let conn = crate::db::open_and_migrate(&db_path).unwrap();
+        let deps = SharedDeps::with_hooks(
+            Arc::new(Mutex::new(conn)),
+            dir.path().to_path_buf(),
+            Arc::new(|_with_tray| {}),
+            Arc::new(|_path| None),
+        );
+
+        let out = dispatch_command(&deps, "get_avatar_shape", &serde_json::json!({})).unwrap();
+        match out {
+            CmdOutcome::Ok(v) => assert_eq!(v, serde_json::json!("circle"), "缺键回默认 circle"),
+            other => panic!("get_avatar_shape 应成功，实际 {other:?}"),
+        }
+
+        {
+            let conn = deps.conn.lock().unwrap();
+            crate::settings::set_avatar_shape(&conn, crate::settings::AVATAR_SHAPE_SQUARE).unwrap();
+        }
+        let out = dispatch_command(&deps, "get_avatar_shape", &serde_json::json!({})).unwrap();
+        match out {
+            CmdOutcome::Ok(v) => assert_eq!(v, serde_json::json!("square"), "跟随桌面写入的值"),
+            other => panic!("get_avatar_shape 应成功，实际 {other:?}"),
+        }
+
+        // 带参也拒（EmptyArgs 严格 schema）：读命令不接受任何键
+        let out = dispatch_command(&deps, "get_avatar_shape", &serde_json::json!({"x": 1}));
+        assert!(
+            matches!(out, Some(CmdOutcome::Rejected(_))),
+            "多余参数应 400 拒绝，实际 {out:?}"
+        );
     }
 
     // ── 窝头像与照片墙（票 01）：photo_wall 只读 + update_photo_crop 唯一新写 ──

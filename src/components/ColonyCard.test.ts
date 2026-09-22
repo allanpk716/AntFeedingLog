@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import ColonyCard from "./ColonyCard.vue";
 import type { Colony, ColonyAction, NestPhotoMeta } from "../types";
+// 窝头像票 03：全局形状镜像直接操作（reset 复位 / save 模拟设置页保存后的更新）
+import { resetAvatarShapeForTests, saveAvatarShapePref } from "../lib/ipc";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（沿 QuickLogDialog.test.ts 先例）
 const { invokeMock, loadPhotoBlobUrlMock, revokeObjectUrlMock } = vi.hoisted(() => ({
@@ -100,6 +102,7 @@ describe("窝卡片头像（窝头像票 02）", () => {
     invokeMock.mockReset();
     loadPhotoBlobUrlMock.mockReset();
     revokeObjectUrlMock.mockReset();
+    resetAvatarShapeForTests(); // 票 03：形状镜像/读取标志不跨测试泄漏
   });
 
   it("无照片窝（avatar 缺省/null）显示 🐜 占位，不渲染 img、不发取图请求", () => {
@@ -213,6 +216,53 @@ describe("窝卡片头像（窝头像票 02）", () => {
     expect(w.find(".avatar").classes()).toContain("circle");
     const sq = mountCard(colonyWithAvatar, { shape: "square" });
     expect(sq.find(".avatar").classes()).toContain("square");
+  });
+
+  // ── 全局形状偏好（窝头像票 03）────────────────────────────────────────
+
+  it("全局形状偏好启动加载：库里 square → 已挂载卡片渲染方形", async () => {
+    // 启动读取路径：首个挂载的卡片触发 get_avatar_shape，收敛进镜像后方形生效
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "get_avatar_shape" ? "square" : undefined,
+    );
+    const w = mountCard(colonyWithAvatar);
+    // 读取落地前先按默认圆形渲染
+    expect(w.find(".avatar").classes()).not.toContain("square");
+    await flushPromises();
+    expect(w.find(".avatar").classes()).toContain("square");
+  });
+
+  it("全局形状偏好读不出脏值（非 square）→ 回退默认圆形，不毒死渲染", async () => {
+    invokeMock.mockImplementation(async () => "rectangle");
+    const w = mountCard(colonyWithAvatar);
+    await flushPromises();
+    expect(w.find(".avatar").classes()).toContain("circle");
+  });
+
+  it("设置变更即时生效：保存成功后的镜像更新让已挂载卡片立即切换，无需重挂", async () => {
+    const w = mountCard(colonyWithAvatar);
+    await flushPromises();
+    expect(w.find(".avatar").classes()).toContain("circle");
+
+    saveAvatarShapePref("square"); // 设置页保存成功后的镜像更新（ipc.ts 内部出口）
+    await flushPromises();
+    // 无需重挂即切换
+    expect(w.find(".avatar").classes()).toContain("square");
+
+    saveAvatarShapePref("circle");
+    await flushPromises();
+    expect(w.find(".avatar").classes()).toContain("circle");
+  });
+
+  it("shape prop 显式传入优先于全局偏好（票 02 契约不破）", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "get_avatar_shape" ? "square" : undefined,
+    );
+    const w = mountCard(colonyWithAvatar, { shape: "circle" });
+    await flushPromises();
+    // 显式 prop 覆盖全局 square
+    expect(w.find(".avatar").classes()).toContain("circle");
+    expect(w.find(".avatar").classes()).not.toContain("square");
   });
 
   describe("桌面 asset 通路", () => {

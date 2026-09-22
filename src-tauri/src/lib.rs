@@ -772,6 +772,23 @@ fn set_settings(
     outcome
 }
 
+// ── 头像形状偏好（窝头像票 03）：双端读、桌面设置页写 ──
+// 独立键不进 AppSettings（同向导键先例）：整体覆盖式 set_settings 不碰它，
+// 网页端白名单只登记 get_avatar_shape 这条只读。
+
+/// 读头像形状：缺行/脏值回退 circle（旧库兼容，不写回）。
+#[tauri::command]
+fn get_avatar_shape(state: tauri::State<'_, DbState>) -> Result<String, String> {
+    with_conn(state, settings::get_avatar_shape)
+}
+
+/// 保存头像形状（桌面设置页专用；不入网页端白名单）：只接受 circle / square，
+/// 返回落库的规范值。纯外观偏好：不触发写后钩子（托盘/自动备份与本键无关）。
+#[tauri::command]
+fn set_avatar_shape(state: tauri::State<'_, DbState>, shape: String) -> Result<String, String> {
+    with_conn(state, |conn| settings::set_avatar_shape(conn, &shape))
+}
+
 /// 设置保存的 command 层裁决：落库结果 + 自启同步结果 → 前端口径。
 /// 落库失败恒报错；自启同步失败只记日志、不吞掉已保存的设置（设置是权威，
 /// 启动时按设置重新对齐插件——与启动路径同一宽宽策略）。
@@ -1789,6 +1806,8 @@ pub fn run() {
             update_expected_end,
             get_settings,
             set_settings,
+            get_avatar_shape,
+            set_avatar_shape,
             send_test_notification,
             check_update_now,
             confirm_and_install,

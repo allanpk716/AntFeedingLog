@@ -24,6 +24,13 @@ pub const K_WEBUI_WIZARD_DONE: &str = "webui_wizard_done";
 /// 缺行 = 应用内未填，发送侧回落环境变量。明文入库已明示接受（规格 G）。
 pub const K_PUSHOVER_USER: &str = "pushover_user";
 pub const K_PUSHOVER_TOKEN: &str = "pushover_token";
+/// 头像显示形状键（窝头像票 03）：`circle`（默认）| `square`。独立函数不进
+/// AppSettings——同向导键先例：整体覆盖式 set_settings 不碰它；读侧缺行/脏值
+/// 回退 circle 且不写回（旧库兼容），写侧只收两个合法值。
+pub const K_AVATAR_SHAPE: &str = "avatar_shape";
+/// 头像形状合法值：圆形（默认）与方形（窝头像票 03）。
+pub const AVATAR_SHAPE_CIRCLE: &str = "circle";
+pub const AVATAR_SHAPE_SQUARE: &str = "square";
 
 /// 临近出眠提前天数默认值（spec 设置节）。
 pub const DEFAULT_WAKE_AHEAD_DAYS: i64 = 7;
@@ -201,6 +208,36 @@ pub fn get_webui_wizard_done(conn: &Connection) -> Result<bool, String> {
 /// 标记向导已处理（完成或跳过都写）：幂等 upsert '1'。
 pub fn mark_webui_wizard_done(conn: &Connection) -> Result<(), String> {
     upsert(conn, K_WEBUI_WIZARD_DONE, "1")
+}
+
+/// 读头像形状（窝头像票 03）：缺行/脏值回退 [`AVATAR_SHAPE_CIRCLE`]，不写回。
+/// 双端共用读出口：桌面 IPC 与网页端白名单各接一条只读命令。
+pub fn get_avatar_shape(conn: &Connection) -> Result<String, String> {
+    Ok(avatar_shape_or_default(&read_string(
+        conn,
+        K_AVATAR_SHAPE,
+        AVATAR_SHAPE_CIRCLE,
+    )?))
+}
+
+/// 保存头像形状（桌面设置页专用写路径，不入网页端白名单）：只接受
+/// circle / square，非法值人话报错不落库；返回落库的规范值。
+pub fn set_avatar_shape(conn: &Connection, shape: &str) -> Result<String, String> {
+    if shape != AVATAR_SHAPE_CIRCLE && shape != AVATAR_SHAPE_SQUARE {
+        return Err(format!("非法的头像形状「{shape}」（只接受 circle / square）"));
+    }
+    upsert(conn, K_AVATAR_SHAPE, shape)?;
+    Ok(shape.to_string())
+}
+
+/// 形状收敛：只有字面 `square` 算方形，其余（缺行/脏值/空串）一律 circle，
+/// 与前端 normalizeAvatarShape 同口径。
+fn avatar_shape_or_default(raw: &str) -> String {
+    if raw == AVATAR_SHAPE_SQUARE {
+        AVATAR_SHAPE_SQUARE.to_string()
+    } else {
+        AVATAR_SHAPE_CIRCLE.to_string()
+    }
 }
 
 // ── 测试：只测外部行为（spec「Testing Decisions」）────────────────────────
@@ -452,5 +489,74 @@ mod tests {
         let cleared = AppSettings { pushover_user: String::new(), pushover_token: String::new(), ..second };
         set_settings(&conn, &cleared).unwrap();
         assert_eq!(get_pushover_credentials(&conn).unwrap(), (String::new(), String::new()));
+    }
+
+    // ── 头像形状偏好（窝头像票 03）────────────────────────────────────────
+
+    #[test]
+    fn avatar_shape_defaults_circle_and_never_writes_back() {
+        // 旧库/未设置键：读出空 → 默认 circle，且不写回默认行（规格兼容条款）
+        let conn = mem_conn();
+        assert_eq!(get_avatar_shape(&conn).unwrap(), AVATAR_SHAPE_CIRCLE);
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = ?1",
+                params![K_AVATAR_SHAPE],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "读取缺键不得写回默认行");
+    }
+
+    #[test]
+    fn avatar_shape_set_round_trips_and_persists() {
+        // 持久化验收：square 落库为 settings 普通行（随备份/恢复走），读回不变；
+        // 切回 circle 同样成立
+        let conn = mem_conn();
+        let saved = set_avatar_shape(&conn, AVATAR_SHAPE_SQUARE).unwrap();
+        assert_eq!(saved, AVATAR_SHAPE_SQUARE);
+        assert_eq!(raw(&conn, K_AVATAR_SHAPE), "square");
+        assert_eq!(get_avatar_shape(&conn).unwrap(), AVATAR_SHAPE_SQUARE);
+
+        set_avatar_shape(&conn, AVATAR_SHAPE_CIRCLE).unwrap();
+        assert_eq!(get_avatar_shape(&conn).unwrap(), AVATAR_SHAPE_CIRCLE);
+        assert_eq!(raw(&conn, K_AVATAR_SHAPE), "circle");
+    }
+
+    #[test]
+    fn avatar_shape_dirty_value_reads_as_circle() {
+        // 脏值（手改库/意外残留）：回退默认 circle，不毒死渲染
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?1, 'rectangle')",
+            params![K_AVATAR_SHAPE],
+        )
+        .unwrap();
+        assert_eq!(get_avatar_shape(&conn).unwrap(), AVATAR_SHAPE_CIRCLE);
+    }
+
+    #[test]
+    fn avatar_shape_set_rejects_unknown_value() {
+        // 写侧严格校验：非法值人话报错且不落库
+        let conn = mem_conn();
+        let err = set_avatar_shape(&conn, "hexagon").unwrap_err();
+        assert!(err.contains("circle"), "报错要点名合法值: {err}");
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM settings WHERE key = ?1",
+                params![K_AVATAR_SHAPE],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "非法值不得落库");
+    }
+
+    #[test]
+    fn set_settings_does_not_clobber_avatar_shape() {
+        // 独立函数取舍（同向导键先例）：通知设置整体覆盖保存不冲掉形状键
+        let conn = mem_conn();
+        set_avatar_shape(&conn, AVATAR_SHAPE_SQUARE).unwrap();
+        set_settings(&conn, &AppSettings::default()).unwrap();
+        assert_eq!(get_avatar_shape(&conn).unwrap(), AVATAR_SHAPE_SQUARE);
     }
 }

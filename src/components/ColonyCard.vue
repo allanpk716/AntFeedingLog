@@ -15,6 +15,9 @@
  * 巢况时间线（与「巢况」按钮同一弹窗）。取图双通路：桌面 asset 协议
  * （photoSrc + getPhotoAbsDir），网页 loadPhotoBlobUrl blob（凭证不进 URL，
  * 换头像/卸载释放）；加载失败回退 🐜 占位，不崩溃。
+ * 窝头像票 03：形状接全局偏好——shape prop 缺省时跟随 ipc.ts 的全局镜像
+ * （首个挂载的卡片经 get_avatar_shape 拉一次，多实例共享；设置页保存成功后
+ * 镜像更新，已挂载卡片经响应性立即切换），显式传入的 prop 仍优先（票 02 契约）。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { Colony, ColonyAction, PhotoCrop } from "../types";
@@ -28,7 +31,15 @@ import {
   retrievalTile,
   type TileView,
 } from "../lib/care";
-import { getPhotoAbsDir, isTauri } from "../lib/ipc";
+import {
+  avatarShape,
+  claimAvatarShapePrefLoad,
+  getAvatarShape,
+  getPhotoAbsDir,
+  isTauri,
+  normalizeAvatarShape,
+  saveAvatarShapePref,
+} from "../lib/ipc";
 import { loadPhotoBlobUrl, photoSrc, revokeObjectUrl } from "../lib/photos";
 import { checkinCardLine } from "../lib/checkin";
 import { hibernationBanner } from "../lib/hibernation";
@@ -41,13 +52,16 @@ import QuickLogDialog from "./QuickLogDialog.vue";
 const props = withDefaults(
   defineProps<{
     colony: Colony;
-    /** 头像显示形状（窝头像票 02）：circle=圆形遮罩（缺省）/ square=方形；
-     *  全局偏好的读取与传参在票 03 接线，本组件只按收到的值渲染。 */
+    /** 头像显示形状（窝头像票 02）：circle=圆形遮罩 / square=方形；缺省 =
+     *  跟随全局偏好（窝头像票 03），显式传入优先于全局（票 02 契约不破）。 */
     shape?: "circle" | "square";
   }>(),
-  { shape: "circle" },
+  { shape: undefined },
 );
 const emit = defineEmits<{ edit: []; saved: [] }>();
+
+/** 实际渲染形状（窝头像票 03）：显式 prop 优先，否则跟随全局偏好镜像。 */
+const shapeClass = computed(() => props.shape ?? avatarShape.value);
 
 const STATUS_TEXT: Record<Colony["status"], string> = {
   active: "● 活跃",
@@ -203,7 +217,19 @@ function onDocClick(e: MouseEvent) {
   menuOpen.value = false;
 }
 
-onMounted(() => document.addEventListener("click", onDocClick));
+onMounted(() => {
+  document.addEventListener("click", onDocClick);
+  // 全局形状偏好启动读取（窝头像票 03）：首个挂载的卡片拉一次，后续卡片共享
+  // （含失败，不逐卡重试）；读不出保默认圆形——外观偏好失败不惊动、不挡头像渲染
+  if (claimAvatarShapePrefLoad()) return;
+  void (async () => {
+    try {
+      saveAvatarShapePref(normalizeAvatarShape(await getAvatarShape()));
+    } catch {
+      /* 保持默认 circle；镜像未被污染，冷启动再试 */
+    }
+  })();
+});
 onBeforeUnmount(() => {
   document.removeEventListener("click", onDocClick);
   // 头像收尾：在途取图作废 + 释放网页端 blob（桌面 asset URL 会被放过）
@@ -268,7 +294,7 @@ function onCheckinSaved() {
       <!-- 窝头像（窝头像票 02）：点击 = 打开巢况时间线，与「巢况」按钮同一弹窗 -->
       <button
         class="avatar"
-        :class="shape"
+        :class="shapeClass"
         type="button"
         data-testid="colony-avatar"
         title="查看巢况时间线"
