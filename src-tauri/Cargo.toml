@@ -1,6 +1,6 @@
 [package]
 name = "ant-feeding-log"
-version = "0.7.1"
+version = "0.7.2"
 description = "蚂蚁饲养记录：单用户本地工具，登记喂食/换水/保湿/清理并提醒"
 authors = ["allan716"]
 edition = "2021"
