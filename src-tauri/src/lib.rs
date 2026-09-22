@@ -369,6 +369,39 @@ fn clean_orphan_photos() -> Result<photo::OrphanCleanOutcome, String> {
     Ok(outcome)
 }
 
+// ── 窝头像与照片墙（窝头像票 01）：裁剪更新 + 照片墙只读 ──
+// 排序契约、头像派生、载荷纯核全在 nest_checkin；巢况系命令永不参与提醒
+// （不刷托盘 tooltip），裁剪写成功走 trigger_after_write 与其他写命令同一咽喉。
+
+/// 更新照片裁剪：`crop` = 合法归一化区域（x/y/边长 ∈ [0,1]、x+边长 ≤ 1、
+/// y+边长 ≤ 1，校验权威在纯核）落库；`null` = 重置默认居中。返回更新后的
+/// 照片元数据（裁剪随载荷可读回）。
+#[tauri::command]
+fn update_photo_crop(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    photo_id: i64,
+    crop: Option<nest_checkin::PhotoCrop>,
+) -> Result<nest_checkin::NestPhotoMeta, String> {
+    let result =
+        with_conn(state, |conn| nest_checkin::update_photo_crop(conn, photo_id, crop));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+/// 照片墙只读载荷：全部窝的照片——窝按 sort/id、窝内按登记日期倒序、同日期
+/// 按登记全序、登记内照片按上传序（排序契约与头像同源），照片带元数据（含
+/// 裁剪），分组随载荷带窝名与日期。只读，无写路径；照片文件本体经既有照片
+/// 通路取（桌面 asset 协议 / 网页端 blob）。
+#[tauri::command]
+fn photo_wall(
+    state: tauri::State<'_, DbState>,
+) -> Result<Vec<nest_checkin::PhotoWallColony>, String> {
+    with_conn(state, nest_checkin::photo_wall)
+}
+
 // ── 字典管理与操作性质设置（票 04）──
 
 #[tauri::command]
@@ -1729,6 +1762,8 @@ pub fn run() {
             get_photo_abs_dir,
             list_orphan_photos,
             clean_orphan_photos,
+            update_photo_crop,
+            photo_wall,
             list_actions,
             save_action,
             set_action_enabled,

@@ -47,6 +47,8 @@ import type {
   NestPhotoMeta,
   OrphanCleanOutcome,
   OrphanPhotoStats,
+  PhotoCrop,
+  PhotoWallColony,
   PushoverStatus,
   RestoreApplyOutcome,
   RestoreSummary,
@@ -371,6 +373,21 @@ export const attachPhotos = cmdFn<
 export const getPhotoAbsDir = cmdFn<void, string>("get_photo_abs_dir");
 export const listOrphanPhotos = cmdFn<void, OrphanPhotoStats>("list_orphan_photos");
 export const cleanOrphanPhotos = cmdFn<void, OrphanCleanOutcome>("clean_orphan_photos");
+
+// ── 窝头像与照片墙（窝头像票 01）：裁剪更新 + 照片墙只读；桌面与网页同构
+//（photo_wall 在网页端只读白名单、update_photo_crop 为其唯一新写路径）──
+
+/** 更新照片裁剪：crop = 合法归一化区域（x/y/size ∈ [0,1] 且 x+size ≤ 1、
+ *  y+size ≤ 1，服务端校验越界拒绝）落库；null = 重置默认居中。返回更新后的
+ *  照片元数据。 */
+export const updatePhotoCrop = cmdFn<
+  { photoId: number; crop: PhotoCrop | null },
+  NestPhotoMeta
+>("update_photo_crop");
+
+/** 照片墙只读载荷：全部窝的照片——窝按 sort/id、窝内按登记日期倒序、同日期
+ *  按登记全序、登记内照片按上传序；分组带窝名与日期，照片带元数据（含裁剪）。 */
+export const photoWall = cmdFn<void, PhotoWallColony[]>("photo_wall");
 
 // ── 冬眠（HibernationDialog；入参键沿用现状 camelCase，Tauri 侧自行映射）──
 

@@ -99,6 +99,10 @@ export interface Colony {
   hibernation: HibernationPreview | null;
   /** 巢况摘要（webui-checkin 票 02）：最新一组数 + 基线 + 距上次登记天数 */
   checkin: CheckinDigest;
+  /** 头像照片引用（窝头像票 01）：按排序契约派生的「最新一张巢况照片」（纯
+   *  投影不落库，删登记自动回退，前端不重复推导）；无照片窝 null（显示占位）。
+   *  可选仅为旧测试载荷兜底——真实 IPC（Rust Colony）恒有值。 */
+  avatar?: NestPhotoMeta | null;
 }
 
 /** 新建/编辑窝入参。保湿方式写入与基础字段同命令同事务（spec F2/F6 整窗单事务）：
@@ -412,7 +416,16 @@ export type RestoreApplyOutcome = "done" | "done_needs_restart";
 
 // ── 巢况登记（webui-checkin 票 02，Rust nest_checkin.rs）──
 
-/** 照片元数据一行（本票恒空数组：写入随票 07 照片管线接线） */
+/** 头像裁剪（窝头像票 01，Rust PhotoCrop）：归一化方形区域——x/y = 左上角、
+ *  size = 边长，各 ∈ [0,1] 且 x+size ≤ 1、y+size ≤ 1；null = 默认居中（未调过）。
+ *  圆形显示只是方形区域挖角，裁剪数据与显示形状无关。 */
+export interface PhotoCrop {
+  x: number;
+  y: number;
+  size: number;
+}
+
+/** 照片元数据一行（写入走照片管线） */
 export interface NestPhotoMeta {
   id: number;
   checkin_id: number;
@@ -421,6 +434,9 @@ export interface NestPhotoMeta {
   /** 客户端原始文件名，仅备注 */
   original_name: string | null;
   note: string;
+  /** 头像裁剪（归一化区域）；null = 默认居中。可选仅为旧测试载荷兜底——
+   *  真实 IPC（Rust NestPhotoMeta）恒有值。 */
+  crop?: PhotoCrop | null;
 }
 
 /** 巢况登记一行（时间线按日期倒序返回） */
@@ -464,6 +480,27 @@ export interface CheckinDigest {
   baseline_date: string | null;
   /** 距上次登记 = 今天 − 最新登记日期（自然日，当天 0） */
   days_since_last: number | null;
+}
+
+// ── 窝头像与照片墙（窝头像票 01，Rust nest_checkin.rs）──
+
+/** 照片墙分组内一条登记：登记 id + 该登记的照片（按上传序号正序） */
+export interface PhotoWallCheckin {
+  checkin_id: number;
+  photos: NestPhotoMeta[];
+}
+
+/** 照片墙一个日期分组：该日期的全部登记按登记全序（创建序号倒序） */
+export interface PhotoWallDayGroup {
+  date: string;
+  checkins: PhotoWallCheckin[];
+}
+
+/** 照片墙一窝载荷：窝 id/名 + 按登记日期倒序的日期分组（无照片的窝不占分组） */
+export interface PhotoWallColony {
+  colony_id: number;
+  colony_name: string;
+  groups: PhotoWallDayGroup[];
 }
 
 // ── 巢况照片（webui-checkin 票 07，Rust photo.rs；桌面专属命令）──

@@ -345,6 +345,7 @@ fn persist_one(
             rel_path,
             original_name: up.original_name.clone(),
             note: String::new(),
+            crop: None, // 新照片默认居中（NULL = 居中，想调才进裁剪编辑器）
         }),
         Err(e) => {
             // rename 后插库失败 → 删文件再报错，不留半截

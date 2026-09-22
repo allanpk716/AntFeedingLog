@@ -594,6 +594,44 @@ impl CheckinUpdateInputArgs {
     }
 }
 
+// ── 窝头像与照片墙（窝头像票 01）：裁剪更新入参镜像 ───────────────────────
+
+/// `update_photo_crop` 入参：photoId + crop（可空 = 重置居中）。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdatePhotoCropArgs {
+    pub photo_id: i64,
+    /// null / 缺省 = 重置为默认居中。
+    #[serde(default)]
+    pub crop: Option<PhotoCropArgs>,
+}
+
+impl ValidatedArgs for UpdatePhotoCropArgs {
+    fn validate(&self) -> Result<(), String> {
+        check_id(self.photo_id, "photoId")?;
+        // 取值校验权威在纯核（validate_crop），本层复用不复制（语义校验分工）
+        match self.crop.as_ref() {
+            Some(c) => nest_checkin::validate_crop(&c.into_core()),
+            None => Ok(()),
+        }
+    }
+}
+
+/// `nest_checkin::PhotoCrop` 的服务端校验镜像（嵌套键沿用 DTO 的单词键 x/y/size）。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhotoCropArgs {
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+}
+
+impl PhotoCropArgs {
+    pub fn into_core(self) -> nest_checkin::PhotoCrop {
+        nest_checkin::PhotoCrop { x: self.x, y: self.y, size: self.size }
+    }
+}
+
 // ── 测试：schema 层单测（形状垃圾全表；端到端真请求在 webui_server tests）──
 
 #[cfg(test)]
@@ -863,5 +901,52 @@ mod tests {
         // args 不是对象形状（长度不符的序列）也按人话拒绝，绝不 panic
         let err = parse::<IdArgs>(&json!([])).unwrap_err();
         assert!(err.contains("不合法"), "实际：{err}");
+    }
+
+    #[test]
+    fn update_photo_crop_args_validate_crop_domain() {
+        // 合法：贴角区域与整幅；crop 缺省 / 显式 null = 重置居中
+        assert!(checked::<UpdatePhotoCropArgs>(&json!({
+            "photoId": 5, "crop": {"x": 0.25, "y": 0.5, "size": 0.5}
+        }))
+        .is_ok());
+        assert!(checked::<UpdatePhotoCropArgs>(&json!({
+            "photoId": 5, "crop": {"x": 0.0, "y": 0.0, "size": 1.0}
+        }))
+        .is_ok());
+        let a = checked::<UpdatePhotoCropArgs>(&json!({"photoId": 5})).unwrap();
+        assert!(a.crop.is_none(), "缺省 crop = 重置居中");
+        let a = checked::<UpdatePhotoCropArgs>(&json!({"photoId": 5, "crop": null})).unwrap();
+        assert!(a.crop.is_none(), "显式 null 同为重置居中");
+
+        // 越界：单值出 [0,1]、x+边长>1、y+边长>1（与纯核 validate_crop 同口径）
+        for bad in [
+            json!({"x": -0.1, "y": 0.0, "size": 0.5}),
+            json!({"x": 0.0, "y": 1.5, "size": 0.5}),
+            json!({"x": 0.6, "y": 0.0, "size": 0.5}),
+            json!({"x": 0.0, "y": 0.7, "size": 0.4}),
+            json!({"x": 0.0, "y": 0.0, "size": 1.5}),
+        ] {
+            let err = checked::<UpdatePhotoCropArgs>(&json!({"photoId": 5, "crop": bad}))
+                .unwrap_err();
+            assert!(err.contains("裁剪"), "实际：{err}");
+        }
+
+        // 形状垃圾：photoId 非正整数 / crop 未知字段 / crop 缺字段
+        assert!(
+            checked::<UpdatePhotoCropArgs>(&json!({"photoId": 0}))
+                .unwrap_err()
+                .contains("photoId")
+        );
+        let err = checked::<UpdatePhotoCropArgs>(&json!({
+            "photoId": 5, "crop": {"x": 0.1, "y": 0.1, "size": 0.5, "bogus": 1}
+        }))
+        .unwrap_err();
+        assert_eq!(err, "参数包含未知字段：bogus");
+        let err = checked::<UpdatePhotoCropArgs>(&json!({
+            "photoId": 5, "crop": {"x": 0.1, "size": 0.5}
+        }))
+        .unwrap_err();
+        assert!(err.contains("缺少必填参数"), "实际：{err}");
     }
 }

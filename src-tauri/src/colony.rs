@@ -40,6 +40,10 @@ pub struct Colony {
     /// 巢况摘要（webui-checkin 票 02）：最新一组数 + 基线 + 距上次登记天数，
     /// Rust 算好；从未登记 latest/baseline_date/days_since_last 皆 None。
     pub checkin: crate::nest_checkin::CheckinDigest,
+    /// 头像照片引用（窝头像票 01）：按排序契约派生的「最新一张巢况照片」
+    /// （纯投影不落库，删登记自动回退，前端不重复推导）；无照片窝 None
+    /// （显示占位）。
+    pub avatar: Option<crate::nest_checkin::NestPhotoMeta>,
 }
 
 /// 新建/编辑窝的入参。
@@ -203,6 +207,7 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
                     baseline_date: None,
                     days_since_last: None,
                 },
+                avatar: None,
             })
         },
     )
@@ -216,6 +221,7 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
         c.recent = crate::care::recent_for_colony(conn, c.id, 2)?;
         c.hibernation = crate::hibernation::open_segment(conn, c.id)?;
         c.checkin = crate::nest_checkin::digest_for_colony(conn, c.id, today)?;
+        c.avatar = crate::nest_checkin::avatar_photo_for_colony(conn, c.id)?;
         Ok(c)
     })
 }
@@ -943,6 +949,61 @@ mod tests {
         let seg = hb.hibernation.as_ref().expect("冬眠中的窝应带开放段");
         assert_eq!(seg.start_date, "2026-09-01");
         assert_eq!(seg.expected_end_date, "2026-12-01");
+    }
+
+    #[test]
+    fn list_colonies_embeds_avatar_photo_reference() {
+        // 窝头像票 01：头像照片引用直入窝列表载荷（纯投影，前端不重复推导）——
+        // 有照片窝指向「第一条含照片登记的第一张」；无照片窝 None。
+        let conn = mem_conn();
+        let with_photos = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        let bare = create_colony(&conn, &input("无照窝", None), TODAY).unwrap();
+
+        // 早登记带照片；最新登记纯文字 → 头像跳过纯文字取早登记那张
+        let older = crate::nest_checkin::save_checkin(
+            &conn,
+            &crate::nest_checkin::CheckinInput {
+                colony_id: with_photos.id,
+                date: "2026-09-10".into(),
+                queen_count: None,
+                worker_count: None,
+                moved_nest: false,
+                note: Some("带照片".into()),
+            },
+            TODAY,
+            "2026-09-10 08:00:00",
+        )
+        .unwrap()
+        .id;
+        conn.execute(
+            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+             VALUES (?1, '1/avatar.jpg', NULL, '')",
+            params![older],
+        )
+        .unwrap();
+        crate::nest_checkin::save_checkin(
+            &conn,
+            &crate::nest_checkin::CheckinInput {
+                colony_id: with_photos.id,
+                date: "2026-09-15".into(),
+                queen_count: Some(2),
+                worker_count: None,
+                moved_nest: false,
+                note: None,
+            },
+            TODAY,
+            "2026-09-15 08:00:00",
+        )
+        .unwrap();
+
+        let list = list_colonies(&conn, TODAY).unwrap();
+        let a = list.iter().find(|c| c.id == with_photos.id).unwrap();
+        let avatar = a.avatar.as_ref().expect("有照片窝应带头像引用");
+        assert_eq!(avatar.rel_path, "1/avatar.jpg");
+        assert_eq!(avatar.checkin_id, older, "跳过纯文字的最新登记");
+        assert_eq!(avatar.crop, None, "未调过裁剪 = 居中（None）");
+        let b = list.iter().find(|c| c.id == bare.id).unwrap();
+        assert!(b.avatar.is_none(), "无照片窝头像为空");
     }
 
     #[test]
