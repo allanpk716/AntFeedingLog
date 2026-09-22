@@ -4,13 +4,16 @@
  * 已结束的窝收底部折叠区（默认折叠）。「＋ 新建窝」在顶栏（交互第三轮 #7），与设置入口同排。
  * 卡片操作块/喂食弹窗在 ColonyCard 内（票 03）：记账成功抛 saved → refresh 数据驱动重算。
  * 设置弹窗（票 04）：字典管理三 tab，任何变更抛 changed → refresh，卡片红/灰即时跟上。
+ * 今天时钟源在根启动（常驻不卸载）：顶栏日期从响应式 today 取值，跨天变更
+ * 驱动 refresh 重拉——卡片距上次/红标/饲养天数跟着换天，零操作自动追上。
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { getWebUiWizardDone, isTauri, listColonies, listLocations, subscribe } from "./lib/ipc";
 import { watchDataVersion } from "./lib/versionSync";
 import type { Colony, LocationItem } from "./types";
 import { groupColonies, splitColonies } from "./lib/home";
 import { todayLabel } from "./lib/dates";
+import { startTodayClock, stopTodayClock, todayIsoRef } from "./lib/today";
 import ColonyCard from "./components/ColonyCard.vue";
 import ColonyFormDialog from "./components/ColonyFormDialog.vue";
 import SettingsDialog from "./components/SettingsDialog.vue";
@@ -37,6 +40,13 @@ const showWebUiWizard = ref(false);
 const activeColonies = computed(() => splitColonies(colonies.value).active);
 const endedColonies = computed(() => splitColonies(colonies.value).ended);
 const groups = computed(() => groupColonies(activeColonies.value, locations.value));
+
+/** 顶栏日期从全局今天源派生（`T00:00` 本地零点解析：任何时区下星期都正确）。 */
+const today = todayIsoRef();
+const todayText = computed(() => todayLabel(new Date(`${today.value}T00:00`)));
+
+// 跨天 → 重拉首页数据（距上次/红标/饲养天数跟新的一天走）
+watch(today, () => void refresh());
 
 async function refresh() {
   try {
@@ -77,6 +87,8 @@ function onSettingsClosed() {
 }
 
 onMounted(() => {
+  // 今天时钟源在根启动（分钟 tick + focus/visibilitychange 兜底）；根卸载才停表
+  startTodayClock();
   void refresh();
   // 恢复完成广播（数据安全二期票 04，语义=无条件刷新，票 06 不改）：整库被
   // 替换，各页数据全部重拉——首页在此刷新；统计/记录页离开再进时按 v-if
@@ -100,6 +112,8 @@ onMounted(() => {
     })
     .catch(() => {});
 });
+
+onBeforeUnmount(() => stopTodayClock());
 </script>
 
 <template>
@@ -133,7 +147,7 @@ onMounted(() => {
           记录
         </button>
       </nav>
-      <div class="today">{{ todayLabel() }}</div>
+      <div class="today">{{ todayText }}</div>
       <div class="tools">
         <!-- 终局评审：新建窝/设置是桌面专属（网页端 API 白名单本就挡住），浏览器不渲染入口 -->
         <button v-if="isTauri()" class="ghost-btn new-top-btn" type="button" @click="openCreate">＋ 新建窝</button>

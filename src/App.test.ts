@@ -3,6 +3,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import App from "./App.vue";
 import type { AppSettings, CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
 import { addDays, todayIso, todayLabel } from "./lib/dates";
+import { stopTodayClock } from "./lib/today";
 import DateTimeField from "./components/DateTimeField.vue";
 import DatePickerPop from "./components/DatePickerPop.vue";
 
@@ -1504,5 +1505,35 @@ describe("轻提示宿主挂应用根（票 03）", () => {
     const wrapper = await mountApp();
 
     expect(wrapper.find(".toast-host").exists()).toBe(true);
+  });
+});
+
+// ── 跨天自动刷新（今天时钟源票）──
+
+describe("跨天自动刷新（今天时钟源）", () => {
+  it("停在首页跨零点：顶栏日期零操作变新的一天，首页数据重拉（距上次/红标/饲养天数跟上）", async () => {
+    // 单例时钟是应用级生命周期：前面用例挂载 App 启动过真表且未卸载，
+    // 先停掉，避免本用例的假表启动被幂等守卫挡掉、漏掉启动对表
+    stopTodayClock();
+    // 只 fake 分钟计时器与系统时钟（仓库先例：不劫持 setImmediate，flushPromises 不挂）
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    vi.setSystemTime(new Date(2026, 8, 21, 23, 59, 30));
+    const wrapper = await mountApp();
+    expect(wrapper.find(".topbar .today").text()).toBe("2026-09-21 周一");
+
+    const before = invokeMock.mock.calls.filter(([cmd]) => cmd === "list_colonies").length;
+
+    // 跨过 00:00，下一次分钟 tick 落在零点后：不点任何按钮，界面自己跟上
+    vi.setSystemTime(new Date(2026, 8, 22, 0, 0, 20));
+    vi.advanceTimersByTime(60_000);
+    await flushPromises();
+
+    expect(wrapper.find(".topbar .today").text()).toBe("2026-09-22 周二");
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "list_colonies").length,
+    ).toBeGreaterThan(before);
+
+    stopTodayClock();
+    vi.useRealTimers();
   });
 });

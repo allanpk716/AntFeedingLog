@@ -11,7 +11,7 @@ import { earliestLogDate, getStats, listColonies } from "../lib/ipc";
 import { watchDataVersion } from "../lib/versionSync";
 import * as echarts from "echarts";
 import type { Colony, StatsDayDetail, StatsPayload } from "../types";
-import { todayIso } from "../lib/dates";
+import { todayIsoRef } from "../lib/today";
 import {
   avgPerDay,
   buildDetailMap,
@@ -32,7 +32,8 @@ const BAR_COLOR = "#d68a2a";
 const PALETTE = ["#d97706", "#4a90d9", "#8b5e34", "#188a4b", "#a34f06", "#5b6472", "#c258a0", "#6a8f3c"];
 const MONTHS = ["1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"];
 
-const today = todayIso();
+/** 时间范围上限取全局今天源（时钟由 App 根启动）：跨天跟新的一天走 */
+const today = todayIsoRef();
 const colonies = ref<Colony[]>([]);
 const colonyId = ref<number | null>(null);
 const range = ref<StatsRange>("6m");
@@ -61,8 +62,8 @@ async function refresh() {
     const earliest = await earliestLogDate();
     payload.value = await getStats({
       colonyId: colonyId.value,
-      startDate: rangeStartFor(range.value, today, colonies.value, earliest),
-      endDate: today,
+      startDate: rangeStartFor(range.value, today.value, colonies.value, earliest),
+      endDate: today.value,
     });
     pageError.value = "";
   } catch (e) {
@@ -214,6 +215,8 @@ onMounted(() => {
   // refresh；筛选条件原样保留，数据驱动重算）。页签卸载即退订。
   unwatchVersion = watchDataVersion(() => void refresh());
 });
+// 停在统计页跨零点：跟着全局今天源重拉（范围上限进到新的一天）
+watch(today, () => void refresh());
 watch(payload, () => void nextTick(renderCharts));
 onBeforeUnmount(() => {
   disposeCharts();

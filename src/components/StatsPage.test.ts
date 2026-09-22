@@ -3,6 +3,7 @@ import { flushPromises, mount } from "@vue/test-utils";
 import StatsPage from "./StatsPage.vue";
 import type { Colony, StatsInterval, StatsPayload } from "../types";
 import { addDays, todayIso } from "../lib/dates";
+import { startTodayClock, stopTodayClock } from "../lib/today";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（沿 LogListPage.test.ts 先例）
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
@@ -284,5 +285,31 @@ describe("统计页（票 07）", () => {
     expect(echartsSetOption).toHaveBeenCalled();
     const rows = wrapper.findAll(".irow");
     expect(rows.length).toBe(0); // 空 intervals 不渲染间隔行
+  });
+});
+
+// ── 跨天自动刷新（今天时钟源票）──
+
+describe("跨天自动刷新（今天时钟源）", () => {
+  it("停在统计页跨零点：时间范围上限跟到新的一天，get_stats 重拉", async () => {
+    stopTodayClock(); // 单例时钟应用级生命周期：先停前面用例可能残留的表
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    vi.setSystemTime(new Date(2026, 8, 21, 23, 59, 30));
+    startTodayClock(); // 测试替根：App 根负责启停时钟，组件只消费响应式今天
+    await mountPage();
+
+    const firstCalls = invokeMock.mock.calls.filter(([cmd]) => cmd === "get_stats");
+    expect((firstCalls[firstCalls.length - 1][1] as { endDate: string }).endDate).toBe("2026-09-21");
+
+    vi.setSystemTime(new Date(2026, 8, 22, 0, 0, 20));
+    vi.advanceTimersByTime(60_000);
+    await flushPromises();
+
+    const calls = invokeMock.mock.calls.filter(([cmd]) => cmd === "get_stats");
+    expect(calls.length).toBeGreaterThan(1);
+    expect((calls[calls.length - 1][1] as { endDate: string }).endDate).toBe("2026-09-22");
+
+    stopTodayClock();
+    vi.useRealTimers();
   });
 });
