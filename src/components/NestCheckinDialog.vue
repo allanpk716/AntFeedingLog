@@ -19,6 +19,9 @@
  *   URL），组件卸载 revokeObjectUrl 释放；点开大图；文件缺失（库有元数据、
  *   磁盘没文件）显示占位符提示，不崩溃；删除确认文案补「该登记的 N 张照片
  *   将一并删除」；
+ * - 大图查看器（票 07）内「调整头像裁剪」（窝头像票 04）：进 PhotoCropEditor
+ *   拖动/缩放调裁剪，保存走 update_photo_crop + 轻提示，回写本地时间线；
+ *   上传流程零变化（不自动弹编辑器，新照片默认居中）；
  * - 手机竖屏（票 08）：≤480px 视口单列表单 + 大号按钮（.vp-form-stack 媒体查询
  *   落点，断点类名供组件测试断言——jsdom 不套用媒体查询）；
  * - 删除两段确认照 LogListPage 先例；
@@ -40,6 +43,7 @@ import type { Colony, NestCheckin, NestPhotoMeta } from "../types";
 import { checkinEntryLine } from "../lib/checkin";
 import { loadPhotoBlobUrl, photoSrc, revokeObjectUrl, uploadPhotosHttp } from "../lib/photos";
 import { todayIso } from "../lib/dates";
+import PhotoCropEditor from "./PhotoCropEditor.vue";
 
 const props = defineProps<{ colony: Colony }>();
 const emit = defineEmits<{ close: []; saved: [] }>();
@@ -106,6 +110,8 @@ const photoError = ref("");
 const missingPhotoIds = ref<Set<number>>(new Set());
 /** 大图查看器当前照片；null = 关闭。 */
 const viewerPhoto = ref<NestPhotoMeta | null>(null);
+/** 头像裁剪编辑器开合（窝头像票 04）：仅从大图查看器手动进入，上传不自动弹。 */
+const cropEditorOpen = ref(false);
 
 /** 浏览器侧 objectURL 表（照片 id → blob: URL）；桌面走 asset 协议不经此。 */
 const blobUrls = ref<Record<number, string>>({});
@@ -169,6 +175,19 @@ function markPhotoMissing(id: number) {
 async function afterPhotosLanded() {
   missingPhotoIds.value = new Set();
   await load();
+  emit("saved");
+}
+
+/** 裁剪保存回写（窝头像票 04）：返回元数据更新进本地时间线与大图状态（同窝
+ * 照片对象替换而非原地遗留），并抛 saved 让外层刷新（首页头像投影跟上）。 */
+function onCropSaved(meta: NestPhotoMeta) {
+  entries.value = entries.value.map((c) => ({
+    ...c,
+    photos: c.photos.map((p) => (p.id === meta.id ? { ...p, crop: meta.crop } : p)),
+  }));
+  if (viewerPhoto.value && viewerPhoto.value.id === meta.id) {
+    viewerPhoto.value = { ...viewerPhoto.value, crop: meta.crop };
+  }
   emit("saved");
 }
 
@@ -512,7 +531,8 @@ async function requestDelete(c: NestCheckin) {
         </button>
       </div>
 
-      <!-- 大图查看器（票 07）：点击缩略图打开，点遮罩关闭 -->
+      <!-- 大图查看器（票 07）：点击缩略图打开，点遮罩关闭；「调整头像裁剪」
+           进裁剪编辑器（窝头像票 04），编辑器盖在其上、关闭即回到大图 -->
       <div v-if="viewerPhoto" class="photo-viewer" @click.self="viewerPhoto = null">
         <img
           class="photo-viewer-img"
@@ -520,7 +540,24 @@ async function requestDelete(c: NestCheckin) {
           :alt="viewerPhoto.original_name ?? viewerPhoto.rel_path"
         />
         <p class="photo-viewer-name">{{ viewerPhoto.original_name || viewerPhoto.rel_path }}</p>
+        <button
+          class="viewer-crop-btn"
+          type="button"
+          @click="cropEditorOpen = true"
+        >
+          调整头像裁剪
+        </button>
       </div>
+
+      <!-- 头像裁剪编辑器（窝头像票 04）：仅手动进入；保存回写本地时间线并抛
+           saved 让外层刷新（首页头像投影跟上）；上传流程零变化不自动弹 -->
+      <PhotoCropEditor
+        v-if="cropEditorOpen && viewerPhoto"
+        :photo="viewerPhoto"
+        :src="photoSrcOf(viewerPhoto)"
+        @close="cropEditorOpen = false"
+        @saved="onCropSaved"
+      />
     </div>
   </div>
 </template>
@@ -669,6 +706,24 @@ div.photo-missing {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* 大图内「调整头像裁剪」入口（窝头像票 04）：查看器容器是 zoom-out 光标，
+   按钮自身恢复可点光标 */
+.viewer-crop-btn {
+  padding: 7px 18px;
+  border-radius: 9px;
+  border: 1px solid var(--border-strong);
+  background: var(--card);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.viewer-crop-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent-deep);
 }
 
 .entry-ops {
