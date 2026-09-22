@@ -27,7 +27,7 @@
  * 回到大图。上传流程零变化：本组件只从大图查看器手动进入，不自动弹（D9）。
  */
 import { computed, onBeforeUnmount, ref } from "vue";
-import { updatePhotoCrop } from "../lib/ipc";
+import { avatarShape, updatePhotoCrop } from "../lib/ipc";
 import { showError, showSuccess } from "../lib/toast";
 import type { NestPhotoMeta, PhotoCrop } from "../types";
 
@@ -266,7 +266,7 @@ onBeforeUnmount(() => {
           @load="onImgLoad"
         />
         <p v-if="!loaded" class="crop-loading">加载照片中…</p>
-        <div class="crop-circle-mask" aria-hidden="true"></div>
+        <div class="crop-circle-mask" :class="{ 'crop-mask-square': avatarShape === 'square' }" aria-hidden="true"></div>
       </div>
 
       <div class="crop-ops">
@@ -376,6 +376,11 @@ onBeforeUnmount(() => {
   border-radius: 50%;
   box-shadow: 0 0 0 999px rgba(0, 0, 0, 0.45);
   pointer-events: none;
+}
+
+/* 全局形状偏好为方形时，预览遮罩跟卡片头像同款方角（终局评审集成补） */
+.crop-circle-mask.crop-mask-square {
+  border-radius: 8px;
 }
 
 .crop-ops {

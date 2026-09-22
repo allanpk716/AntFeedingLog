@@ -144,6 +144,9 @@ function ensureLoaded(id: number) {
 /** 滚出视口（仅网页端释放；桌面 asset URL 无需释放）：撤 URL、退请求位，
  *  重新进视口会再取。 */
 function releaseOnLeave(id: number) {
+  // 大图正显示这一张时不回收（终局评审裁量）：viewer 是 fixed 覆盖层，底层
+  // 滚出视口不该把显示中的图抽成「加载中…」且无再取触发；关掉/翻走后照常回收
+  if (viewerItem.value !== null && viewerItem.value.photo.id === id) return;
   const url = blobUrls.value[id];
   if (url === undefined) return;
   revokeObjectUrl(url);

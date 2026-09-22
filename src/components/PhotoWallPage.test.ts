@@ -315,6 +315,30 @@ describe("照片墙页 · 懒加载与网页端取图", () => {
     expect(w.find('.wall-thumb[data-photo-id="11"] img').exists()).toBe(true);
   });
 
+  it("大图开着时背景滚出不回收显示中的那张（终局裁量）：URL 保留、重进不重取，关掉后照常回收", async () => {
+    const w = await mountWall(wallData, "web");
+    fireThumb(11);
+    await flushPromises();
+    expect(w.find('.wall-thumb[data-photo-id="11"] img').exists()).toBe(true);
+
+    await w.find('.wall-thumb[data-photo-id="11"]').trigger("click");
+    expect(w.find(".wall-viewer").exists()).toBe(true);
+
+    fireThumb(11, false); // 底层滚出：显示中的这张不回收
+    await flushPromises();
+    expect(revokeObjectUrlMock).not.toHaveBeenCalled();
+    expect(w.find('.wall-thumb[data-photo-id="11"] img').exists()).toBe(true);
+
+    fireThumb(11);
+    await flushPromises();
+    expect(loadPhotoBlobUrlMock).toHaveBeenCalledTimes(1); // 未被回收，无需重取
+
+    await w.find(".viewer-close").trigger("click"); // 关掉大图后滚出照常回收
+    fireThumb(11, false);
+    await flushPromises();
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:u-1/a11.jpg");
+  });
+
   it("卸载释放全部已取的 blob", async () => {
     const w = await mountWall(wallData, "web");
     fireIn(w);

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import PhotoCropEditor from "./PhotoCropEditor.vue";
+import { resetAvatarShapeForTests } from "../lib/ipc"; // 形状镜像透传（ipcMock 原样放行非命令导出）
 import type { NestPhotoMeta } from "../types";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（沿 NestCheckinDialog.test.ts 先例）
@@ -289,5 +290,15 @@ describe("PhotoCropEditor（窝头像票 04）", () => {
     expect(invokeMock).not.toHaveBeenCalled();
     expect(w.emitted("close")).toHaveLength(1);
     expect(w.emitted("saved")).toBeUndefined();
+  });
+
+  it("预览遮罩跟随全局形状偏好：square 时去圆角、circle 恢复（终局评审集成补）", async () => {
+    resetAvatarShapeForTests("square");
+    const square = await mountEditor(photo({ crop: null }), 2000, 1000);
+    expect(square.find(".crop-circle-mask").classes()).toContain("crop-mask-square");
+
+    resetAvatarShapeForTests(); // 默认 circle
+    const circle = await mountEditor(photo({ crop: null }), 2000, 1000);
+    expect(circle.find(".crop-circle-mask").classes()).not.toContain("crop-mask-square");
   });
 });
