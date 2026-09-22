@@ -126,6 +126,8 @@ function baseMock() {
         return actions;
       case "list_logs":
         return { total: 0, rows: [] };
+      case "photo_wall":
+        return []; // 照片墙页挂载即拉载荷；默认空库（页面自渲染空态）
       case "get_settings":
         return currentSettings;
       case "colony_month_records":
@@ -750,11 +752,11 @@ describe("顶栏导航（票 07/08）", () => {
     expect(wrapper.find(".topbar .today").text()).toBe(todayLabel());
   });
 
-  it("三页 nav：首页/统计/记录可切换，记录页挂载后拉记录列表", async () => {
+  it("四页 nav：首页/统计/照片/记录可切换，照片页拉照片墙、记录页拉记录列表", async () => {
     const wrapper = await mountApp();
 
     const tabs = wrapper.findAll(".topbar .tab");
-    expect(tabs.map((t) => t.text())).toEqual(["首页", "统计", "记录"]);
+    expect(tabs.map((t) => t.text())).toEqual(["首页", "统计", "照片", "记录"]);
     expect(tabs[0].classes()).toContain("active");
 
     // 切到统计：统计页渲染并拉数据
@@ -764,9 +766,16 @@ describe("顶栏导航（票 07/08）", () => {
     expect(wrapper.find(".stats-page").exists()).toBe(true);
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "get_stats")).toBe(true);
 
-    // 切到记录（票 08）：记录列表页渲染并拉数据
+    // 切到照片（窝头像票 05）：照片墙页渲染并拉载荷
     invokeMock.mockClear();
     await wrapper.findAll(".topbar .tab")[2].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".photo-wall").exists()).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "photo_wall")).toBe(true);
+
+    // 切到记录（票 08）：记录列表页渲染并拉数据
+    invokeMock.mockClear();
+    await wrapper.findAll(".topbar .tab")[3].trigger("click");
     await flushPromises();
     expect(wrapper.find(".log-list").exists()).toBe(true);
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_logs")).toBe(true);
@@ -775,6 +784,7 @@ describe("顶栏导航（票 07/08）", () => {
     await wrapper.findAll(".topbar .tab")[0].trigger("click");
     expect(wrapper.find(".group-title").exists()).toBe(true);
     expect(wrapper.find(".stats-page").exists()).toBe(false);
+    expect(wrapper.find(".photo-wall").exists()).toBe(false);
     expect(wrapper.find(".log-list").exists()).toBe(false);
   });
 
@@ -786,7 +796,7 @@ describe("顶栏导航（票 07/08）", () => {
 
   it("记录页里改动记录后抛 changed：首页数据即时重算（票 08 验收 5 的接线）", async () => {
     const wrapper = await mountApp();
-    await wrapper.findAll(".topbar .tab")[2].trigger("click");
+    await wrapper.findAll(".topbar .tab")[3].trigger("click");
     await flushPromises();
 
     invokeMock.mockClear();
@@ -1466,25 +1476,38 @@ describe("冬眠管理（票 05）", () => {
 });
 
 describe("浏览器模式隐藏桌面专属入口（终局评审 Important）", () => {
-  it("浏览器模式：顶栏无「统计」/设置/新建窝、卡片无「编辑」；首页/记录与巢况入口照常", async () => {
+  it("浏览器模式：顶栏无「统计」/设置/新建窝、卡片无「编辑」；首页/照片/记录与巢况入口照常", async () => {
     delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     const wrapper = await mountApp();
 
-    // 顶栏只剩 首页/记录 两个 tab（统计是桌面专属页）
+    // 顶栏三 tab：首页/照片/记录（统计是桌面专属页；照片墙双端都有，窝头像票 05）
     const tabs = wrapper.findAll(".topbar .tab");
-    expect(tabs.map((t) => t.text())).toEqual(["首页", "记录"]);
+    expect(tabs.map((t) => t.text())).toEqual(["首页", "照片", "记录"]);
     expect(wrapper.find(".settings-btn").exists()).toBe(false);
     expect(wrapper.find(".new-top-btn").exists()).toBe(false);
     // 卡片「编辑」按钮（ColonyCard）同样隐藏；「巢况」是网页端功能不隐藏
     expect(wrapper.find(".card .edit-btn").exists()).toBe(false);
     expect(wrapper.find(".card .checkin-btn").exists()).toBe(true);
+
+    // 网页端「照片」页照常进入并拉载荷
+    invokeMock.mockClear();
+    await tabs[1].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".photo-wall").exists()).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "photo_wall")).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "get_photo_abs_dir")).toBe(false);
   });
 
-  it("桌面模式：统计 tab / 设置 / 新建窝 / 卡片编辑四入口照常渲染", async () => {
+  it("桌面模式：统计 tab / 照片 tab / 设置 / 新建窝 / 卡片编辑照常渲染", async () => {
     (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
     const wrapper = await mountApp();
 
-    expect(wrapper.findAll(".topbar .tab").map((t) => t.text())).toEqual(["首页", "统计", "记录"]);
+    expect(wrapper.findAll(".topbar .tab").map((t) => t.text())).toEqual([
+      "首页",
+      "统计",
+      "照片",
+      "记录",
+    ]);
     expect(wrapper.find(".settings-btn").exists()).toBe(true);
     expect(wrapper.find(".new-top-btn").exists()).toBe(true);
     expect(wrapper.find(".card .edit-btn").exists()).toBe(true);
