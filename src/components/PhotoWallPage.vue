@@ -15,10 +15,12 @@
  * - 「查看登记」：经 list_colonies 取该窝完整对象后在本页渲染 NestCheckinDialog
  *   （弹窗打开是天然反馈，无轻提示）；窝已被删除给失败轻提示兜底。
  * - 只读页：无上传/删除/裁剪任何写入口；页内时间线弹窗自己抛 saved → 重拉
- *   载荷（删了照片墙上即时跟上）。
+ *   载荷（删了照片墙上即时跟上）；数据版本广播（票 04）同样驱动重拉——
+ *   保活后页面在后台也自动保鲜，真卸载才退订。
  */
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { getPhotoAbsDir, isTauri, listColonies, photoWall } from "../lib/ipc";
+import { watchDataVersion } from "../lib/versionSync";
 import type { Colony, NestPhotoMeta, PhotoWallColony } from "../types";
 import { loadPhotoBlobUrl, photoSrc, revokeObjectUrl } from "../lib/photos";
 import { showError } from "../lib/toast";
@@ -210,10 +212,18 @@ watch(filterColonyId, () => {
   viewerIndex.value = null;
 });
 
+/** 数据版本广播退订柄（票 04，对齐统计/记录页口径）：App 真卸载时退订。 */
+let unwatchVersion: (() => void) | null = null;
+
 onMounted(async () => {
   if (typeof IntersectionObserver !== "undefined") {
     io = new IntersectionObserver(onIoChange);
   }
+  // 数据版本订阅（票 04）：任一端写入 → 重拉照片墙（复用 refresh：大图索引
+  // 由 refresh 复位、blob 由 reconcileBlobs 保位回收）。注册赶在下方首个 await
+  // 之前，不留漏帧窗口。保活切换（票 04 App.vue）不卸载组件，订阅持续有效
+  // ——页面在后台也自动跟上写入；真卸载（App 退出）才退订。
+  unwatchVersion = watchDataVersion(() => void refresh());
   if (isTauri()) {
     // 照片根目录取不到不挡页面（缩略图停留占位）
     try {
@@ -226,6 +236,7 @@ onMounted(async () => {
 });
 
 onBeforeUnmount(() => {
+  unwatchVersion?.();
   io?.disconnect();
   io = null;
   for (const url of Object.values(blobUrls.value)) {

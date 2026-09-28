@@ -7,7 +7,7 @@
  * 今天时钟源在根启动（常驻不卸载）：顶栏日期从响应式 today 取值，跨天变更
  * 驱动 refresh 重拉——卡片距上次/红标/饲养天数跟着换天，零操作自动追上。
  */
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, KeepAlive, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { getWebUiWizardDone, isTauri, listColonies, listLocations, subscribe } from "./lib/ipc";
 import { watchDataVersion } from "./lib/versionSync";
 import type { Colony, LocationItem } from "./types";
@@ -98,8 +98,8 @@ onMounted(() => {
   startTodayClock();
   void refresh();
   // 恢复完成广播（数据安全二期票 04，语义=无条件刷新，票 06 不改）：整库被
-  // 替换，各页数据全部重拉——首页在此刷新；统计/记录页离开再进时按 v-if
-  // 重挂载自然重拉
+  // 替换，各页数据全部重拉——首页在此刷新；统计/照片/记录页保活常驻，经各自
+  // 的数据版本订阅跟进（恢复完成后端同帧广播版本，见 lib.rs restore 钩子）
   void subscribe("db-restored", () => {
     void refresh();
   });
@@ -213,13 +213,24 @@ onBeforeUnmount(() => stopTodayClock());
       </section>
     </main>
 
-    <StatsPage v-if="page === 'stats'" />
+    <!-- 三页保活（票 04）：统计/照片/记录各自包一层 KeepAlive（page 四值单选，
+         任一时刻至多一个有活动子节点）。懒保活：会话内首次进入照常挂载读取
+         （各页自己的加载态负责占位），切走实例缓存（ECharts 等随实例保留），
+         再进即时——不重挂载、不重发 IPC；数据保鲜靠各页的数据版本订阅。
+         首页不保活：数据在根组件，切换本就不受影响。 -->
+    <KeepAlive>
+      <StatsPage v-if="page === 'stats'" />
+    </KeepAlive>
 
-    <!-- 照片墙（窝头像票 05）：只读回看页，离开再进按 v-if 重挂载自然重拉 -->
-    <PhotoWallPage v-if="page === 'photos'" />
+    <!-- 照片墙（窝头像票 05）：只读回看页；保活后靠版本订阅保鲜（票 04 补订） -->
+    <KeepAlive>
+      <PhotoWallPage v-if="page === 'photos'" />
+    </KeepAlive>
 
     <!-- 记录流水（票 08）：任何编辑/删除抛 changed → refresh，首页红绿态即时重算 -->
-    <LogListPage v-if="page === 'logs'" @changed="void refresh()" />
+    <KeepAlive>
+      <LogListPage v-if="page === 'logs'" @changed="void refresh()" />
+    </KeepAlive>
     </div>
 
     <ColonyFormDialog
