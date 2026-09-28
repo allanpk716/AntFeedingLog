@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import ColonyFormDialog from "./ColonyFormDialog.vue";
 import type { CareActionItem, Colony, ColonyAction, LocationItem } from "../types";
@@ -516,5 +516,37 @@ describe("保湿方式：新建（D3 随建随落，create_colony 原子）", ()
     const input = colonyInputPayload(w, "create_colony");
     expect(input.hydration_method).toBe("tower");
     expect(input.interval_changes).toEqual([]);
+  });
+});
+
+// ── 删除/置为已结束按钮双端可见性（网页端窝编辑票 02）──
+
+describe("删除/置为已结束按钮双端可见性（网页端窝编辑票 02）", () => {
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  it("网页端：编辑模式「删除」可见，「置为已结束」不可见（已结束经状态下拉可达）", async () => {
+    const w = await mountDlg(sampleActions());
+
+    expect(w.find(".delete-btn").exists()).toBe(true);
+    expect(w.find(".archive-btn").exists()).toBe(false);
+  });
+
+  it("桌面端：编辑模式「删除」「置为已结束」都可见，行为不变", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    const w = await mountDlg(sampleActions());
+
+    expect(w.find(".delete-btn").exists()).toBe(true);
+    expect(w.find(".archive-btn").exists()).toBe(true);
+  });
+
+  it("新建模式（editing=null）：两按钮都不渲染（编辑模式专属）", async () => {
+    invokeMock.mockImplementation(async () => null);
+    const w = mount(ColonyFormDialog, { props: { editing: null, colonies: [], locations } });
+    await flushPromises();
+
+    expect(w.find(".delete-btn").exists()).toBe(false);
+    expect(w.find(".archive-btn").exists()).toBe(false);
   });
 });

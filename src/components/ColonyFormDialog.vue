@@ -3,7 +3,8 @@
  * 新建/编辑窝弹窗：名字、物种、地点下拉、开始日期、状态。
  * 状态下拉只开放 活跃/已结束——冬眠只能走卡片「开始冬眠/确认出眠」流程（定点修 5）；
  * 编辑冬眠中的窝时该状态以禁用项显示、保存不改变它。
- * 编辑模式额外提供「置为已结束」与「删除」（删除是否成功由 Rust 判定：仅无记录窝可删）。
+ * 编辑模式额外提供「置为已结束」（桌面专属，网页端窝编辑票 02：网页端已结束经状态下拉可达）与「删除」
+ * （双端；删除是否成功由 Rust 判定：仅无记录窝可删）。
  * 编辑模式再有「周期提醒」小节（每窝周期票 04）：该窝每个启用操作一行可选周期，
  * 撤食不出现；其余行设/清走 set_colony_action_interval 逐行提交（现状不动）。
  * 巢穴保湿行（保湿方式票 02）变为「方式下拉 + 天数输入」，交互按规格状态矩阵
@@ -18,6 +19,7 @@ import {
   archiveColony,
   createColony,
   deleteColony,
+  isTauri,
   listActions,
   setColonyActionInterval,
   updateColony,
@@ -413,7 +415,8 @@ async function remove() {
       <p v-if="formError" class="form-error">{{ formError }}</p>
 
       <div class="dlg-btns">
-        <button v-if="editingId !== null && form.status !== 'ended'" class="btn danger archive-btn" type="button" @click="archive">
+        <!-- 网页端窝编辑票 02：置为已结束维持桌面专属（网页端「已结束」经状态下拉可达，服务端白名单无 archive_colony）；「删除」双端可见 -->
+        <button v-if="editingId !== null && form.status !== 'ended' && isTauri()" class="btn danger archive-btn" type="button" @click="archive">
           置为已结束
         </button>
         <button v-if="editingId !== null" class="btn danger delete-btn" type="button" @click="remove">
