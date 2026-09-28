@@ -12,6 +12,7 @@ import { watchDataVersion } from "../lib/versionSync";
 import * as echarts from "echarts";
 import type { Colony, StatsDayDetail, StatsPayload } from "../types";
 import { todayIsoRef } from "../lib/today";
+import LoadingHint from "./LoadingHint.vue";
 import {
   avgPerDay,
   buildDetailMap,
@@ -39,7 +40,12 @@ const colonyId = ref<number | null>(null);
 const range = ref<StatsRange>("6m");
 const payload = ref<StatsPayload | null>(null);
 const pageError = ref("");
+/** 读取进行中（含首读与所有重拉）；首读占位判定见 showLoading（界面切换卡顿票 05）。 */
 const loading = ref(false);
+/** 首读占位：仅首读在途（payload 未到 + 读取中）显示。空数据载荷 payload 非 null
+ * 照常退出（不用图表非空判定）；失败在 finally 复位 loading 退出（错误区接管）；
+ * 已有数据在屏的刷新 payload 保持非 null，不闪占位（规格 D5）。 */
+const showLoading = computed(() => payload.value === null && loading.value);
 /** 版本广播退订柄（票 06；页签卸载时调用）。 */
 let unwatchVersion: (() => void) | null = null;
 
@@ -242,85 +248,89 @@ onBeforeUnmount(() => {
 
     <p v-if="pageError" class="page-error">{{ pageError }}</p>
 
-    <div class="kpis">
-      <div class="kpi">
-        <div class="n">{{ totalLogs }}<small> 条</small></div>
-        <div class="l">记录总数</div>
-      </div>
-      <div class="kpi">
-        <div class="n">{{ avgPerDay(totalLogs, payload?.range_days ?? 0) }}<small> 次/天</small></div>
-        <div class="l">平均每天操作</div>
-      </div>
-    </div>
-    <p class="freq-note" data-testid="freq-note">
-      口径：平均每天 = 记录总数 ÷ {{ payload?.range_days ?? 0 }} 个自然日（不扣冬眠）。
-    </p>
-
-    <p v-if="payload && totalLogs === 0" class="empty-hint">该范围内暂无记录</p>
-
-    <section class="card">
-      <h3>日历热力图 <span class="hint">一格一天，颜色越深当天操作越多 · 悬停看明细</span></h3>
-      <div class="heat-area">
-        <div ref="heatEl" class="heat-chart"></div>
-        <div class="legend">
-          少
-          <i v-for="c in HEAT_COLORS" :key="c" :style="{ background: c }"></i>
-          多
+    <!-- 首读占位（票 05）：仅首次读取在途显示；顶栏筛选保持可用。 -->
+    <LoadingHint v-if="showLoading" class="stats-loading" />
+    <template v-else>
+      <div class="kpis">
+        <div class="kpi">
+          <div class="n">{{ totalLogs }}<small> 条</small></div>
+          <div class="l">记录总数</div>
+        </div>
+        <div class="kpi">
+          <div class="n">{{ avgPerDay(totalLogs, payload?.range_days ?? 0) }}<small> 次/天</small></div>
+          <div class="l">平均每天操作</div>
         </div>
       </div>
-    </section>
+      <p class="freq-note" data-testid="freq-note">
+        口径：平均每天 = 记录总数 ÷ {{ payload?.range_days ?? 0 }} 个自然日（不扣冬眠）。
+      </p>
 
-    <div class="row2">
+      <p v-if="payload && totalLogs === 0" class="empty-hint">该范围内暂无记录</p>
+
       <section class="card">
-        <h3>喂食构成 <span class="hint">按食物出现次数归一化</span></h3>
-        <div class="donut-wrap">
-          <div v-if="foodSlices.length > 0" class="donut-box">
-            <div ref="donutEl" class="donut"></div>
-            <div class="donut-center">
-              <b>{{ feedTotalCount }}</b>
-              <span>次投喂</span>
-            </div>
+        <h3>日历热力图 <span class="hint">一格一天，颜色越深当天操作越多 · 悬停看明细</span></h3>
+        <div class="heat-area">
+          <div ref="heatEl" class="heat-chart"></div>
+          <div class="legend">
+            少
+            <i v-for="c in HEAT_COLORS" :key="c" :style="{ background: c }"></i>
+            多
           </div>
-          <ul v-if="foodSlices.length > 0" class="dlegend">
-            <li v-for="(s, i) in foodSlices" :key="s.food_name">
-              <span class="dot" :style="{ background: PALETTE[i % PALETTE.length] }"></span>
-              <span>{{ s.food_name }}</span>
-              <b class="pct">{{ s.pct }}%</b>
-              <span class="lc">{{ s.occurrences }} 次</span>
-            </li>
-          </ul>
-          <div v-else class="dlegend"><p class="empty">暂无喂食记录</p></div>
         </div>
       </section>
+
+      <div class="row2">
+        <section class="card">
+          <h3>喂食构成 <span class="hint">按食物出现次数归一化</span></h3>
+          <div class="donut-wrap">
+            <div v-if="foodSlices.length > 0" class="donut-box">
+              <div ref="donutEl" class="donut"></div>
+              <div class="donut-center">
+                <b>{{ feedTotalCount }}</b>
+                <span>次投喂</span>
+              </div>
+            </div>
+            <ul v-if="foodSlices.length > 0" class="dlegend">
+              <li v-for="(s, i) in foodSlices" :key="s.food_name">
+                <span class="dot" :style="{ background: PALETTE[i % PALETTE.length] }"></span>
+                <span>{{ s.food_name }}</span>
+                <b class="pct">{{ s.pct }}%</b>
+                <span class="lc">{{ s.occurrences }} 次</span>
+              </li>
+            </ul>
+            <div v-else class="dlegend"><p class="empty">暂无喂食记录</p></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h3>每周操作次数 <span class="hint">最近 12 周</span></h3>
+          <div ref="weeklyEl" class="weekly-chart"></div>
+        </section>
+      </div>
 
       <section class="card">
-        <h3>每周操作次数 <span class="hint">最近 12 周</span></h3>
-        <div ref="weeklyEl" class="weekly-chart"></div>
-      </section>
-    </div>
-
-    <section class="card">
-      <h3>实际间隔 vs 建议间隔 <span class="hint">间隔已扣除冬眠天数 · 竖线 = 建议间隔（仅提醒类）</span></h3>
-      <div>
-        <div v-for="row in intervalList" :key="row.action_id" class="irow">
-          <span class="iname">{{ row.name }}</span>
-          <template v-if="row.avgPct === null">
-            <div class="itrack"></div>
-            <span class="itext">记录不足 · {{ row.tail }}</span>
-          </template>
-          <template v-else>
-            <div class="itrack">
-              <div class="ibar" :style="{ width: row.avgPct + '%' }"></div>
-              <div v-if="row.markPct !== null" class="imark" :style="{ left: row.markPct + '%' }"></div>
-            </div>
-            <span class="itext">
-              平均 <b>{{ row.avgLabel }}</b> 天 · 最短 {{ row.min_days }} · 最长 {{ row.max_days }} · {{ row.tail }}
-            </span>
-          </template>
+        <h3>实际间隔 vs 建议间隔 <span class="hint">间隔已扣除冬眠天数 · 竖线 = 建议间隔（仅提醒类）</span></h3>
+        <div>
+          <div v-for="row in intervalList" :key="row.action_id" class="irow">
+            <span class="iname">{{ row.name }}</span>
+            <template v-if="row.avgPct === null">
+              <div class="itrack"></div>
+              <span class="itext">记录不足 · {{ row.tail }}</span>
+            </template>
+            <template v-else>
+              <div class="itrack">
+                <div class="ibar" :style="{ width: row.avgPct + '%' }"></div>
+                <div v-if="row.markPct !== null" class="imark" :style="{ left: row.markPct + '%' }"></div>
+              </div>
+              <span class="itext">
+                平均 <b>{{ row.avgLabel }}</b> 天 · 最短 {{ row.min_days }} · 最长 {{ row.max_days }} · {{ row.tail }}
+              </span>
+            </template>
+          </div>
+          <p v-if="intervalList.length === 0" class="empty">暂无操作可统计</p>
         </div>
-        <p v-if="intervalList.length === 0" class="empty">暂无操作可统计</p>
-      </div>
-    </section>
+      </section>
+    </template>
   </div>
 </template>
 
@@ -369,6 +379,11 @@ select {
   background: var(--bad-soft);
   color: var(--bad);
   font-size: 13px;
+}
+
+/* 首读占位（LoadingHint 根元素落 class）：与内容区同节奏 */
+.stats-loading {
+  margin-top: 14px;
 }
 
 .kpis {

@@ -108,6 +108,58 @@ describe("更新面板（票 06）：挂载与启动残留引导", () => {
   });
 });
 
+describe("更新面板：首读加载占位（界面切换卡顿票 03）", () => {
+  it("版本/状态未到前只渲染加载占位：不渲染空版本号、不出横幅；到齐后按现状渲染", async () => {
+    let resolveVersion!: (v: string) => void;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_app_version")
+        return new Promise<string>((resolve) => {
+          resolveVersion = resolve;
+        });
+      if (cmd === "get_update_state") return { status: "idle" };
+      return null;
+    });
+    const wrapper = mount(UpdatePanel);
+    await flushPromises();
+
+    expect(wrapper.find(".loading-hint").text()).toContain("加载中");
+    expect(wrapper.find(".current-version").exists()).toBe(false);
+    expect(wrapper.find(".update-banner-warn").exists()).toBe(false);
+    expect(wrapper.find(".check-btn").exists()).toBe(false);
+
+    resolveVersion("0.1.0");
+    await flushPromises();
+
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".current-version").text()).toContain("v0.1.0");
+    expect(wrapper.find(".check-btn").exists()).toBe(true);
+    // 订阅逻辑不受占位影响
+    expect(subscribeMock).toHaveBeenCalledWith("update-download-progress", expect.any(Function));
+  });
+
+  it("版本/状态读取失败 → 静默退出占位，按无数据渲染（v… 占位符），不卡加载中", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      invokeMock.mockImplementation(async (cmd: string) => {
+        if (cmd === "get_app_version") throw "读取版本失败";
+        if (cmd === "get_update_state") return { status: "idle" };
+        return null;
+      });
+      const wrapper = mount(UpdatePanel);
+      await flushPromises();
+
+      expect(wrapper.find(".loading-hint").exists()).toBe(false);
+      expect(wrapper.find(".current-version").exists()).toBe(true);
+      expect(wrapper.find(".current-version").text()).toContain("…");
+      expect(wrapper.find(".update-banner-warn").exists()).toBe(false);
+      expect(wrapper.find(".update-banner-ok").exists()).toBe(false);
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
+
 describe("更新面板：立即检查更新三态", () => {
   it("无更新 → 平静的「已是最新」", async () => {
     const wrapper = await mountPanel();

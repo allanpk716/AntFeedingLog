@@ -813,6 +813,88 @@ describe("顶栏导航（票 07/08）", () => {
   });
 });
 
+// ── 主界面三页保活（票 04）：再进即时——不重挂载、不重发页面级 IPC ──
+
+describe("主界面三页保活（票 04）", () => {
+  it("统计页切走再进：不重挂载，get_stats 不重发", async () => {
+    const wrapper = await mountApp();
+    const tabs = () => wrapper.findAll(".topbar .tab");
+
+    await tabs()[1].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".stats-page").exists()).toBe(true);
+    const firstVisits = invokeMock.mock.calls.filter(([cmd]) => cmd === "get_stats").length;
+    expect(firstVisits).toBeGreaterThanOrEqual(1);
+
+    invokeMock.mockClear();
+    await tabs()[0].trigger("click"); // 切回首页：统计页失活（离屏缓存）
+    await flushPromises();
+    expect(wrapper.find(".stats-page").exists()).toBe(false);
+    await tabs()[1].trigger("click"); // 再进统计
+    await flushPromises();
+
+    expect(wrapper.find(".stats-page").exists()).toBe(true);
+    // 保活：实例与数据保留，不重新挂载、不重发页面级 IPC
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "get_stats")).toBe(false);
+  });
+
+  it("照片页切走再进：不重挂载，photo_wall 不重发", async () => {
+    const wrapper = await mountApp();
+    const tabs = () => wrapper.findAll(".topbar .tab");
+
+    await tabs()[2].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".photo-wall").exists()).toBe(true);
+
+    invokeMock.mockClear();
+    await tabs()[0].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".photo-wall").exists()).toBe(false);
+    await tabs()[2].trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".photo-wall").exists()).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "photo_wall")).toBe(false);
+  });
+
+  it("记录页切走再进：不重挂载，list_logs 不重发，筛选状态在往返间保留", async () => {
+    const wrapper = await mountApp();
+    const tabs = () => wrapper.findAll(".topbar .tab");
+
+    await tabs()[3].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".log-list").exists()).toBe(true);
+    // 选地点筛选（即改即查，会再发一次 list_logs），随后往返
+    await wrapper.find(".f-location").setValue("1");
+    await flushPromises();
+
+    invokeMock.mockClear();
+    await tabs()[0].trigger("click");
+    await flushPromises();
+    await tabs()[3].trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".log-list").exists()).toBe(true);
+    // 保活：不重发页面级 IPC；筛选状态保留（预期行为，规格 Further Notes）
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_logs")).toBe(false);
+    expect((wrapper.find(".f-location").element as HTMLSelectElement).value).toBe("1");
+  });
+
+  it("首页不进 KeepAlive：数据在根组件，往返后照常渲染", async () => {
+    const wrapper = await mountApp();
+    const tabs = () => wrapper.findAll(".topbar .tab");
+
+    await tabs()[2].trigger("click");
+    await flushPromises();
+    await tabs()[0].trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".group-title").exists()).toBe(true);
+    expect(wrapper.find(".photo-wall").exists()).toBe(false);
+    expect(tabs()[0].classes()).toContain("active");
+  });
+});
+
 describe("设置 · 通知（票 06）", () => {
   async function openNotifyTab(wrapper: Awaited<ReturnType<typeof mountApp>>) {
     await wrapper.find(".settings-btn").trigger("click");
@@ -1166,6 +1248,8 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(dialog.exists()).toBe(true);
     expect(dialog.find("h3").text()).toBe("记录投喂 · 大头一号");
     expect(invokeMock).toHaveBeenCalledWith("list_foods");
+    // 票 07：字典首读完成前食物区是「加载中…」占位——flush 后 chips 才渲染
+    await flushPromises();
 
     // 停用食物不出现在新建记录入口（规则 10）
     const chips = dialog.findAll(".food");

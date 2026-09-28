@@ -79,6 +79,8 @@ export function perishableChipTitle(f: PerishableProbe): string | null {
  * 选中日已有同操作记录出黄条（不拦提交）。接入与 QuickLogDialog 同构。
  * 票 04：易腐项加圆点记号；提交成功且有撤食反馈时行内告知、点「知道了」再关窗刷新
  * （无反馈维持现状直接关窗，父层 onFeedSaved 负责刷新）。
+ * 票 07：字典（foods + 操作名字表）首读完成前食物选择区显 LoadingHint 占位、
+ * 不渲染空选项组；退出判定用首读完成标志而非列表长度（空字典合法）。
  */
 import { computed, onMounted, ref, watch } from "vue";
 import { colonyMonthRecords, listActions, listFoods, logCare } from "../lib/ipc";
@@ -87,6 +89,7 @@ import { nowLocalDateTime } from "../lib/care";
 import { todayIso } from "../lib/dates";
 import { buildMarkers, duplicateInfo, dupWarningText } from "../lib/monthview";
 import DateTimeField from "./DateTimeField.vue";
+import LoadingHint from "./LoadingHint.vue";
 
 const props = defineProps<{
   colony: Colony;
@@ -103,11 +106,20 @@ const busy = ref(false);
 
 const enabledFoods = computed(() => foods.value.filter((f) => f.enabled));
 
+// ── 票 07：字典首读占位判定 ──
+/** foods 与操作名字表（loadActions 内的 list_actions）都落地（含各自失败语义）
+ *  才算首读完成；占位退出用标志不用列表长度（空字典合法，不能永久卡加载中）。
+ *  月份标记（loadMonth）属辅助增强，不挡占位。 */
+const dictLoaded = ref(false);
+
 onMounted(async () => {
   try {
-    foods.value = await listFoods();
+    const [fs] = await Promise.all([listFoods(), loadActions()]);
+    foods.value = fs;
   } catch (e) {
     formError.value = String(e);
+  } finally {
+    dictLoaded.value = true;
   }
 });
 
@@ -135,6 +147,8 @@ onMounted(() => void loadMonth(viewMonth.value.year, viewMonth.value.month));
 // 终局评审：名字表口径统一——colony.actions 只有启用项，停用操作的标记名会丢；
 // 改拉 list_actions 全量（含停用），与 LogListPage 编辑弹窗一致
 const allActions = ref<CareActionItem[]>([]);
+/** 名字表是增强，失败静默（当前操作名有 props 兜底）；由字典首读 onMounted 与
+ *  listFoods 同批等待（票 07 占位口径：foods+allActions 都落地才算首读完成）。 */
 async function loadActions() {
   try {
     allActions.value = await listActions();
@@ -142,7 +156,6 @@ async function loadActions() {
     // 名字表是增强，失败静默（当前操作名有 props 兜底）
   }
 }
-onMounted(() => void loadActions());
 
 // 复审 #15/#16：「现在/±10分/选日期」可跨月，月份跟随时间值重同步（黄条判定依赖 viewMonth）
 watch(
@@ -239,7 +252,10 @@ async function submit() {
       <h3>记录{{ action.name }} · {{ colony.name }}</h3>
 
       <div class="field-label">食物（可多选）</div>
-      <div class="foods">
+      <!-- 票 07：字典首读未完成显「加载中…」占位、不渲染空选项组；退出判定用
+           首读完成标志而非列表长度（空字典合法，不能永久卡加载中）。 -->
+      <LoadingHint v-if="!dictLoaded" />
+      <div v-else class="foods">
         <button
           v-for="f in enabledFoods"
           :key="f.id"

@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import FeedDialog, { retrievalFeedback, retrievalFeedbackText } from "./FeedDialog.vue";
 import DateTimeField from "./DateTimeField.vue";
-import type { Colony, ColonyAction, FoodItem } from "../types";
+import type { CareActionItem, Colony, ColonyAction, FoodItem } from "../types";
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -198,6 +198,62 @@ describe("FeedDialog 提交反馈分支", () => {
     expect(w.find(".form-error").exists()).toBe(true);
     expect(w.find(".save-ok").exists()).toBe(false);
     expect(w.emitted("saved")).toBeUndefined();
+  });
+});
+
+describe("字典加载占位（票 07）", () => {
+  it("字典挂起期：食物选择区显「加载中…」占位，不渲染空选项组；字典到齐后渲染 chips", async () => {
+    let resolveFoods!: (v: FoodItem[]) => void;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_foods") return new Promise<FoodItem[]>((r) => { resolveFoods = r; });
+      if (cmd === "colony_month_records") return [];
+      if (cmd === "list_actions") return [];
+      return null;
+    });
+    const w = mount(FeedDialog, { props: { colony, action } });
+    await flushPromises(); // 挂载钩子已跑，list_foods 仍挂起
+
+    expect(w.find(".loading-hint").exists()).toBe(true);
+    expect(w.find(".loading-hint").text()).toContain("加载中");
+    expect(w.find(".foods").exists()).toBe(false);
+
+    resolveFoods(foods);
+    await flushPromises();
+    expect(w.find(".loading-hint").exists()).toBe(false);
+    expect(w.find(".foods").exists()).toBe(true);
+    expect(w.findAll(".food")).toHaveLength(4); // 与既有口径一致：停用食物不进列表
+  });
+
+  it("foods 先到但操作名字表未到 → 占位不提前退出（首读=两者都完成）", async () => {
+    let resolveActions!: (v: CareActionItem[]) => void;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_foods") return foods;
+      if (cmd === "list_actions") return new Promise<CareActionItem[]>((r) => { resolveActions = r; });
+      if (cmd === "colony_month_records") return [];
+      return null;
+    });
+    const w = mount(FeedDialog, { props: { colony, action } });
+    await flushPromises();
+
+    expect(w.find(".loading-hint").exists()).toBe(true);
+    expect(w.find(".foods").exists()).toBe(false);
+
+    resolveActions([]);
+    await flushPromises();
+    expect(w.find(".loading-hint").exists()).toBe(false);
+    expect(w.findAll(".food")).toHaveLength(4);
+  });
+
+  it("字典读取失败 → 占位退出不卡加载中，错误照旧显示在表单错误位", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_foods"
+        ? Promise.reject("字典读取失败")
+        : cmd === "colony_month_records" ? [] : cmd === "list_actions" ? [] : null,
+    );
+    const w = mount(FeedDialog, { props: { colony, action } });
+    await flushPromises();
+    expect(w.find(".loading-hint").exists()).toBe(false);
+    expect(w.find(".form-error").text()).toContain("字典读取失败");
   });
 });
 

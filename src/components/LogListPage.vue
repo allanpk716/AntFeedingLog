@@ -8,6 +8,8 @@
  * 停用操作/食物按规则 10：历史照常显示；编辑表单原引用可保留（标「已停用」），
  * 新挂停用项前后端双重拒绝。任何编辑/删除成功抛 changed → 外层 refresh，
  * 首页「距上次」与超期态即时重算（数据驱动）。
+ * 加载占位（界面切换卡顿票 06）：读取中且当前无行可显（首载 / 空态后再筛选）
+ * 显示 LoadingHint；有旧数据在屏不闪占位；非加载且无行才显空态文案。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
@@ -47,6 +49,7 @@ import { todayIso } from "../lib/dates";
 import { buildMarkers, duplicateInfo, dupWarningText } from "../lib/monthview";
 import DatePickerPop from "./DatePickerPop.vue";
 import DateTimeField from "./DateTimeField.vue";
+import LoadingHint from "./LoadingHint.vue";
 
 const emit = defineEmits<{ changed: [] }>();
 
@@ -460,6 +463,10 @@ onBeforeUnmount(() => {
             </tr>
           </tbody>
         </table>
+        <!-- 加载占位（票 06）：loading 且无行可显（首载 / 空态后再筛选）；追加更多时
+             rows.length>0 不触发，有旧数据在屏同样不触发——三分支互斥且穷尽：
+             loading&&无行→占位 / !loading&&无行→空态 / 有行→列表 -->
+        <LoadingHint v-if="loading && rows.length === 0" class="list-loading" />
         <p v-if="rows.length === 0 && !loading" class="empty">没有符合条件的记录</p>
       </div>
 
@@ -726,6 +733,12 @@ onBeforeUnmount(() => {
   text-align: center;
   color: var(--muted);
   font-size: 13px;
+}
+
+/* 加载占位（票 06，LoadingHint 根元素落 class）：与 .empty 同节奏 */
+.list-loading {
+  padding: 22px;
+  text-align: center;
 }
 
 .more-btn {

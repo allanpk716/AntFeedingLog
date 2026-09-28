@@ -828,6 +828,9 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("list_actions");
+    // 终局修复：整库替换后推送状态与头像形状也重拉自新库（不残留恢复前旧值）
+    expect(invokeMock).toHaveBeenCalledWith("pushover_status");
+    expect(invokeMock).toHaveBeenCalledWith("get_avatar_shape");
     expect(wrapper.emitted("changed")).toBeTruthy();
   });
 
@@ -1552,5 +1555,285 @@ describe("设置弹窗轻提示接线（保湿方式+轻提示票 03）", () => 
     expect(select.exists()).toBe(true);
     expect(select.attributes("title")).toContain("只记录，本页不催促");
     expect(select.attributes("title")).toContain("单个窝仍可在窝编辑里设周期提醒");
+  });
+});
+
+// ── 首开体验（界面切换卡顿票 02）：默认页签占位 + 三面板急挂载保活 + 打开链并行化 + 孤儿区三态 ──
+
+/** 可控延迟桩：挂起期断言占位/并行发出，resolve/reject 后断言终态。 */
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  let reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+/** 主链可控 mock：actions/foods/orphan 可挂起，其余命令即时返回（未列命令回 null，
+ *  含网页端/更新面板急挂载后自读的命令——null 回放不产生错误 UI）。 */
+function slowMock(
+  opts: { actions?: Promise<unknown>; foods?: Promise<unknown>; orphan?: Promise<unknown> } = {},
+) {
+  invokeMock.mockImplementation(async (cmd: string) => {
+    switch (cmd) {
+      case "list_actions":
+        return opts.actions ?? [];
+      case "list_foods":
+        return opts.foods ?? [];
+      case "list_locations":
+        return [];
+      case "get_settings":
+        return settingsFixture();
+      case "list_orphan_photos":
+        return opts.orphan ?? { dir_count: 0, file_count: 0, total_bytes: 0 };
+      default:
+        return null;
+    }
+  });
+}
+
+describe("设置弹窗首开体验（界面切换卡顿票 02）", () => {
+  it("弹窗打开、字典未返回：「操作」页签显示「加载中…」而非空白列表", async () => {
+    const dict = deferred<CareActionItem[]>();
+    slowMock({ actions: dict.promise, foods: dict.promise });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+
+    expect(wrapper.find(".tab-body .loading-hint").text()).toContain("加载中");
+    expect(wrapper.findAll(".tab-body .dict-row").length).toBe(0);
+    expect(wrapper.find(".tab-body .add-row").exists()).toBe(false);
+
+    // 空字典也是「首次读取完成」：占位退出（判定用完成标志，不用列表长度）
+    dict.resolve([]);
+    await flushPromises();
+    expect(wrapper.find(".tab-body .loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".tab-body .add-row").exists()).toBe(true);
+    expect(wrapper.findAll(".tab-body .dict-row").length).toBe(0);
+    wrapper.unmount();
+  });
+
+  it("「食物」页签同占位逻辑；字典返回非空后行照常渲染", async () => {
+    const actions = deferred<CareActionItem[]>();
+    const foods = deferred<FoodItem[]>();
+    slowMock({ actions: actions.promise, foods: foods.promise });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+    await wrapper.find(".tab-foods").trigger("click");
+    expect(wrapper.find(".tab-body .loading-hint").exists()).toBe(true);
+
+    foods.resolve(foodsFixture());
+    actions.resolve(actionsFixture());
+    await flushPromises();
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.findAll(".tab-body .dict-row").length).toBe(3);
+
+    await wrapper.find(".tab-actions").trigger("click");
+    expect(wrapper.findAll(".tab-body .dict-row").length).toBe(3);
+    wrapper.unmount();
+  });
+
+  it("保存后重拉（数据已在内存）不重新显示占位", async () => {
+    const wrapper = await openDictTab("actions", foodsFixture(), actionsFixture());
+    const reload = deferred<CareActionItem[]>();
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_actions" ? reload.promise : dictMock(cmd, foodsFixture(), actionsFixture()),
+    );
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    // 重拉挂起期间：旧数据在屏、无占位（加载态规范：数据已在内存不进加载态）
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.findAll(".tab-body .dict-row").length).toBe(3);
+
+    reload.resolve(actionsFixture());
+    await flushPromises();
+    expect(wrapper.findAll(".tab-body .dict-row").length).toBe(3);
+    wrapper.unmount();
+  });
+
+  it("主链失败：轻提示照旧，占位同样退出（首读已发生，不卡在加载中）", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_actions") throw "库打不开";
+      switch (cmd) {
+        case "list_foods":
+        case "list_locations":
+          return [];
+        case "get_settings":
+          return settingsFixture();
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+
+    expect(showErrorMock).toHaveBeenCalledWith("设置加载失败", "库打不开");
+    expect(wrapper.find(".tab-body .loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".tab-body .add-row").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("打开弹窗即挂载三面板：网页端/更新与主加载同批读取，地点挂载不晚于主链完成", async () => {
+    const dict = deferred<CareActionItem[]>();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_actions":
+          return dict.promise;
+        case "list_foods":
+        case "list_locations":
+        case "list_network_segments":
+          return [];
+        case "get_settings":
+          return settingsFixture();
+        case "get_webui_config":
+          return webUiConfigFixture();
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+
+    // 网页端/更新面板自读：挂载即发起读取，不等点页签、不等主链
+    expect(wrapper.find(".webui-panel").exists()).toBe(true);
+    expect(wrapper.find(".update-body").exists()).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "get_webui_config")).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "get_app_version")).toBe(true);
+
+    // 地点面板数据来自主链（面板不自读）：主链未完成前不挂载（占位），完成后即挂载
+    expect(wrapper.find(".loc-panel").exists()).toBe(false);
+    dict.resolve([]);
+    await flushPromises();
+    expect(wrapper.find(".loc-panel").exists()).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("「网页端」改表单 → 切「操作」→ 切回：修改保留，面板初始读取不重发", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_actions":
+        case "list_foods":
+        case "list_locations":
+        case "list_network_segments":
+          return [];
+        case "get_settings":
+          return settingsFixture();
+        case "get_webui_config":
+          return webUiConfigFixture();
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+    const reads = () => invokeMock.mock.calls.filter(([cmd]) => cmd === "get_webui_config").length;
+    const before = reads();
+
+    await wrapper.find(".tab-webui").trigger("click");
+    await wrapper.find(".webui-port-input").setValue("20000");
+    await wrapper.find(".tab-actions").trigger("click");
+    await wrapper.find(".tab-webui").trigger("click");
+
+    expect((wrapper.find(".webui-port-input").element as HTMLInputElement).value).toBe("20000");
+    expect(reads()).toBe(before);
+    wrapper.unmount();
+  });
+
+  it("地点面板行内改名在页签往返间保留（面板不销毁）", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_actions":
+        case "list_foods":
+          return [];
+        case "list_locations":
+          return [
+            { id: 1, name: "家", enabled: true, sort: 1 },
+            { id: 2, name: "公司", enabled: true, sort: 2 },
+          ];
+        case "get_settings":
+          return settingsFixture();
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+
+    await wrapper.find(".tab-locations").trigger("click");
+    await wrapper.find(".loc-row .loc-name-input").setValue("老家");
+    await wrapper.find(".tab-actions").trigger("click");
+    await wrapper.find(".tab-locations").trigger("click");
+
+    expect((wrapper.find(".loc-row .loc-name-input").element as HTMLInputElement).value).toBe("老家");
+    wrapper.unmount();
+  });
+
+  it("打开加载链六段并行：主链未返回时五段辅助读取已发出（串行版要等主链）", async () => {
+    const dict = deferred<CareActionItem[]>();
+    slowMock({ actions: dict.promise, foods: dict.promise });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+
+    const called = (want: string) => invokeMock.mock.calls.some(([cmd]) => cmd === want);
+    expect(called("pushover_status")).toBe(true);
+    expect(called("get_avatar_shape")).toBe(true);
+    expect(called("get_recent_errors")).toBe(true);
+    expect(called("get_backup_config")).toBe(true);
+    expect(called("list_orphan_photos")).toBe(true);
+    wrapper.unmount();
+  });
+
+  it("辅助段全失败不影响主链：字典照常渲染、无「设置加载失败」轻提示、孤儿区显「读取失败」", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_actions":
+          return actionsFixture();
+        case "list_foods":
+          return foodsFixture();
+        case "list_locations":
+          return [];
+        case "get_settings":
+          return settingsFixture();
+        case "pushover_status":
+        case "get_avatar_shape":
+        case "get_recent_errors":
+        case "get_last_abnormal_exit":
+        case "get_backup_config":
+        case "list_orphan_photos":
+          throw "辅助段失败";
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+
+    expect(wrapper.findAll(".tab-body .dict-row").length).toBe(3);
+    expect(showErrorMock).not.toHaveBeenCalled();
+
+    await wrapper.find(".tab-data").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("读取失败");
+    wrapper.unmount();
+  });
+
+  it("孤儿区三态：首读期间「加载中…」（不误显读取失败），无孤儿显示统计文本", async () => {
+    const orphan = deferred<{ dir_count: number; file_count: number; total_bytes: number }>();
+    slowMock({ orphan: orphan.promise });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+    await wrapper.find(".tab-data").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".orphan-section .loading-hint").text()).toContain("加载中");
+    expect(wrapper.find(".orphan-stats-value").exists()).toBe(false);
+
+    orphan.resolve({ dir_count: 0, file_count: 0, total_bytes: 0 });
+    await flushPromises();
+    expect(wrapper.find(".orphan-section .loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".orphan-stats-value").text()).toContain("无孤儿");
+    wrapper.unmount();
   });
 });

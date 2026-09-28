@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
+import { nextTick } from "vue";
 import PhotoWallPage from "./PhotoWallPage.vue";
 import ToastHost from "./ToastHost.vue";
 import type { Colony, NestPhotoMeta, PhotoWallColony } from "../types";
@@ -25,6 +26,16 @@ vi.mock("../lib/photos", async (importOriginal) => {
     revokeObjectUrl: revokeObjectUrlMock,
   };
 });
+
+// 票 04：数据版本订阅走可控桩——只验组件侧编排（何时订阅、广播是否重拉、
+// 何时退订），对账规则本身归 versionSync.test.ts
+const { watchDataVersionMock, unwatchVersionMock } = vi.hoisted(() => ({
+  watchDataVersionMock: vi.fn(),
+  unwatchVersionMock: vi.fn(),
+}));
+vi.mock("../lib/versionSync", () => ({
+  watchDataVersion: watchDataVersionMock,
+}));
 
 // jsdom/happy-dom 无 IntersectionObserver（或行为不定）：装可控假体，
 // 用例里用 fire() 手动派发「进/出视口」事件
@@ -169,6 +180,9 @@ beforeEach(() => {
   invokeMock.mockReset();
   loadPhotoBlobUrlMock.mockReset();
   revokeObjectUrlMock.mockReset();
+  watchDataVersionMock.mockReset();
+  unwatchVersionMock.mockReset();
+  watchDataVersionMock.mockReturnValue(unwatchVersionMock);
   clearToasts();
   FakeIntersectionObserver.latest = null;
   (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
@@ -452,5 +466,78 @@ describe("照片墙页 · 大图查看器", () => {
     expect(w.text()).not.toContain("裁剪");
     const cmds = new Set(invokeMock.mock.calls.map(([cmd]) => cmd));
     expect([...cmds].every((c) => ["photo_wall", "get_photo_abs_dir"].includes(c))).toBe(true);
+  });
+});
+
+// ── 数据版本订阅（票 04）：对齐统计/记录页口径，保活后靠订阅保鲜 ──
+
+describe("照片墙页 · 数据版本订阅（票 04）", () => {
+  it("挂载即订阅数据版本广播（回调用于重拉）", async () => {
+    await mountWall(wallData);
+    expect(watchDataVersionMock).toHaveBeenCalledTimes(1);
+    expect(typeof watchDataVersionMock.mock.calls[0][0]).toBe("function");
+  });
+
+  it("收到数据版本广播：重拉 photo_wall，墙上数据跟上", async () => {
+    const w = await mountWall(wallData);
+    expect(w.findAll(".wall-colony").map((c) => c.find(".wall-colony-name").text())).toEqual([
+      "大头一号",
+      "针毛一号",
+    ]);
+
+    // 别端写入后：1 号窝的照片全没了，载荷只剩 2 号窝
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "photo_wall" ? [wallData[1]] : null,
+    );
+    const onStale = watchDataVersionMock.mock.calls[0][0] as () => void;
+    onStale();
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("photo_wall");
+    expect(w.findAll(".wall-colony").map((c) => c.find(".wall-colony-name").text())).toEqual([
+      "针毛一号",
+    ]);
+  });
+
+  it("真卸载才退订：unmount 调用订阅返回的退订柄", async () => {
+    const w = await mountWall(wallData);
+    expect(unwatchVersionMock).not.toHaveBeenCalled();
+    w.unmount();
+    expect(unwatchVersionMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("保活切换（KeepAlive + v-if）不卸载组件：不退订、不重订阅、不重拉；再激活后订阅仍有效", async () => {
+    // 不走 mountWall（它直接挂本页）：这里用 App.vue 同款 KeepAlive + v-if 容器
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "photo_wall" ? wallData : cmd === "get_photo_abs_dir" ? "C:\\photos" : null,
+    );
+    const w = mount({
+      components: { PhotoWallPage },
+      data: () => ({ show: true }),
+      template: "<KeepAlive><PhotoWallPage v-if='show' /></KeepAlive>",
+    });
+    await flushPromises();
+    expect(watchDataVersionMock).toHaveBeenCalledTimes(1);
+    const onStale = watchDataVersionMock.mock.calls[0][0] as () => void;
+    // 内联 options 组件的 vm 上 TS 推不出 data 字段，显式窄化后再拨 v-if
+    const shell = w.vm as unknown as { show: boolean };
+
+    // 切走再切回：缓存往返不触发卸载钩子
+    shell.show = false;
+    await nextTick();
+    await flushPromises();
+    shell.show = true;
+    await nextTick();
+    await flushPromises();
+    expect(w.find(".photo-wall").exists()).toBe(true);
+    expect(unwatchVersionMock).not.toHaveBeenCalled();
+    expect(watchDataVersionMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "photo_wall").length).toBe(1);
+
+    // 订阅持续有效：后台收到版本广播 → 重拉（保活后数据保鲜的路径）
+    invokeMock.mockClear();
+    onStale();
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("photo_wall");
   });
 });
