@@ -286,3 +286,23 @@ describe("窝卡片头像（窝头像票 02）", () => {
     });
   });
 });
+
+// ── 编辑入口双端可见（网页端窝编辑票 02）──
+
+describe("编辑入口双端可见（网页端窝编辑票 02）", () => {
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  it("网页端（非 Tauri）：⋯菜单「✏️ 编辑窝信息」渲染，入口放开", () => {
+    const w = mountCard();
+    // 菜单容器 v-show 保 DOM（交互第三轮 #7），按钮断言不依赖菜单展开
+    expect(w.find(".m-item.edit-btn").exists()).toBe(true);
+  });
+
+  it("桌面端：同样渲染，行为不变", () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
+    const w = mountCard();
+    expect(w.find(".m-item.edit-btn").exists()).toBe(true);
+  });
+});

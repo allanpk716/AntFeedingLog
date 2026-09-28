@@ -396,8 +396,8 @@ function onCheckinSaved() {
       >
         📅 补录冬眠
       </button>
-      <!-- 终局评审：窝的编辑是桌面专属（网页端 API 白名单挡住 update_colony 等），浏览器不渲染入口 -->
-      <button v-if="isTauri()" class="m-item edit-btn" type="button" @click="menuAction(() => emit('edit'))">✏️ 编辑窝信息</button>
+      <!-- 网页端窝编辑票 02：「✏️ 编辑窝信息」放开双端渲染（网页端可维护窝资料） -->
+      <button class="m-item edit-btn" type="button" @click="menuAction(() => emit('edit'))">✏️ 编辑窝信息</button>
     </div>
 
     <FeedDialog

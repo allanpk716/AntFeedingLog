@@ -158,8 +158,8 @@ onBeforeUnmount(() => stopTodayClock());
       </nav>
       <div class="today">{{ todayText }}</div>
       <div class="tools">
-        <!-- 终局评审：新建窝/设置是桌面专属（网页端 API 白名单本就挡住），浏览器不渲染入口 -->
-        <button v-if="isTauri()" class="ghost-btn new-top-btn" type="button" @click="openCreate">＋ 新建窝</button>
+        <!-- 网页端窝编辑票 02：「＋ 新建窝」放开双端渲染；⚙ 设置仍桌面专属，浏览器不渲染 -->
+        <button class="ghost-btn new-top-btn" type="button" @click="openCreate">＋ 新建窝</button>
         <button v-if="isTauri()" class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
           ⚙ 设置
         </button>
