@@ -296,6 +296,37 @@ describe("photos 网页端（webui-checkin 票 08）", () => {
       expect((init.body as FormData).get("date")).toBeNull();
     });
 
+    it("字段段（票 03 缝合）：计数整数段、movedNest 仅 true 带、note trim 非空才带；null/缺省不带", async () => {
+      const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => [] }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await createCheckinPhotosHttp(3, [new File(["a"], "a.jpg")], "2026-09-28", {
+        queenCount: 2,
+        workerCount: null, // null = 未数，不带段
+        movedNest: true,
+        note: "  状态不错  ", // trim 后带
+      });
+
+      const form = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1]
+        .body as FormData;
+      expect(form.get("queenCount")).toBe("2");
+      expect(form.get("workerCount")).toBeNull();
+      expect(form.get("movedNest")).toBe("true");
+      expect(form.get("note")).toBe("状态不错");
+
+      // 反向形态：movedNest false / note 空白 / 字段全缺省 → 三个段都不带
+      await createCheckinPhotosHttp(3, [new File(["a"], "a.jpg")], "2026-09-28", {
+        movedNest: false,
+        note: "   ",
+      });
+      const form2 = (fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1]
+        .body as FormData;
+      expect(form2.get("queenCount")).toBeNull();
+      expect(form2.get("workerCount")).toBeNull();
+      expect(form2.get("movedNest")).toBeNull();
+      expect(form2.get("note")).toBeNull();
+    });
+
     it("预检沿用：张数超 9 / 单张超 15MB 本地拒绝不发请求；空列表空数组返回", async () => {
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock);

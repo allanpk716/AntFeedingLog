@@ -150,15 +150,31 @@ const CREATE_UPLOAD_INTERRUPTED_MSG =
   "上传中断（网络断开或超时）。本次登记未保存，可直接重试";
 
 /**
- * 浏览器上传·创建模式（checkin-photo-entry 票 02「拍一张」）：不挂既有登记，
- * multipart 不带 checkinId 段，改带 `colonyId` 必填文本段 + 可选 `date` 段
- * （缺省服务端按今天）+ photos 文件段 → POST /api/photos。服务端建当天登记
- * （纯照片合法）后返回新建登记的照片元数据 NestPhotoMeta[]。预检与挂靠模式同款。
+ * 创建模式可选字段段（checkin-photo-entry 票 03 缝合）：完整登记带照片时把
+ * 表单字段一并原子带给服务端；与服务端 ParsedPhotoForm 契约逐字对齐——
+ * 计数为整数段（null/缺省不带）、movedNest 仅 true 带 "true"（false 与缺省
+ * 等价）、note trim 后非空才带。
+ */
+export interface CreateCheckinPhotosFields {
+  queenCount?: number | null;
+  workerCount?: number | null;
+  movedNest?: boolean;
+  note?: string | null;
+}
+
+/**
+ * 浏览器上传·创建模式（checkin-photo-entry 票 02「拍一张」/票 03 完整登记）：
+ * 不挂既有登记，multipart 不带 checkinId 段，改带 `colonyId` 必填文本段 +
+ * 可选 `date` 段（缺省服务端按今天）+ 可选字段段（fields，见
+ * [`CreateCheckinPhotosFields`]）+ photos 文件段 → POST /api/photos。服务端
+ * 同事务建登记（纯照片合法）后返回新建登记的照片元数据 NestPhotoMeta[]。
+ * 预检与挂靠模式同款。
  */
 export async function createCheckinPhotosHttp(
   colonyId: number,
   files: File[],
   date?: string,
+  fields?: CreateCheckinPhotosFields,
 ): Promise<NestPhotoMeta[]> {
   if (files.length === 0) return [];
   assertPhotosWithinLimits(files);
@@ -166,6 +182,19 @@ export async function createCheckinPhotosHttp(
   form.append("colonyId", String(colonyId));
   if (date !== undefined) {
     form.append("date", date);
+  }
+  if (fields?.queenCount != null) {
+    form.append("queenCount", String(fields.queenCount));
+  }
+  if (fields?.workerCount != null) {
+    form.append("workerCount", String(fields.workerCount));
+  }
+  if (fields?.movedNest === true) {
+    form.append("movedNest", "true");
+  }
+  const note = fields?.note?.trim();
+  if (note) {
+    form.append("note", note);
   }
   for (const f of files) {
     form.append("photos", f, f.name);
