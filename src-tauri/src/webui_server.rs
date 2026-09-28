@@ -486,6 +486,13 @@ pub const WEBUI_COMMANDS: &[&str] = &[
     // 首页：窝卡片墙（含超期投影）+ 地点下拉
     "list_colonies",
     "list_locations",
+    // 窝资料维护（web-colony-edit 票 01）：新建/编辑/删除与桌面 IPC 同形。
+    // update 附加状态守卫（D7：冬眠不可绕流程直改）；delete 仅无记录窝放行
+    //（纯核把关）。archive_colony 不入白名单——「已结束」经 update 的状态
+    // 字段可达，置为已结束按钮维持桌面专属。
+    "create_colony",
+    "update_colony",
+    "delete_colony",
     // 打卡：字典读 + 提交（colony_month_records 为交互第三轮日历标记数据源，
     // 打卡面板与记录页在用，网页端同样可达）
     "list_actions",
@@ -604,6 +611,49 @@ pub fn dispatch_command(
         })),
         "list_locations" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
             crate::colony::list_locations(conn)
+        })),
+        // ── 窝资料维护（web-colony-edit 票 01，与桌面 IPC 同形）──
+        "create_colony" => Some(write_cmd(
+            deps,
+            args,
+            true,
+            |conn, a: webui_args::CreateColonyArgs| {
+                crate::colony::create_colony(conn, &a.input.into_core(), &crate::colony::today_iso())
+            },
+        )),
+        "update_colony" => Some(write_cmd(
+            deps,
+            args,
+            true,
+            |conn, a: webui_args::UpdateColonyArgs| {
+                // 状态守卫（D7）：同一把库锁内先读库内 status 再判定（读-判-写
+                // 无 TOCTOU 窗口），不过则人话拒绝、不进写路径。守卫是镜像校验
+                // 之外的附加判定，不替代镜像与纯核校验链（载荷其他字段照走）。
+                let stored_status: String = conn
+                    .query_row(
+                        "SELECT status FROM colony WHERE id = ?1",
+                        rusqlite::params![a.id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => "窝不存在".to_string(),
+                        other => format!("数据库操作失败: {other}"),
+                    })?;
+                ensure_web_status_transition_allowed(&stored_status, &a.input.status)?;
+                crate::colony::update_colony(conn, a.id, &a.input.into_core(), &crate::colony::today_iso())
+            },
+        )),
+        "delete_colony" => Some(write_cmd(deps, args, true, |conn, a: webui_args::IdArgs| {
+            // 与桌面 delete_colony 同序（lib.rs 先例）：先取照片路径 → 库事务
+            // 删行提交 → 删照片文件；文件删失败仅孤儿记账，不回滚库。仅无记录
+            // 窝可删由纯核 delete_colony 把关。
+            let rel_paths = crate::photo::collect_colony_photo_paths(conn, a.id)?;
+            crate::colony::delete_colony(conn, a.id)?;
+            let photos_root = deps.data_dir.join(crate::photo::PHOTOS_DIR_NAME);
+            for f in crate::photo::delete_photo_files(&photos_root, &rel_paths) {
+                crate::applog::log_error(&format!("照片文件删除失败（遗留孤儿，待巡检隔离）: {f}"));
+            }
+            Ok(())
         })),
         // ── 打卡 ──
         "list_actions" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
@@ -777,6 +827,22 @@ pub fn dispatch_command(
         // 钉住两边同步；走到这等于调用方没先查注册表
         _ => None,
     }
+}
+
+/// 状态守卫（web-colony-edit 票 01，D7）：网页端 update_colony 的状态变更仅
+/// 允许 active↔ended；hibernating 只能原样透传（不变更豁免——冬眠窝可正常
+/// 编辑其他字段，表单复用使载荷必带原值）。入眠走 start_hibernation、出眠走
+/// confirm_wake，任何入口不得绕过冬眠流程直改状态。`stored_status` 来自库内
+/// 原值（同一把库锁内读-判-写），`new_status` 来自过镜像校验的载荷。
+fn ensure_web_status_transition_allowed(stored_status: &str, new_status: &str) -> Result<(), String> {
+    if stored_status == "hibernating" {
+        if new_status != "hibernating" {
+            return Err("该窝正在冬眠，不能在网页端直接改状态；出眠请走「确认出眠」流程".into());
+        }
+    } else if new_status == "hibernating" {
+        return Err("入眠请走「开始冬眠」流程，不能在网页端直接把窝状态改为冬眠中".into());
+    }
+    Ok(())
 }
 
 /// schema 解析 + 取值校验（两段都过才进库；任一失败 = 400 人话）。
@@ -4142,5 +4208,229 @@ mod tests {
         assert!(!ok("1", "x.jpg"), "长度不足");
         assert!(!ok("1", &format!("{uuid}.png")), "非 .jpg 后缀拒");
         assert!(!ok("1", &format!("{uuid}.jpg.jpg")), "双尾缀拒");
+    }
+
+    // ── 窝资料三命令（web-colony-edit 票 01）：白名单路由 + 同形 + 删窝同序 ──
+
+    /// 网页端编辑窝的标准载荷（与桌面前端整窗提交同形，嵌套键 snake_case）。
+    fn colony_input_payload(name: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "input": {"name": name, "species": null, "location_id": null,
+                      "start_date": crate::colony::today_iso(), "status": status,
+                      "hydration_method": null, "interval_changes": []}
+        })
+    }
+
+    #[test]
+    fn http_colony_write_commands_whitelisted_and_desktop_same_shape() {
+        // 三命令入白名单且返回形状与桌面 invoke 同形；archive_colony 不入表
+        //（「已结束」经 update 的状态字段可达，规格 Out of Scope）。
+        assert!(WEBUI_COMMANDS.contains(&"create_colony"));
+        assert!(WEBUI_COMMANDS.contains(&"update_colony"));
+        assert!(WEBUI_COMMANDS.contains(&"delete_colony"));
+        assert!(!WEBUI_COMMANDS.contains(&"archive_colony"));
+
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
+        let today = crate::colony::today_iso();
+
+        // create：返回体 = 桌面 Colony 投影（snake_case 全键，逐字段相等）
+        let out = dispatch_command(
+            &deps,
+            "create_colony",
+            &serde_json::json!({
+                "input": {"name": "新建窝", "species": "Messor", "location_id": null,
+                          "start_date": today, "status": "active",
+                          "hydration_method": "tower",
+                          "interval_changes": [{"action_id": 1, "interval_days": 3}]}
+            }),
+        )
+        .unwrap();
+        let created = match out {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("create_colony 应成功，实际 {other:?}"),
+        };
+        let desktop = {
+            let conn = deps.conn.lock().unwrap();
+            serde_json::to_value(crate::colony::list_colonies(&conn, &today).unwrap()).unwrap()
+        };
+        assert_eq!(created, desktop[0], "create 返回与桌面投影同形");
+        assert_eq!(created["hydration_method"], "tower");
+
+        // update：active→ended 直切放行（守卫专项另测），返回同形
+        let id = created["id"].as_i64().unwrap();
+        let mut payload = colony_input_payload("改名窝", "ended");
+        payload["id"] = serde_json::json!(id);
+        let out = dispatch_command(&deps, "update_colony", &payload).unwrap();
+        let updated = match out {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("update_colony 应成功，实际 {other:?}"),
+        };
+        let desktop = {
+            let conn = deps.conn.lock().unwrap();
+            serde_json::to_value(crate::colony::list_colonies(&conn, &today).unwrap()).unwrap()
+        };
+        assert_eq!(updated, desktop[0], "update 返回与桌面投影同形");
+        assert_eq!(updated["name"], "改名窝");
+        assert_eq!(updated["status"], "ended");
+
+        // delete：返回 null（与桌面 Result<()> 同形），行已删
+        let out = dispatch_command(&deps, "delete_colony", &serde_json::json!({"id": id}))
+            .unwrap();
+        assert_eq!(out, CmdOutcome::Ok(serde_json::Value::Null), "实际：{out:?}");
+        let count: i64 = deps
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM colony", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "窝行已删");
+    }
+
+    #[test]
+    fn http_delete_colony_removes_photo_files_same_order() {
+        // 与桌面 delete_colony 同序（lib.rs 先例）：库事务删行提交 → 照片文件
+        // 连带删掉；文件删失败才留孤儿。从未打卡的窝才可删（纯核把关）。
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join(crate::db::DB_FILE_NAME);
+        let conn = crate::db::open_and_migrate(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, status) VALUES ('带照窝', '2026-01-20', 'active')",
+            [],
+        )
+        .unwrap();
+        let checkin_id = crate::nest_checkin::save_checkin(
+            &conn,
+            &crate::nest_checkin::CheckinInput {
+                colony_id: 1,
+                date: "2026-09-18".into(),
+                queen_count: None,
+                worker_count: None,
+                moved_nest: false,
+                note: Some("带照片".into()),
+            },
+            "2026-09-18",
+            "2026-09-18 21:00:00",
+        )
+        .unwrap()
+        .id;
+        let photos_root = dir.path().join(crate::photo::PHOTOS_DIR_NAME);
+        let saved = crate::photo::attach_photos(
+            &conn,
+            &photos_root,
+            checkin_id,
+            &[crate::photo::PhotoUpload {
+                original_name: Some("a.jpg".into()),
+                bytes: vec![1, 2, 3],
+            }],
+        )
+        .unwrap();
+        let rel = saved[0].rel_path.clone();
+        assert!(photos_root.join(&rel).exists(), "前置：照片文件在盘上");
+
+        let deps = SharedDeps::new(Arc::new(Mutex::new(conn)), dir.path().to_path_buf());
+        let out = dispatch_command(&deps, "delete_colony", &serde_json::json!({"id": 1})).unwrap();
+        assert!(matches!(out, CmdOutcome::Ok(_)), "实际：{out:?}");
+        assert!(!photos_root.join(&rel).exists(), "HTTP 删窝连带删照片文件");
+        for (table, want) in [("nest_photo", 0i64), ("nest_checkin", 0), ("colony", 0)] {
+            let n: i64 = deps
+                .conn
+                .lock()
+                .unwrap()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, want, "{table} 应清空");
+        }
+    }
+
+    #[test]
+    fn web_update_status_guard_blocks_hibernation_bypass() {
+        // D7 状态守卫四条专项 + 守卫不豁免镜像校验：
+        // ① 冬眠窝改名可保存且 status 保持 hibernating（不变更豁免）
+        // ② 非冬眠窝直发 hibernating 拒（入眠走 start_hibernation）
+        // ③ 冬眠窝直发 active/ended 拒（出眠走 confirm_wake）
+        // ④ active↔ended 直切放行
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
+        let today = crate::colony::today_iso();
+        let active_id = seed_colony(&deps.conn, "活跃窝");
+        let hib_id = seed_colony(&deps.conn, "冬眠窝");
+        let ended_id = seed_colony(&deps.conn, "已结束窝");
+        {
+            let conn = deps.conn.lock().unwrap();
+            // 冬眠窝夹具：活跃窝走合法流程入眠；已结束窝：直改库（桌面同款自由）
+            crate::hibernation::start_hibernation(&conn, hib_id, "2026-01-10", "2026-03-01", &today)
+                .unwrap();
+            conn.execute("UPDATE colony SET status = 'ended' WHERE id = ?1", [ended_id])
+                .unwrap();
+        }
+
+        let upd = |id: i64, name: &str, status: &str| -> CmdOutcome {
+            let mut payload = colony_input_payload(name, status);
+            payload["id"] = serde_json::json!(id);
+            dispatch_command(&deps, "update_colony", &payload).unwrap()
+        };
+        let status_of = |id: i64| -> String {
+            deps.conn
+                .lock()
+                .unwrap()
+                .query_row("SELECT status FROM colony WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+
+        // ① 冬眠窝原样透传（status=hibernating）：改名保存，库内状态不变
+        let out = upd(hib_id, "冬眠改名", "hibernating");
+        let v = match out {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("冬眠窝透传编辑应成功，实际 {other:?}"),
+        };
+        assert_eq!(v["name"], "冬眠改名");
+        assert_eq!(status_of(hib_id), "hibernating", "透传编辑不改冬眠状态");
+
+        // ② 非冬眠窝直发 hibernating：业务拒绝（500 人话），库内不动
+        let out = upd(active_id, "活跃窝", "hibernating");
+        match out {
+            CmdOutcome::Failed(msg) => {
+                assert!(msg.contains("开始冬眠"), "实际：{msg}");
+            }
+            other => panic!("入眠绕行应拒绝，实际 {other:?}"),
+        }
+        assert_eq!(status_of(active_id), "active", "拒绝不落库");
+
+        // ③ 冬眠窝直发 active / ended：拒绝且库内状态保持 hibernating
+        for st in ["active", "ended"] {
+            let out = upd(hib_id, "冬眠改名", st);
+            match out {
+                CmdOutcome::Failed(msg) => {
+                    assert!(msg.contains("出眠"), "st={st} 实际：{msg}");
+                }
+                other => panic!("出眠绕行（{st}）应拒绝，实际 {other:?}"),
+            }
+            assert_eq!(status_of(hib_id), "hibernating", "st={st} 拒绝不落库");
+        }
+
+        // ④ active↔ended 直切放行（双向）
+        let out = upd(active_id, "活跃改", "ended");
+        assert!(matches!(out, CmdOutcome::Ok(_)), "实际：{out:?}");
+        assert_eq!(status_of(active_id), "ended");
+        let out = upd(active_id, "活跃改", "active");
+        assert!(matches!(out, CmdOutcome::Ok(_)), "实际：{out:?}");
+        let out = upd(ended_id, "已结束改", "active");
+        assert!(matches!(out, CmdOutcome::Ok(_)), "实际：{out:?}");
+        assert_eq!(status_of(ended_id), "active");
+
+        // ⑤ 守卫不豁免其他校验：冬眠窝载荷其他字段非法仍在镜像层 400（不进库）
+        let out = dispatch_command(
+            &deps,
+            "update_colony",
+            &serde_json::json!({
+                "id": hib_id,
+                "input": {"name": "改过名的窝", "species": null, "location_id": null,
+                          "start_date": today, "status": "hibernating",
+                          "hydration_method": null,
+                          "interval_changes": [{"action_id": 1, "interval_days": 0}]}
+            }),
+        )
+        .unwrap();
+        assert!(matches!(out, CmdOutcome::Rejected(_)), "实际：{out:?}");
+        assert_eq!(status_of(hib_id), "hibernating");
     }
 }

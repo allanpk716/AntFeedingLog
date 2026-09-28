@@ -19,6 +19,7 @@ use chrono::Datelike;
 use serde::de::DeserializeOwned;
 
 use crate::care;
+use crate::colony;
 use crate::nest_checkin;
 
 // ── 上限常量（规格 A：字符串长度/分页/数值范围服务端兜底）─────────────────
@@ -594,6 +595,122 @@ impl CheckinUpdateInputArgs {
     }
 }
 
+// ── 窝资料：create / update_colony（web-colony-edit 票 01）────────────────
+
+/// `colony::ColonyIntervalChange` 的服务端校验镜像（嵌套键 snake_case，与桌面
+/// invoke 同形；`interval_days: null` = 删行语义）。天数取值域与纯核
+/// `INTERVAL_DAYS_RANGE`（1..=365）同口径，操作存在性权威在纯核（写前预检）。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColonyIntervalChangeArgs {
+    pub action_id: i64,
+    pub interval_days: Option<i64>,
+}
+
+impl ColonyIntervalChangeArgs {
+    fn validate(&self) -> Result<(), String> {
+        check_id(self.action_id, "action_id")?;
+        if let Some(days) = self.interval_days {
+            if !(1..=365).contains(&days) {
+                return Err(format!("每窝周期应是 1–365 的整数天（收到 {days}）"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn into_core(self) -> colony::ColonyIntervalChange {
+        colony::ColonyIntervalChange { action_id: self.action_id, interval_days: self.interval_days }
+    }
+}
+
+/// `colony::ColonyInput` 的服务端校验镜像（嵌套键 snake_case 与桌面 IPC 同形——
+/// 桌面 invoke 对嵌套键不做映射，无需 rename_all）。纯核同口径的必填键
+/// （name/species/location_id/start_date/status）不带 default：缺键 serde 层即拒。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ColonyInputArgs {
+    pub name: String,
+    pub species: Option<String>,
+    pub location_id: Option<i64>,
+    pub start_date: String,
+    pub status: String,
+    #[serde(default)]
+    pub hydration_method: Option<String>,
+    #[serde(default)]
+    pub interval_changes: Vec<ColonyIntervalChangeArgs>,
+}
+
+impl ColonyInputArgs {
+    fn validate(&self) -> Result<(), String> {
+        if self.name.trim().is_empty() {
+            return Err("窝名字不能为空".into());
+        }
+        if let Some(id) = self.location_id {
+            check_id(id, "location_id")?;
+        }
+        check_iso_date(&self.start_date, "开始饲养日期")?;
+        if !colony::STATUSES.contains(&self.status.as_str()) {
+            return Err(format!("无效的窝状态：{}（应为 活跃/冬眠/已结束）", self.status));
+        }
+        if let Some(m) = &self.hydration_method {
+            if !["manual", "tower"].contains(&m.as_str()) {
+                return Err(format!("无效的保湿方式：{m}（应为 未设/手动加水/水塔）"));
+            }
+        }
+        for change in &self.interval_changes {
+            change.validate()?;
+        }
+        Ok(())
+    }
+
+    pub fn into_core(self) -> colony::ColonyInput {
+        colony::ColonyInput {
+            name: self.name,
+            species: self.species,
+            location_id: self.location_id,
+            start_date: self.start_date,
+            status: self.status,
+            hydration_method: self.hydration_method,
+            interval_changes: self.interval_changes.into_iter().map(|c| c.into_core()).collect(),
+        }
+    }
+}
+
+/// `{ input }` 形命令（create_colony）。create 场景状态域收紧（D7）：新建不可
+/// 能是冬眠中——镜像枚举校验只放行 active|ended，hibernating 只能经
+/// start_hibernation 流程进入。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateColonyArgs {
+    pub input: ColonyInputArgs,
+}
+
+impl ValidatedArgs for CreateColonyArgs {
+    fn validate(&self) -> Result<(), String> {
+        self.input.validate()?;
+        if self.input.status == "hibernating" {
+            return Err("新建窝不能是「冬眠中」；请建窝后走「开始冬眠」流程".into());
+        }
+        Ok(())
+    }
+}
+
+/// `{ id, input }` 形命令（update_colony，与桌面 invoke 同形）。状态守卫在
+/// webui_server 派发层（需读库内原值），镜像层放行 hibernating 透传。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateColonyArgs {
+    pub id: i64,
+    pub input: ColonyInputArgs,
+}
+
+impl ValidatedArgs for UpdateColonyArgs {
+    fn validate(&self) -> Result<(), String> {
+        check_id(self.id, "id")?;
+        self.input.validate()
+    }
+}
+
 // ── 窝头像与照片墙（窝头像票 01）：裁剪更新入参镜像 ───────────────────────
 
 /// `update_photo_crop` 入参：photoId + crop（可空 = 重置居中）。
@@ -901,6 +1018,180 @@ mod tests {
         // args 不是对象形状（长度不符的序列）也按人话拒绝，绝不 panic
         let err = parse::<IdArgs>(&json!([])).unwrap_err();
         assert!(err.contains("不合法"), "实际：{err}");
+    }
+
+    // ── 窝资料：create / update 参数镜像（web-colony-edit 票 01）──────────────
+
+    #[test]
+    fn colony_args_valid_payload_passes_and_maps_to_core() {
+        // 全字段合法载荷：过校验且 into_core 与纯核 ColonyInput 同形（键 snake_case）
+        let a = checked::<CreateColonyArgs>(&json!({
+            "input": {
+                "name": "大头一号", "species": "Messor barbarus",
+                "location_id": 2, "start_date": "2026-09-28", "status": "active",
+                "hydration_method": "tower",
+                "interval_changes": [{"action_id": 1, "interval_days": 3}]
+            }
+        }))
+        .unwrap();
+        let core = a.input.into_core();
+        assert_eq!(core.name, "大头一号");
+        assert_eq!(core.species.as_deref(), Some("Messor barbarus"));
+        assert_eq!(core.location_id, Some(2));
+        assert_eq!(core.start_date, "2026-09-28");
+        assert_eq!(core.status, "active");
+        assert_eq!(core.hydration_method.as_deref(), Some("tower"));
+        assert_eq!(core.interval_changes.len(), 1);
+        assert_eq!(core.interval_changes[0].action_id, 1);
+        assert_eq!(core.interval_changes[0].interval_days, Some(3));
+
+        // update 顶层形状（与桌面 invoke 同形）：id + input
+        let a = checked::<UpdateColonyArgs>(&json!({
+            "id": 7,
+            "input": {"name": "改名窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "ended",
+                      "hydration_method": null, "interval_changes": []}
+        }))
+        .unwrap();
+        assert_eq!(a.id, 7);
+        let core = a.input.into_core();
+        assert!(core.species.is_none());
+        assert_eq!(core.status, "ended");
+
+        // hydration_method / interval_changes 缺省 = serde default（与纯核同口径）
+        let a = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "简窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "ended"}
+        }))
+        .unwrap();
+        let core = a.input.into_core();
+        assert!(core.hydration_method.is_none());
+        assert!(core.interval_changes.is_empty());
+    }
+
+    #[test]
+    fn create_colony_rejects_hibernating_status() {
+        // D7：新建不可能是冬眠中——create 场景镜像枚举校验只放行 active|ended；
+        // hibernating 只能经 start_hibernation 流程进入。
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "偷渡窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "hibernating"}
+        }))
+        .unwrap_err();
+        assert!(err.contains("冬眠"), "实际：{err}");
+        // update 场景 hibernating 在镜像层放行（原样透传语义），守卫在派发层
+        assert!(checked::<UpdateColonyArgs>(&json!({
+            "id": 1,
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "hibernating"}
+        }))
+        .is_ok());
+    }
+
+    #[test]
+    fn colony_args_garbage_rejected_with_human_messages() {
+        // update id 非正整数
+        let err = checked::<UpdateColonyArgs>(&json!({
+            "id": 0,
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "active"}
+        }))
+        .unwrap_err();
+        assert_eq!(err, "id 必须是正整数（收到 0）");
+        // 名字空白（镜像层先挡，纯核同口径）
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "   ", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "active"}
+        }))
+        .unwrap_err();
+        assert!(err.contains("名字"), "实际：{err}");
+        // 开始日期垃圾 / 超年段
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026/09/28", "status": "active"}
+        }))
+        .unwrap_err();
+        assert!(err.contains("开始饲养日期"), "实际：{err}");
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "1850-01-01", "status": "active"}
+        }))
+        .unwrap_err();
+        assert!(err.contains("超出合理范围"), "实际：{err}");
+        // 状态取值域外（三态之外）
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "睡着"}
+        }))
+        .unwrap_err();
+        assert!(err.contains("无效的窝状态"), "实际：{err}");
+        // 保湿方式取值域外（null|manual|tower 之外）
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "active",
+                      "hydration_method": "喷壶"}
+        }))
+        .unwrap_err();
+        assert!(err.contains("无效的保湿方式"), "实际：{err}");
+        // location_id 非正整数
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": -3,
+                      "start_date": "2026-09-28", "status": "active"}
+        }))
+        .unwrap_err();
+        assert!(err.contains("location_id"), "实际：{err}");
+        // 周期行：interval_days 0 / 366 / 负 全拒；action_id 非正整数拒
+        for bad in [0i64, 366, -5] {
+            let err = checked::<CreateColonyArgs>(&json!({
+                "input": {"name": "窝", "species": null, "location_id": null,
+                          "start_date": "2026-09-28", "status": "active",
+                          "interval_changes": [{"action_id": 1, "interval_days": bad}]}
+            }))
+            .unwrap_err();
+            assert!(err.contains("每窝周期"), "bad={bad} 实际：{err}");
+        }
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "active",
+                      "interval_changes": [{"action_id": 0, "interval_days": null}]}
+        }))
+        .unwrap_err();
+        assert!(err.contains("action_id"), "实际：{err}");
+        // interval_days = null 合法（删行语义）
+        assert!(checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "active",
+                      "interval_changes": [{"action_id": 1, "interval_days": null}]}
+        }))
+        .is_ok());
+        // 未知字段三层全拒：顶层 / input / 周期行
+        let err = checked::<CreateColonyArgs>(&json!({
+            "bogus": 1,
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "active"}
+        }))
+        .unwrap_err();
+        assert_eq!(err, "参数包含未知字段：bogus");
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "active", "bogus": 1}
+        }))
+        .unwrap_err();
+        assert_eq!(err, "参数包含未知字段：bogus");
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "active",
+                      "interval_changes": [{"action_id": 1, "interval_days": 3, "bogus": 1}]}
+        }))
+        .unwrap_err();
+        assert_eq!(err, "参数包含未知字段：bogus");
+        // 必填字段缺失（status 无 default，serde 天然拒绝）
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "location_id": null,
+                      "start_date": "2026-09-28"}
+        }))
+        .unwrap_err();
+        assert!(err.contains("缺少必填参数"), "实际：{err}");
     }
 
     #[test]
