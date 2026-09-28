@@ -14,11 +14,12 @@
  *   [`revokeObjectUrl`] 释放，防内存泄漏。
  * - **上传**：`uploadPhotosHttp` 先做客户端预检（张数 ≤9、单张 ≤15MB——超限
  *   请求在 Windows 服务端常表现为连接被 RST，413 半路断连，先在本地挡体验），
- *   再以 multipart 表单 POST `/api/photos`（checkinId 文本段 + photos 文件段）。
+ *   再逐张过 [`compressForUpload`]（上传前压缩，拍照上传中断修复），最后以
+ *   multipart 表单 POST `/api/photos`（checkinId 文本段 + photos 文件段）。
  *   服务端一套校验链兜底（票 07 纯核），返回与桌面 attach_photos 同形的
  *   NestPhotoMeta[]。创建模式 `createCheckinPhotosHttp`（checkin-photo-entry
  *   票 02「拍一张」）不带 checkinId 段、改带 colonyId（+可选 date），服务端
- *   建当天登记挂照片，预检沿用。
+ *   建当天登记挂照片，预检与压缩沿用。
  */
 
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -108,6 +109,68 @@ function assertPhotosWithinLimits(files: File[]): void {
   }
 }
 
+// ── 浏览器上传前压缩（拍照上传中断修复）─────────────────────────────────────
+
+/** 压缩触发的体积下限（512KB）：更小的文件重编码收益有限还可能有损，直接原样传。 */
+export const UPLOAD_COMPRESS_THRESHOLD_BYTES = 512 * 1024;
+
+/** 压缩目标长边 2048：与服务端重编码 `photo::LONG_EDGE` 同口径——原图直传纯属
+ * 浪费（手机主摄 2-5MB，服务端落盘前必缩到 2048），先在浏览器端缩掉可把上传
+ * 体积降一个量级，弱网/绕道路径才扛得住。 */
+export const UPLOAD_COMPRESS_LONG_EDGE = 2048;
+
+/** 压缩质量 JPEG 0.85：与服务端重编码同口径。 */
+export const UPLOAD_COMPRESS_QUALITY = 0.85;
+
+/**
+ * 上传前压缩（拍照上传中断修复）：图解码 → 画布缩到长边 2048 → JPEG 0.85
+ * 重编码。手机 NetBird 直连建不起来时流量绕道云服务器，MB 级原图稳定断连
+ * 而亚 MB 级请求都能过——先压再传，落在能活下来的量级。
+ *
+ * 任何一步失败（浏览器解不了该格式/无 2D 画布/压完没变小）都退回原文件，
+ * 服务端校验链照旧兜底。EXIF 方向由浏览器 `<img>` 默认 from-image 渲染摆正
+ * （画布拿到的是已转向的像素）；透明 PNG 拍平白底（JPEG 无 alpha）。
+ */
+export async function compressForUpload(file: File): Promise<File> {
+  if (file.size <= UPLOAD_COMPRESS_THRESHOLD_BYTES) return file;
+  if (typeof document === "undefined") return file;
+  let url = "";
+  try {
+    url = URL.createObjectURL(file);
+    const img = new Image();
+    img.src = url;
+    await img.decode();
+    const longEdge = Math.max(img.naturalWidth, img.naturalHeight);
+    if (longEdge < 1) return file;
+    const scale = longEdge > UPLOAD_COMPRESS_LONG_EDGE
+      ? UPLOAD_COMPRESS_LONG_EDGE / longEdge
+      : 1;
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return file;
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", UPLOAD_COMPRESS_QUALITY),
+    );
+    if (!blob || blob.size >= file.size) return file;
+    return new File([blob], file.name, { type: "image/jpeg" });
+  } catch {
+    return file; // 解码不了（如部分浏览器对 HEIC）：原样上传，服务端校验链兜底
+  } finally {
+    if (url) URL.revokeObjectURL(url);
+  }
+}
+
+/** 上传文件集就绪：预检（原图口径，与单张 15MB 上限一致）→ 逐张压缩。 */
+async function prepareUploadFiles(files: File[]): Promise<File[]> {
+  assertPhotosWithinLimits(files);
+  return Promise.all(files.map(compressForUpload));
+}
+
 /**
  * 浏览器上传（票 08）：客户端预检（张数/单张体积）→ multipart POST
  * /api/photos。返回与桌面 attach_photos 同形的 NestPhotoMeta[]。
@@ -117,10 +180,10 @@ export async function uploadPhotosHttp(
   files: File[],
 ): Promise<NestPhotoMeta[]> {
   if (files.length === 0) return [];
-  assertPhotosWithinLimits(files);
+  const ready = await prepareUploadFiles(files);
   const form = new FormData();
   form.append("checkinId", String(checkinId));
-  for (const f of files) {
+  for (const f of ready) {
     form.append("photos", f, f.name);
   }
   let res: Response;
@@ -177,7 +240,7 @@ export async function createCheckinPhotosHttp(
   fields?: CreateCheckinPhotosFields,
 ): Promise<NestPhotoMeta[]> {
   if (files.length === 0) return [];
-  assertPhotosWithinLimits(files);
+  const ready = await prepareUploadFiles(files);
   const form = new FormData();
   form.append("colonyId", String(colonyId));
   if (date !== undefined) {
@@ -196,7 +259,7 @@ export async function createCheckinPhotosHttp(
   if (note) {
     form.append("note", note);
   }
-  for (const f of files) {
+  for (const f of ready) {
     form.append("photos", f, f.name);
   }
   let res: Response;

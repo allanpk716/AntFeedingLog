@@ -366,3 +366,172 @@ describe("photos 网页端（webui-checkin 票 08）", () => {
     });
   });
 });
+
+// ── 浏览器上传前压缩（拍照上传中断修复）：大图先缩到服务端同口径再传 ─────────
+// 背景：手机网页端拍照上传稳定「上传中断」——手机 NetBird 直连建不起来、流量
+// 绕道云服务器，MB 级原图过不去而亚 MB 级请求都能过。服务端本来就要重编码
+// （长边 2048/质量 85），原图直传纯浪费。上传前浏览器端先压到同口径。
+
+describe("photos 浏览器上传前压缩（拍照上传中断修复）", () => {
+  /** 大图 File（600KB，size 用 defineProperty 虚标，不占内存）。 */
+  function bigCamPhoto(name = "IMG_0001.jpg"): File {
+    const f = new File(["x"], name);
+    Object.defineProperty(f, "size", { value: 600 * 1024 });
+    return f;
+  }
+
+  /** 画布桩：记录 toBlob 参数，回调小体积 JPEG blob（22B < 600KB 虚标原文件）。 */
+  function stubCanvas(toBlobImpl?: (cb: (b: Blob | null) => void, type: string, q: number) => void) {
+    const canvas = {
+      width: 0,
+      height: 0,
+      getContext: () => ({ fillRect: vi.fn(), drawImage: vi.fn() }),
+      toBlob:
+        toBlobImpl ??
+        ((cb: (b: Blob | null) => void, _type: string, _q: number) => {
+          cb(new Blob(["compressed-jpeg-bytes"], { type: "image/jpeg" }));
+        }),
+    };
+    const origCreate = document.createElement.bind(document);
+    return vi
+      .spyOn(document, "createElement")
+      .mockImplementation((tag: string) =>
+        tag === "canvas" ? (canvas as unknown as HTMLCanvasElement) : origCreate(tag),
+      );
+  }
+
+  /** 图桩：4032×3024（iPhone 主摄量级），decode 可注入成败。 */
+  function stubImage(decode: () => Promise<void> = () => Promise.resolve()) {
+    class FakeImage {
+      src = "";
+      naturalWidth = 4032;
+      naturalHeight = 3024;
+      decode(): Promise<void> {
+        return decode();
+      }
+    }
+    vi.stubGlobal("Image", FakeImage);
+    return FakeImage;
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    Object.defineProperty(URL, "createObjectURL", {
+      value: vi.fn(() => "blob:mock-url"),
+      configurable: true,
+      writable: true,
+    });
+    Object.defineProperty(URL, "revokeObjectURL", {
+      value: vi.fn(),
+      configurable: true,
+      writable: true,
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it("小文件（≤512KB）不压缩：原样引用返回，不建画布不解码", async () => {
+    const { compressForUpload } = await import("./photos");
+    const createSpy = vi.spyOn(document, "createElement");
+    const small = new File(["x"], "a.jpg");
+
+    const out = await compressForUpload(small);
+
+    expect(out).toBe(small);
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it("大图压缩：缩到长边 2048、JPEG 0.85 重编码，名字保留、体积更小", async () => {
+    const { compressForUpload } = await import("./photos");
+    stubImage();
+    const createSpy = stubCanvas();
+
+    const out = await compressForUpload(bigCamPhoto());
+
+    expect(createSpy).toHaveBeenCalled();
+    expect(out).not.toHaveProperty("size", 600 * 1024);
+    expect(out.name).toBe("IMG_0001.jpg");
+    expect(out.type).toBe("image/jpeg");
+    expect(out.size).toBeLessThan(600 * 1024);
+    const canvas = createSpy.mock.results[0]!.value as { width: number; height: number };
+    expect(canvas.width).toBe(2048);
+    expect(canvas.height).toBe(1536);
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:mock-url");
+  });
+
+  it("解码不了（如部分浏览器对 HEIC）退回原文件：原样引用，服务端校验链兜底", async () => {
+    const { compressForUpload } = await import("./photos");
+    stubImage(() => Promise.reject(new Error("decode error")));
+    stubCanvas();
+
+    const src = bigCamPhoto();
+    const out = await compressForUpload(src);
+
+    expect(out).toBe(src);
+  });
+
+  it("重编码后不小于原文件（压不动）退回原文件", async () => {
+    const { compressForUpload } = await import("./photos");
+    stubImage();
+    stubCanvas((cb) => {
+      cb(new Blob([new Uint8Array(700 * 1024)], { type: "image/jpeg" }));
+    });
+
+    const src = bigCamPhoto();
+    const out = await compressForUpload(src);
+
+    expect(out).toBe(src);
+  });
+
+  it("uploadPhotosHttp 发出的是压缩后的照片（FormData photos 段）", async () => {
+    stubImage();
+    stubCanvas();
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => [],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await uploadPhotosHttp(7, [bigCamPhoto()]);
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const form = init.body as FormData;
+    const sent = form.getAll("photos")[0] as File;
+    expect(sent.size).toBe(21); // 压缩桩产出的 blob 体积，不是 600KB 原图
+    expect(sent.type).toBe("image/jpeg");
+  });
+
+  it("createCheckinPhotosHttp 同样先压缩（「拍一张」直达通道）", async () => {
+    stubImage();
+    stubCanvas();
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => [],
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createCheckinPhotosHttp(3, [bigCamPhoto()], "2026-09-28");
+
+    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const form = init.body as FormData;
+    const sent = form.getAll("photos")[0] as File;
+    expect(sent.size).toBe(21);
+    expect(sent.type).toBe("image/jpeg");
+  });
+
+  it("预检仍按原图口径：15MB 上限在压缩前拦（与服务端单张口径一致）", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const over = new File(["x"], "huge.jpg");
+    Object.defineProperty(over, "size", { value: MAX_PHOTO_BYTES + 1 });
+
+    await expect(uploadPhotosHttp(7, [over])).rejects.toContain("huge.jpg");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
