@@ -288,6 +288,111 @@ describe("统计页（票 07）", () => {
   });
 });
 
+// ── 首读加载占位（界面切换卡顿票 05）──
+
+describe("首读加载占位（界面切换卡顿票 05）", () => {
+  it("首次读取期间显示「加载中…」，不渲染数据区与图表骨架；数据到齐退出占位", async () => {
+    let resolveStats: (p: StatsPayload) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return colonies;
+        case "get_stats":
+          return new Promise<StatsPayload>((res) => {
+            resolveStats = res;
+          });
+        default:
+          return null;
+      }
+    });
+
+    const wrapper = mount(StatsPage);
+    await flushPromises(); // list_colonies / earliest_log_date 已过，get_stats 挂起
+
+    // 占位在，内容主体与图表不在（echarts 未被触达）
+    expect(wrapper.find(".loading-hint").exists()).toBe(true);
+    expect(wrapper.text()).toContain("加载中…");
+    expect(wrapper.find(".kpis").exists()).toBe(false);
+    expect(wrapper.find(".heat-chart").exists()).toBe(false);
+    expect(echartsSetOption).not.toHaveBeenCalled();
+
+    resolveStats(makePayload());
+    await flushPromises();
+
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".kpis").exists()).toBe(true);
+    expect(wrapper.find(".heat-chart").exists()).toBe(true);
+    expect(echartsSetOption).toHaveBeenCalled();
+  });
+
+  it("返回空数据载荷也退出占位（payload 非 null 判定，不用图表非空判定）", async () => {
+    currentStats = makePayload({
+      daily: [],
+      daily_detail: [],
+      food_share: [],
+      weekly: [],
+      intervals: [],
+    });
+    const wrapper = await mountPage();
+
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.text()).toContain("暂无记录");
+  });
+
+  it("读取失败退出占位不卡死：显示 pageError", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return colonies;
+        case "get_stats":
+          throw new Error("boom");
+        default:
+          return null;
+      }
+    });
+    const wrapper = await mountPage();
+
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".page-error").exists()).toBe(true);
+    expect(wrapper.text()).toContain("boom");
+  });
+
+  it("已有数据时刷新（换窝重拉）不闪占位：旧内容保持显示", async () => {
+    const wrapper = await mountPage();
+    let resolveSecond: (p: StatsPayload) => void = () => {};
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_colonies":
+          return colonies;
+        case "get_stats":
+          return new Promise<StatsPayload>((res) => {
+            resolveSecond = res;
+          });
+        default:
+          return null;
+      }
+    });
+
+    await wrapper.find(".colony-select").setValue("2");
+    await flushPromises(); // 第二次 get_stats 挂起
+
+    expect(invokeMock).toHaveBeenCalledWith("get_stats", {
+      colonyId: 2,
+      startDate: addDays(todayIso(), -179),
+      endDate: todayIso(),
+    });
+    // 旧数据在屏：无占位、图表容器仍在
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".heat-chart").exists()).toBe(true);
+
+    resolveSecond(makePayload());
+    await flushPromises();
+
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".kpis").exists()).toBe(true);
+  });
+});
+
 // ── 跨天自动刷新（今天时钟源票）──
 
 describe("跨天自动刷新（今天时钟源）", () => {
