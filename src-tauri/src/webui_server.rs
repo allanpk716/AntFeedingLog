@@ -521,6 +521,8 @@ pub const WEBUI_COMMANDS: &[&str] = &[
     // 是本票唯一新写路径（校验与既有写命令同档）
     "photo_wall",
     "update_photo_crop",
+    // 照片旋转（头像旋转：烧进文件）：裁剪编辑器「↻ 旋转」的通道
+    "rotate_photo",
     // 头像形状偏好（窝头像票 03）：只读生效（网页无设置页，写路径不开放）
     "get_avatar_shape",
 ];
@@ -837,6 +839,24 @@ pub fn dispatch_command(
                 )
             },
         )),
+        // 照片旋转（头像旋转：烧进文件）：文件换向的写路径；圈数校验 schema 层
+        // 与纯核双层同口径（出界 400 不碰盘）
+        "rotate_photo" => {
+            let photos_root = deps.data_dir.join(crate::photo::PHOTOS_DIR_NAME);
+            Some(write_cmd(
+                deps,
+                args,
+                false,
+                move |conn, a: webui_args::RotatePhotoArgs| {
+                    crate::nest_checkin::rotate_photo(
+                        conn,
+                        &photos_root,
+                        a.photo_id,
+                        a.quarter_turns,
+                    )
+                },
+            ))
+        }
         // 头像形状只读（窝头像票 03）：网页端跟随全局偏好渲染遮罩；写入只在
         // 桌面设置页（本白名单不登记 set_avatar_shape，deny-by-default 兜底）。
         "get_avatar_shape" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
@@ -1332,13 +1352,15 @@ fn photo_url_parts_valid(colony_id: &str, file_name: &str) -> bool {
     base.len() == 36 && base.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
-/// 照片响应头三件套（规格 E）：类型钉死 JPEG + `nosniff` 禁 MIME 嗅探 +
-/// `inline` 只以图片身份渲染（禁下载/禁当文档内嵌）。
-fn photo_response_headers() -> [(&'static str, &'static str); 3] {
+/// 照片响应头四件套（规格 E + 头像旋转）：类型钉死 JPEG + `nosniff` 禁 MIME
+/// 嗅探 + `inline` 只以图片身份渲染（禁下载/禁当文档内嵌）+ `no-store` 禁缓存
+///（照片是可变资源——旋转烧进文件同路径换内容，缓存会让网页端重取到旧图）。
+fn photo_response_headers() -> [(&'static str, &'static str); 4] {
     [
         ("Content-Type", "image/jpeg"),
         ("X-Content-Type-Options", "nosniff"),
         ("Content-Disposition", "inline"),
+        ("Cache-Control", "no-store"),
     ]
 }
 
@@ -2620,6 +2642,90 @@ mod tests {
             other => panic!("{other:?}"),
         };
         assert_eq!(wall[0]["groups"][0]["checkins"][0]["photos"][0]["crop"]["x"], 0.2);
+    }
+
+    // ── 照片旋转（头像旋转：烧进文件）：rotate_photo 新写路径 ──
+
+    #[test]
+    fn dispatch_rotate_photo_write_rotates_file_and_rejects_bad_turns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join(crate::db::DB_FILE_NAME);
+        let conn = crate::db::open_and_migrate(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, status) VALUES ('大头一号', '2026-01-20', 'active')",
+            [],
+        )
+        .unwrap();
+        let checkin_id = crate::nest_checkin::save_checkin(
+            &conn,
+            &crate::nest_checkin::CheckinInput {
+                colony_id: 1,
+                date: "2026-09-18".into(),
+                queen_count: None,
+                worker_count: None,
+                moved_nest: false,
+                note: Some("带照片".into()),
+            },
+            "2026-09-18",
+            "2026-09-18 21:00:00",
+        )
+        .unwrap()
+        .id;
+        conn.execute(
+            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+             VALUES ((SELECT id FROM nest_checkin LIMIT 1), '1/a.jpg', NULL, '')",
+            [],
+        )
+        .unwrap();
+        // 盘库成对：把真 JPEG 写到照片根目录对应位置
+        let photo_path = dir.path().join(crate::photo::PHOTOS_DIR_NAME).join("1").join("a.jpg");
+        std::fs::create_dir_all(photo_path.parent().unwrap()).unwrap();
+        std::fs::write(&photo_path, tiny_jpeg()).unwrap();
+
+        let writes = Arc::new(AtomicUsize::new(0));
+        let counter = writes.clone();
+        let deps = SharedDeps::with_hooks(
+            Arc::new(Mutex::new(conn)),
+            dir.path().to_path_buf(),
+            Arc::new(move |_with_tray| {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }),
+            Arc::new(|_path| None),
+        );
+
+        // 合法旋转：文件换向（宽高互换）、触发写副作用一次
+        let out = dispatch_command(
+            &deps,
+            "rotate_photo",
+            &serde_json::json!({"photoId": 1, "quarterTurns": 1}),
+        )
+        .unwrap();
+        match out {
+            CmdOutcome::Ok(v) => {
+                assert_eq!(v["id"], 1);
+                assert_eq!(v["checkin_id"], checkin_id);
+                assert_eq!(v["rel_path"], "1/a.jpg");
+            }
+            other => panic!("合法旋转应成功，实际 {other:?}"),
+        }
+        let bytes = std::fs::read(&photo_path).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!(
+            (img.width(), img.height()),
+            (48, 64),
+            "tiny_jpeg 64×48 顺时针 1 圈后应 48×64"
+        );
+        assert_eq!(writes.load(Ordering::SeqCst), 1, "rotate_photo 成功触发写副作用");
+
+        // 圈数出界：400 Rejected（校验层拦下，文件不再被动）
+        let out = dispatch_command(
+            &deps,
+            "rotate_photo",
+            &serde_json::json!({"photoId": 1, "quarterTurns": 0}),
+        )
+        .unwrap();
+        assert!(matches!(out, CmdOutcome::Rejected(_)), "实际：{out:?}");
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 
     // ── 集成：真监听（127.0.0.1 随机端口）+ ureq 真请求 ──
@@ -4504,6 +4610,8 @@ mod tests {
         assert_eq!(resp.header("content-type"), Some("image/jpeg"), "类型钉死 JPEG");
         assert_eq!(resp.header("x-content-type-options"), Some("nosniff"));
         assert_eq!(resp.header("content-disposition"), Some("inline"));
+        // 照片是可变资源（旋转烧进文件同路径换内容）：禁缓存，重取必是盘上现状
+        assert_eq!(resp.header("cache-control"), Some("no-store"));
         use std::io::Read;
         let mut buf = Vec::new();
         resp.into_reader().read_to_end(&mut buf).unwrap();

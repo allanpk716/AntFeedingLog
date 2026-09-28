@@ -44,18 +44,6 @@ const filterColonyId = computed<number | null>(() =>
   filterKey.value === "" || filterKey.value === null ? null : Number(filterKey.value),
 );
 
-async function refresh() {
-  viewerIndex.value = null; // 数据可能变了：连翻索引不可跨数据沿用
-  try {
-    wall.value = await photoWall();
-    reconcileBlobs();
-    loadError.value = "";
-  } catch (e) {
-    loadError.value = String(e);
-  }
-  loading.value = false;
-}
-
 /** 窝内全序扁平化（载荷顺序 = 新→旧），大图连翻的唯一顺序依据。 */
 const flatPhotos = computed<WallPhoto[]>(() => {
   const out: WallPhoto[] = [];
@@ -70,6 +58,25 @@ const flatPhotos = computed<WallPhoto[]>(() => {
   }
   return out;
 });
+
+/** 版本广播计数（头像旋转联动）：照片是可变资源（旋转烧进文件同路径换内容），
+ * 桌面端以 `?v=` 推进破除 src 不变不重请求的问题；浏览器端走 blob 弃取。 */
+const dataRev = ref(0);
+
+async function refresh(reloadBlobs = false) {
+  viewerIndex.value = null; // 数据可能变了：连翻索引不可跨数据沿用
+  try {
+    wall.value = await photoWall();
+    if (reloadBlobs && !isTauri()) {
+      invalidateBlobs();
+    }
+    reconcileBlobs();
+    loadError.value = "";
+  } catch (e) {
+    loadError.value = String(e);
+  }
+  loading.value = false;
+}
 
 const filteredColonies = computed<PhotoWallColony[]>(() =>
   filterColonyId.value === null
@@ -99,7 +106,9 @@ function photoUrlOf(p: NestPhotoMeta): string {
   if (!isTauri()) {
     return blobUrls.value[p.id] ?? "";
   }
-  return photoSrc(p.rel_path, photoAbsDir.value);
+  const base = photoSrc(p.rel_path, photoAbsDir.value);
+  // 版本广播后 ?v= 推进：src 变化才触发 <img> 重发请求（旋转同路径换内容）
+  return dataRev.value ? `${base}?v=${dataRev.value}` : base;
 }
 
 type ThumbState = "ok" | "missing" | "pending";
@@ -173,6 +182,26 @@ function reconcileBlobs() {
   }
 }
 
+/** 版本广播后弃全部已取 blob 并重置请求位，对仍在场的缩略图直接补取（头像
+ * 旋转联动：照片可变（同路径换内容），保位的旧字节已过期；不依赖 IO 对已
+ * 相交元素是否补发初次回调——实现间语义有差，直接按观察集补。在场判定用
+ * root.contains（isConnected 在 happy-dom 对在树元素也报 false，测试环境
+ * 不可依赖）。 */
+function invalidateBlobs() {
+  for (const url of Object.values(blobUrls.value)) {
+    revokeObjectUrl(url);
+  }
+  blobUrls.value = {};
+  requestedIds.value = new Set();
+  for (const el of observedEls) {
+    if (!root.value?.contains(el)) continue;
+    const id = Number(el.getAttribute("data-photo-id"));
+    if (Number.isInteger(id)) {
+      ensureLoaded(id);
+    }
+  }
+}
+
 let io: IntersectionObserver | null = null;
 const observedEls = new Set<Element>();
 
@@ -220,10 +249,15 @@ onMounted(async () => {
     io = new IntersectionObserver(onIoChange);
   }
   // 数据版本订阅（票 04）：任一端写入 → 重拉照片墙（复用 refresh：大图索引
-  // 由 refresh 复位、blob 由 reconcileBlobs 保位回收）。注册赶在下方首个 await
-  // 之前，不留漏帧窗口。保活切换（票 04 App.vue）不卸载组件，订阅持续有效
-  // ——页面在后台也自动跟上写入；真卸载（App 退出）才退订。
-  unwatchVersion = watchDataVersion(() => void refresh());
+  // 由 refresh 复位、blob 由 reconcileBlobs 保位回收）。头像旋转起带
+  // reloadBlobs：照片可变（同路径换内容），广播后旧字节一律弃（桌面 ?v=
+  // 推进、浏览器 blob 重取）。注册赶在下方首个 await 之前，不留漏帧窗口。
+  // 保活切换（票 04 App.vue）不卸载组件，订阅持续有效——页面在后台也自动
+  // 跟上写入；真卸载（App 退出）才退订。
+  unwatchVersion = watchDataVersion(() => {
+    dataRev.value += 1;
+    void refresh(true);
+  });
   if (isTauri()) {
     // 照片根目录取不到不挡页面（缩略图停留占位）
     try {

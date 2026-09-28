@@ -407,6 +407,14 @@ export const updatePhotoCrop = cmdFn<
   NestPhotoMeta
 >("update_photo_crop");
 
+/** 照片旋转（头像旋转：烧进文件）：quarterTurns = 顺时针 90° 圈数 1–3，像素
+ *  旋转后原子写回同一文件（同质量重编码）。裁剪不动；成功触发版本广播
+ * （头像/照片墙/时间线自动换新图）。返回照片元数据。 */
+export const rotatePhoto = cmdFn<
+  { photoId: number; quarterTurns: number },
+  NestPhotoMeta
+>("rotate_photo");
+
 /** 照片墙只读载荷：全部窝的照片——窝按 sort/id、窝内按登记日期倒序、同日期
  *  按登记全序、登记内照片按上传序；分组带窝名与日期，照片带元数据（含裁剪）。 */
 export const photoWall = cmdFn<void, PhotoWallColony[]>("photo_wall");

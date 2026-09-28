@@ -541,3 +541,44 @@ describe("照片墙页 · 数据版本订阅（票 04）", () => {
     expect(invokeMock).toHaveBeenCalledWith("photo_wall");
   });
 });
+
+// ── 版本广播后的字节新鲜度（头像旋转联动）：旋转同路径换内容，旧字节不得存活 ──
+
+describe("照片墙页 · 版本广播后的字节新鲜度（头像旋转联动）", () => {
+  it("桌面：广播后缩略图 URL 加 ?v= 促 <img> 重发请求（src 不变不会重请求）", async () => {
+    const w = await mountWall(wallData, "desktop");
+    fireThumb(14);
+    await flushPromises();
+    expect(w.find('.wall-thumb[data-photo-id="14"] img').attributes("src")).toBe(
+      "asset://photos/1/a14.jpg",
+    );
+
+    (watchDataVersionMock.mock.calls[0][0] as () => void)();
+    await flushPromises();
+
+    expect(w.find('.wall-thumb[data-photo-id="14"] img').attributes("src")).toBe(
+      "asset://photos/1/a14.jpg?v=1",
+    );
+  });
+
+  it("网页：广播后弃已取 blob 并对在场缩略图重取（旋转后旧字节过期）", async () => {
+    loadPhotoBlobUrlMock.mockImplementation(async (relPath: string) => `blob:old-${relPath}`);
+    const w = await mountWall(wallData, "web");
+    fireThumb(11);
+    await flushPromises();
+    expect(w.find('.wall-thumb[data-photo-id="11"] img').attributes("src")).toBe(
+      "blob:old-1/a11.jpg",
+    );
+
+    // 广播后取图换新串（模拟旋转后的新响应）
+    loadPhotoBlobUrlMock.mockImplementation(async (relPath: string) => `blob:new-${relPath}`);
+    (watchDataVersionMock.mock.calls[0][0] as () => void)();
+    await flushPromises();
+    await flushPromises();
+
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:old-1/a11.jpg");
+    expect(w.find('.wall-thumb[data-photo-id="11"] img').attributes("src")).toBe(
+      "blob:new-1/a11.jpg",
+    );
+  });
+});

@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import NestCheckinDialog from "./NestCheckinDialog.vue";
 import PhotoCropEditor from "./PhotoCropEditor.vue";
@@ -1140,5 +1140,78 @@ describe("NestCheckinDialog 时间线改版（checkin-photo-entry 票 03）", ()
     expect(w.findAll(".staged-thumb")).toHaveLength(0);
     // 预填正常（清暂存不破坏表单回填）
     expect((w.find(".queen-input").element as HTMLInputElement).value).toBe("2");
+  });
+});
+
+// ── 照片旋转接线（头像旋转：烧进文件）：编辑器抛 rotated → 大图/编辑器换新图 ──
+
+describe("NestCheckinDialog 照片旋转接线（头像旋转）", () => {
+  const PHOTO_DIR = "C:\data\photos";
+  const REL = "1/6ba7b810-9dad-11d1-80b4-00c04fd430c8.jpg";
+  const photoMeta = {
+    id: 11,
+    checkin_id: 7,
+    rel_path: REL,
+    original_name: "ok.jpg",
+    note: "",
+  };
+
+  /** 挂载并开到大图+编辑器（形态由调用方先布置好 __TAURI_INTERNALS__）。 */
+  async function mountToEditor() {
+    const w = mount(NestCheckinDialog, { props: { colony } });
+    await flushPromises();
+    await w.find("img.photo-thumb").trigger("click");
+    await w.find(".viewer-crop-btn").trigger("click");
+    return w;
+  }
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    loadPhotoBlobUrlMock.mockReset();
+    revokeObjectUrlMock.mockReset();
+  });
+
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  it("桌面：编辑器抛 rotated → 大图与编辑器 src 加 ?v= 缓存破除，连转递增", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      convertFileSrc: (p: string) => `http://asset.localhost/${encodeURIComponent(p)}`,
+    };
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7, photos: [photoMeta as never] })];
+      if (cmd === "get_photo_abs_dir") return PHOTO_DIR;
+      return null;
+    });
+    const w = await mountToEditor();
+    const base = `http://asset.localhost/${encodeURIComponent(`${PHOTO_DIR}/${REL}`)}`;
+    expect(w.findComponent(PhotoCropEditor).props("src")).toBe(base);
+
+    await w.findComponent(PhotoCropEditor).vm.$emit("rotated", photoMeta);
+    // WebView2 按整 URL 缓存：文件同路径换内容必须破缓存才换新图
+    expect(w.find(".photo-viewer-img").attributes("src")).toBe(`${base}?v=1`);
+    expect(w.findComponent(PhotoCropEditor).props("src")).toBe(`${base}?v=1`);
+
+    await w.findComponent(PhotoCropEditor).vm.$emit("rotated", photoMeta);
+    expect(w.find(".photo-viewer-img").attributes("src")).toBe(`${base}?v=2`);
+  });
+
+  it("浏览器：编辑器抛 rotated → 弃旧 blob（revoke）并重取新 blob URL", async () => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7, photos: [photoMeta as never] })];
+      return null;
+    });
+    loadPhotoBlobUrlMock.mockImplementation(async () => "blob:first");
+    const w = await mountToEditor();
+    expect(w.findComponent(PhotoCropEditor).props("src")).toBe("blob:first");
+
+    loadPhotoBlobUrlMock.mockImplementation(async () => "blob:second");
+    await w.findComponent(PhotoCropEditor).vm.$emit("rotated", photoMeta);
+    await flushPromises();
+
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:first");
+    expect(w.findComponent(PhotoCropEditor).props("src")).toBe("blob:second");
   });
 });

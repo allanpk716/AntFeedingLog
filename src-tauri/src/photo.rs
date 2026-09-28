@@ -171,6 +171,30 @@ fn reencode_jpeg(img: &image::DynamicImage) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// 旋转圈数校验（头像旋转）：顺时针 90° 的圈数，合法 1–3（0 与负数无意义；
+/// ≥4 等价取模——不静默归一，显式拒绝）。纯核权威，schema 层镜像调用。
+pub fn validate_quarter_turns(quarter_turns: i64) -> Result<(), String> {
+    if !(1..=3).contains(&quarter_turns) {
+        return Err(format!("旋转圈数应为 1–3（顺时针 90° 的倍数，收到 {quarter_turns}）"));
+    }
+    Ok(())
+}
+
+/// 照片像素旋转（头像旋转：烧进文件）：解码 → 顺时针旋转 quarter_turns×90° →
+/// 重编码 JPEG（同 [`JPEG_QUALITY`]、不携带 EXIF）。输入是自家重编码产物
+///（白名单 JPEG），解码失败即文件损坏 → 人话错误；圈数先校验再烧解码 CPU。
+pub fn rotate_photo_bytes(bytes: &[u8], quarter_turns: i64) -> Result<Vec<u8>, String> {
+    validate_quarter_turns(quarter_turns)?;
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| format!("照片解码失败（文件可能已损坏）: {e}"))?;
+    let rotated = match quarter_turns {
+        1 => img.rotate90(),
+        2 => img.rotate180(),
+        _ => img.rotate270(),
+    };
+    reencode_jpeg(&rotated)
+}
+
 /// 处理一张上传照片：完整校验链 → 重编码 JPEG。输入原始字节，输出处理后的
 /// JPEG 字节（长边 2048、质量 85、无 EXIF/GPS）。
 pub fn process_photo_bytes(bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -366,7 +390,7 @@ fn persist_one(
 }
 
 /// 写临时文件 → fsync → 同目录 rename（同目录保证原子性，规格 E）。
-fn write_fsync_rename(tmp: &Path, final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_fsync_rename(tmp: &Path, final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut f = std::fs::File::create(tmp)?;
     f.write_all(bytes)?;
@@ -448,7 +472,7 @@ pub fn delete_photo_files(photos_root: &Path, rel_paths: &[String]) -> Vec<Strin
 
 /// 防路径逃逸的相对路径形态：`<非点开头的目录名>/<.jpg 结尾的文件名>`，
 /// 无反斜杠/冒号/绝对路径/`..`。库内 rel_path 只由本模块写入，这里是防御层。
-fn is_safe_rel_path(rel: &str) -> bool {
+pub(crate) fn is_safe_rel_path(rel: &str) -> bool {
     if rel.contains('\\') || rel.contains(':') || rel.starts_with('/') {
         return false;
     }
@@ -905,6 +929,55 @@ mod tests {
         let big = vec![0u8; MAX_INPUT_BYTES + 1];
         let err = process_photo_bytes(&big).unwrap_err();
         assert!(err.contains("15"), "实际错误：{err}");
+    }
+
+    // ── 照片旋转（头像旋转：烧进文件）────────────────────────────────────
+
+    /// 左红右蓝的横向图（旋转方向可辨：顺时针 90° 后红到顶、蓝到底）。
+    fn halves_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                let red = x < w / 2;
+                img.put_pixel(
+                    x,
+                    y,
+                    Rgb([if red { 200 } else { 0 }, 0, if red { 0 } else { 200 }]),
+                );
+            }
+        }
+        encode_bytes(&DynamicImage::ImageRgb8(img), ImageFormat::Jpeg)
+    }
+
+    #[test]
+    fn rotate_quarter_turns_swap_dims() {
+        // 尺寸：64×48 → 1 圈 48×64；2 圈 64×48；3 圈 48×64
+        let src = jpeg_bytes(64, 48);
+        assert_eq!(decoded_size(&rotate_photo_bytes(&src, 1).unwrap()), (48, 64));
+        assert_eq!(decoded_size(&rotate_photo_bytes(&src, 2).unwrap()), (64, 48));
+        assert_eq!(decoded_size(&rotate_photo_bytes(&src, 3).unwrap()), (48, 64));
+    }
+
+    #[test]
+    fn rotate_is_clockwise() {
+        // 左红右蓝 → 顺时针 1 圈后：新图 20×40，红区占上半 20 行、蓝区占下半
+        //（JPEG 有损，宽容比对；取样点 y=4 在红区、y=30 在蓝区）
+        let rotated = rotate_photo_bytes(&halves_bytes(40, 20), 1).unwrap();
+        let img = image::load_from_memory(&rotated).unwrap().to_rgb8();
+        assert_eq!((img.width(), img.height()), (20, 40));
+        let top = img.get_pixel(10, 4);
+        let bottom = img.get_pixel(10, 30);
+        assert!(top[0] > 120 && top[2] < 80, "上半应偏红，实际 {top:?}");
+        assert!(bottom[2] > 120 && bottom[0] < 80, "下半应偏蓝，实际 {bottom:?}");
+    }
+
+    #[test]
+    fn rotate_rejects_invalid_quarter_turns() {
+        let src = jpeg_bytes(8, 8);
+        for bad in [0, 4, -1] {
+            let err = rotate_photo_bytes(&src, bad).unwrap_err();
+            assert!(err.contains("圈数"), "实际错误：{err}");
+        }
     }
 
     #[test]

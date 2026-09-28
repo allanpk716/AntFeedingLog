@@ -72,7 +72,13 @@ import { showSuccess } from "../lib/toast";
 import PhotoCropEditor from "./PhotoCropEditor.vue";
 
 const props = defineProps<{ colony: Colony }>();
-const emit = defineEmits<{ close: []; saved: [] }>();
+const emit = defineEmits<{
+  close: [];
+  saved: [];
+  /** 弹窗内照片已旋转（头像旋转）：冒泡给宿主卡片刷新头像（rel_path 不变，
+   * 桌面需破缓存、浏览器需重取 blob——卡片侧自行分流）。 */
+  rotatedPhoto: [meta: NestPhotoMeta];
+}>();
 
 const entries = ref<NestCheckin[]>([]);
 const loading = ref(true);
@@ -174,11 +180,18 @@ const cropEditorOpen = ref(false);
 /** 浏览器侧 objectURL 表（照片 id → blob: URL）；桌面走 asset 协议不经此。 */
 const blobUrls = ref<Record<number, string>>({});
 
+/** 桌面照片 URL 的缓存破除版本号（照片 id → 旋转次数）：文件同路径换内容后
+ * WebView2 仍按整 URL 缓存旧图，追加 `?v=` 才换新（asset 协议按路径段解析，
+ * 查询串不影响定位）。浏览器端 blob 每次 revoke 重取天然全新，不用它。 */
+const photoRev = ref<Record<number, number>>({});
+
 function photoSrcOf(p: NestPhotoMeta): string {
   if (!isTauri()) {
     return blobUrls.value[p.id] ?? "";
   }
-  return photoSrc(p.rel_path, photoAbsDir.value);
+  const base = photoSrc(p.rel_path, photoAbsDir.value);
+  const rev = photoRev.value[p.id];
+  return rev ? `${base}?v=${rev}` : base;
 }
 
 /** 浏览器取图（票 08）：逐张 fetch blob（时间线照片量小，串行即可）；
@@ -248,6 +261,23 @@ function onCropSaved(meta: NestPhotoMeta) {
     viewerPhoto.value = { ...viewerPhoto.value, crop: meta.crop };
   }
   emit("saved");
+}
+
+/** 照片已旋转（头像旋转：烧进文件）：换新图——桌面破缓存（`?v=` 递增，
+ * WebView2 按整 URL 缓存，文件同路径换内容不重载），浏览器弃旧 blob 重取
+ * （新 blob URL 天然全新）。元数据行零变化，时间线对象不必替换。 */
+function onCropRotated(meta: NestPhotoMeta) {
+  if (isTauri()) {
+    photoRev.value = { ...photoRev.value, [meta.id]: (photoRev.value[meta.id] ?? 0) + 1 };
+  } else {
+    const old = blobUrls.value[meta.id];
+    if (old) {
+      revokeObjectUrl(old);
+      delete blobUrls.value[meta.id];
+    }
+    void loadPhotoBlobs(entries.value.flatMap((c) => c.photos));
+  }
+  emit("rotatedPhoto", meta); // 宿主卡片刷新头像（rel 不变也要换新图）
 }
 
 // ── 桌面上传（票 07）：系统文件对话框 → attach_photos ──
@@ -917,13 +947,15 @@ async function requestDelete(c: NestCheckin) {
       </div>
 
       <!-- 头像裁剪编辑器（窝头像票 04）：仅手动进入；保存回写本地时间线并抛
-           saved 让外层刷新（首页头像投影跟上）；上传流程零变化不自动弹 -->
+           saved 让外层刷新（首页头像投影跟上）；rotated 换新图（头像旋转）；
+           上传流程零变化不自动弹 -->
       <PhotoCropEditor
         v-if="cropEditorOpen && viewerPhoto"
         :photo="viewerPhoto"
         :src="photoSrcOf(viewerPhoto)"
         @close="cropEditorOpen = false"
         @saved="onCropSaved"
+        @rotated="onCropRotated"
       />
     </div>
   </div>

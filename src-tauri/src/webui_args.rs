@@ -759,6 +759,22 @@ impl ValidatedArgs for UpdatePhotoCropArgs {
     }
 }
 
+/// rotate_photo 入参镜像（头像旋转：烧进文件）：photoId ≥1；quarterTurns =
+/// 顺时针 90° 圈数 1–3（取值校验权威在纯核 validate_quarter_turns，本层复用）。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RotatePhotoArgs {
+    pub photo_id: i64,
+    pub quarter_turns: i64,
+}
+
+impl ValidatedArgs for RotatePhotoArgs {
+    fn validate(&self) -> Result<(), String> {
+        check_id(self.photo_id, "photoId")?;
+        crate::photo::validate_quarter_turns(self.quarter_turns)
+    }
+}
+
 /// `nest_checkin::PhotoCrop` 的服务端校验镜像（嵌套键沿用 DTO 的单词键 x/y/size）。
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1295,5 +1311,33 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("缺少必填参数"), "实际：{err}");
+    }
+
+    #[test]
+    fn rotate_photo_args_shape() {
+        // 合法：顺时针圈数 1–3
+        for ok in [1, 2, 3] {
+            assert!(
+                checked::<RotatePhotoArgs>(&json!({"photoId": 5, "quarterTurns": ok})).is_ok()
+            );
+        }
+        // 圈数出界：0 / 4 / 负数（与纯核同口径的人话，不带 JSON 键名——同裁剪先例）
+        for bad in [0, 4, -1] {
+            let err = checked::<RotatePhotoArgs>(&json!({"photoId": 5, "quarterTurns": bad}))
+                .unwrap_err();
+            assert!(err.contains("圈数"), "实际：{err}");
+        }
+        // 形状垃圾：photoId 非正整数 / quarterTurns 缺失 / 未知字段
+        assert!(
+            checked::<RotatePhotoArgs>(&json!({"photoId": 0, "quarterTurns": 1}))
+                .unwrap_err()
+                .contains("photoId")
+        );
+        assert!(checked::<RotatePhotoArgs>(&json!({"photoId": 5})).is_err(), "quarterTurns 必填");
+        let err = checked::<RotatePhotoArgs>(&json!({
+            "photoId": 5, "quarterTurns": 1, "bogus": 1
+        }))
+        .unwrap_err();
+        assert_eq!(err, "参数包含未知字段：bogus");
     }
 }

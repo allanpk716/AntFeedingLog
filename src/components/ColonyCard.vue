@@ -117,6 +117,9 @@ const avatarBroken = ref(false);
 /** 图片 natural 尺寸（load 后可得；裁剪定位的输入，happy-dom/真实浏览器一致） */
 const avatarImgSize = ref<{ w: number; h: number } | null>(null);
 const avatarRel = computed(() => props.colony.avatar?.rel_path ?? null);
+/** 头像缓存破除版本（头像旋转：烧进文件）：文件同路径换内容后 WebView2 按整
+ * URL 缓存旧图，`?v=` 递增才换新；浏览器 blob 重取天然全新，此值只驱动桌面。 */
+const avatarRev = ref(0);
 /** 竞态守卫：连换头像/卸载时只让最后一轮取图落地 */
 let avatarSeq = 0;
 
@@ -147,7 +150,7 @@ async function loadAvatar(rel: string | null): Promise<void> {
       avatarBroken.value = true;
       return;
     }
-    avatarUrl.value = src;
+    avatarUrl.value = avatarRev.value ? `${src}?v=${avatarRev.value}` : src;
     return;
   }
   try {
@@ -359,6 +362,13 @@ function onCheckinSaved() {
   showCheckin.value = false;
   emit("saved");
 }
+
+/** 弹窗照片旋转（头像旋转）：文件已换内容，头像立即换新图——rel_path 不变，
+ * 桌面靠 `?v=` 破缓存、浏览器重取 blob（loadAvatar 顶上释放旧 URL）。 */
+function onCheckinPhotoRotated() {
+  avatarRev.value += 1;
+  void loadAvatar(avatarRel.value);
+}
 </script>
 
 <template>
@@ -522,6 +532,7 @@ function onCheckinSaved() {
       :colony="colony"
       @close="showCheckin = false"
       @saved="onCheckinSaved"
+      @rotated-photo="onCheckinPhotoRotated"
     />
   </article>
 </template>

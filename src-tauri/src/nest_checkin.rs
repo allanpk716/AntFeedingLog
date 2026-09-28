@@ -559,6 +559,55 @@ pub fn update_photo_crop(
     get_photo_meta(conn, photo_id)
 }
 
+/// 旋转照片（头像旋转：烧进文件）：按 id 查 rel_path → 读文件 → 像素旋转
+///（[`crate::photo::rotate_photo_bytes`]，同质量重编码）→ 沿照片写入协议原子
+/// 替换（同目录 `.tmp-` + fsync + rename）。**裁剪不动**——旧坐标随新方向在
+/// 编辑器里重调；元数据行零变化，回读即证照片仍在。圈数校验权威在纯核
+///（读盘前先拒，不烧解码 CPU）。
+pub fn rotate_photo(
+    conn: &Connection,
+    photos_root: &Path,
+    photo_id: i64,
+    quarter_turns: i64,
+) -> Result<NestPhotoMeta, String> {
+    crate::photo::validate_quarter_turns(quarter_turns)?;
+    let rel_path: Option<String> = conn
+        .query_row(
+            "SELECT rel_path FROM nest_photo WHERE id = ?1",
+            params![photo_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_err)?;
+    let rel_path = rel_path.ok_or_else(|| "照片不存在".to_string())?;
+    if !crate::photo::is_safe_rel_path(&rel_path) {
+        return Err(format!("{rel_path}: 相对路径形态非法"));
+    }
+    let mut path = photos_root.to_path_buf();
+    for comp in rel_path.split('/') {
+        path.push(comp);
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取照片失败（{rel_path}）: {e}"))?;
+    let rotated = crate::photo::rotate_photo_bytes(&bytes, quarter_turns)?;
+    // 原子替换：同目录 .tmp- 前缀临时文件（孤儿巡检/清理只认 .jpg 与 .tmp-
+    // 残留治理约定，不引入新形态）；失败路径的半截 tmp 由 write_fsync_rename
+    // 之前的各步残留可能性 → 这里兜底清一次
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("{rel_path}: 文件名不可解析"))?
+        .to_string();
+    let tmp = path
+        .parent()
+        .unwrap_or(photos_root)
+        .join(format!("{}{}", crate::photo::TMP_PREFIX, file_name));
+    if let Err(e) = crate::photo::write_fsync_rename(&tmp, &path, &rotated) {
+        let _ = std::fs::remove_file(&tmp); // 半截 tmp 不留垃圾
+        return Err(format!("旋转照片写入失败（{rel_path}）: {e}"));
+    }
+    get_photo_meta(conn, photo_id)
+}
+
 /// 头像照片引用（纯投影，不落库）：按排序契约取**第一条含照片的登记**的第一张
 /// 照片——纯文字登记无照片行自然跳过（spec F6）；该窝从无照片则 None（前端显示
 /// 占位）。删登记后投影重算自然回退到更早照片，裁剪随照片行原样生效。
@@ -1138,6 +1187,88 @@ mod tests {
         let reset = update_photo_crop(&conn, p, None).unwrap();
         assert_eq!(reset.crop, None, "重置后读回 None（居中）");
         update_photo_crop(&conn, p, None).unwrap();
+    }
+
+    // ── 照片旋转（头像旋转：烧进文件）────────────────────────────────────
+
+    /// 盘库成对的照片夹具：插元数据行 + 把真 JPEG 写到 rel_path 对应位置。
+    fn photo_with_file(conn: &Connection, tmp: &TempDir, checkin_id: i64, rel: &str) -> i64 {
+        let id = photo(conn, checkin_id, rel);
+        let mut path = photo_dir(tmp);
+        for comp in rel.split('/') {
+            path.push(comp);
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, jpeg_bytes(64, 48)).unwrap();
+        id
+    }
+
+    #[test]
+    fn rotate_photo_rewrites_file_and_keeps_crop() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let ck = checkin_on(&conn, c, "2026-09-18", "带照片");
+        let tmp = TempDir::new().unwrap();
+        let p = photo_with_file(&conn, &tmp, ck, "1/a.jpg");
+        update_photo_crop(&conn, p, Some(PhotoCrop { x: 0.1, y: 0.2, size: 0.5 })).unwrap();
+
+        let meta = rotate_photo(&conn, &photo_dir(&tmp), p, 1).unwrap();
+
+        assert_eq!(meta.id, p);
+        assert_eq!(
+            meta.crop,
+            Some(PhotoCrop { x: 0.1, y: 0.2, size: 0.5 }),
+            "旋转不动裁剪（旧坐标仍可读，编辑器里随新方向重调）"
+        );
+        // 文件内容已换向：64×48 → 48×64；目录里不残留临时文件
+        let mut path = photo_dir(&tmp);
+        for comp in meta.rel_path.split('/') {
+            path.push(comp);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (48, 64));
+        assert_eq!(std::fs::read_dir(photo_dir(&tmp).join("1")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rotate_photo_unknown_id_or_bad_turns_rejected_without_touching_disk() {
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let ck = checkin_on(&conn, c, "2026-09-18", "带照片");
+        let tmp = TempDir::new().unwrap();
+        let p = photo_with_file(&conn, &tmp, ck, "1/a.jpg");
+
+        assert_eq!(rotate_photo(&conn, &photo_dir(&tmp), 999, 1).unwrap_err(), "照片不存在");
+        let err = rotate_photo(&conn, &photo_dir(&tmp), p, 0).unwrap_err();
+        assert!(err.contains("圈数"), "实际错误：{err}");
+
+        // 文件原样未动（仍是 64×48）
+        let mut path = photo_dir(&tmp);
+        for comp in "1/a.jpg".split('/') {
+            path.push(comp);
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (64, 48));
+    }
+
+    #[test]
+    fn rotate_photo_missing_file_reports_read_error() {
+        // 库里有行、盘上没文件（恢复过旧备份的形态）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let ck = checkin_on(&conn, c, "2026-09-18", "带照片");
+        let tmp = TempDir::new().unwrap();
+        let p = photo_with_file(&conn, &tmp, ck, "1/a.jpg");
+        let mut path = photo_dir(&tmp);
+        for comp in "1/a.jpg".split('/') {
+            path.push(comp);
+        }
+        std::fs::remove_file(&path).unwrap();
+
+        let err = rotate_photo(&conn, &photo_dir(&tmp), p, 1).unwrap_err();
+        assert!(err.contains("读取"), "人话应带读取失败，实际：{err}");
     }
 
     #[test]

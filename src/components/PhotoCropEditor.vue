@@ -27,12 +27,17 @@
  * 回到大图。上传流程零变化：本组件只从大图查看器手动进入，不自动弹（D9）。
  */
 import { computed, onBeforeUnmount, ref } from "vue";
-import { avatarShape, updatePhotoCrop } from "../lib/ipc";
+import { avatarShape, rotatePhoto, updatePhotoCrop } from "../lib/ipc";
 import { showError, showSuccess } from "../lib/toast";
 import type { NestPhotoMeta, PhotoCrop } from "../types";
 
 const props = defineProps<{ photo: NestPhotoMeta; src: string }>();
-const emit = defineEmits<{ close: []; saved: [meta: NestPhotoMeta] }>();
+const emit = defineEmits<{
+  close: [];
+  saved: [meta: NestPhotoMeta];
+  /** 照片已旋转（头像旋转：烧进文件）：父级需换新图（弃旧 blob / 缓存破除）。 */
+  rotated: [meta: NestPhotoMeta];
+}>();
 
 const MIN_SIZE = 0.1; // 近看下限（长边的 10%）；极端宽高比时被 sizeMax 收紧
 const WHEEL_OUT = 1.15; // 滚轮向下 = 视野外推（size 增大）
@@ -235,6 +240,25 @@ async function save() {
   }
 }
 
+// ── 旋转（头像旋转：烧进文件）：点一下顺时针 90°，立即生效不等「保存」──
+// 文件换向后图可见地转过来（天然反馈，不弹轻提示）；裁剪坐标不动（旧坐标随
+// 新方向照常映射，可继续拖调）；父级接 rotated 换新图。
+
+const rotating = ref(false);
+
+async function rotate() {
+  if (rotating.value) return;
+  rotating.value = true;
+  try {
+    const meta = await rotatePhoto({ photoId: props.photo.id, quarterTurns: 1 });
+    emit("rotated", meta);
+  } catch (e) {
+    showError("旋转失败", String(e)); // 编辑器不关，可重试
+  } finally {
+    rotating.value = false;
+  }
+}
+
 onBeforeUnmount(() => {
   pointers.clear();
 });
@@ -270,7 +294,17 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="crop-ops">
-        <button class="btn crop-reset-btn" type="button" @click="reset">重置居中</button>
+        <div class="crop-ops-left">
+          <button class="btn crop-reset-btn" type="button" @click="reset">重置居中</button>
+          <button
+            class="btn crop-rotate-btn"
+            type="button"
+            :disabled="rotating || !loaded"
+            @click="rotate"
+          >
+            {{ rotating ? "旋转中…" : "↻ 旋转 90°" }}
+          </button>
+        </div>
         <label class="crop-zoom-row">
           缩放
           <input
@@ -285,7 +319,7 @@ onBeforeUnmount(() => {
           />
         </label>
       </div>
-      <p class="crop-hint">拖动照片调整位置；滚轮 / 滑杆 / 双指缩放；圆形为头像预览</p>
+      <p class="crop-hint">拖动照片调整位置；滚轮 / 滑杆 / 双指缩放；圆形为头像预览；旋转立即生效</p>
 
       <div class="crop-btns">
         <button class="btn crop-cancel-btn" type="button" @click="$emit('close')">取消</button>
@@ -389,6 +423,12 @@ onBeforeUnmount(() => {
   justify-content: space-between;
   gap: 10px;
   margin-top: 12px;
+}
+
+/* 重置居中 + 旋转一组（头像旋转：烧进文件） */
+.crop-ops-left {
+  display: flex;
+  gap: 6px;
 }
 
 .crop-zoom-row {

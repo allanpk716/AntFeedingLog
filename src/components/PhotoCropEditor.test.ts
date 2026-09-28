@@ -301,4 +301,65 @@ describe("PhotoCropEditor（窝头像票 04）", () => {
     const circle = await mountEditor(photo({ crop: null }), 2000, 1000);
     expect(circle.find(".crop-circle-mask").classes()).not.toContain("crop-mask-square");
   });
+
+  // ── 旋转（头像旋转：烧进文件）：立即生效，不等「保存」──
+
+  it("骨架带「↻ 旋转」按钮（重置居中旁）", async () => {
+    const w = await mountEditor(photo(), 2000, 1000);
+    const btn = w.find(".crop-rotate-btn");
+    expect(btn.exists()).toBe(true);
+    expect(btn.text()).toContain("旋转");
+  });
+
+  it("点旋转：调 rotate_photo（photoId + 顺时针 1 圈），抛 rotated 带回读元数据；不弹成功轻提示（图可见换向=天然反馈），编辑器不关", async () => {
+    const meta = photo({ crop: null });
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "rotate_photo" ? meta : {},
+    );
+    const w = await mountEditor(photo({ crop: { x: 0.4, y: 0.2, size: 0.25 } }), 2000, 1000);
+
+    await w.find(".crop-rotate-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock.mock.calls.find(([cmd]) => cmd === "rotate_photo")?.[1]).toEqual({
+      photoId: 11,
+      quarterTurns: 1,
+    });
+    expect(w.emitted("rotated")?.[0]).toEqual([meta]);
+    expect(showSuccessMock).not.toHaveBeenCalled();
+    expect(w.find(".crop-editor").exists()).toBe(true);
+  });
+
+  it("旋转失败：红色轻提示带原因，不抛 rotated；编辑器不关可重试", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "rotate_photo") throw "旋转照片写入失败（1/a.jpg）: boom";
+      return {};
+    });
+    const w = await mountEditor(photo(), 2000, 1000);
+
+    await w.find(".crop-rotate-btn").trigger("click");
+    await flushPromises();
+
+    expect(showErrorMock).toHaveBeenCalledWith("旋转失败", expect.any(String));
+    expect(w.emitted("rotated")).toBeUndefined();
+    expect(w.find(".crop-editor").exists()).toBe(true);
+  });
+
+  it("旋转进行中：按钮禁用并显示「旋转中…」，完成后恢复", async () => {
+    let release!: (v: NestPhotoMeta) => void;
+    invokeMock.mockImplementation(
+      (cmd: string) =>
+        cmd === "rotate_photo" ? new Promise((res) => (release = res)) : Promise.resolve({}),
+    );
+    const w = await mountEditor(photo(), 2000, 1000);
+
+    void w.find(".crop-rotate-btn").trigger("click");
+    await flushPromises();
+    expect(w.find(".crop-rotate-btn").attributes("disabled")).toBeDefined();
+    expect(w.find(".crop-rotate-btn").text()).toContain("旋转中");
+
+    release(photo());
+    await flushPromises();
+    expect(w.find(".crop-rotate-btn").attributes("disabled")).toBeUndefined();
+  });
 });

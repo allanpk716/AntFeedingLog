@@ -445,6 +445,31 @@ fn update_photo_crop(
     result
 }
 
+/// 旋转照片（头像旋转：烧进文件）：`quarter_turns` = 顺时针 90° 圈数 1–3；
+/// 像素旋转后沿照片写入协议原子替换同一文件（同质量重编码）。裁剪不动；
+/// 成功触发写后钩子（自动备份 + 版本广播——头像/照片墙/时间线自动换新图）。
+#[tauri::command]
+async fn rotate_photo(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    photo_id: i64,
+    quarter_turns: i64,
+) -> Result<nest_checkin::NestPhotoMeta, String> {
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let conn_handle = state.inner().conn_handle();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        run_with_conn(&conn_handle, |conn| {
+            nest_checkin::rotate_photo(conn, &photos_root, photo_id, quarter_turns)
+        })
+    })
+    .await
+    .map_err(|e| format!("照片旋转任务异常退出: {e}"))?;
+    if outcome.is_ok() {
+        trigger_after_write(&app);
+    }
+    outcome
+}
+
 /// 照片墙只读载荷：全部窝的照片——窝按 sort/id、窝内按登记日期倒序、同日期
 /// 按登记全序、登记内照片按上传序（排序契约与头像同源），照片带元数据（含
 /// 裁剪），分组随载荷带窝名与日期。只读，无写路径；照片文件本体经既有照片
@@ -1837,6 +1862,7 @@ pub fn run() {
             list_orphan_photos,
             clean_orphan_photos,
             update_photo_crop,
+            rotate_photo,
             photo_wall,
             list_actions,
             save_action,

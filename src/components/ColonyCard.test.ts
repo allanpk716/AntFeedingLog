@@ -489,3 +489,53 @@ describe("「📷 拍一张」菜单项与拍照编排（checkin-photo-entry 票
     expect(w.find(".m-item.snap-btn").attributes("disabled")).toBeUndefined();
   });
 });
+
+// ── 照片旋转联动（头像旋转：烧进文件）：弹窗旋转 → 卡片头像换新图 ──
+
+describe("窝卡片头像旋转联动（头像旋转）", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    loadPhotoBlobUrlMock.mockReset();
+    revokeObjectUrlMock.mockReset();
+    resetAvatarShapeForTests();
+  });
+
+  afterEach(() => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  });
+
+  it("桌面：弹窗抛 rotatedPhoto → 头像 URL 加 ?v= 破缓存，连转递增", async () => {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      convertFileSrc: (p: string) => `http://asset.localhost/${encodeURIComponent(p)}`,
+    };
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "get_photo_abs_dir" ? "C:/photos" : null,
+    );
+    const w = mountCard(colonyWithAvatar);
+    await flushPromises();
+    const base = `http://asset.localhost/${encodeURIComponent("C:/photos/1/abc.jpg")}`;
+    expect(w.find("img.avatar-img").attributes("src")).toBe(base);
+
+    await w.find('[data-testid="colony-avatar"]').trigger("click"); // 打开巢况弹窗
+    await w.findComponent(CheckinDialogStub).vm.$emit("rotatedPhoto", avatarPhoto);
+    expect(w.find("img.avatar-img").attributes("src")).toBe(`${base}?v=1`);
+
+    await w.findComponent(CheckinDialogStub).vm.$emit("rotatedPhoto", avatarPhoto);
+    expect(w.find("img.avatar-img").attributes("src")).toBe(`${base}?v=2`);
+  });
+
+  it("浏览器：弹窗抛 rotatedPhoto → 释放旧 blob 重取新 blob", async () => {
+    loadPhotoBlobUrlMock.mockImplementation(async () => "blob:old");
+    const w = mountCard(colonyWithAvatar);
+    await flushPromises();
+    expect(w.find("img.avatar-img").attributes("src")).toBe("blob:old");
+
+    await w.find('[data-testid="colony-avatar"]').trigger("click"); // 打开巢况弹窗
+    loadPhotoBlobUrlMock.mockImplementation(async () => "blob:new");
+    await w.findComponent(CheckinDialogStub).vm.$emit("rotatedPhoto", avatarPhoto);
+    await flushPromises();
+
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:old");
+    expect(w.find("img.avatar-img").attributes("src")).toBe("blob:new");
+  });
+});
