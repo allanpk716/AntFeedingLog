@@ -587,9 +587,11 @@ fn delete_colony(
 }
 
 // ── 每窝周期（每窝周期票 01）──
-// 桌面管理入口专用：不入网页端 HTTP 命令白名单（webui_server.rs 保持不动），
-// 读侧数据经 tiles/窝列表对网页端可见属票 02 的接线范围。改周期会动超期态 →
-// 与其他窝命令同一锁外模式刷托盘 tooltip；写成功走 trigger_after_write。
+// web-colony-edit 终局修复：本命令已入网页端白名单（编辑表单「周期提醒」小节
+// 的保存链是两段式——整窗 update_colony 之外，非保湿周期行经本命令逐行提交，
+// webui_server.rs 有镜像校验）。读侧数据经 tiles/窝列表对网页端可见属票 02 的
+// 接线范围。改周期会动超期态 → 与其他窝命令同一锁外模式刷托盘 tooltip；写成功
+// 走 trigger_after_write。
 
 /// 设置/清除某窝某操作的每窝周期：`interval_days = Some(1..=365)` 设/改，
 /// `None` 清除。非整数入参在 IPC 反序列化处即被拒绝（入参类型即契约）。

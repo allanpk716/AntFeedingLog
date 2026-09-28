@@ -328,8 +328,9 @@ export const updateColony = cmdFn<{ id: number; input: ColonyInput }, void>("upd
 export const archiveColony = cmdFn<{ id: number }, void>("archive_colony");
 export const deleteColony = cmdFn<{ id: number }, void>("delete_colony");
 
-// ── 每窝周期（ColonyFormDialog「周期提醒」小节）：桌面专属命令，不入网页端
-//    HTTP 白名单（webui_server.rs 侧保持不动），网页端本也无窝编辑入口 ──
+// ── 每窝周期（ColonyFormDialog「周期提醒」小节）──
+// web-colony-edit 终局修复：已入网页端 HTTP 白名单——编辑表单保存是两段式，
+// 非保湿周期行经本命令逐行提交（服务端镜像键 camelCase 与本处同形）。 ──
 
 /** 设/清某窝某操作的每窝周期：intervalDays = 1..365 整数设/改（已设即改），
  *  null = 清除删行（未设时也成功，幂等）；人话报错以字符串 reject。 */

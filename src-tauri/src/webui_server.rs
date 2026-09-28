@@ -493,6 +493,8 @@ pub const WEBUI_COMMANDS: &[&str] = &[
     "create_colony",
     "update_colony",
     "delete_colony",
+    // 每窝周期行（终局修复）：编辑表单保存是两段式，非保湿周期行逐行走此命令
+    "set_colony_action_interval",
     // 打卡：字典读 + 提交（colony_month_records 为交互第三轮日历标记数据源，
     // 打卡面板与记录页在用，网页端同样可达）
     "list_actions",
@@ -655,6 +657,23 @@ pub fn dispatch_command(
             }
             Ok(())
         })),
+        // 每窝周期行（终局修复）：ColonyFormDialog 保存链是两段式——整窗
+        // update_colony 之外，非保湿周期行经本命令逐行提交（桌面同一命令同一
+        // 纯核，lib.rs 同款锁外刷托盘：改周期动超期态）。不动 status，状态守卫
+        // 不适用（冬眠窝改周期与桌面行为一致）。
+        "set_colony_action_interval" => Some(write_cmd(
+            deps,
+            args,
+            true,
+            |conn, a: webui_args::SetColonyActionIntervalArgs| {
+                crate::colony::set_colony_action_interval(
+                    conn,
+                    a.colony_id,
+                    a.action_id,
+                    a.interval_days,
+                )
+            },
+        )),
         // ── 打卡 ──
         "list_actions" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
             crate::dict::list_actions(conn)
@@ -4228,6 +4247,9 @@ mod tests {
         assert!(WEBUI_COMMANDS.contains(&"create_colony"));
         assert!(WEBUI_COMMANDS.contains(&"update_colony"));
         assert!(WEBUI_COMMANDS.contains(&"delete_colony"));
+        // 终局修复：编辑表单周期小节逐行保存的命令也须在表（否则网页端改非保湿
+        // 周期必 404——部分成功后的失败）；archive_colony 仍不入（D4）。
+        assert!(WEBUI_COMMANDS.contains(&"set_colony_action_interval"));
         assert!(!WEBUI_COMMANDS.contains(&"archive_colony"));
 
         let (deps, _dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
@@ -4432,5 +4454,99 @@ mod tests {
         .unwrap();
         assert!(matches!(out, CmdOutcome::Rejected(_)), "实际：{out:?}");
         assert_eq!(status_of(hib_id), "hibernating");
+    }
+
+    #[test]
+    fn http_set_colony_action_interval_roundtrip_even_for_hibernating() {
+        // 终局修复集成验收：编辑表单的周期小节逐行保存走本命令——设行成功、
+        // 库内落行、null 清除幂等；冬眠窝改周期与桌面行为一致（不动 status，
+        // 状态守卫不适用）。snake_key 直发（镜像 camelCase）应 400。
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
+        let today = crate::colony::today_iso();
+
+        let out = dispatch_command(
+            &deps,
+            "create_colony",
+            &serde_json::json!({
+                "input": {"name": "周期窝", "species": null, "location_id": null,
+                          "start_date": today, "status": "active",
+                          "hydration_method": null, "interval_changes": []}
+            }),
+        )
+        .unwrap();
+        let id = match out {
+            CmdOutcome::Ok(v) => v["id"].as_i64().unwrap(),
+            other => panic!("create_colony 应成功，实际 {other:?}"),
+        };
+        // 走真流程入眠（夹具与守卫测试同口径）
+        let out = dispatch_command(
+            &deps,
+            "start_hibernation",
+            &serde_json::json!({"colonyId": id, "startDate": today, "expectedEndDate": today}),
+        )
+        .unwrap();
+        assert!(matches!(out, CmdOutcome::Ok(_)), "实际：{out:?}");
+
+        let set = |payload: serde_json::Value| {
+            dispatch_command(&deps, "set_colony_action_interval", &payload).unwrap()
+        };
+        let feed_id: i64 = {
+            let conn = deps.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT id FROM care_action WHERE name = '喂食'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // 设行：冬眠窝改喂食周期成功，库内落行，状态不变
+        let out = set(serde_json::json!({
+            "colonyId": id, "actionId": feed_id, "intervalDays": 5
+        }));
+        assert!(matches!(out, CmdOutcome::Ok(_)), "实际：{out:?}");
+        {
+            let conn = deps.conn.lock().unwrap();
+            let days: Option<i64> = conn
+                .query_row(
+                    "SELECT interval_days FROM colony_action_interval
+                     WHERE colony_id = ?1 AND action_id = ?2",
+                    [id, feed_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(days, Some(5), "周期行已落库");
+            let status: String = conn
+                .query_row("SELECT status FROM colony WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap();
+            assert_eq!(status, "hibernating", "改周期不动冬眠状态");
+        }
+
+        // null 清除删行；再清一次仍成功（幂等）
+        let out = set(serde_json::json!({
+            "colonyId": id, "actionId": feed_id, "intervalDays": null
+        }));
+        assert!(matches!(out, CmdOutcome::Ok(_)), "实际：{out:?}");
+        let out = set(serde_json::json!({
+            "colonyId": id, "actionId": feed_id, "intervalDays": null
+        }));
+        assert!(matches!(out, CmdOutcome::Ok(_)), "幂等清除应成功：{out:?}");
+        {
+            let conn = deps.conn.lock().unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM colony_action_interval WHERE colony_id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "清除后无残留行");
+        }
+
+        // 镜像 camelCase 契约：snake 键直发在 schema 层 400（不进库）
+        let out = set(serde_json::json!({
+            "colony_id": id, "actionId": feed_id, "intervalDays": 5
+        }));
+        assert!(matches!(out, CmdOutcome::Rejected(_)), "实际：{out:?}");
     }
 }

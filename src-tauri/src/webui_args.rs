@@ -711,6 +711,31 @@ impl ValidatedArgs for UpdateColonyArgs {
     }
 }
 
+/// `set_colony_action_interval` 入参（web-colony-edit 终局修复）：编辑表单的
+/// 保存链是两段式——整窗 update_colony 之外，非保湿的每窝周期行经本命令逐行
+/// 提交（桌面同一命令同一纯核）。键 camelCase 对齐前端 cmdFn（ColonyIdArgs 同例）。
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetColonyActionIntervalArgs {
+    pub colony_id: i64,
+    pub action_id: i64,
+    /// null = 清除删行（未设时也成功，幂等）；Some = 1..=365 设/改。
+    pub interval_days: Option<i64>,
+}
+
+impl ValidatedArgs for SetColonyActionIntervalArgs {
+    fn validate(&self) -> Result<(), String> {
+        check_id(self.colony_id, "colonyId")?;
+        check_id(self.action_id, "actionId")?;
+        if let Some(days) = self.interval_days {
+            if !(1..=365).contains(&days) {
+                return Err(format!("每窝周期应是 1–365 的整数天（收到 {days}）"));
+            }
+        }
+        Ok(())
+    }
+}
+
 // ── 窝头像与照片墙（窝头像票 01）：裁剪更新入参镜像 ───────────────────────
 
 /// `update_photo_crop` 入参：photoId + crop（可空 = 重置居中）。
@@ -1067,6 +1092,37 @@ mod tests {
         let core = a.input.into_core();
         assert!(core.hydration_method.is_none());
         assert!(core.interval_changes.is_empty());
+    }
+
+    #[test]
+    fn set_colony_action_interval_args_shape_and_bounds() {
+        // camelCase 三键 + null 清除语义；越界天数与未知字段/缺键人话拒绝
+        let a = checked::<SetColonyActionIntervalArgs>(&json!({
+            "colonyId": 3, "actionId": 1, "intervalDays": 7
+        }))
+        .unwrap();
+        assert_eq!(a.colony_id, 3);
+        assert_eq!(a.action_id, 1);
+        assert_eq!(a.interval_days, Some(7));
+        assert!(checked::<SetColonyActionIntervalArgs>(&json!({
+            "colonyId": 3, "actionId": 1, "intervalDays": null
+        }))
+        .is_ok(), "null = 清除删行，镜像放行");
+        let err = checked::<SetColonyActionIntervalArgs>(&json!({
+            "colonyId": 3, "actionId": 1, "intervalDays": 366
+        }))
+        .unwrap_err();
+        assert!(err.contains("1–365"), "实际：{err}");
+        let err = checked::<SetColonyActionIntervalArgs>(&json!({
+            "colonyId": 0, "actionId": 1, "intervalDays": 7
+        }))
+        .unwrap_err();
+        assert!(err.contains("colonyId"), "实际：{err}");
+        let err = checked::<SetColonyActionIntervalArgs>(&json!({
+            "colonyId": 3, "action_id": 1, "intervalDays": 7
+        }))
+        .unwrap_err();
+        assert!(err.contains("未知字段") || err.contains("缺少必填参数"), "实际：{err}");
     }
 
     #[test]
