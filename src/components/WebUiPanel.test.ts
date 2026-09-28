@@ -191,3 +191,53 @@ describe("设置「网页端」面板（webui-checkin 票 03）", () => {
     expect(wrapper.find(".webui-saved").text()).toContain("旧地址即刻作废");
   });
 });
+
+describe("设置「网页端」面板：首读加载占位（界面切换卡顿票 03）", () => {
+  it("配置未到前只渲染加载占位：表单/子组件/保存按钮都不挂载，不闪默认值", async () => {
+    let resolveConfig!: (v: WebUiConfigInfo) => void;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_webui_config")
+        return new Promise<WebUiConfigInfo>((resolve) => {
+          resolveConfig = resolve;
+        });
+      if (cmd === "list_network_segments") return segments;
+      return null;
+    });
+    const wrapper = mount(WebUiPanel);
+    await flushPromises();
+
+    expect(wrapper.find(".loading-hint").text()).toContain("加载中");
+    expect(wrapper.find(".webui-enabled-input").exists()).toBe(false);
+    expect(wrapper.find(".webui-seg-title").exists()).toBe(false);
+    expect(wrapper.find(".seg-picker").exists()).toBe(false);
+    expect(wrapper.find(".webui-port-input").exists()).toBe(false);
+    expect(wrapper.find(".token-area").exists()).toBe(false);
+    expect(wrapper.find(".access-url-box").exists()).toBe(false);
+    expect(wrapper.find(".save-webui-btn").exists()).toBe(false);
+    // 占位期间地址区不挂载：不发 get_access_url
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "get_access_url")).toBe(false);
+
+    resolveConfig(configFixture({ enabled: true, port: 28888, segments: ["100.84.0.0/16"] }));
+    await flushPromises();
+
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect((wrapper.find(".webui-enabled-input").element as HTMLInputElement).checked).toBe(true);
+    expect((wrapper.find(".webui-port-input").element as HTMLInputElement).value).toBe("28888");
+    expect(wrapper.find(".token-masked").text()).toBe("0123…cdef");
+  });
+
+  it("配置读取失败 → 退出占位、显示错误，表单按现状渲染不卡加载中", async () => {
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_webui_config") throw "配置读取失败";
+      if (cmd === "list_network_segments") return segments;
+      return null;
+    });
+    const wrapper = mount(WebUiPanel);
+    await flushPromises();
+
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".webui-error").text()).toContain("配置读取失败");
+    expect(wrapper.find(".webui-enabled-input").exists()).toBe(true);
+    expect(wrapper.find(".save-webui-btn").exists()).toBe(true);
+  });
+});

@@ -16,6 +16,7 @@ import {
 } from "../lib/ipc";
 import type { NetworkSegment, WebUiConfigInfo, WebUiSaveOutcome } from "../types";
 import { PORT_ERROR, copyText, validatePortText } from "../lib/webuiUi";
+import LoadingHint from "./LoadingHint.vue";
 import WebUiSegmentPicker from "./WebUiSegmentPicker.vue";
 import WebUiTokenArea from "./WebUiTokenArea.vue";
 import WebUiAccessUrl from "./WebUiAccessUrl.vue";
@@ -24,6 +25,8 @@ const emit = defineEmits<{ changed: [] }>();
 
 const config = ref<WebUiConfigInfo | null>(null);
 const segments = ref<NetworkSegment[]>([]);
+/** 首次读取完成标志（加载态判定口径）：成功或失败都置真，占位据此退出，不用 config 判定（防失败路径卡占位）。 */
+const loaded = ref(false);
 const form = ref<{ enabled: boolean; selected: string[]; portText: string }>({
   enabled: false,
   selected: [],
@@ -55,6 +58,8 @@ onMounted(async () => {
     await load();
   } catch (e) {
     errorText.value = String(e);
+  } finally {
+    loaded.value = true;
   }
 });
 
@@ -112,62 +117,66 @@ async function copyManual() {
 
 <template>
   <div class="webui-panel">
-    <div class="webui-row">
-      <label>
-        <input v-model="form.enabled" class="webui-enabled-input" type="checkbox" />
-        启用网页端（局域网内手机访问；端口与网段保存后同步防火墙规则）
-      </label>
-    </div>
+    <!-- 首读未完成只渲染占位：不渲染表单/子组件，消灭"先默认值再跳真实值" -->
+    <LoadingHint v-if="!loaded" />
+    <template v-else>
+      <div class="webui-row">
+        <label>
+          <input v-model="form.enabled" class="webui-enabled-input" type="checkbox" />
+          启用网页端（局域网内手机访问；端口与网段保存后同步防火墙规则）
+        </label>
+      </div>
 
-    <div class="webui-row">
-      <p class="webui-seg-title">受信网段（NetBird 段自动识别置顶；勾选物理网段会要求确认明文风险）：</p>
-      <WebUiSegmentPicker v-model:selected="form.selected" :segments="segments" />
-    </div>
+      <div class="webui-row">
+        <p class="webui-seg-title">受信网段（NetBird 段自动识别置顶；勾选物理网段会要求确认明文风险）：</p>
+        <WebUiSegmentPicker v-model:selected="form.selected" :segments="segments" />
+      </div>
 
-    <div class="webui-row">
-      <label>
-        端口
-        <input
-          v-model="form.portText"
-          class="webui-port-input"
-          type="number"
-          min="1024"
-          max="65535"
-          title="1024–65535；端口被占用时服务不启动，保存后会在这里提示"
-        />
-      </label>
-    </div>
+      <div class="webui-row">
+        <label>
+          端口
+          <input
+            v-model="form.portText"
+            class="webui-port-input"
+            type="number"
+            min="1024"
+            max="65535"
+            title="1024–65535；端口被占用时服务不启动，保存后会在这里提示"
+          />
+        </label>
+      </div>
 
-    <WebUiTokenArea
-      :token="config?.token ?? ''"
-      :generated-at="config?.token_generated_at ?? null"
-      @regenerate="regenerate"
-    />
+      <WebUiTokenArea
+        :token="config?.token ?? ''"
+        :generated-at="config?.token_generated_at ?? null"
+        @regenerate="regenerate"
+      />
 
-    <WebUiAccessUrl :refresh-key="urlKey" />
+      <WebUiAccessUrl :refresh-key="urlKey" />
 
-    <p v-if="errorText" class="form-error webui-error">{{ errorText }}</p>
-    <p v-if="savedText" class="saved-hint webui-saved">{{ savedText }}</p>
+      <p v-if="errorText" class="form-error webui-error">{{ errorText }}</p>
+      <p v-if="savedText" class="saved-hint webui-saved">{{ savedText }}</p>
 
-    <!-- 防火墙联动失败（半成功语义）：配置已保存，这里给现成手动命令 -->
-    <div v-if="lastOutcome && !lastOutcome.firewall_ok" class="firewall-fail">
-      <p class="form-error firewall-fail-msg">{{ lastOutcome.firewall_error }}</p>
-      <pre class="firewall-manual">{{ lastOutcome.firewall_manual_cmd }}</pre>
-      <button class="btn copy-manual-btn" type="button" @click="copyManual">复制手动命令</button>
-      <span v-if="manualCopied" class="copy-ok">已复制</span>
-    </div>
+      <!-- 防火墙联动失败（半成功语义）：配置已保存，这里给现成手动命令 -->
+      <div v-if="lastOutcome && !lastOutcome.firewall_ok" class="firewall-fail">
+        <p class="form-error firewall-fail-msg">{{ lastOutcome.firewall_error }}</p>
+        <pre class="firewall-manual">{{ lastOutcome.firewall_manual_cmd }}</pre>
+        <button class="btn copy-manual-btn" type="button" @click="copyManual">复制手动命令</button>
+        <span v-if="manualCopied" class="copy-ok">已复制</span>
+      </div>
 
-    <!-- 服务起停失败（半成功语义，票 04）：端口被占用等，配置已照常保存 -->
-    <p v-if="lastOutcome && !lastOutcome.server_ok" class="form-error server-fail-msg">
-      {{ lastOutcome.server_error }}
-    </p>
+      <!-- 服务起停失败（半成功语义，票 04）：端口被占用等，配置已照常保存 -->
+      <p v-if="lastOutcome && !lastOutcome.server_ok" class="form-error server-fail-msg">
+        {{ lastOutcome.server_error }}
+      </p>
 
-    <div class="dlg-btns">
-      <span class="spacer"></span>
-      <button class="btn primary save-webui-btn" type="button" :disabled="busy" @click="save">
-        保存
-      </button>
-    </div>
+      <div class="dlg-btns">
+        <span class="spacer"></span>
+        <button class="btn primary save-webui-btn" type="button" :disabled="busy" @click="save">
+          保存
+        </button>
+      </div>
+    </template>
   </div>
 </template>
 

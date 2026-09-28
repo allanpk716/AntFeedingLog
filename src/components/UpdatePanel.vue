@@ -35,9 +35,12 @@ import {
   type ShownProgress,
   type StateBannerView,
 } from "../lib/updaterUi";
+import LoadingHint from "./LoadingHint.vue";
 
 const currentVersion = ref("");
 const banner = ref<StateBannerView>({ kind: "none" });
+/** 首次读取完成标志（加载态判定口径）：版本/状态到齐或读取失败都置真，占位据此退出。 */
+const loaded = ref(false);
 const checkView = ref<CheckView>({ kind: "idle" });
 const checking = ref(false);
 /** 安装流视图；null = 不在安装流（确认行可见的条件之一） */
@@ -75,6 +78,9 @@ async function loadVersionAndState() {
   } catch (e) {
     // 版本/状态只是展示性信息，失败不出横幅（不打扰）
     console.error("读取版本/更新状态失败", e);
+  } finally {
+    // 失败也退出占位（按无数据渲染，不卡在加载中）
+    loaded.value = true;
   }
 }
 
@@ -160,39 +166,43 @@ async function openReleases() {
 
 <template>
   <div class="update-body">
-    <!-- 启动残留引导（升级未完成 / 升级成功） -->
-    <p v-if="banner.kind === 'incomplete'" class="update-banner update-banner-warn">
-      <span class="banner-text">{{ banner.text }}</span>
-      <button class="btn row-btn manual-dl-btn" type="button" title="在浏览器打开发布页下载安装包" @click="openReleases">
-        手动下载
-      </button>
-    </p>
-    <p v-else-if="banner.kind === 'succeeded'" class="update-banner update-banner-ok">{{ banner.text }}</p>
-
-    <div class="update-row">
-      <span class="current-version">当前版本：v{{ currentVersion || "…" }}</span>
-      <button class="btn check-btn" type="button" :disabled="checking || installing || installStarted" @click="checkNow">
-        {{ checking ? "检查中…" : "立即检查更新" }}
-      </button>
-    </div>
-
-    <!-- 三态：无更新 / 有新版 / 失败 -->
-    <p v-if="checkView.kind === 'up_to_date'" class="update-ok">{{ checkView.text }}</p>
-
-    <div v-else-if="checkView.kind === 'available'" class="update-available">
-      <p class="update-title">{{ updateAvailableTitle(checkView.version) }}</p>
-      <p v-if="checkView.notes" class="update-notes">{{ checkView.notes }}</p>
-      <div v-if="!declined && install === null" class="confirm-row">
-        <button class="btn primary install-btn" type="button" :disabled="installing" @click="installNow">
-          下载并安装
+    <!-- 版本/状态首读未完成只渲染占位：不渲染空版本号与横幅 -->
+    <LoadingHint v-if="!loaded" />
+    <template v-else>
+      <!-- 启动残留引导（升级未完成 / 升级成功） -->
+      <p v-if="banner.kind === 'incomplete'" class="update-banner update-banner-warn">
+        <span class="banner-text">{{ banner.text }}</span>
+        <button class="btn row-btn manual-dl-btn" type="button" title="在浏览器打开发布页下载安装包" @click="openReleases">
+          手动下载
         </button>
-        <button class="btn decline-btn" type="button" :disabled="installing" @click="decline">暂不更新</button>
-      </div>
-    </div>
+      </p>
+      <p v-else-if="banner.kind === 'succeeded'" class="update-banner update-banner-ok">{{ banner.text }}</p>
 
-    <p v-else-if="checkView.kind === 'failed'" class="form-error check-error">
-      检查更新失败：{{ checkView.message }}
-    </p>
+      <div class="update-row">
+        <span class="current-version">当前版本：v{{ currentVersion || "…" }}</span>
+        <button class="btn check-btn" type="button" :disabled="checking || installing || installStarted" @click="checkNow">
+          {{ checking ? "检查中…" : "立即检查更新" }}
+        </button>
+      </div>
+
+      <!-- 三态：无更新 / 有新版 / 失败 -->
+      <p v-if="checkView.kind === 'up_to_date'" class="update-ok">{{ checkView.text }}</p>
+
+      <div v-else-if="checkView.kind === 'available'" class="update-available">
+        <p class="update-title">{{ updateAvailableTitle(checkView.version) }}</p>
+        <p v-if="checkView.notes" class="update-notes">{{ checkView.notes }}</p>
+        <div v-if="!declined && install === null" class="confirm-row">
+          <button class="btn primary install-btn" type="button" :disabled="installing" @click="installNow">
+            下载并安装
+          </button>
+          <button class="btn decline-btn" type="button" :disabled="installing" @click="decline">暂不更新</button>
+        </div>
+      </div>
+
+      <p v-else-if="checkView.kind === 'failed'" class="form-error check-error">
+        检查更新失败：{{ checkView.message }}
+      </p>
+    </template>
 
     <!-- 安装流：进度 / 将重启 / 失败出口 -->
     <div v-if="install !== null" class="install-area">
