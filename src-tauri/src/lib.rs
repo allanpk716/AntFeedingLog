@@ -230,17 +230,36 @@ fn list_checkins(
 /// （格式/尺寸/重编码）+ 同一事务建登记行与挂照片（照片算内容：有照片字段可
 /// 全空；无照片走既有「至少填一项」防呆）。成功走 trigger_after_write 与其他
 /// 写命令同一咽喉；巢况不刷托盘（永不参与提醒）。
+///
+/// 入参形状（票 01 复审 R1 对齐）：扁平参数与前端 `ipc.ts saveCheckinWithPhotos`
+/// 的 `SaveCheckinWithPhotosArgs`（camelCase 单对象）逐键对应——Tauri 按参数名
+/// 映射 `colony_id↔colonyId`、`photo_paths↔photoPaths`；可选键缺省语义：
+/// `date` 缺省=今天（「拍一张」径），`moved_nest` 缺省=false，计数/备注缺省空。
 #[tauri::command]
 async fn save_checkin_with_photos(
     state: tauri::State<'_, DbState>,
     app: tauri::AppHandle,
-    input: nest_checkin::CheckinInput,
-    paths: Vec<String>,
+    colony_id: i64,
+    date: Option<String>,
+    queen_count: Option<i64>,
+    worker_count: Option<i64>,
+    moved_nest: Option<bool>,
+    note: Option<String>,
+    photo_paths: Vec<String>,
 ) -> Result<nest_checkin::NestCheckin, String> {
     let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
     let conn_handle = state.inner().conn_handle();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let uploads = photo::read_photo_files(&paths)?;
+        let uploads = photo::read_photo_files(&photo_paths)?;
+        let input = nest_checkin::CheckinInput {
+            colony_id,
+            // date 缺省=今天：「拍一张」径前端只传 colonyId+photoPaths
+            date: date.unwrap_or_else(colony::today_iso),
+            queen_count,
+            worker_count,
+            moved_nest: moved_nest.unwrap_or(false),
+            note,
+        };
         run_with_conn(&conn_handle, |conn| {
             nest_checkin::save_checkin_with_photos(
                 conn,

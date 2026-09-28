@@ -367,7 +367,9 @@ export const getCheckinDigest = cmdFn<{ colonyId: number }, CheckinDigest>("get_
 // ── 「拍一张」桌面通道（checkin-photo-entry 票 02）：建登记（字段可全空，纯照片
 // 合法）+ 照片同事务挂载，返回新建登记。桌面专用——照片为 pick_photo_files 拿到的
 // 本地文件路径；网页端不走此命令，走 photos.ts 的 multipart 创建模式。入参
-// camelCase 与网页端 multipart 段名同形；date 缺省 = 今天（服务端同口径）。 ──
+// camelCase 与网页端 multipart 段名同形；date 缺省 = 今天（服务端同口径）。
+// 后端契约互认（票 01 复审 R1）：lib.rs 命令为扁平参数（colony_id/date/…/
+// photo_paths），与本接口键逐键映射——改任一侧形状须同步另一侧。 ──
 
 export interface SaveCheckinWithPhotosArgs {
   colonyId: number;
