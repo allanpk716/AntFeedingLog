@@ -8,6 +8,8 @@
  * 顺带撤食（ADR 0006）：仅 implies_retrieval 操作（预置「垃圾清理」）出行——
  * 已逾期默认勾、未到期默认不勾、无待撤/所选时刻早于易腐喂食不出行；
  * 态随所选时刻动态重算，态变化才重置勾选（用户改过且态没变时不打扰）。
+ * 票 07：操作字典（list_actions 名字表）与首月标记首读完成前时间区显
+ * LoadingHint 占位、不渲染半截日历选项；退出用首读完成标志（失败也算完成）。
  */
 import { computed, onMounted, ref, watch } from "vue";
 import { colonyMonthRecords, listActions, logCare, retrievalLinkState } from "../lib/ipc";
@@ -17,6 +19,7 @@ import { nowLocalDateTime } from "../lib/care";
 import { todayIso } from "../lib/dates";
 import { buildMarkers, duplicateInfo, dupWarningText } from "../lib/monthview";
 import DateTimeField from "./DateTimeField.vue";
+import LoadingHint from "./LoadingHint.vue";
 
 const props = defineProps<{ colony: Colony; action: ColonyAction }>();
 const emit = defineEmits<{ close: []; saved: [] }>();
@@ -25,6 +28,14 @@ const time = ref(nowLocalDateTime());
 const note = ref("");
 const formError = ref("");
 const busy = ref(false);
+
+// ── 票 07：字典首读占位判定 ──
+/** 操作字典（list_actions 名字表）与首月标记（colony_month_records）都首读完成
+ *  才出时间区（含各自失败静默——退出用标志不用数据长度，失败不卡加载中）；
+ *  后续改时间/翻月重拉不回占位（数据已在内存即时渲染）。 */
+const actionsLoaded = ref(false);
+const monthLoaded = ref(false);
+const dictLoaded = computed(() => actionsLoaded.value && monthLoaded.value);
 
 const monthRows = ref<MonthDayRecords[]>([]);
 const viewMonth = ref({ year: +time.value.slice(0, 4), month: +time.value.slice(5, 7) });
@@ -43,6 +54,8 @@ async function loadMonth(y: number, m: number) {
     monthRows.value = res;
   } catch {
     if (seq === monthSeq) monthRows.value = []; // 标记是增强，失败静默（提交校验权威在后端）
+  } finally {
+    monthLoaded.value = true; // 票 07：首读完成即置位（含失败）；后续翻月重拉不回占位
   }
 }
 onMounted(() => void loadMonth(viewMonth.value.year, viewMonth.value.month));
@@ -55,6 +68,8 @@ async function loadActions() {
     allActions.value = await listActions();
   } catch {
     // 名字表是增强，失败静默（当前操作名有 props 兜底）
+  } finally {
+    actionsLoaded.value = true; // 票 07：首读完成（含失败）退出占位，不用列表长度
   }
 }
 onMounted(() => void loadActions());
@@ -143,7 +158,10 @@ async function submit() {
       <h3>记录{{ action.name }} · {{ colony.name }}</h3>
 
       <div class="field-label">时间（默认现在，可补录）</div>
-      <DateTimeField v-model="time" :markers="markers" @month="onMonth" />
+      <!-- 票 07：操作字典与首月标记首读未完成显「加载中…」占位、不渲染半截
+           日历选项（灰点/名字表到齐前不出场）；失败也算首读完成，不卡加载中。 -->
+      <LoadingHint v-if="!dictLoaded" />
+      <DateTimeField v-else v-model="time" :markers="markers" @month="onMonth" />
       <p v-if="dupText !== ''" class="dup-warn">⚠ {{ dupText }}<span class="why">确属再次操作可直接记录</span></p>
 
       <label v-if="linkVisible" class="link-row" data-testid="retrieval-link">

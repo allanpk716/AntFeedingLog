@@ -86,6 +86,7 @@ describe("QuickLogDialog", () => {
       cmd === "colony_month_records" ? [] : cmd === "list_actions" ? allActions : cmd === "log_care" ? 4 : null,
     );
     const w = mountDlg();
+    await flushPromises(); // 票 07：字典首读完成前 DateTimeField 在占位之后，先等首读落地
     await w.findComponent(DateTimeField).vm.$emit("update:modelValue", "2026-09-17T21:30");
     await w.find(".note-input").setValue("  顺手清了垃圾区  ");
     await w.find(".record-btn").trigger("click");
@@ -277,5 +278,67 @@ describe("重复提醒（交互第三轮 #8）", () => {
     // 计划原稿用 .at(-1)，项目 lib 是 ES2020（Array.prototype.at 是 ES2022）——改尾下标（同票 02 先例）
     const last = emitted![emitted!.length - 1] as unknown[];
     expect(last[0]).toBe(shiftMinutes(before, -10));
+  });
+});
+
+describe("字典加载占位（票 07）", () => {
+  /** list_actions / colony_month_records 可挂起的 mock：deferred 由测试握着决定何时放行 */
+  function mockDeferredDict(opts: { hangActions?: boolean; hangMonth?: boolean }) {
+    let resolveActions!: (v: CareActionItem[]) => void;
+    let resolveMonth!: (v: unknown[]) => void;
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_actions") {
+        if (opts.hangActions === true) return new Promise<CareActionItem[]>((r) => { resolveActions = r; });
+        return allActions;
+      }
+      if (cmd === "colony_month_records") {
+        if (opts.hangMonth === true) return new Promise<unknown[]>((r) => { resolveMonth = r; });
+        return [];
+      }
+      return null;
+    });
+    return {
+      resolveActions: () => resolveActions(allActions),
+      resolveMonth: () => resolveMonth([]),
+    };
+  }
+
+  it("操作字典挂起期：时间区显「加载中…」占位，DateTimeField 不渲染；到齐后按现状渲染", async () => {
+    const d = mockDeferredDict({ hangActions: true });
+    const w = mountDlg();
+    await flushPromises();
+
+    expect(w.find(".loading-hint").exists()).toBe(true);
+    expect(w.find(".loading-hint").text()).toContain("加载中");
+    expect(w.findComponent(DateTimeField).exists()).toBe(false);
+
+    d.resolveActions();
+    await flushPromises();
+    expect(w.find(".loading-hint").exists()).toBe(false);
+    expect(w.findComponent(DateTimeField).exists()).toBe(true);
+  });
+
+  it("首月标记未返回也占位（操作字典先到不提前退出）", async () => {
+    const d = mockDeferredDict({ hangMonth: true });
+    const w = mountDlg();
+    await flushPromises();
+
+    expect(w.find(".loading-hint").exists()).toBe(true);
+    expect(w.findComponent(DateTimeField).exists()).toBe(false);
+
+    d.resolveMonth();
+    await flushPromises();
+    expect(w.find(".loading-hint").exists()).toBe(false);
+    expect(w.findComponent(DateTimeField).exists()).toBe(true);
+  });
+
+  it("字典读取失败 → 占位照常退出（失败静默，不卡加载中）", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_actions" ? Promise.reject("字典读取失败") : cmd === "colony_month_records" ? [] : null,
+    );
+    const w = mountDlg();
+    await flushPromises();
+    expect(w.find(".loading-hint").exists()).toBe(false);
+    expect(w.findComponent(DateTimeField).exists()).toBe(true);
   });
 });
