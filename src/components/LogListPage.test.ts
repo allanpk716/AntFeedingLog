@@ -611,3 +611,105 @@ describe("记录列表页（票 08）", () => {
     expect(wrapper.emitted("changed")).toBeTruthy();
   });
 });
+
+// ── 加载占位（界面切换卡顿票 06）──
+// 口径：loading 且当前无行可显 → 占位；非加载且无行 → 空态文案；有行 → 列表。
+// 空态选择器带 .table-wrap 前缀：DatePickerPop 触发钮无值时也有 .empty 类，须避开。
+
+describe("加载占位（界面切换卡顿票 06）", () => {
+  it("首次加载挂起：列表区显示「加载中…」占位而非空态文案，数据到齐退出", async () => {
+    let releaseFirst: ((p: LogPage) => void) | null = null;
+    invokeMock.mockImplementation(
+      (cmd: string) =>
+        new Promise((resolve) => {
+          if (cmd === "list_logs") {
+            releaseFirst = resolve; // 首查挂起
+            return;
+          }
+          resolve(baseImpl(cmd));
+        }),
+    );
+    const wrapper = mount(LogListPage);
+    await flushPromises(); // 字典已过，首查仍在途
+
+    expect(wrapper.find(".loading-hint").exists()).toBe(true);
+    expect(wrapper.text()).toContain("加载中…");
+    expect(wrapper.find(".table-wrap .empty").exists()).toBe(false);
+
+    releaseFirst!(currentPage);
+    await flushPromises();
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.findAll(".log-row").length).toBe(2);
+  });
+
+  it("空结果后改筛选挂起：仍显「加载中…」不显空态，新结果到达正常渲染", async () => {
+    currentPage = { total: 0, rows: [] };
+    let callCount = 0;
+    let releaseSecond: ((p: LogPage) => void) | null = null;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_logs") {
+        callCount += 1;
+        if (callCount === 1) return Promise.resolve(currentPage); // 首查：空结果
+        return new Promise((resolve) => {
+          releaseSecond = resolve; // 筛选重查：挂起
+        });
+      }
+      return Promise.resolve(baseImpl(cmd));
+    });
+    const wrapper = await mountPage();
+
+    // 首查已回且为空：非加载无行 → 空态文案（现状语义）
+    expect(wrapper.find(".table-wrap .empty").exists()).toBe(true);
+    expect(wrapper.find(".table-wrap .empty").text()).toContain("没有符合条件的记录");
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+
+    // 改筛选触发重查，挂起期间：占位在、空态退
+    await wrapper.find(".f-action").setValue("1");
+    await flushPromises();
+    expect(wrapper.find(".loading-hint").exists()).toBe(true);
+    expect(wrapper.find(".table-wrap .empty").exists()).toBe(false);
+
+    releaseSecond!({ total: 1, rows: leftover });
+    await flushPromises();
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.findAll(".log-row").length).toBe(1);
+  });
+
+  it("有旧数据在屏改筛选：不闪占位，旧行保持渲染直到新结果到达", async () => {
+    let callCount = 0;
+    let releaseSecond: ((p: LogPage) => void) | null = null;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_logs") {
+        callCount += 1;
+        if (callCount === 1) return Promise.resolve(currentPage);
+        return new Promise((resolve) => {
+          releaseSecond = resolve; // 筛选重查：挂起
+        });
+      }
+      return Promise.resolve(baseImpl(cmd));
+    });
+    const wrapper = await mountPage();
+    expect(wrapper.findAll(".log-row").length).toBe(2);
+
+    await wrapper.find(".f-action").setValue("1");
+    await flushPromises();
+    // 挂起期间：无占位、无空态、旧两行仍在屏
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.find(".table-wrap .empty").exists()).toBe(false);
+    expect(wrapper.findAll(".log-row").length).toBe(2);
+
+    releaseSecond!({ total: 1, rows: leftover });
+    await flushPromises();
+    expect(wrapper.findAll(".log-row").length).toBe(1);
+  });
+
+  it("非加载且无行：显示空态文案不显示占位（现状不回归）", async () => {
+    currentPage = { total: 0, rows: [] };
+    const wrapper = await mountPage();
+
+    expect(wrapper.find(".table-wrap .empty").exists()).toBe(true);
+    expect(wrapper.find(".table-wrap .empty").text()).toContain("没有符合条件的记录");
+    expect(wrapper.find(".loading-hint").exists()).toBe(false);
+    expect(wrapper.text()).not.toContain("加载中…");
+  });
+});
