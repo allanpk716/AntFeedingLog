@@ -38,6 +38,15 @@
  *   存即效——写 set_avatar_shape 落库（桌面专属命令）+ 更新 ipc.ts 全局镜像，
  *   已渲染头像立即切换；打开弹窗时 get_avatar_shape 回显，读不出保默认圆形。
  *   成败走轻提示（设置保存属「改了不关窗」写操作）。
+ * - 首开体验（界面切换卡顿票 02）：地点/网页端/更新三页签急挂载保活——独立
+ *   v-show 块（置于 v-if 链后，链只摘三分支、完整性不受影响），弹窗一打开
+ *   即后台挂载并与主加载同批读取；页签切换只切显隐不销毁面板（未保存表单、
+ *   地点行内改名在往返间保留）；弹窗关闭由外层整体销毁重读。地点面板数据
+ *   来自主链（面板不自读），首读完成即挂载（不晚于主链完成）。默认页签
+ *   （操作/食物）主链首读完成前显 LoadingHint 占位、不渲染空列表，退出判定
+ *   用 firstLoadDone 布尔标志（含失败与空字典），保存后重拉不回占位。打开
+ *   加载链六段并行（主链/推送状态/头像形状/日志/备份/孤儿，主链失败轻提示、
+ *   辅助段静默）。孤儿区三态：未完成首读占位、成功统计文本、失败才「读取失败」。
  *
  * 行级 停用/启用/删除 即时落库并抛 changed（外层刷新首页，卡片红/灰随之变化）；
  * 名字/排序/性质/间隔/喂食标记在本地行上积累，「保存」一次性按行序落库（sort=行下标），
@@ -130,6 +139,7 @@ import {
   PUSHOVER_PLAINTEXT_WARNING,
   pushoverSourceLabel,
 } from "../lib/pushoverUi";
+import LoadingHint from "./LoadingHint.vue";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
 import WebUiPanel from "./WebUiPanel.vue";
@@ -147,6 +157,12 @@ const addActionName = ref("");
 const addFoodName = ref("");
 const error = ref("");
 const busy = ref(false);
+
+// ── 首开加载态（界面切换卡顿票 02）──
+/** 主链（字典+设置）首次读取完成——含失败：默认页签（操作/食物）占位退出与
+ *  地点面板挂载的唯一判定，不用列表长度（字典合法为空时不能永久卡在
+ *  「加载中」）；保存后重拉不重置（数据已在内存，按加载态规范不回占位）。 */
+const firstLoadDone = ref(false);
 
 // ── 通知 tab（票 06 + 反馈第二轮 F4 + 票 05 撤食开关 + webui-checkin 票 11 凭据）──
 const notifyForm = ref<NotifySettingsForm>({ master: true, retrieval: true, daysAheadText: "7", pushoverUser: "", pushoverToken: "" });
@@ -202,8 +218,6 @@ async function load() {
   locations.value = locs;
   notifyForm.value = toForm(s);
   autostart.value = s.autostart_enabled;
-  await refreshPushoverStatus();
-  await refreshAvatarShape();
 }
 
 /** 生效来源三态（票 11）：读取失败静默降级为「读取失败」标注，不打扰其他功能区 */
@@ -215,19 +229,25 @@ async function refreshPushoverStatus() {
   }
 }
 
-onMounted(async () => {
-  try {
-    await load();
-  } catch (e) {
-    // 非校验失败走轻提示（票 03 通道迁移），不再占内联红字
-    showError("设置加载失败", String(e));
-  }
-  // 日志区（票 01）加载失败静默：日志区是辅助信息，不值得为它报错打扰
-  await loadLogSection();
-  // 自动备份区（票 02）加载失败同样静默：配置读不出时整区隐藏，不挡其他功能区
-  await loadBackupSection();
-  // 孤儿照片区（票 07）加载失败同样静默：辅助信息不打扰
-  await loadOrphanSection();
+onMounted(() => {
+  // 打开加载链并行化（票 02）：主链与五段辅助读取同批并行。主链失败走轻提示
+  // （与串行版一致）；辅助段各自内部静默（读失败不挡其他功能区）。主链无论
+  // 成败都算「首次读取完成」——占位退出不卡失败态（失败已有轻提示兜底）。
+  const main = load()
+    .catch((e) => {
+      showError("设置加载失败", String(e));
+    })
+    .finally(() => {
+      firstLoadDone.value = true;
+    });
+  void Promise.allSettled([
+    main,
+    refreshPushoverStatus(),
+    refreshAvatarShape(),
+    loadLogSection(),
+    loadBackupSection(),
+    loadOrphanSection(),
+  ]);
 });
 
 // ── 行级即时操作 ──
@@ -651,6 +671,9 @@ function cancelRestore() {
 // 巡检隔离本身在 Rust 启动/恢复后自动做，本区不做移动。
 
 const orphanStats = ref<OrphanPhotoStats | null>(null);
+/** 孤儿区首次读取完成——含失败（票 02 三态判定）：stats 有值 = 成功文本；
+ *  未完成 = LoadingHint 占位；完成而无值 = 「读取失败」（首读期间不再误显）。 */
+const orphanLoaded = ref(false);
 const orphanConfirming = ref(false);
 const orphanBusy = ref(false);
 const orphanError = ref("");
@@ -671,6 +694,8 @@ async function loadOrphanSection(reportError = false) {
   } catch (e) {
     if (reportError) orphanError.value = String(e);
     // 静默路径（首载）：辅助信息读不出不挡其他功能区
+  } finally {
+    orphanLoaded.value = true;
   }
 }
 
@@ -737,110 +762,113 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
 
       <!-- 操作 -->
       <div v-if="activeTab === 'actions'" class="tab-body">
-        <!-- 轻提示票 03：常驻提示行，让「每窝周期」优先于全局设置的能力被看见 -->
-        <p class="hint per-colony-hint">
-          同一操作各窝节奏不同时，编辑某个窝可单独设「每窝周期」，优先于此处的全局设置
-        </p>
-        <div v-for="(row, index) in actionRows" :key="row.id ?? `new-${index}`" class="dict-row" :class="{ 'row-disabled': !row.enabled }">
-          <span class="movers">
-            <button type="button" :disabled="index === 0" @click="moveRow(actionRows, index, -1)">↑</button>
-            <button type="button" :disabled="index === actionRows.length - 1" @click="moveRow(actionRows, index, 1)">↓</button>
-          </span>
-          <input v-model="row.name" class="name-input" type="text" />
-          <select
-            v-if="row.kind !== 'follow'"
-            v-model="row.kind"
-            class="kind-select"
-            :title="row.kind === 'reminding' ? '提醒类：超期标红并通知' : '仅登记：只记录，本页不催促；单个窝仍可在窝编辑里设周期提醒'"
-          >
-            <option value="reminding">提醒</option>
-            <option value="log_only">仅登记</option>
-          </select>
-          <span v-else class="follow-chip" title="跟随喂食：喂了易腐食物后由它收尾，不参与提醒/登记切换">跟随喂食</span>
-          <input
-            v-if="row.kind === 'reminding'"
-            v-model="row.intervalText"
-            class="interval-input"
-            type="number"
-            min="1"
-            title="建议间隔天数：距上次超过它就标红"
-          />
-          <label class="feeding-flag" title="勾选后记账时弹出食物多选；建议全局只勾一个（不强制）">
-            <input v-model="row.isFeeding" type="checkbox" />
-            喂食
-          </label>
-          <span v-if="!row.enabled" class="disabled-chip">已停用</span>
-          <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setActionEnabled(row, false)">停用</button>
-          <button v-else class="row-btn" type="button" @click="setActionEnabled(row, true)">启用</button>
-          <button class="row-btn erase-btn" type="button" :disabled="row.referenced || row.isPreset" :title="eraseTitle(row)" @click="eraseAction(row)">
-            删除
-          </button>
-        </div>
+        <!-- 票 02：主链首读完成前显示加载占位、不渲染空列表；完成后（含失败与
+             空字典）渲染本体——退出判定用 firstLoadDone 标志，不用列表长度。 -->
+        <LoadingHint v-if="!firstLoadDone" />
+        <template v-else>
+          <!-- 轻提示票 03：常驻提示行，让「每窝周期」优先于全局设置的能力被看见 -->
+          <p class="hint per-colony-hint">
+            同一操作各窝节奏不同时，编辑某个窝可单独设「每窝周期」，优先于此处的全局设置
+          </p>
+          <div v-for="(row, index) in actionRows" :key="row.id ?? `new-${index}`" class="dict-row" :class="{ 'row-disabled': !row.enabled }">
+            <span class="movers">
+              <button type="button" :disabled="index === 0" @click="moveRow(actionRows, index, -1)">↑</button>
+              <button type="button" :disabled="index === actionRows.length - 1" @click="moveRow(actionRows, index, 1)">↓</button>
+            </span>
+            <input v-model="row.name" class="name-input" type="text" />
+            <select
+              v-if="row.kind !== 'follow'"
+              v-model="row.kind"
+              class="kind-select"
+              :title="row.kind === 'reminding' ? '提醒类：超期标红并通知' : '仅登记：只记录，本页不催促；单个窝仍可在窝编辑里设周期提醒'"
+            >
+              <option value="reminding">提醒</option>
+              <option value="log_only">仅登记</option>
+            </select>
+            <span v-else class="follow-chip" title="跟随喂食：喂了易腐食物后由它收尾，不参与提醒/登记切换">跟随喂食</span>
+            <input
+              v-if="row.kind === 'reminding'"
+              v-model="row.intervalText"
+              class="interval-input"
+              type="number"
+              min="1"
+              title="建议间隔天数：距上次超过它就标红"
+            />
+            <label class="feeding-flag" title="勾选后记账时弹出食物多选；建议全局只勾一个（不强制）">
+              <input v-model="row.isFeeding" type="checkbox" />
+              喂食
+            </label>
+            <span v-if="!row.enabled" class="disabled-chip">已停用</span>
+            <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setActionEnabled(row, false)">停用</button>
+            <button v-else class="row-btn" type="button" @click="setActionEnabled(row, true)">启用</button>
+            <button class="row-btn erase-btn" type="button" :disabled="row.referenced || row.isPreset" :title="eraseTitle(row)" @click="eraseAction(row)">
+              删除
+            </button>
+          </div>
 
-        <div class="add-row">
-          <input v-model="addActionName" class="add-input" type="text" placeholder="新操作，如：糖水" @keyup.enter="addActionRow('actions')" />
-          <button class="add-btn" type="button" @click="addActionRow('actions')">＋ 添加</button>
-        </div>
+          <div class="add-row">
+            <input v-model="addActionName" class="add-input" type="text" placeholder="新操作，如：糖水" @keyup.enter="addActionRow('actions')" />
+            <button class="add-btn" type="button" @click="addActionRow('actions')">＋ 添加</button>
+          </div>
 
-        <p class="hint">「喂食」标记：勾选的操作记账时会弹出食物多选，建议全局只勾一个（不强制）。性质与间隔改完点「保存」，首页卡片红/灰随之变化。</p>
-        <div class="dlg-btns">
-          <span class="spacer"></span>
-          <button class="btn primary" type="button" :disabled="busy" @click="saveActions">保存</button>
-        </div>
+          <p class="hint">「喂食」标记：勾选的操作记账时会弹出食物多选，建议全局只勾一个（不强制）。性质与间隔改完点「保存」，首页卡片红/灰随之变化。</p>
+          <div class="dlg-btns">
+            <span class="spacer"></span>
+            <button class="btn primary" type="button" :disabled="busy" @click="saveActions">保存</button>
+          </div>
+        </template>
       </div>
 
-      <!-- 食物 -->
+      <!-- 食物（票 02：占位判定与「操作」页签同款，见上） -->
       <div v-else-if="activeTab === 'foods'" class="tab-body">
-        <div v-for="(row, index) in foodRows" :key="row.id ?? `new-${index}`" class="dict-row" :class="{ 'row-disabled': !row.enabled }">
-          <span class="movers">
-            <button type="button" :disabled="index === 0" @click="moveRow(foodRows, index, -1)">↑</button>
-            <button type="button" :disabled="index === foodRows.length - 1" @click="moveRow(foodRows, index, 1)">↓</button>
-          </span>
-          <input v-model="row.name" class="name-input" type="text" />
-          <input
-            v-model="row.intervalText"
-            class="interval-input"
-            type="number"
-            min="1"
-            title="食物建议间隔：距上次喂该食物超过它就单独提醒；留空 = 只按喂食统一周期"
-          />
-          <label class="perish-flag" title="易腐：喂下后超过撤食间隔就提醒收走残食">
-            <input v-model="row.perishable" class="perish-input" type="checkbox" @change="onPerishableChange(row)" />
-            易腐
-          </label>
-          <input
-            v-model="row.retrievalHoursText"
-            class="interval-input retrieval-hours-input"
-            type="number"
-            min="1"
-            max="168"
-            :disabled="!row.perishable"
-            title="撤食间隔（小时）：喂下易腐食物后经过这么久提醒撤走；1–168 整数"
-          />
-          <span v-if="!row.enabled" class="disabled-chip">已停用</span>
-          <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setFoodEnabled(row, false)">停用</button>
-          <button v-else class="row-btn" type="button" @click="setFoodEnabled(row, true)">启用</button>
-          <button class="row-btn erase-btn" type="button" :disabled="row.referenced || row.isPreset" :title="eraseTitle(row)" @click="eraseFood(row)">
-            删除
-          </button>
-        </div>
+        <LoadingHint v-if="!firstLoadDone" />
+        <template v-else>
+          <div v-for="(row, index) in foodRows" :key="row.id ?? `new-${index}`" class="dict-row" :class="{ 'row-disabled': !row.enabled }">
+            <span class="movers">
+              <button type="button" :disabled="index === 0" @click="moveRow(foodRows, index, -1)">↑</button>
+              <button type="button" :disabled="index === foodRows.length - 1" @click="moveRow(foodRows, index, 1)">↓</button>
+            </span>
+            <input v-model="row.name" class="name-input" type="text" />
+            <input
+              v-model="row.intervalText"
+              class="interval-input"
+              type="number"
+              min="1"
+              title="食物建议间隔：距上次喂该食物超过它就单独提醒；留空 = 只按喂食统一周期"
+            />
+            <label class="perish-flag" title="易腐：喂下后超过撤食间隔就提醒收走残食">
+              <input v-model="row.perishable" class="perish-input" type="checkbox" @change="onPerishableChange(row)" />
+              易腐
+            </label>
+            <input
+              v-model="row.retrievalHoursText"
+              class="interval-input retrieval-hours-input"
+              type="number"
+              min="1"
+              max="168"
+              :disabled="!row.perishable"
+              title="撤食间隔（小时）：喂下易腐食物后经过这么久提醒撤走；1–168 整数"
+            />
+            <span v-if="!row.enabled" class="disabled-chip">已停用</span>
+            <button v-if="row.enabled" class="row-btn" type="button" :disabled="row.id === null" @click="setFoodEnabled(row, false)">停用</button>
+            <button v-else class="row-btn" type="button" @click="setFoodEnabled(row, true)">启用</button>
+            <button class="row-btn erase-btn" type="button" :disabled="row.referenced || row.isPreset" :title="eraseTitle(row)" @click="eraseFood(row)">
+              删除
+            </button>
+          </div>
 
-        <div class="add-row">
-          <input v-model="addFoodName" class="add-input" type="text" placeholder="新食物，如：糖水" @keyup.enter="addActionRow('foods')" />
-          <button class="add-btn" type="button" @click="addActionRow('foods')">＋ 添加</button>
-        </div>
+          <div class="add-row">
+            <input v-model="addFoodName" class="add-input" type="text" placeholder="新食物，如：糖水" @keyup.enter="addActionRow('foods')" />
+            <button class="add-btn" type="button" @click="addActionRow('foods')">＋ 添加</button>
+          </div>
 
-        <p class="hint">设了间隔的食物各自算「距上次」，任一超期喂食块就变红并单独提醒。勾「易腐」的食物必须填 1–168 的整数小时（喂下后到点提醒收走残食），取消勾选会清空间隔。</p>
+          <p class="hint">设了间隔的食物各自算「距上次」，任一超期喂食块就变红并单独提醒。勾「易腐」的食物必须填 1–168 的整数小时（喂下后到点提醒收走残食），取消勾选会清空间隔。</p>
 
-        <div class="dlg-btns">
-          <span class="spacer"></span>
-          <button class="btn primary" type="button" :disabled="busy" @click="saveFoods">保存</button>
-        </div>
-      </div>
-
-      <!-- 地点 -->
-      <div v-else-if="activeTab === 'locations'" class="tab-body">
-        <LocationManagerPanel :locations="locations" @saved="onPanelSaved" @changed="onPanelChanged" />
+          <div class="dlg-btns">
+            <span class="spacer"></span>
+            <button class="btn primary" type="button" :disabled="busy" @click="saveFoods">保存</button>
+          </div>
+        </template>
       </div>
 
       <!-- 外观（窝头像票 03）：头像形状全局偏好，选择即存即效（读写与轻提示见 script） -->
@@ -956,16 +984,6 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         </div>
       </div>
 
-      <!-- 网页端（webui-checkin 票 03）：网段 / 端口 / 凭证 / 访问地址 / 防火墙联动 -->
-      <div v-else-if="activeTab === 'webui'" class="tab-body">
-        <WebUiPanel @changed="onPanelChanged" />
-      </div>
-
-      <!-- 更新（release-update 票 06）：检查更新 / 确认安装 / 升级残留引导 -->
-      <div v-else-if="activeTab === 'update'" class="tab-body">
-        <UpdatePanel />
-      </div>
-
       <!-- 数据（票 09 手动出口 + 数据安全二期票 02 自动备份区 + 票 01 日志区） -->
       <div v-else-if="activeTab === 'data'" class="tab-body">
         <!-- 自动备份区（数据安全二期票 02）：开关 / 目录 / 保留份数 / 上次备份状态 -->
@@ -1066,7 +1084,10 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         <div class="backup-section orphan-section">
           <div class="notify-row">
             <span>巢况照片孤儿：</span>
+            <!-- 票 02 三态：未完成首读 → 占位；成功（含「无孤儿」）→ 统计文本；
+                 读取完成而无值（首载失败或手动重试失败）→「读取失败」 -->
             <span v-if="orphanStats" class="orphan-stats-value">{{ orphanStatsText }}</span>
+            <LoadingHint v-else-if="!orphanLoaded" />
             <span v-else class="orphan-stats-value">读取失败</span>
           </div>
           <div class="notify-row">
@@ -1142,6 +1163,28 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
           </div>
           <p v-else class="hint recent-errors-empty">最近没有错误记录。</p>
         </div>
+      </div>
+
+      <!-- 地点 / 网页端 / 更新：急挂载保活（票 02）——独立 v-show 块，脱离上方
+           v-if 链（链只摘除这三个分支，链完整性与其余分支共存不受影响）。弹窗
+           一打开即挂载并与主加载同批读取；页签切换只切显隐不销毁面板（未保存
+           的表单修改、地点行内改名在往返间保留）；弹窗关闭由外层整体销毁重读。
+           置于链后：保证 .tab-body 内的类查找仍先命中当前渲染页签。 -->
+      <div v-show="activeTab === 'locations'" class="tab-body">
+        <!-- 地点面板数据来自主链（面板不自读），主链首读完成即挂载（不晚于主链
+             完成），挂载即带全量数据（面板行是入参快照，不能先空挂再等数据） -->
+        <LocationManagerPanel v-if="firstLoadDone" :locations="locations" @saved="onPanelSaved" @changed="onPanelChanged" />
+        <LoadingHint v-else />
+      </div>
+
+      <!-- 网页端（webui-checkin 票 03）：网段 / 端口 / 凭证 / 访问地址 / 防火墙联动 -->
+      <div v-show="activeTab === 'webui'" class="tab-body">
+        <WebUiPanel @changed="onPanelChanged" />
+      </div>
+
+      <!-- 更新（release-update 票 06）：检查更新 / 确认安装 / 升级残留引导 -->
+      <div v-show="activeTab === 'update'" class="tab-body">
+        <UpdatePanel />
       </div>
 
       <!-- 只剩字段级校验错误走这里（票 03 通道迁移）：非校验失败一律走轻提示 -->
