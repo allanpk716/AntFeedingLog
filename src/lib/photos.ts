@@ -16,7 +16,9 @@
  *   请求在 Windows 服务端常表现为连接被 RST，413 半路断连，先在本地挡体验），
  *   再以 multipart 表单 POST `/api/photos`（checkinId 文本段 + photos 文件段）。
  *   服务端一套校验链兜底（票 07 纯核），返回与桌面 attach_photos 同形的
- *   NestPhotoMeta[]。
+ *   NestPhotoMeta[]。创建模式 `createCheckinPhotosHttp`（checkin-photo-entry
+ *   票 02「拍一张」）不带 checkinId 段、改带 colonyId（+可选 date），服务端
+ *   建当天登记挂照片，预检沿用。
  */
 
 import { convertFileSrc } from "@tauri-apps/api/core";
@@ -93,6 +95,19 @@ export function revokeObjectUrl(url: string): void {
   }
 }
 
+/** 客户端预检（张数 ≤9、单张 ≤15MB）：超限 throw 人话，调用方不发请求。
+ * （超限请求在 Windows 服务端常表现为连接被 RST，413 半路断连，先在本地挡体验。） */
+function assertPhotosWithinLimits(files: File[]): void {
+  if (files.length > MAX_PHOTOS_PER_SUBMIT) {
+    throw `一次最多上传 ${MAX_PHOTOS_PER_SUBMIT} 张照片`;
+  }
+  for (const f of files) {
+    if (f.size > MAX_PHOTO_BYTES) {
+      throw `${f.name}: 单张照片压缩前不能超过 ${MAX_PHOTO_BYTES / 1024 / 1024}MB`;
+    }
+  }
+}
+
 /**
  * 浏览器上传（票 08）：客户端预检（张数/单张体积）→ multipart POST
  * /api/photos。返回与桌面 attach_photos 同形的 NestPhotoMeta[]。
@@ -102,14 +117,7 @@ export async function uploadPhotosHttp(
   files: File[],
 ): Promise<NestPhotoMeta[]> {
   if (files.length === 0) return [];
-  if (files.length > MAX_PHOTOS_PER_SUBMIT) {
-    throw `一次最多上传 ${MAX_PHOTOS_PER_SUBMIT} 张照片`;
-  }
-  for (const f of files) {
-    if (f.size > MAX_PHOTO_BYTES) {
-      throw `${f.name}: 单张照片压缩前不能超过 ${MAX_PHOTO_BYTES / 1024 / 1024}MB`;
-    }
-  }
+  assertPhotosWithinLimits(files);
   const form = new FormData();
   form.append("checkinId", String(checkinId));
   for (const f of files) {
@@ -125,6 +133,53 @@ export async function uploadPhotosHttp(
   } catch {
     // 网络层错误（TypeError: Failed to fetch 等）：不透出浏览器原文，换人话
     throw UPLOAD_INTERRUPTED_MSG;
+  }
+  if (!res.ok) {
+    throw await httpErrorMessage(res);
+  }
+  const body: unknown = await res.json();
+  if (!Array.isArray(body)) {
+    throw "HTTP 响应不是照片清单";
+  }
+  return body as NestPhotoMeta[];
+}
+
+/** 创建模式的网络中断人话（checkin-photo-entry 票 02）：新通道是事务（全成或
+ * 全无），中断 = 本次登记没落库，与挂靠模式的「可能部分成功」措辞区分开。 */
+const CREATE_UPLOAD_INTERRUPTED_MSG =
+  "上传中断（网络断开或超时）。本次登记未保存，可直接重试";
+
+/**
+ * 浏览器上传·创建模式（checkin-photo-entry 票 02「拍一张」）：不挂既有登记，
+ * multipart 不带 checkinId 段，改带 `colonyId` 必填文本段 + 可选 `date` 段
+ * （缺省服务端按今天）+ photos 文件段 → POST /api/photos。服务端建当天登记
+ * （纯照片合法）后返回新建登记的照片元数据 NestPhotoMeta[]。预检与挂靠模式同款。
+ */
+export async function createCheckinPhotosHttp(
+  colonyId: number,
+  files: File[],
+  date?: string,
+): Promise<NestPhotoMeta[]> {
+  if (files.length === 0) return [];
+  assertPhotosWithinLimits(files);
+  const form = new FormData();
+  form.append("colonyId", String(colonyId));
+  if (date !== undefined) {
+    form.append("date", date);
+  }
+  for (const f of files) {
+    form.append("photos", f, f.name);
+  }
+  let res: Response;
+  try {
+    res = await fetch("/api/photos", {
+      method: "POST",
+      headers: authHeaders(),
+      body: form,
+    });
+  } catch {
+    // 网络层错误（TypeError: Failed to fetch 等）：不透出浏览器原文，换人话
+    throw CREATE_UPLOAD_INTERRUPTED_MSG;
   }
   if (!res.ok) {
     throw await httpErrorMessage(res);

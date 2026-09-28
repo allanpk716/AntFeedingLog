@@ -6,6 +6,7 @@ import {
   getStats,
   isTauri,
   listColonies,
+  saveCheckinWithPhotos,
   setColonyActionInterval,
   subscribe,
   type SseVersionFrame,
@@ -135,6 +136,38 @@ describe("桌面路由（透传 Tauri invoke，命令名/参数/返回逐字等�
       colonyId: 1,
       actionId: 2,
       intervalDays: null,
+    });
+  });
+
+  it("save_checkin_with_photos：入参 camelCase 原样透传（拍一张桌面通道，checkin-photo-entry 票 02）", async () => {
+    asTauri();
+    invokeMock.mockResolvedValue(null);
+
+    // 「拍一张」= 仅 colonyId + 照片路径数组（字段可全空，纯照片登记合法）
+    await saveCheckinWithPhotos({ colonyId: 1, photoPaths: ["C:/pics/a.jpg", "C:/pics/b.jpg"] });
+    expect(invokeMock).toHaveBeenCalledWith("save_checkin_with_photos", {
+      colonyId: 1,
+      photoPaths: ["C:/pics/a.jpg", "C:/pics/b.jpg"],
+    });
+
+    // 可选字段（date/queenCount/workerCount/movedNest/note）带上时也原样透传
+    await saveCheckinWithPhotos({
+      colonyId: 2,
+      date: "2026-09-28",
+      queenCount: 1,
+      workerCount: 120,
+      movedNest: true,
+      note: "搬家了",
+      photoPaths: ["C:/pics/c.jpg"],
+    });
+    expect(invokeMock).toHaveBeenCalledWith("save_checkin_with_photos", {
+      colonyId: 2,
+      date: "2026-09-28",
+      queenCount: 1,
+      workerCount: 120,
+      movedNest: true,
+      note: "搬家了",
+      photoPaths: ["C:/pics/c.jpg"],
     });
   });
 
@@ -497,5 +530,7 @@ describe("命令包装的导出面（测试 mock 工厂的路由依据）", () =
     expect(createColony.cmdName).toBe("create_colony");
     expect(getStats.cmdName).toBe("get_stats");
     expect(setColonyActionInterval.cmdName).toBe("set_colony_action_interval");
+    // 拍一张桌面通道（checkin-photo-entry 票 02）：命令名按规格钉死
+    expect(saveCheckinWithPhotos.cmdName).toBe("save_checkin_with_photos");
   });
 });
