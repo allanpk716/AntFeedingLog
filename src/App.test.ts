@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import App from "./App.vue";
+import pkg from "../package.json";
 import type { AppSettings, CareActionItem, Colony, ColonyAction, FoodItem, LocationItem, RecentLog } from "./types";
 import { addDays, todayIso, todayLabel } from "./lib/dates";
 import { stopTodayClock } from "./lib/today";
@@ -160,6 +161,11 @@ describe("首页卡片墙", () => {
     const cards = wrapper.findAll(".vp-cards");
     expect(cards.length).toBeGreaterThanOrEqual(1);
     expect(cards[0].classes()).toContain("cards");
+  });
+
+  it("顶栏品牌旁显示版本号（与 package.json 同源，双端可见）", async () => {
+    const wrapper = await mountApp();
+    expect(wrapper.find(".brand .ver").text()).toBe(`v${pkg.version}`);
   });
 
   it("按地点清单顺序分组，卡片含名字/物种徽章/状态徽章/饲养天数大数字", async () => {

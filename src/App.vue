@@ -23,6 +23,12 @@ import PhotoWallPage from "./components/PhotoWallPage.vue";
 import ToastHost from "./components/ToastHost.vue";
 import WebUiWizard from "./components/WebUiWizard.vue";
 
+import pkg from "../package.json";
+
+/** 界面版本显示（主界面 + 托盘菜单）：前端取 package.json，托盘取 Cargo.toml
+ *  （env! 编译期常量）——两处与 tauri.conf.json 由发版流程四处同步保持一致。 */
+const appVersion = `v${pkg.version}`;
+
 /** 顶栏 nav（票 08 接活「记录」；窝头像票 05 接活「照片」，双端都有） */
 type Page = "home" | "stats" | "photos" | "logs";
 const page = ref<Page>("home");
@@ -120,7 +126,7 @@ onBeforeUnmount(() => stopTodayClock());
 <template>
   <div class="page">
     <header class="topbar">
-      <div class="brand">🐜 蚂蚁饲养日志</div>
+      <div class="brand">🐜 蚂蚁饲养日志<span class="ver">{{ appVersion }}</span></div>
       <nav class="nav">
         <button
           class="tab"
@@ -292,6 +298,14 @@ onBeforeUnmount(() => stopTodayClock());
   font-size: 17px;
   font-weight: 700;
   white-space: nowrap;
+}
+
+/* 版本小字（主界面版本显示）：低调不抢 nav 视线，色取视觉基线 muted */
+.brand .ver {
+  margin-left: 6px;
+  font-size: 12px;
+  font-weight: 400;
+  color: #8f887d;
 }
 
 /* 顶栏 nav（视觉基线 mocks/mock-b-stats.html 的 .nav/.tab） */
