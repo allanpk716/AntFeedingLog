@@ -828,6 +828,9 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("list_actions");
+    // 终局修复：整库替换后推送状态与头像形状也重拉自新库（不残留恢复前旧值）
+    expect(invokeMock).toHaveBeenCalledWith("pushover_status");
+    expect(invokeMock).toHaveBeenCalledWith("get_avatar_shape");
     expect(wrapper.emitted("changed")).toBeTruthy();
   });
 

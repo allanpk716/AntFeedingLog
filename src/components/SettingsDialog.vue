@@ -651,6 +651,9 @@ async function confirmRestoreApply() {
     restoreConfirming.value = false;
     // 库已整体替换：弹窗内字典/通知设置重拉自新库；备份配置在库外不受影响
     await load();
+    // 整库替换后通知凭据与头像形状可能来自不同的库（终局修复：打开链并行化
+    // 把这两段挪出 load() 后，恢复路径不再顺带刷新——此处补回，旧值不残留）
+    await Promise.all([refreshPushoverStatus(), refreshAvatarShape()]);
     emit("changed");
   } catch (e) {
     restoreError.value = String(e);

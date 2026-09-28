@@ -1248,6 +1248,8 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(dialog.exists()).toBe(true);
     expect(dialog.find("h3").text()).toBe("记录投喂 · 大头一号");
     expect(invokeMock).toHaveBeenCalledWith("list_foods");
+    // 票 07：字典首读完成前食物区是「加载中…」占位——flush 后 chips 才渲染
+    await flushPromises();
 
     // 停用食物不出现在新建记录入口（规则 10）
     const chips = dialog.findAll(".food");
