@@ -225,6 +225,41 @@ fn list_checkins(
     with_conn(state, |conn| nest_checkin::list_checkins(conn, colony_id))
 }
 
+/// 新建巢况登记并同事务挂照片（checkin-photo-entry 票 01：「拍一张」「完整登记
+/// 带照片」共用通道）：读盘（体积闸在读内存之前）→ 纯核原子通道——照片校验链
+/// （格式/尺寸/重编码）+ 同一事务建登记行与挂照片（照片算内容：有照片字段可
+/// 全空；无照片走既有「至少填一项」防呆）。成功走 trigger_after_write 与其他
+/// 写命令同一咽喉；巢况不刷托盘（永不参与提醒）。
+#[tauri::command]
+async fn save_checkin_with_photos(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    input: nest_checkin::CheckinInput,
+    paths: Vec<String>,
+) -> Result<nest_checkin::NestCheckin, String> {
+    let photos_root = current_data_dir()?.join(photo::PHOTOS_DIR_NAME);
+    let conn_handle = state.inner().conn_handle();
+    let outcome = tauri::async_runtime::spawn_blocking(move || {
+        let uploads = photo::read_photo_files(&paths)?;
+        run_with_conn(&conn_handle, |conn| {
+            nest_checkin::save_checkin_with_photos(
+                conn,
+                &photos_root,
+                &input,
+                uploads,
+                &colony::today_iso(),
+                &care::now_local(),
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("照片上传任务异常退出: {e}"))?;
+    if outcome.is_ok() {
+        trigger_after_write(&app);
+    }
+    outcome
+}
+
 #[tauri::command]
 fn update_checkin(
     state: tauri::State<'_, DbState>,
@@ -1772,6 +1807,7 @@ pub fn run() {
             update_log,
             delete_log,
             save_checkin,
+            save_checkin_with_photos,
             list_checkins,
             update_checkin,
             delete_checkin,
