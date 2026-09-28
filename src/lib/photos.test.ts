@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MAX_PHOTOS_PER_SUBMIT,
   MAX_PHOTO_BYTES,
+  createCheckinPhotosHttp,
   formatBytes,
   joinPhotoPath,
   loadPhotoBlobUrl,
@@ -249,6 +250,118 @@ describe("photos 网页端（webui-checkin 票 08）", () => {
       );
       await expect(uploadPhotosHttp(7, [new File(["x"], "a.jpg")])).rejects.toBe(
         "上传中断（网络断开或超时）。请刷新查看已保存的照片，避免重复上传后再试",
+      );
+    });
+  });
+
+  // ── 创建模式（checkin-photo-entry 票 02）：「拍一张」不挂既有登记，直接建当天
+  // 登记挂照片。multipart 无 checkinId 段：colonyId 必填文本段 + 可选 date 段
+  // + photos 文件段 → POST /api/photos 返回 NestPhotoMeta[]。 ──
+
+  describe("创建模式 createCheckinPhotosHttp（checkin-photo-entry 票 02）", () => {
+    it("multipart 形状：colonyId 文本段 + date 段 + photos 文件段，无 checkinId 段，Bearer 头照带", async () => {
+      localStorage.setItem(WEBUI_TOKEN_KEY, "tok-create");
+      const created = [
+        { id: 11, checkin_id: 55, rel_path: "1/x.jpg", original_name: null, note: "" },
+      ];
+      const fetchMock = vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => created,
+      }));
+      vi.stubGlobal("fetch", fetchMock);
+      const files = [new File(["a"], "a.jpg"), new File(["b"], "b.png")];
+
+      const out = await createCheckinPhotosHttp(3, files, "2026-09-28");
+
+      expect(out).toEqual(created);
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe("/api/photos");
+      expect(init.method).toBe("POST");
+      expect((init.headers as Record<string, string>).Authorization).toBe("Bearer tok-create");
+      const form = init.body as FormData;
+      expect(form.get("colonyId")).toBe("3");
+      expect(form.get("date")).toBe("2026-09-28");
+      expect(form.get("checkinId")).toBeNull(); // 创建模式与既有挂靠模式互斥的分界
+      expect(form.getAll("photos")).toHaveLength(2);
+    });
+
+    it("date 缺省：multipart 不带 date 段（服务端缺省按今天）", async () => {
+      const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => [] }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await createCheckinPhotosHttp(3, [new File(["a"], "a.jpg")]);
+
+      const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect((init.body as FormData).get("date")).toBeNull();
+    });
+
+    it("字段段（票 03 缝合）：计数整数段、movedNest 仅 true 带、note trim 非空才带；null/缺省不带", async () => {
+      const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => [] }));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await createCheckinPhotosHttp(3, [new File(["a"], "a.jpg")], "2026-09-28", {
+        queenCount: 2,
+        workerCount: null, // null = 未数，不带段
+        movedNest: true,
+        note: "  状态不错  ", // trim 后带
+      });
+
+      const form = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1]
+        .body as FormData;
+      expect(form.get("queenCount")).toBe("2");
+      expect(form.get("workerCount")).toBeNull();
+      expect(form.get("movedNest")).toBe("true");
+      expect(form.get("note")).toBe("状态不错");
+
+      // 反向形态：movedNest false / note 空白 / 字段全缺省 → 三个段都不带
+      await createCheckinPhotosHttp(3, [new File(["a"], "a.jpg")], "2026-09-28", {
+        movedNest: false,
+        note: "   ",
+      });
+      const form2 = (fetchMock.mock.calls[1] as unknown as [string, RequestInit])[1]
+        .body as FormData;
+      expect(form2.get("queenCount")).toBeNull();
+      expect(form2.get("workerCount")).toBeNull();
+      expect(form2.get("movedNest")).toBeNull();
+      expect(form2.get("note")).toBeNull();
+    });
+
+    it("预检沿用：张数超 9 / 单张超 15MB 本地拒绝不发请求；空列表空数组返回", async () => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const files = Array.from({ length: 10 }, (_, i) => new File(["x"], `${i}.jpg`));
+      await expect(createCheckinPhotosHttp(3, files)).rejects.toBe("一次最多上传 9 张照片");
+      const big = new File(["x"], "big.jpg");
+      Object.defineProperty(big, "size", { value: MAX_PHOTO_BYTES + 1 });
+      await expect(createCheckinPhotosHttp(3, [big])).rejects.toContain("big.jpg");
+      await expect(createCheckinPhotosHttp(3, [])).resolves.toEqual([]);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it("非 2xx 以响应体 { error } 人话 reject（与既有模式同路）", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => ({
+          ok: false,
+          status: 400,
+          json: async () => ({ error: "窝不存在" }),
+        })),
+      );
+      await expect(createCheckinPhotosHttp(3, [new File(["x"], "a.jpg")])).rejects.toBe(
+        "窝不存在",
+      );
+    });
+
+    it("网络层中断换人话：新通道事务全成或全无，本次未保存可直接重试", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          throw new TypeError("Failed to fetch");
+        }),
+      );
+      await expect(createCheckinPhotosHttp(3, [new File(["x"], "a.jpg")])).rejects.toBe(
+        "上传中断（网络断开或超时）。本次登记未保存，可直接重试",
       );
     });
   });

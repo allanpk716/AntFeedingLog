@@ -240,7 +240,9 @@ describe("首页卡片墙", () => {
     await flushPromises();
     expect(wrapper.find(".checkin-dialog").exists()).toBe(true);
     expect(invokeMock).toHaveBeenCalledWith("list_checkins", { colonyId: 1 });
-    expect(wrapper.find(".checkin-dialog .checkin-empty").text()).toContain("还没有巢况登记");
+    // 空态占位（checkin-photo-entry 票 03）：拍一张大按钮成为主角，次级链接进完整登记
+    expect(wrapper.find(".checkin-dialog .empty-snap-btn").text()).toContain("拍一张巢况照片");
+    expect(wrapper.find(".checkin-dialog .empty-full-link").text()).toContain("完整登记");
   });
 
   it("已结束的窝默认折叠，展开后可见，且不占分组", async () => {

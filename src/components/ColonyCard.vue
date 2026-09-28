@@ -18,6 +18,11 @@
  * 窝头像票 03：形状接全局偏好——shape prop 缺省时跟随 ipc.ts 的全局镜像
  * （首个挂载的卡片经 get_avatar_shape 拉一次，多实例共享；设置页保存成功后
  * 镜像更新，已挂载卡片经响应性立即切换），显式传入的 prop 仍优先（票 02 契约）。
+ * 拍照直达票 02：「⋯」菜单置顶「📷 拍一张」——不进弹窗直接调相机（网页端隐藏
+ * capture input / 桌面系统文件选择，分流同 NestCheckinDialog onAddPhotos 先例），
+ * 选定照片走新原子保存通道（桌面 save_checkin_with_photos / 网页端 multipart
+ * 创建模式）自动建当天登记挂照片；成功轻提示 + 抛 saved（头像投影即时跟上），
+ * 失败红色轻提示带原因；busy 期间菜单项禁用。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { Colony, ColonyAction, PhotoCrop } from "../types";
@@ -38,12 +43,20 @@ import {
   getPhotoAbsDir,
   isTauri,
   normalizeAvatarShape,
+  pickPhotoFiles,
   saveAvatarShapePref,
+  saveCheckinWithPhotos,
 } from "../lib/ipc";
-import { loadPhotoBlobUrl, photoSrc, revokeObjectUrl } from "../lib/photos";
+import {
+  createCheckinPhotosHttp,
+  loadPhotoBlobUrl,
+  photoSrc,
+  revokeObjectUrl,
+} from "../lib/photos";
 import { checkinCardLine } from "../lib/checkin";
 import { hibernationBanner } from "../lib/hibernation";
 import { todayIso } from "../lib/dates";
+import { showError, showSuccess } from "../lib/toast";
 import FeedDialog from "./FeedDialog.vue";
 import HibernationDialog from "./HibernationDialog.vue";
 import NestCheckinDialog from "./NestCheckinDialog.vue";
@@ -237,6 +250,66 @@ onBeforeUnmount(() => {
   revokeObjectUrl(avatarUrl.value);
 });
 
+// ── 「📷 拍一张」一步直达（checkin-photo-entry 票 02）────────────────────────
+// 菜单点一下不进弹窗直接调相机：网页端点隐藏 capture input（手机直调相机），
+// 桌面走 pick_photo_files 系统文件对话框（桌面无相机，分流同 NestCheckinDialog
+// onAddPhotos 先例）。选定照片不弹确认框，自动建当天登记挂照片（新原子通道，
+// 纯照片合法）；成功轻提示（窗不关视图不变的写操作，全局规范）+ 抛 saved 刷新
+// （首页头像投影即时跟上）；失败红色轻提示带原因；busy 期间菜单项禁用。
+
+const snapBusy = ref(false);
+const snapInput = ref<HTMLInputElement | null>(null);
+
+/** 桌面编排：系统文件选择 → save_checkin_with_photos（路径数组，camelCase）。 */
+async function snapSaveDesktop(): Promise<void> {
+  let picked: string[] | null = null;
+  try {
+    picked = await pickPhotoFiles();
+  } catch (e) {
+    showError("打不开选照片窗口", String(e));
+    return;
+  }
+  if (picked === null || picked.length === 0) return; // 用户取消选文件
+  snapBusy.value = true;
+  try {
+    await saveCheckinWithPhotos({ colonyId: props.colony.id, photoPaths: picked });
+    showSuccess(`✓ 已登记到「${props.colony.name}」· 头像已更新`);
+    emit("saved");
+  } catch (e) {
+    showError("拍照登记失败", String(e));
+  } finally {
+    snapBusy.value = false;
+  }
+}
+
+/** 菜单入口：桌面直接走文件选择；网页端点隐藏 capture input，选定回 onSnapFilesChosen。 */
+function onSnapPhoto(): void {
+  if (isTauri()) {
+    void snapSaveDesktop();
+    return;
+  }
+  snapInput.value?.click();
+}
+
+/** 网页端编排：File 列表 → multipart 创建模式（colonyId + 今天，服务端建当天
+ * 登记挂照片）。取消（files 空）静默返回。 */
+async function onSnapFilesChosen(ev: Event): Promise<void> {
+  const input = ev.target as HTMLInputElement;
+  const files = Array.from(input.files ?? []);
+  input.value = ""; // 清空：同一批文件二次选择也能触发 change
+  if (files.length === 0) return; // 用户取消
+  snapBusy.value = true;
+  try {
+    await createCheckinPhotosHttp(props.colony.id, files, todayIso());
+    showSuccess(`✓ 已登记到「${props.colony.name}」· 头像已更新`);
+    emit("saved");
+  } catch (e) {
+    showError("拍照登记失败", String(e));
+  } finally {
+    snapBusy.value = false;
+  }
+}
+
 const showFeed = ref(false);
 const feedAction = ref<ColonyAction | null>(null);
 
@@ -368,8 +441,31 @@ function onCheckinSaved() {
       </button>
     </div>
 
-    <!-- 交互第三轮 #7：低频操作收进 ⋯ 菜单（v-show 保 DOM，按钮原类名与测试兼容） -->
+    <!-- 拍一张（checkin-photo-entry 票 02）：网页端隐藏 capture input（手机直调
+         相机）；桌面忽略此 input（走 pick_photo_files 系统对话框）。视觉隐藏但可
+         programmatic click（沿 NestCheckinDialog .photo-file-input 先例） -->
+    <input
+      ref="snapInput"
+      class="snap-file-input"
+      type="file"
+      accept="image/*"
+      multiple
+      capture="environment"
+      @change="onSnapFilesChosen"
+    />
+
+    <!-- 交互第三轮 #7：低频操作收进 ⋯ 菜单（v-show 保 DOM，按钮原类名与测试兼容）；
+         拍照直达票 02：「📷 拍一张」置顶第一项，双端渲染 -->
     <div v-show="menuOpen" class="card-menu" @click.stop>
+      <button
+        class="m-item snap-btn"
+        type="button"
+        :disabled="snapBusy"
+        title="拍一张自动登记到今天，头像即时更新"
+        @click="menuAction(onSnapPhoto)"
+      >
+        📷 拍一张
+      </button>
       <button
         v-if="colony.status === 'active'"
         class="m-item hib-btn"
@@ -779,5 +875,20 @@ function onCheckinSaved() {
 .m-item:hover {
   background: var(--accent-soft);
   color: var(--accent-deep);
+}
+
+/* busy 期间「📷 拍一张」禁用态（重开菜单可感知，防并发重复登记） */
+.m-item:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 拍一张的隐藏 capture input（拍照直达票 02）：视觉隐藏但可 programmatic click */
+.snap-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 </style>

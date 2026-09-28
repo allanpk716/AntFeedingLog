@@ -1375,15 +1375,62 @@ async fn drain_field(field: &mut axum::extract::multipart::Field<'_>) {
     while field.chunk().await.ok().flatten().is_some() {}
 }
 
+/// multipart 解析产物：`checkinId` 在 = 挂到已有登记（既有模式）；缺省 = 创建
+/// 模式（colonyId 必填 + 可选字段段，checkin-photo-entry 票 01）。
+struct ParsedPhotoForm {
+    checkin_id: Option<i64>,
+    colony_id: Option<i64>,
+    date: Option<String>,
+    queen_count: Option<i64>,
+    worker_count: Option<i64>,
+    moved_nest: Option<bool>,
+    note: Option<String>,
+    photos: Vec<RawPhoto>,
+}
+
+/// 小文本字段（id/日期/布尔）的单段上限：正常取值远小于此，防任意大文本段。
+const PHOTO_FORM_TEXT_CAP: usize = 64;
+/// 备注段上限：登记备注本无长度硬闸，这里只做内存防身的宽松上限。
+const PHOTO_FORM_NOTE_CAP: usize = 64 * 1024;
+
+/// 单个 multipart 文本字段：cap 内读满、按 UTF-8 宽松解码并 trim。
+async fn read_text_field_capped(
+    field: &mut axum::extract::multipart::Field<'_>,
+    name: &str,
+    cap: usize,
+) -> Result<String, String> {
+    let bytes = read_field_capped(field, cap, &format!("{name} 字段超长")).await?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+/// 解析可选整数字段段：空段 = 缺省；非整数给 400 人话。
+fn parse_optional_count(text: String, field: &str) -> Result<Option<i64>, String> {
+    if text.is_empty() {
+        return Ok(None);
+    }
+    text.parse::<i64>()
+        .map(Some)
+        .map_err(|_| format!("{field} 必须是整数（收到 {text}）"))
+}
+
 /// multipart 解析：`checkinId` 文本段 + `photos` 文件段（≤9 张，逐张流式体积
-/// 闸 ≤15MB）。任何坏形状（缺 checkinId/超张数/超单张/未知字段）返回人话
-/// Err，由调用方统一回 400——先把剩余体排干再回，413 半路断连的形态只留给
-/// limits_mw 的 Content-Length 预检。
+/// 闸 ≤15MB）；创建模式（checkinId 缺省）补收 `colonyId`（必填）与可选
+/// `date/queenCount/workerCount/movedNest/note`。任何坏形状（混用两模式/缺
+/// colonyId/超张数/超单张/未知字段）返回人话 Err，由调用方统一回 400——先把
+/// 剩余体排干再回，413 半路断连的形态只留给 limits_mw 的 Content-Length 预检。
 async fn read_multipart_photos(
     mut multipart: axum::extract::Multipart,
-) -> Result<(i64, Vec<RawPhoto>), String> {
-    let mut checkin_id: Option<i64> = None;
-    let mut photos: Vec<RawPhoto> = Vec::new();
+) -> Result<ParsedPhotoForm, String> {
+    let mut form = ParsedPhotoForm {
+        checkin_id: None,
+        colony_id: None,
+        date: None,
+        queen_count: None,
+        worker_count: None,
+        moved_nest: None,
+        note: None,
+        photos: Vec::new(),
+    };
     let mut error: Option<String> = None;
     while let Some(mut field) = multipart
         .next_field()
@@ -1396,20 +1443,76 @@ async fn read_multipart_photos(
         }
         match field.name() {
             Some("checkinId") => {
-                let read = read_field_capped(&mut field, 64, "checkinId 字段超长").await;
+                let read = read_text_field_capped(&mut field, "checkinId", PHOTO_FORM_TEXT_CAP)
+                    .await;
                 match read {
-                    Ok(bytes) => {
-                        let text = String::from_utf8_lossy(&bytes).trim().to_string();
-                        match text.parse::<i64>() {
-                            Ok(v) if v >= 1 => checkin_id = Some(v),
-                            _ => error = Some(format!("checkinId 必须是正整数（收到 {text}）")),
+                    Ok(text) => match text.parse::<i64>() {
+                        Ok(v) if v >= 1 => form.checkin_id = Some(v),
+                        _ => error = Some(format!("checkinId 必须是正整数（收到 {text}）")),
+                    },
+                    Err(e) => error = Some(e),
+                }
+            }
+            Some("colonyId") => {
+                let read = read_text_field_capped(&mut field, "colonyId", PHOTO_FORM_TEXT_CAP)
+                    .await;
+                match read {
+                    Ok(text) => match text.parse::<i64>() {
+                        Ok(v) if v >= 1 => form.colony_id = Some(v),
+                        _ => error = Some(format!("colonyId 必须是正整数（收到 {text}）")),
+                    },
+                    Err(e) => error = Some(e),
+                }
+            }
+            Some("date") => {
+                match read_text_field_capped(&mut field, "date", PHOTO_FORM_TEXT_CAP).await {
+                    Ok(text) if !text.is_empty() => form.date = Some(text),
+                    Ok(_) => {}
+                    Err(e) => error = Some(e),
+                }
+            }
+            Some("queenCount") => {
+                match read_text_field_capped(&mut field, "queenCount", PHOTO_FORM_TEXT_CAP).await {
+                    Ok(text) => match parse_optional_count(text, "queenCount") {
+                        Ok(v) => form.queen_count = v,
+                        Err(e) => error = Some(e),
+                    },
+                    Err(e) => error = Some(e),
+                }
+            }
+            Some("workerCount") => {
+                match read_text_field_capped(&mut field, "workerCount", PHOTO_FORM_TEXT_CAP).await
+                {
+                    Ok(text) => match parse_optional_count(text, "workerCount") {
+                        Ok(v) => form.worker_count = v,
+                        Err(e) => error = Some(e),
+                    },
+                    Err(e) => error = Some(e),
+                }
+            }
+            Some("movedNest") => {
+                match read_text_field_capped(&mut field, "movedNest", PHOTO_FORM_TEXT_CAP).await {
+                    Ok(text) => match text.to_ascii_lowercase().as_str() {
+                        "" => {}
+                        "true" | "1" => form.moved_nest = Some(true),
+                        "false" | "0" => form.moved_nest = Some(false),
+                        _ => {
+                            error =
+                                Some(format!("movedNest 必须是 true 或 false（收到 {text}）"))
                         }
-                    }
+                    },
+                    Err(e) => error = Some(e),
+                }
+            }
+            Some("note") => {
+                match read_text_field_capped(&mut field, "note", PHOTO_FORM_NOTE_CAP).await {
+                    Ok(text) if !text.is_empty() => form.note = Some(text),
+                    Ok(_) => {}
                     Err(e) => error = Some(e),
                 }
             }
             Some("photos") => {
-                if photos.len() >= crate::photo::MAX_PHOTOS_PER_SUBMIT {
+                if form.photos.len() >= crate::photo::MAX_PHOTOS_PER_SUBMIT {
                     error = Some(format!(
                         "一次最多上传 {} 张照片",
                         crate::photo::MAX_PHOTOS_PER_SUBMIT
@@ -1424,7 +1527,7 @@ async fn read_multipart_photos(
                 );
                 match read_field_capped(&mut field, crate::photo::MAX_INPUT_BYTES, &message).await
                 {
-                    Ok(bytes) => photos.push(RawPhoto {
+                    Ok(bytes) => form.photos.push(RawPhoto {
                         original_name,
                         bytes,
                     }),
@@ -1432,7 +1535,10 @@ async fn read_multipart_photos(
                 }
             }
             _ => {
-                error = Some("表单包含不认识的字段（只收 checkinId 与 photos）".to_string());
+                error = Some(
+                    "表单包含不认识的字段（只收 checkinId/colonyId/date/queenCount/workerCount/movedNest/note 与 photos）"
+                        .to_string(),
+                );
                 drain_field(&mut field).await;
             }
         }
@@ -1440,9 +1546,28 @@ async fn read_multipart_photos(
     if let Some(e) = error {
         return Err(e);
     }
-    match checkin_id {
-        Some(id) => Ok((id, photos)),
-        None => Err("缺少 checkinId 表单字段".to_string()),
+    // 两模式互斥：挂已有登记（checkinId）与创建模式字段段不能混
+    if form.checkin_id.is_some()
+        && (form.colony_id.is_some()
+            || form.date.is_some()
+            || form.queen_count.is_some()
+            || form.worker_count.is_some()
+            || form.moved_nest.is_some()
+            || form.note.is_some())
+    {
+        return Err(
+            "checkinId 与创建模式字段（colonyId/date/queenCount/workerCount/movedNest/note）不能同时提供"
+                .to_string(),
+        );
+    }
+    match form.checkin_id {
+        Some(_) => Ok(form),
+        // 不带 checkinId 即创建模式：colonyId 必填（400 人话，spec 票 01）
+        None if form.colony_id.is_some() => Ok(form),
+        None => Err(
+            "缺少 colonyId 表单字段（不带 checkinId 上传即为创建模式：给该窝新建当天登记，必须提供 colonyId）"
+                .to_string(),
+        ),
     }
 }
 
@@ -1454,54 +1579,105 @@ enum UploadRejection {
     Failed(String),
 }
 
-/// `POST /api/photos`（票 08，规格 E「桌面/网页同一套校验链」）：multipart
-/// `checkinId` + ≤9 张照片，字节过 [`crate::photo::process_uploads`] 纯核
-///（魔数白名单/头部尺寸/解码炸弹/重编码 JPEG 清 EXIF），落盘名一律服务端
-/// UUID（[`crate::photo::attach_photos`] 写入协议：tmp+fsync+原子 rename+插库，
-/// 失败不留半截），成功触发写后钩子（版本 bump + 自动备份；巢况不刷托盘）。
+/// `POST /api/photos`（票 08，规格 E「桌面/网页同一套校验链」；创建模式随
+/// checkin-photo-entry 票 01）：multipart `checkinId` + ≤9 张照片，字节过
+/// [`crate::photo::process_uploads`] 纯核（魔数白名单/头部尺寸/解码炸弹/重编码
+/// JPEG 清 EXIF），落盘名一律服务端 UUID（[`crate::photo::attach_photos`] 写入
+/// 协议：tmp+fsync+原子 rename+插库，失败不留半截），成功触发写后钩子（版本
+/// bump + 自动备份；巢况不刷托盘）。
+///
+/// 创建模式（票 01）：`checkinId` 缺省时补收 `colonyId`（必填，缺则 400）与可选
+/// `date/queenCount/workerCount/movedNest/note`（缺省 date=今天、其余空），走
+/// [`crate::nest_checkin::save_checkin_with_photos`] 通用原子通道（字段+照片同
+/// 事务；照片算内容——纯照片登记合法），返回新登记的 NestPhotoMeta[]。带
+/// `checkinId` 的既有分支行为逐字不变。
 ///
 /// 取舍：**整段在内存处理，不经临时文件**——单张 ≤15MB、单次 ≤9 张，批量内存
 /// 峰值 ≤135MB 与桌面 read_photo_files（整读文件进内存）同包络；超限在
 /// multipart 流式读取时前置拦截，不会先囤满再拒。解码/重编码是 CPU 重活，
-/// 放 spawn_blocking 且库锁外（锁内只留写入协议的小 IO 与插行），与桌面
-/// attach_photos 命令同款。并发计入普通 8 槽（limits_mw 照挂）。
+/// 放 spawn_blocking（既有分支在库锁外做；创建分支在通用通道内、写事务开起前
+/// 先行完成，单用户本地应用可接受）。并发计入普通 8 槽（limits_mw 照挂）。
 async fn photo_upload_handler(
     State(deps): State<Shared>,
     multipart: axum::extract::Multipart,
 ) -> axum::response::Response {
     use axum::http::StatusCode;
-    let (checkin_id, raws) = match read_multipart_photos(multipart).await {
+    let form = match read_multipart_photos(multipart).await {
         Ok(v) => v,
         Err(msg) => return json_error(StatusCode::BAD_REQUEST, &msg),
     };
-    if raws.is_empty() {
+    if form.photos.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "没有收到照片（photos 字段为空）");
     }
+    let ParsedPhotoForm {
+        checkin_id,
+        colony_id,
+        date,
+        queen_count,
+        worker_count,
+        moved_nest,
+        note,
+        photos,
+    } = form;
     let photos_root = deps.data_dir.join(crate::photo::PHOTOS_DIR_NAME);
     let conn = deps.conn.clone();
-    let uploads: Vec<crate::photo::PhotoUpload> = raws
+    let uploads: Vec<crate::photo::PhotoUpload> = photos
         .into_iter()
         .map(|r| crate::photo::PhotoUpload {
             original_name: r.original_name,
             bytes: r.bytes,
         })
         .collect();
+    // 创建模式入参（checkinId 缺省）：可选字段缺省 date=今天、其余空
+    let create_input = checkin_id.is_none().then(|| {
+        crate::nest_checkin::CheckinInput {
+            colony_id: colony_id.unwrap_or(0),
+            date: date.unwrap_or_else(|| crate::colony::today_iso()),
+            queen_count,
+            worker_count,
+            moved_nest: moved_nest.unwrap_or(false),
+            note,
+        }
+    });
     let joined = tauri::async_runtime::spawn_blocking(
         move || -> Result<Vec<crate::nest_checkin::NestPhotoMeta>, UploadRejection> {
-            // 快速失败：登记不存在就不烧解码重编码的 CPU（业务错误 → 500）
-            let exists =
-                crate::run_with_conn(&conn, |c| crate::nest_checkin::checkin_exists(c, checkin_id))
+            match checkin_id {
+                Some(checkin_id) => {
+                    // 既有分支：挂已有登记。快速失败：登记不存在就不烧解码
+                    // 重编码的 CPU（业务错误 → 500）
+                    let exists = crate::run_with_conn(&conn, |c| {
+                        crate::nest_checkin::checkin_exists(c, checkin_id)
+                    })
                     .map_err(UploadRejection::Failed)?;
-            if !exists {
-                return Err(UploadRejection::Failed("登记不存在".to_string()));
+                    if !exists {
+                        return Err(UploadRejection::Failed("登记不存在".to_string()));
+                    }
+                    // 校验链拒 = 客户端内容坏 → 400
+                    let processed = crate::photo::process_uploads(uploads)
+                        .map_err(UploadRejection::BadRequest)?;
+                    crate::run_with_conn(&conn, |c| {
+                        crate::photo::attach_photos(c, &photos_root, checkin_id, &processed)
+                    })
+                    .map_err(UploadRejection::Failed)
+                }
+                None => {
+                    // 创建模式：通用原子通道（字段+照片同事务）。业务错误与
+                    // /api/cmd 同口径 → 500 人话
+                    let input = create_input.expect("解析层保证创建模式必有 colonyId");
+                    crate::run_with_conn(&conn, |c| {
+                        crate::nest_checkin::save_checkin_with_photos(
+                            c,
+                            &photos_root,
+                            &input,
+                            uploads,
+                            &crate::colony::today_iso(),
+                            &crate::care::now_local(),
+                        )
+                    })
+                    .map_err(UploadRejection::Failed)
+                    .map(|checkin| checkin.photos)
+                }
             }
-            // 校验链拒 = 客户端内容坏 → 400
-            let processed = crate::photo::process_uploads(uploads)
-                .map_err(UploadRejection::BadRequest)?;
-            crate::run_with_conn(&conn, |c| {
-                crate::photo::attach_photos(c, &photos_root, checkin_id, &processed)
-            })
-            .map_err(UploadRejection::Failed)
         },
     )
     .await
@@ -3830,12 +4006,22 @@ mod tests {
     const MULTIPART_BOUNDARY: &str = "----antfeedinglog-test-boundary";
 
     fn multipart_body(checkin_id: Option<i64>, photos: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let fields: Vec<(&str, String)> = checkin_id
+            .map(|id| ("checkinId", id.to_string()))
+            .into_iter()
+            .collect();
+        multipart_body_fields(&fields, photos)
+    }
+
+    /// 通用 multipart 构造：文本字段若干（checkinId/colonyId/可选字段）+ photos
+    /// 文件段（创建模式用——checkinId 缺省，colonyId 与可选字段为文本段）。
+    fn multipart_body_fields(fields: &[(&str, String)], photos: &[(&str, Vec<u8>)]) -> Vec<u8> {
         let mut b = Vec::new();
-        if let Some(id) = checkin_id {
+        for (name, value) in fields {
             b.extend_from_slice(
                 format!(
                     "--{MULTIPART_BOUNDARY}\r\n\
-                     Content-Disposition: form-data; name=\"checkinId\"\r\n\r\n{id}\r\n"
+                     Content-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
                 )
                 .as_bytes(),
             );
@@ -4061,6 +4247,226 @@ mod tests {
             body["error"].as_str().unwrap_or("").contains("凭证"),
             "实际：{body}"
         );
+        block(handle.stop());
+    }
+
+    #[test]
+    fn photo_upload_create_mode_builds_checkin_with_fields_and_photos() {
+        // 创建模式（checkinId 缺省）：colonyId + 可选字段段 + 照片 → 通用原子通道：
+        // 建登记行（字段落库）+ 照片成对落盘，返回 NestPhotoMeta[]；写后钩子按
+        // 巢况语义（不刷托盘）触发。
+        let token = "a".repeat(32);
+        let fired = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let fired2 = fired.clone();
+        let after_write: AfterWriteHook = Arc::new(move |with_tray| {
+            fired2.lock().unwrap().push(with_tray);
+        });
+        let (deps, _dir) = test_deps_with(&["127.0.0.0/8"], &token, after_write, Arc::new(|_| None));
+        let colony_id = seed_colony(&deps.conn, "拍照窝");
+        let handle = block(start(deps.clone(), 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+
+        // 带字段的创建：字段+照片一并落库
+        let (status, body) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body_fields(
+                &[
+                    ("colonyId", colony_id.to_string()),
+                    ("date", "2026-09-15".into()),
+                    ("queenCount", "2".into()),
+                    ("note", "网页拍照".into()),
+                ],
+                &[("IMG_001.jpg", tiny_jpeg())],
+            ),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        let arr = body.as_array().expect("返回 NestPhotoMeta[]");
+        assert_eq!(arr.len(), 1);
+        let rel = arr[0]["rel_path"].as_str().expect("rel_path");
+        let checkin_id = arr[0]["checkin_id"].as_i64().expect("挂靠登记 id 随照片带回");
+        let conn = deps.conn.lock().unwrap();
+        let (date, queen, note): (String, Option<i64>, String) = conn
+            .query_row(
+                "SELECT date, queen_count, note FROM nest_checkin WHERE id = ?1",
+                [checkin_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let rel_in_db: String = conn
+            .query_row(
+                "SELECT rel_path FROM nest_photo WHERE checkin_id = ?1",
+                [checkin_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(date, "2026-09-15");
+        assert_eq!(queen, Some(2));
+        assert_eq!(note, "网页拍照");
+        assert_eq!(rel_in_db, rel, "元数据行已插且与返回一致");
+        assert!(
+            deps.data_dir
+                .join(crate::photo::PHOTOS_DIR_NAME)
+                .join(rel)
+                .exists(),
+            "照片文件成对落盘"
+        );
+        assert_eq!(fired.lock().unwrap().as_slice(), &[false], "巢况写不刷托盘");
+
+        // 全缺省（拍一张形状）：只有 colonyId + 照片 → date=今天、其余空
+        let (status, body) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body_fields(
+                &[("colonyId", colony_id.to_string())],
+                &[("IMG_002.jpg", tiny_jpeg())],
+            ),
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        let arr = body.as_array().unwrap();
+        let checkin_id = arr[0]["checkin_id"].as_i64().unwrap();
+        let conn = deps.conn.lock().unwrap();
+        let (date, queen, worker, moved, note): (String, Option<i64>, Option<i64>, bool, String) =
+            conn.query_row(
+                "SELECT date, queen_count, worker_count, moved_nest, note
+                 FROM nest_checkin WHERE id = ?1",
+                [checkin_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, i64>(3)? != 0, r.get(4)?)),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(date, crate::colony::today_iso(), "缺省 date=今天");
+        assert_eq!(queen, None);
+        assert_eq!(worker, None);
+        assert!(!moved);
+        assert_eq!(note, "");
+        block(handle.stop());
+    }
+
+    #[test]
+    fn photo_upload_create_mode_rejects_missing_unknown_colony_mixed_and_bad_fields() {
+        // 创建模式的拒绝面：缺 colonyId 400 人话；未知窝 500（与既有未知登记同
+        // 口径）；checkinId 与创建模式字段混用 400；可选字段段乱值 400；零照片
+        // 400；拒绝轮不污染后续上传。
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let colony_id = seed_colony(&deps.conn, "拒绝窝");
+        let checkin_id = seed_checkin(&deps, "已有登记窝");
+        let handle = block(start(deps.clone(), 0)).unwrap();
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+
+        // 缺 colonyId（无 checkinId 无 colonyId = 创建模式缺窝 id）→ 400
+        let (status, body) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body_fields(&[], &[("a.jpg", tiny_jpeg())]),
+        );
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("colonyId"),
+            "实际：{body}"
+        );
+
+        // 未知窝 → 500（业务错误，与既有未知登记同口径）
+        let (status, body) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body_fields(&[("colonyId", "999".into())], &[("a.jpg", tiny_jpeg())]),
+        );
+        assert_eq!(status, 500);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("窝不存在"),
+            "实际：{body}"
+        );
+
+        // 混用 checkinId + colonyId → 400（两模式互斥）
+        let (status, body) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body_fields(
+                &[
+                    ("checkinId", checkin_id.to_string()),
+                    ("colonyId", colony_id.to_string()),
+                ],
+                &[("a.jpg", tiny_jpeg())],
+            ),
+        );
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("colonyId"),
+            "实际：{body}"
+        );
+
+        // movedNest 乱值 → 400
+        let (status, body) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body_fields(
+                &[
+                    ("colonyId", colony_id.to_string()),
+                    ("movedNest", "是".into()),
+                ],
+                &[("a.jpg", tiny_jpeg())],
+            ),
+        );
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("movedNest"),
+            "实际：{body}"
+        );
+
+        // queenCount 非整数 → 400
+        let (status, body) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body_fields(
+                &[
+                    ("colonyId", colony_id.to_string()),
+                    ("queenCount", "很多".into()),
+                ],
+                &[("a.jpg", tiny_jpeg())],
+            ),
+        );
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("queenCount"),
+            "实际：{body}"
+        );
+
+        // 创建模式零照片 → 400（本端点照片必需；纯核双空拒由纯核单测覆盖）
+        let (status, body) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body_fields(&[("colonyId", colony_id.to_string())], &[]),
+        );
+        assert_eq!(status, 400);
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("照片"),
+            "实际：{body}"
+        );
+
+        // 一轮拒绝之后照常可用（无半截状态）
+        let (status, _) = post_photos(
+            &a,
+            &base,
+            Some(&token),
+            multipart_body_fields(
+                &[("colonyId", colony_id.to_string())],
+                &[("ok.jpg", tiny_jpeg())],
+            ),
+        );
+        assert_eq!(status, 200, "拒绝轮不污染后续上传");
         block(handle.stop());
     }
 

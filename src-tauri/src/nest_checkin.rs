@@ -14,8 +14,12 @@
 //!   照片的登记的第一张照片」，纯查询不落库；photo_wall 照片墙只读载荷同契约；
 //! - 巢况永不参与提醒/催促（reminder.rs 不引用本模块，不进维护操作清单）。
 
+use std::path::Path;
+
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+
+use crate::photo::{self, PhotoUpload};
 
 // ── DTO ──────────────────────────────────────────────────────────────────
 
@@ -158,7 +162,9 @@ fn ensure_colony_exists(conn: &Connection, colony_id: i64) -> Result<(), String>
     Ok(())
 }
 
-/// 保存前共通校验：返回（规整日期、trim 后备注）。
+/// 保存前共通校验：返回（规整日期、trim 后备注）。`photo_counts_as_content` =
+/// 「照片算内容」（checkin-photo-entry 票 01）：true 时字段可全空（纯照片登记
+/// 合法，跳过至少填一项防呆）；false 走既有防呆。
 fn validate_fields(
     date: &str,
     queen_count: Option<i64>,
@@ -166,12 +172,15 @@ fn validate_fields(
     moved_nest: bool,
     note: Option<&str>,
     today: &str,
+    photo_counts_as_content: bool,
 ) -> Result<(String, String), String> {
     let date = parse_checkin_date(date)?;
     ensure_not_future_date(&date, today)?;
     validate_counts(queen_count, worker_count)?;
     let note = note.map(str::trim).unwrap_or("").to_string();
-    ensure_something_filled(queen_count, worker_count, moved_nest, &note)?;
+    if !photo_counts_as_content {
+        ensure_something_filled(queen_count, worker_count, moved_nest, &note)?;
+    }
     Ok((date, note))
 }
 
@@ -192,6 +201,7 @@ pub fn save_checkin(
         input.moved_nest,
         input.note.as_deref(),
         today,
+        false,
     )?;
     conn.execute(
         "INSERT INTO nest_checkin
@@ -209,6 +219,62 @@ pub fn save_checkin(
     )
     .map_err(db_err)?;
     get_checkin(conn, conn.last_insert_rowid())
+}
+
+/// 通用原子保存通道（checkin-photo-entry 票 01）：同一事务边界内建登记行（含
+/// 全部表单字段 date/queen_count/worker_count/moved_nest/note）+ 挂照片，返回
+/// 带照片元数据的完整行。
+///
+/// 校验语义（照片算内容·新建径）：`uploads` 非空 → 表单字段可全空（纯照片登记
+/// 合法）；`uploads` 空 → 走既有「至少填一项」防呆；colony 不存在拒；双空拒。
+/// 照片沿用既有校验链（格式/尺寸/重编码，[`photo::process_uploads`]，在事务外
+/// 先走：失败则一切未落，CPU 重活不占写事务）与文件编排
+/// （[`photo::attach_photos`]：UUID 落盘 + 元数据行）。事务性（库层）：照片环节
+/// 返回 Err（校验失败/库写失败）时登记行一并回滚不落；文件级失败沿既有孤儿口径
+/// （下轮巡检隔离），不回滚库。
+///
+/// 三个调用面同一通道：「拍一张」= 全空 input（date=今天）+ 照片；「完整登记
+/// 带照片」= 完整 input + 照片一并原子落库；「完整登记无照片」= 既有
+/// [`save_checkin`] 零变化。
+pub fn save_checkin_with_photos(
+    conn: &Connection,
+    photos_root: &Path,
+    input: &CheckinInput,
+    uploads: Vec<PhotoUpload>,
+    today: &str,
+    now: &str,
+) -> Result<NestCheckin, String> {
+    ensure_colony_exists(conn, input.colony_id)?;
+    let (date, note) = validate_fields(
+        &input.date,
+        input.queen_count,
+        input.worker_count,
+        input.moved_nest,
+        input.note.as_deref(),
+        today,
+        !uploads.is_empty(),
+    )?;
+    let processed = photo::process_uploads(uploads)?;
+    let tx = conn.unchecked_transaction().map_err(db_err)?;
+    tx.execute(
+        "INSERT INTO nest_checkin
+             (colony_id, date, queen_count, worker_count, moved_nest, note, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            input.colony_id,
+            date,
+            input.queen_count,
+            input.worker_count,
+            input.moved_nest,
+            note,
+            now
+        ],
+    )
+    .map_err(db_err)?;
+    let checkin_id = tx.last_insert_rowid();
+    photo::attach_photos(&tx, photos_root, checkin_id, &processed)?;
+    tx.commit().map_err(db_err)?;
+    get_checkin(conn, checkin_id)
 }
 
 /// 照片元数据（按 id 序）。
@@ -352,6 +418,15 @@ pub fn update_checkin(
     if exists == 0 {
         return Err("登记不存在".into());
     }
+    // 照片算内容（checkin-photo-entry 票 01·更新径）：库内已有照片的登记，
+    // 数/换巢/备注全空也可保存（纯照片条目后补/清空字段不被防呆拦）。
+    let photo_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM nest_photo WHERE checkin_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
     let (date, note) = validate_fields(
         &input.date,
         input.queen_count,
@@ -359,6 +434,7 @@ pub fn update_checkin(
         input.moved_nest,
         input.note.as_deref(),
         today,
+        photo_count > 0,
     )?;
     conn.execute(
         "UPDATE nest_checkin
@@ -604,6 +680,7 @@ pub fn photo_wall(conn: &Connection) -> Result<Vec<PhotoWallColony>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     /// 建内存库并迁移到最新 schema（票 01 地基）。
     fn mem_conn() -> Connection {
@@ -1175,6 +1252,234 @@ mod tests {
         checkin_on(&conn, bare, "2026-09-15", "纯文字");
         assert!(avatar_photo_for_colony(&conn, bare).unwrap().is_none());
         assert!(avatar_photo_for_colony(&conn, 999).unwrap().is_none());
+    }
+
+    // ── 通用原子保存通道（checkin-photo-entry 票 01）─────────────────────────
+
+    fn jpeg_bytes(w: u32, h: u32) -> Vec<u8> {
+        use std::io::Cursor;
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            w,
+            h,
+            image::Rgb([10, 20, 30]),
+        ));
+        let mut buf = Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+        buf.into_inner()
+    }
+
+    fn upload(name: &str, bytes: Vec<u8>) -> crate::photo::PhotoUpload {
+        crate::photo::PhotoUpload {
+            original_name: Some(name.into()),
+            bytes,
+        }
+    }
+
+    fn photo_dir(tmp: &TempDir) -> std::path::PathBuf {
+        tmp.path().join(crate::photo::PHOTOS_DIR_NAME)
+    }
+
+    #[test]
+    fn save_with_photos_lands_fields_and_photos_in_one_tx() {
+        // 四向之一「字段+照片」：全部表单字段 + 照片一并落库，文件成对在盘
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let tmp = TempDir::new().unwrap();
+        let mut input = empty_input(c, " 2026-09-18 ");
+        input.queen_count = Some(2);
+        input.worker_count = Some(3000);
+        input.moved_nest = true;
+        input.note = Some("  搬进新塔  ".into());
+
+        let saved = save_checkin_with_photos(
+            &conn,
+            &photo_dir(&tmp),
+            &input,
+            vec![upload("a.jpg", jpeg_bytes(64, 48)), upload("b.jpg", jpeg_bytes(80, 60))],
+            TODAY,
+            NOW,
+        )
+        .unwrap();
+
+        assert_eq!(saved.colony_id, c);
+        assert_eq!(saved.date, "2026-09-18", "日期规整照走");
+        assert_eq!(saved.queen_count, Some(2));
+        assert_eq!(saved.worker_count, Some(3000));
+        assert!(saved.moved_nest);
+        assert_eq!(saved.note, "搬进新塔", "备注 trim 照走");
+        assert_eq!(saved.photos.len(), 2, "照片元数据随返回行带回");
+        for p in &saved.photos {
+            assert!(photo_dir(&tmp).join(&p.rel_path).exists(), "文件成对落盘");
+        }
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM nest_checkin"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM nest_photo"), 2);
+    }
+
+    #[test]
+    fn save_with_photos_photo_only_is_legal_with_blank_fields() {
+        // 四向之二「仅照片」：uploads 非空 → 字段全空合法（纯照片登记）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let tmp = TempDir::new().unwrap();
+
+        let saved = save_checkin_with_photos(
+            &conn,
+            &photo_dir(&tmp),
+            &empty_input(c, "2026-09-18"),
+            vec![upload("随手拍.jpg", jpeg_bytes(64, 48))],
+            TODAY,
+            NOW,
+        )
+        .unwrap();
+
+        assert_eq!(saved.queen_count, None, "字段可全空");
+        assert_eq!(saved.worker_count, None);
+        assert!(!saved.moved_nest);
+        assert_eq!(saved.note, "");
+        assert_eq!(saved.photos.len(), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM nest_checkin"), 1);
+    }
+
+    #[test]
+    fn save_with_photos_fields_only_keeps_guard_and_double_empty_rejected() {
+        // 四向之三「仅字段」：uploads 空 → 既有「至少填一项」防呆照走（填了放行）；
+        // 四向之四「双空」：无字段无照片拒，不落库
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let tmp = TempDir::new().unwrap();
+
+        let mut note_only = empty_input(c, "2026-09-18");
+        note_only.note = Some("手记".into());
+        save_checkin_with_photos(&conn, &photo_dir(&tmp), &note_only, vec![], TODAY, NOW)
+            .expect("填了字段的零照片登记照常放行");
+
+        let err = save_checkin_with_photos(
+            &conn,
+            &photo_dir(&tmp),
+            &empty_input(c, "2026-09-18"),
+            vec![],
+            TODAY,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(err.contains("至少填一项"), "实际错误：{err}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM nest_checkin"), 1, "双空不落库");
+    }
+
+    #[test]
+    fn save_with_photos_rejects_unknown_colony_before_touching_disk() {
+        // colony 不存在拒：校验先行，不烧重编码 CPU、不建照片目录
+        let conn = mem_conn();
+        let tmp = TempDir::new().unwrap();
+
+        let err = save_checkin_with_photos(
+            &conn,
+            &photo_dir(&tmp),
+            &empty_input(999, "2026-09-18"),
+            vec![upload("a.jpg", jpeg_bytes(64, 48))],
+            TODAY,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(err.contains("窝不存在"), "实际错误：{err}");
+        assert!(!photo_dir(&tmp).exists(), "未到照片环节，不建目录");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM nest_checkin"), 0);
+    }
+
+    #[test]
+    fn save_with_photos_photo_failure_rolls_back_checkin_row() {
+        // 库层事务性：attach_photos 返回 Err（注入 nest_photo 表缺失）→ 登记行回滚不落；
+        // rename 后的半截文件由既有写入协议自清
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let tmp = TempDir::new().unwrap();
+        conn.execute("DROP TABLE nest_photo", []).unwrap();
+        let mut input = empty_input(c, "2026-09-18");
+        input.note = Some("会回滚".into());
+
+        let err = save_checkin_with_photos(
+            &conn,
+            &photo_dir(&tmp),
+            &input,
+            vec![upload("a.jpg", jpeg_bytes(64, 48))],
+            TODAY,
+            NOW,
+        )
+        .unwrap_err();
+        assert!(err.contains("数据库操作失败"), "实际错误：{err}");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM nest_checkin"),
+            0,
+            "照片失败登记不落"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(photo_dir(&tmp).join(c.to_string()))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(leftovers.is_empty(), "失败照片不留半截文件，实际 {leftovers:?}");
+    }
+
+    #[test]
+    fn update_checkin_all_empty_succeeds_when_checkin_has_photos() {
+        // 更新径「照片算内容」：库内有照片的登记，数/换巢/备注全空可保存（补录不被拦）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let mut input = empty_input(c, "2026-09-15");
+        input.note = Some("待清空".into());
+        let saved = save_checkin(&conn, &input, TODAY, NOW).unwrap();
+        photo(&conn, saved.id, "1/a.jpg");
+
+        let updated = update_checkin(
+            &conn,
+            saved.id,
+            &CheckinUpdateInput {
+                date: "2026-09-15".into(),
+                queen_count: None,
+                worker_count: None,
+                moved_nest: false,
+                note: None,
+            },
+            TODAY,
+        )
+        .unwrap();
+        assert_eq!(updated.queen_count, None);
+        assert_eq!(updated.worker_count, None);
+        assert!(!updated.moved_nest);
+        assert_eq!(updated.note, "");
+        assert_eq!(updated.photos.len(), 1, "编辑不动照片");
+    }
+
+    #[test]
+    fn avatar_follows_latest_capture_when_two_photo_only_saves_same_day() {
+        // 同日两次「拍一张」（纯照片登记）→ 头像取后一次（排序契约：同日后建者在前）
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号");
+        let tmp = TempDir::new().unwrap();
+
+        let first = save_checkin_with_photos(
+            &conn,
+            &photo_dir(&tmp),
+            &empty_input(c, "2026-09-18"),
+            vec![upload("早.jpg", jpeg_bytes(64, 48))],
+            TODAY,
+            NOW,
+        )
+        .unwrap();
+        let second = save_checkin_with_photos(
+            &conn,
+            &photo_dir(&tmp),
+            &empty_input(c, "2026-09-18"),
+            vec![upload("晚.jpg", jpeg_bytes(64, 48))],
+            TODAY,
+            NOW,
+        )
+        .unwrap();
+
+        let avatar = avatar_photo_for_colony(&conn, c).unwrap().unwrap();
+        assert_eq!(avatar.checkin_id, second.id, "同日取后建登记");
+        assert_eq!(avatar.id, second.photos[0].id, "头像取后一次的照片");
+        assert_ne!(avatar.id, first.photos[0].id);
     }
 
     #[test]

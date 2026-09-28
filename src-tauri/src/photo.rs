@@ -325,18 +325,26 @@ fn persist_one(
     // 库存相对路径（统一正斜杠，跨平台口径一致）
     let rel_path = format!("{dir_name}/{uuid}.jpg");
     let insert = || -> Result<i64, String> {
-        let tx = conn
-            .unchecked_transaction()
+        // 既有协议：自动提交态自带小事务（库行与文件成对收尾）。处于调用方
+        // 事务内（nest_checkin::save_checkin_with_photos 原子通道，rusqlite 的
+        // BEGIN 不支持嵌套）则直接插行、提交归外层——登记与照片同事务落库。
+        let exec = |c: &Connection| -> Result<i64, String> {
+            c.execute(
+                "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
+                 VALUES (?1, ?2, ?3, '')",
+                params![checkin_id, rel_path, up.original_name],
+            )
             .map_err(db_err)?;
-        tx.execute(
-            "INSERT INTO nest_photo (checkin_id, rel_path, original_name, note)
-             VALUES (?1, ?2, ?3, '')",
-            params![checkin_id, rel_path, up.original_name],
-        )
-        .map_err(db_err)?;
-        let id = tx.last_insert_rowid();
-        tx.commit().map_err(db_err)?;
-        Ok(id)
+            Ok(c.last_insert_rowid())
+        };
+        if conn.is_autocommit() {
+            let tx = conn.unchecked_transaction().map_err(db_err)?;
+            let id = exec(&tx)?;
+            tx.commit().map_err(db_err)?;
+            Ok(id)
+        } else {
+            exec(conn)
+        }
     };
     match insert() {
         Ok(id) => Ok(NestPhotoMeta {

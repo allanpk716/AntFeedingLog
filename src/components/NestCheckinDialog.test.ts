@@ -3,15 +3,21 @@ import { flushPromises, mount } from "@vue/test-utils";
 import NestCheckinDialog from "./NestCheckinDialog.vue";
 import PhotoCropEditor from "./PhotoCropEditor.vue";
 import type { Colony, NestCheckin } from "../types";
+import { todayIso } from "../lib/dates";
+// 时间线改版（checkin-photo-entry 票 03）：轻提示断言走真实 toast store（沿 ColonyCard 先例）
+import { clearToasts, toastItems } from "../lib/toast";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（沿 QuickLogDialog.test.ts 先例）
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
 // 票 08：网页端照片通路（blob 取图/HTTP 上传）打桩；photoSrc 等 桌面既有函数透传
-const { uploadPhotosHttpMock, loadPhotoBlobUrlMock, revokeObjectUrlMock } = vi.hoisted(() => ({
-  uploadPhotosHttpMock: vi.fn(),
-  loadPhotoBlobUrlMock: vi.fn(),
-  revokeObjectUrlMock: vi.fn(),
-}));
+// 票 03：网页端创建模式上传打桩（「拍一张」编排/表单带照片保存断言用）
+const { uploadPhotosHttpMock, loadPhotoBlobUrlMock, revokeObjectUrlMock, createCheckinPhotosHttpMock } =
+  vi.hoisted(() => ({
+    uploadPhotosHttpMock: vi.fn(),
+    loadPhotoBlobUrlMock: vi.fn(),
+    revokeObjectUrlMock: vi.fn(),
+    createCheckinPhotosHttpMock: vi.fn(),
+  }));
 vi.mock("../lib/ipc", async (importOriginal) => {
   const { ipcModuleMock } = await import("../testing/ipcMock");
   return ipcModuleMock(invokeMock)(importOriginal);
@@ -21,6 +27,7 @@ vi.mock("../lib/photos", async (importOriginal) => {
   return {
     ...actual,
     uploadPhotosHttp: uploadPhotosHttpMock,
+    createCheckinPhotosHttp: createCheckinPhotosHttpMock,
     loadPhotoBlobUrl: loadPhotoBlobUrlMock,
     revokeObjectUrl: revokeObjectUrlMock,
   };
@@ -68,6 +75,7 @@ async function mountDlg(entries: NestCheckin[]) {
 
 beforeEach(() => {
   invokeMock.mockReset();
+  clearToasts(); // 轻提示断言跨用例隔离（toast store 是模块级状态）
 });
 
 describe("NestCheckinDialog（webui-checkin 票 02）", () => {
@@ -92,23 +100,31 @@ describe("NestCheckinDialog（webui-checkin 票 02）", () => {
     expect(entries[0].find(".entry-photos").exists()).toBe(false);
   });
 
-  it("空时间线显示空态", async () => {
+  it("空时间线：大占位「拍一张巢况照片」按钮 + 次级链接，不再渲染顶部双按钮与表单", async () => {
     const w = await mountDlg([]);
-    expect(w.find(".checkin-empty").exists()).toBe(true);
-    expect(w.find(".checkin-empty").text()).toContain("还没有巢况登记");
+    expect(w.find(".empty-snap").exists()).toBe(true);
+    expect(w.find(".empty-snap-btn").text()).toContain("拍一张巢况照片");
+    expect(w.find(".empty-full-link").text()).toContain("或做一次完整登记");
+    // 空态由占位区承担同款入口（对齐 mock 场景 3，避免双份拍照按钮）；表单默认收起
+    expect(w.find(".top-actions").exists()).toBe(false);
+    expect(w.find(".record-btn").exists()).toBe(false);
   });
 
-  it("全空提交被前端拦截：不发 save_checkin，弹窗内提示", async () => {
+  it("全空提交被前端拦截：不发 save_checkin，弹窗内提示（内联红字，不进轻提示）", async () => {
     const w = await mountDlg([]);
+    await w.find(".empty-full-link").trigger("click"); // 票 03：空态无顶部按钮，用次级链接展开
     await w.find(".record-btn").trigger("click");
     await flushPromises();
 
     expect(w.find(".form-error").text()).toContain("至少填一项");
+    expect(w.find(".form-error").text()).toContain("或选一张照片");
+    expect(toastItems.value).toHaveLength(0);
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "save_checkin")).toBe(false);
   });
 
   it("只填备注可提交：save_checkin 带 snake_case 入参，成功后重拉时间线并抛 saved", async () => {
     const w = await mountDlg([]);
+    await w.find(".empty-full-link").trigger("click"); // 票 03：空态用次级链接展开
     await w.find(".date-input").setValue("2026-09-10"); // 补录过去日期
     await w.find(".note-input").setValue("  顺手数了蚁口  ");
 
@@ -144,6 +160,7 @@ describe("NestCheckinDialog（webui-checkin 票 02）", () => {
   it("蚁后数/工蚁数随表单提交；负数前端拦截不发 IPC", async () => {
     const w = await mountDlg([]);
     invokeMock.mockImplementation(async (cmd: string) => (cmd === "list_checkins" ? [] : checkin()));
+    await w.find(".empty-full-link").trigger("click"); // 票 03：空态用次级链接展开
 
     await w.find(".queen-input").setValue("3");
     await w.find(".worker-input").setValue("1200");
@@ -176,6 +193,8 @@ describe("NestCheckinDialog（webui-checkin 票 02）", () => {
       checkin({ id: 5, date: "2026-09-15", queen_count: 2, worker_count: 3000 }),
     ]);
     await w.find(".entry-edit-btn").trigger("click");
+    // 票 03：编辑既有条目自动展开表单（默认收起态下 record-btn 本不存在）
+    expect(w.find(".record-btn").exists()).toBe(true);
 
     expect((w.find(".date-input").element as HTMLInputElement).value).toBe("2026-09-15");
     expect((w.find(".queen-input").element as HTMLInputElement).value).toBe("2");
@@ -245,6 +264,7 @@ describe("NestCheckinDialog（webui-checkin 票 02）", () => {
   it("提交失败：错误展示在弹窗内、表单值保留、弹窗不关", async () => {
     const w = await mountDlg([]);
     invokeMock.mockRejectedValue("登记日期不能晚于今天（2026-09-19 在未来）");
+    await w.find(".empty-full-link").trigger("click"); // 票 03：空态用次级链接展开
     await w.find(".date-input").setValue("2026-09-19");
     await w.find(".note-input").setValue("提前写好");
     await w.find(".record-btn").trigger("click");
@@ -718,6 +738,7 @@ describe("NestCheckinDialog 网页端（webui-checkin 票 08）", () => {
     invokeMock.mockImplementation(async (cmd: string) =>
       cmd === "list_checkins" ? [checkin({ id: 7, photos: [{ ...browserPhoto }] })] : null,
     );
+    await w.find(".form-toggle-btn").trigger("click"); // 票 03：表单默认收起
     await w.find(".note-input").setValue("再登记一次触发重拉");
     await w.find(".record-btn").trigger("click");
     await flushPromises();
@@ -735,5 +756,389 @@ describe("NestCheckinDialog 网页端（webui-checkin 票 08）", () => {
 
     w.unmount();
     expect(revokeObjectUrlMock).toHaveBeenCalledWith("blob:bye");
+  });
+});
+
+// ── 时间线改版（checkin-photo-entry 票 03）：顶部双按钮/拍一张编排/表单嵌照片/
+// 左轴视觉/纯照片条目/空态占位 ──────────────────────────────────────────────
+
+describe("NestCheckinDialog 时间线改版（checkin-photo-entry 票 03）", () => {
+  /** happy-dom 不实现 objectURL：注入桩记录调用（沿 photos.test.ts 先例）。 */
+  let createObjectURLMock: ReturnType<typeof vi.fn>;
+
+  /** 浏览器形态挂载（默认；桌面用例自行注入 __TAURI_INTERNALS__）。 */
+  async function mountDlg03(entries: NestCheckin[]) {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_checkins" ? entries : null,
+    );
+    const w = mount(NestCheckinDialog, { props: { colony } });
+    await flushPromises();
+    return w;
+  }
+
+  /** 桌面 WebView 形态（票 07 先例）：isTauri 判定 + convertFileSrc。 */
+  function stubTauriInternals() {
+    (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {
+      convertFileSrc: (p: string) => `http://asset.localhost/${encodeURIComponent(p)}`,
+    };
+  }
+
+  /** 给隐藏 input 塞文件并触发 change（网页端选照片的测试形态）。 */
+  async function chooseFiles(w: ReturnType<typeof mount>, inputClass: string, files: File[]) {
+    const input = w.find(inputClass);
+    Object.defineProperty(input.element, "files", { value: files, configurable: true });
+    await input.trigger("change");
+  }
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    createCheckinPhotosHttpMock.mockReset();
+    loadPhotoBlobUrlMock.mockReset();
+    revokeObjectUrlMock.mockReset();
+    clearToasts();
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    createObjectURLMock = vi.fn(() => `blob:staged-${Math.random()}`);
+    Object.defineProperty(URL, "createObjectURL", {
+      value: createObjectURLMock,
+      configurable: true,
+      writable: true,
+    });
+  });
+
+  it("顶部双按钮：拍一张主按钮 + 完整登记次按钮；表单默认收起、点次按钮展开再收起", async () => {
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    const snap = w.find(".snap-btn");
+    expect(snap.exists()).toBe(true);
+    expect(snap.text()).toContain("📷 拍一张");
+    expect(snap.classes()).toContain("btn-snap"); // accent 主色按钮
+    const toggle = w.find(".form-toggle-btn");
+    expect(toggle.text()).toContain("完整登记");
+
+    // 表单默认收起：日期/数字输入与提交按钮都不渲染
+    expect(w.find(".record-btn").exists()).toBe(false);
+    expect(w.find(".date-input").exists()).toBe(false);
+
+    await toggle.trigger("click");
+    expect(w.find(".record-btn").exists()).toBe(true);
+    expect(w.find(".form-toggle-btn").text()).toContain("收起");
+
+    await w.find(".form-toggle-btn").trigger("click");
+    expect(w.find(".record-btn").exists()).toBe(false);
+  });
+
+  it("「📷 拍一张」（网页端）：capture input → 创建模式(colonyId+今天) → 成功轻提示+重拉时间线+抛 saved", async () => {
+    const newPhoto = { id: 21, checkin_id: 9, rel_path: "1/new.jpg", original_name: "n.jpg", note: "" };
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    createCheckinPhotosHttpMock.mockResolvedValue([newPhoto]);
+    loadPhotoBlobUrlMock.mockResolvedValue("blob:ok");
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_checkins"
+        ? [checkin({ id: 9, date: todayIso(), queen_count: null, worker_count: null, photos: [newPhoto] })]
+        : null,
+    );
+
+    await w.find(".snap-btn").trigger("click");
+    const files = [new File(["a"], "a.jpg")];
+    await chooseFiles(w, ".snap-file-input", files);
+    await flushPromises();
+
+    // 编排断言：走创建模式（colonyId + 今天 + 文件），不走挂靠模式也不发 save_checkin
+    expect(createCheckinPhotosHttpMock).toHaveBeenCalledWith(1, files, todayIso());
+    expect(uploadPhotosHttpMock).not.toHaveBeenCalled();
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "save_checkin")).toBe(false);
+    // 成功轻提示（窗不关视图不变的写操作，全局规范；文案同卡片票 02）
+    const last = toastItems.value[toastItems.value.length - 1];
+    expect(last?.kind).toBe("success");
+    expect(last?.message).toBe("✓ 已登记到「大头一号」· 头像已更新");
+    // 重拉弹窗内时间线 + 抛 saved（外层头像/摘要投影跟上）
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "list_checkins").length,
+    ).toBeGreaterThanOrEqual(2);
+    expect(w.emitted("saved")).toHaveLength(1);
+  });
+
+  it("「📷 拍一张」busy 反馈：进行中按钮禁用并显示「处理中…」，完成恢复", async () => {
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    let resolveUpload!: (v: unknown) => void;
+    createCheckinPhotosHttpMock.mockImplementation(
+      () => new Promise((resolve) => { resolveUpload = resolve; }),
+    );
+
+    await w.find(".snap-btn").trigger("click");
+    await chooseFiles(w, ".snap-file-input", [new File(["a"], "a.jpg")]);
+    await flushPromises();
+
+    const snap = w.find(".snap-btn");
+    expect((snap.element as HTMLButtonElement).disabled).toBe(true);
+    expect(snap.text()).toContain("处理中…");
+
+    resolveUpload!([]);
+    await flushPromises();
+    expect((w.find(".snap-btn").element as HTMLButtonElement).disabled).toBe(false);
+    expect(w.find(".snap-btn").text()).toContain("📷 拍一张");
+  });
+
+  it("「📷 拍一张」取消选照片（files 空）：不调通道、无轻提示、不抛 saved", async () => {
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    await w.find(".snap-btn").trigger("click");
+    await chooseFiles(w, ".snap-file-input", []);
+    await flushPromises();
+
+    expect(createCheckinPhotosHttpMock).not.toHaveBeenCalled();
+    expect(toastItems.value).toHaveLength(0);
+    expect(w.emitted("saved")).toBeUndefined();
+  });
+
+  it("「📷 拍一张」失败：错误内联展示（弹窗顶部 photo-error），不抛 saved、无成功轻提示", async () => {
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    createCheckinPhotosHttpMock.mockRejectedValue("HTTP 400");
+
+    await w.find(".snap-btn").trigger("click");
+    await chooseFiles(w, ".snap-file-input", [new File(["a"], "a.jpg")]);
+    await flushPromises();
+
+    expect(w.find(".photo-error").text()).toContain("400");
+    expect(toastItems.value).toHaveLength(0);
+    expect(w.emitted("saved")).toBeUndefined();
+  });
+
+  it("「📷 拍一张」（桌面）：pick_photo_files → save_checkin_with_photos(colonyId+photoPaths) → 轻提示+saved", async () => {
+    stubTauriInternals();
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7 })];
+      if (cmd === "pick_photo_files") return ["C:/pics/a.jpg", "C:/pics/b.png"];
+      if (cmd === "get_photo_abs_dir") return "C:\\data\\photos";
+      if (cmd === "save_checkin_with_photos") return checkin({ id: 9 });
+      return null;
+    });
+
+    await w.find(".snap-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("pick_photo_files");
+    expect(invokeMock).toHaveBeenCalledWith("save_checkin_with_photos", {
+      colonyId: 1,
+      photoPaths: ["C:/pics/a.jpg", "C:/pics/b.png"],
+    });
+    const last = toastItems.value[toastItems.value.length - 1];
+    expect(last?.kind).toBe("success");
+    expect(last?.message).toBe("✓ 已登记到「大头一号」· 头像已更新");
+    expect(w.emitted("saved")).toHaveLength(1);
+  });
+
+  it("桌面「📷 拍一张」取消选文件（pick_photo_files 返回 null）：不发通道、无轻提示", async () => {
+    stubTauriInternals();
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_checkins" ? [checkin({ id: 7 })] : cmd === "pick_photo_files" ? null : null,
+    );
+
+    await w.find(".snap-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "save_checkin_with_photos")).toBe(false);
+    expect(toastItems.value).toHaveLength(0);
+    expect(w.emitted("saved")).toBeUndefined();
+  });
+
+  it("空态占位：大按钮同拍照编排；次级链接展开表单", async () => {
+    const w = await mountDlg03([]);
+    createCheckinPhotosHttpMock.mockResolvedValue([]);
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_checkins"
+        ? [checkin({ id: 9, date: todayIso(), queen_count: null, worker_count: null })]
+        : null,
+    );
+
+    await w.find(".empty-snap-btn").trigger("click");
+    await chooseFiles(w, ".snap-file-input", [new File(["a"], "a.jpg")]);
+    await flushPromises();
+
+    expect(createCheckinPhotosHttpMock).toHaveBeenCalledWith(1, [expect.any(File)], todayIso());
+    expect(w.emitted("saved")).toHaveLength(1);
+
+    // 再次进入空态：次级链接展开完整登记表单
+    const w2 = await mountDlg03([]);
+    expect(w2.find(".record-btn").exists()).toBe(false);
+    await w2.find(".empty-full-link").trigger("click");
+    expect(w2.find(".record-btn").exists()).toBe(true);
+  });
+
+  it("左轴结构：轴容器+每条节点+今日高亮类；日期与换巢/基线标记挂轴、正文不再重复换巢", async () => {
+    const w = await mountDlg03([
+      checkin({ id: 3, date: todayIso(), queen_count: 1 }),
+      checkin({ id: 2, date: "2026-09-20", queen_count: null, worker_count: null, moved_nest: true, note: "搬家" }),
+      checkin({ id: 1, date: "2026-09-01", queen_count: 2 }),
+    ]);
+
+    // 轴容器（滚动外层 + 挂 ::before 竖轴的列表）
+    expect(w.find(".timeline-scroll .timeline").exists()).toBe(true);
+    const nodes = w.findAll(".timeline .entry.node");
+    expect(nodes).toHaveLength(3);
+
+    // 今日节点/日期橙色高亮 + 「今天」前缀
+    expect(nodes[0].classes()).toContain("today");
+    expect(nodes[0].find(".entry-date").text()).toBe(`今天 ${todayIso()}`);
+    expect(nodes[1].classes()).not.toContain("today");
+
+    // 换巢 chip 挂日期旁；正文只剩数与备注，不重复「换巢」
+    expect(nodes[1].find(".moved-chip").text()).toBe("换巢");
+    expect(nodes[1].find(".entry-main").text()).toBe("备注：搬家");
+
+    // 基线 chip 仍标最早一条，挂日期旁
+    expect(nodes[2].find(".baseline-chip").text()).toBe("基线");
+  });
+
+  it("纯照片条目无正文行（只显示照片区+操作按钮）；全空无照片仍有「（未填内容）」兜底", async () => {
+    loadPhotoBlobUrlMock.mockResolvedValue("blob:ok");
+    const photo = { id: 21, checkin_id: 3, rel_path: "1/x.jpg", original_name: "x.jpg", note: "" };
+    const w = await mountDlg03([
+      checkin({ id: 3, date: "2026-09-25", queen_count: null, worker_count: null, photos: [photo] }),
+      checkin({ id: 4, date: "2026-09-20", queen_count: null, worker_count: null }),
+    ]);
+
+    const pure = w.find('[data-checkin-id="3"]');
+    expect(pure.find(".entry-main").exists()).toBe(false); // 纯照片：无正文行
+    expect(pure.find(".entry-photos").exists()).toBe(true);
+    expect(pure.find(".photo-add-btn").exists()).toBe(true); // 既有条目按钮保留
+    expect(pure.find(".entry-edit-btn").exists()).toBe(true);
+    expect(pure.find(".entry-delete-btn").exists()).toBe(true);
+
+    const blank = w.find('[data-checkin-id="4"]');
+    expect(blank.find(".entry-main-ghost").text()).toBe("（未填内容）");
+  });
+
+  it("表单嵌照片区：选照片暂存缩略预览、可移除；≤9 张/15MB 预检内联拦截不弹 toast", async () => {
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    await w.find(".form-toggle-btn").trigger("click");
+    expect(w.find(".photo-pick").exists()).toBe(true);
+
+    await chooseFiles(w, ".form-photo-input", [
+      new File(["a"], "a.jpg"),
+      new File(["b"], "b.png"),
+    ]);
+    await flushPromises();
+    expect(w.findAll(".staged-thumb")).toHaveLength(2);
+    expect(createObjectURLMock).toHaveBeenCalledTimes(2);
+
+    // 移除一张：缩略消失
+    await w.findAll(".staged-remove")[0].trigger("click");
+    expect(w.findAll(".staged-thumb")).toHaveLength(1);
+
+    // 超张数（累计 10 > 9）：整批不收，内联提示
+    await chooseFiles(
+      w,
+      ".form-photo-input",
+      Array.from({ length: 10 }, (_, i) => new File([String(i)], `f${i}.jpg`)),
+    );
+    expect(w.find(".form-photo-error").text()).toContain("最多上传 9 张");
+    expect(w.findAll(".staged-thumb")).toHaveLength(1);
+    expect(toastItems.value).toHaveLength(0);
+
+    // 超单张体积（>15MB）：内联提示
+    await chooseFiles(w, ".form-photo-input", [
+      new File([new ArrayBuffer(15 * 1024 * 1024 + 1)], "big.jpg"),
+    ]);
+    expect(w.find(".form-photo-error").text()).toContain("15MB");
+    expect(w.findAll(".staged-thumb")).toHaveLength(1);
+  });
+
+  it("表单带照片保存走创建模式：字段+照片一并上传（带全部表单字段），不发 save_checkin", async () => {
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    await w.find(".form-toggle-btn").trigger("click");
+    createCheckinPhotosHttpMock.mockResolvedValue([]);
+
+    const files = [new File(["a"], "a.jpg")];
+    await chooseFiles(w, ".form-photo-input", files);
+    await w.find(".queen-input").setValue("3");
+    await w.find(".note-input").setValue("带图登记");
+    await w.find(".record-btn").trigger("click");
+    await flushPromises();
+
+    expect(createCheckinPhotosHttpMock).toHaveBeenCalledWith(1, files, todayIso(), {
+      queenCount: 3,
+      workerCount: null,
+      movedNest: false,
+      note: "带图登记",
+    });
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "save_checkin")).toBe(false);
+    expect(w.emitted("saved")).toHaveLength(1);
+    // 表单保存是弹窗内反馈（列表即时变化）：不弹轻提示
+    expect(toastItems.value).toHaveLength(0);
+    // 保存成功后暂存清空、表单回新增态
+    expect(w.findAll(".staged-thumb")).toHaveLength(0);
+    expect(w.find(".record-btn").exists()).toBe(true);
+  });
+
+  it("纯照片表单保存合法：字段全空但选了照片不拦，直接走创建模式", async () => {
+    const w = await mountDlg03([]);
+    await w.find(".empty-full-link").trigger("click"); // 空态次级链接展开表单
+    createCheckinPhotosHttpMock.mockResolvedValue([]);
+
+    const files = [new File(["a"], "a.jpg")];
+    await chooseFiles(w, ".form-photo-input", files);
+    await w.find(".record-btn").trigger("click");
+    await flushPromises();
+
+    expect(w.find(".form-error").exists()).toBe(false);
+    expect(createCheckinPhotosHttpMock).toHaveBeenCalledWith(1, files, todayIso(), {
+      queenCount: null,
+      workerCount: null,
+      movedNest: false,
+      note: null,
+    });
+    expect(w.emitted("saved")).toHaveLength(1);
+  });
+
+  it("桌面表单带照片保存：save_checkin_with_photos 全字段 + photoPaths；暂存显示文件名 chip", async () => {
+    stubTauriInternals();
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    await w.find(".form-toggle-btn").trigger("click");
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "list_checkins") return [checkin({ id: 7 })];
+      if (cmd === "pick_photo_files") return ["C:/pics/夏日巢照.jpg"];
+      if (cmd === "get_photo_abs_dir") return "C:\\data\\photos";
+      if (cmd === "save_checkin_with_photos") return checkin({ id: 9 });
+      return null;
+    });
+
+    await w.find(".staged-add").trigger("click");
+    await flushPromises();
+    expect(w.find(".staged-name").text()).toBe("夏日巢照.jpg"); // 桌面无缩略（asset scope 限制），显示文件名
+    expect(w.findAll(".staged-remove")).toHaveLength(1);
+
+    await w.find(".moved-input").setValue(true);
+    await w.find(".record-btn").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("save_checkin_with_photos", {
+      colonyId: 1,
+      date: todayIso(),
+      queenCount: null,
+      workerCount: null,
+      movedNest: true,
+      note: null,
+      photoPaths: ["C:/pics/夏日巢照.jpg"],
+    });
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "save_checkin")).toBe(false);
+    expect(w.emitted("saved")).toHaveLength(1);
+    expect(w.find(".staged-name").exists()).toBe(false); // 保存后暂存清空
+  });
+
+  it("点条目「编辑」自动展开表单；编辑态不渲染照片暂存区且清掉新建暂存", async () => {
+    const w = await mountDlg03([checkin({ id: 7 })]);
+    await w.find(".form-toggle-btn").trigger("click");
+    await chooseFiles(w, ".form-photo-input", [new File(["a"], "a.jpg")]);
+    expect(w.findAll(".staged-thumb")).toHaveLength(1);
+
+    await w.find(".entry-edit-btn").trigger("click");
+
+    expect(w.find(".record-btn").exists()).toBe(true); // 自动展开
+    expect(w.find(".photo-pick").exists()).toBe(false); // 编辑态不嵌照片
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith(expect.stringContaining("blob:staged"));
+    expect(w.findAll(".staged-thumb")).toHaveLength(0);
+    // 预填正常（清暂存不破坏表单回填）
+    expect((w.find(".queen-input").element as HTMLInputElement).value).toBe("2");
   });
 });
