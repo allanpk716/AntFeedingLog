@@ -111,8 +111,17 @@ pub fn sync(enabled: bool, segments: &[String], port: u16) -> Result<(), Firewal
         disable_script(&delete_rule_cmd())
     };
     let script = elevate_script(&base64_utf16le(&inner));
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW：外层 PowerShell 子进程不弹控制台窗体（追加位，不影响
+    // stdout/stderr 捕获；内层提权窗口本就 -WindowStyle Hidden）
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd
         .output()
         .map_err(|e| FirewallError {
             message: format!("无法启动 PowerShell（防火墙联动需要它）: {e}"),

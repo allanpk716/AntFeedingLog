@@ -231,8 +231,16 @@ pub fn parse_powershell_nics(json: &str) -> Vec<NicInfo> {
 
 /// 跑 PowerShell 拿本机网卡信息（get_access_url 的「找本机 IP」也用它）。
 pub fn list_nics() -> Result<Vec<NicInfo>, String> {
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", PS_LIST_SCRIPT])
+    #[cfg(windows)]
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW：子进程不弹控制台窗体（追加位，不影响 stdout/stderr 捕获）
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args(["-NoProfile", "-NonInteractive", "-Command", PS_LIST_SCRIPT]);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let out = cmd
         .output()
         .map_err(|e| format!("枚举网卡失败（无法启动 PowerShell）: {e}"))?;
     if !out.status.success() {
