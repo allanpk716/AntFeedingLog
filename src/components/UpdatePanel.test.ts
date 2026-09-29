@@ -386,3 +386,31 @@ describe("更新面板：确认安装交互流", () => {
     expect((wrapper.find(".check-btn").element as HTMLButtonElement).disabled).toBe(true);
   });
 });
+
+// ── 直达自动检查（update-entry 票 01）：经主页面按钮/托盘直达时挂载即查 ──
+
+describe("更新面板：直达自动检查（update-entry 票 01）", () => {
+  it("autoCheck 挂载即自动检查一次，无需再点「立即检查更新」；结果照常展示", async () => {
+    baseMock();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      if (cmd === "check_update_now") return { status: "up_to_date" };
+      if (cmd === "get_app_version") return "0.1.0";
+      if (cmd === "get_update_state") return { status: "idle" };
+      return null;
+    });
+    const wrapper = mount(UpdatePanel, { props: { autoCheck: true } });
+    await flushPromises();
+
+    const calls = invokeMock.mock.calls.filter(([cmd]) => cmd === "check_update_now");
+    expect(calls.length).toBe(1);
+    expect(wrapper.find(".update-ok").text()).toContain("已是最新");
+    // 检查完成后按钮恢复可点（没卡在「检查中…」）
+    expect((wrapper.find(".check-btn").element as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("默认挂载不自动检查：需手动点「立即检查更新」（浏览设置不发多余网络请求）", async () => {
+    const wrapper = await mountPanel();
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "check_update_now")).toBe(false);
+    expect(wrapper.find(".check-btn").text()).toContain("立即检查更新");
+  });
+});

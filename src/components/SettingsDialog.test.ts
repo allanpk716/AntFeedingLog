@@ -248,6 +248,57 @@ function webUiConfigFixture(): WebUiConfigInfo {
   };
 }
 
+// ── 直达「更新」页签（update-entry 票 01）：主页面按钮一步进升级流 ──
+
+describe("设置弹窗直达「更新」页签（update-entry 票 01）", () => {
+  it("initialTab=update：打开即落在更新页签，autoUpdateCheck 传给面板自动检查", async () => {
+    baseMock();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_actions":
+        case "list_foods":
+        case "list_locations":
+          return [];
+        case "list_food_categories":
+          return [
+            { category: "seed", interval_days: 7 },
+            { category: "protein", interval_days: 3 },
+            { category: "sugar", interval_days: 3 },
+          ];
+        case "get_settings":
+          return settingsFixture();
+        case "get_app_version":
+          return "0.1.0";
+        case "get_update_state":
+          return { status: "idle" };
+        case "check_update_now":
+          return { status: "up_to_date" };
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog, {
+      props: { initialTab: "update", autoUpdateCheck: true },
+    });
+    await flushPromises();
+
+    expect(wrapper.find(".tab-update").classes()).toContain("active");
+    expect(wrapper.find(".tab-actions").classes()).not.toContain("active");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "check_update_now")).toBe(true);
+    expect(wrapper.find(".update-ok").text()).toContain("已是最新");
+  });
+
+  it("默认打开仍是「操作」页签且不自动检查", async () => {
+    baseMock();
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+
+    expect(wrapper.find(".tab-actions").classes()).toContain("active");
+    expect(wrapper.find(".tab-update").classes()).not.toContain("active");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "check_update_now")).toBe(false);
+  });
+});
+
 describe("设置弹窗「网页端」tab（webui-checkin 票 03）", () => {
   it("新增「网页端」tab：点开渲染面板（总开关/网段/端口/凭证/地址），面板加载走新命令", async () => {
     baseMock();

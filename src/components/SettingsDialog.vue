@@ -146,9 +146,12 @@ import { showError, showSuccess } from "../lib/toast";
 
 type Tab = "actions" | "foods" | "locations" | "notify" | "webui" | "data" | "update";
 
+// 直达「更新」页签（update-entry 票 01）：initialTab 缺省维持「操作」不动旧路径；
+// autoUpdateCheck 仅直达时为真，随挂载传给 UpdatePanel 自动检查一次。
+const props = defineProps<{ initialTab?: Tab; autoUpdateCheck?: boolean }>();
 const emit = defineEmits<{ close: []; changed: [] }>();
 
-const activeTab = ref<Tab>("actions");
+const activeTab = ref<Tab>(props.initialTab ?? "actions");
 const actionRows = ref<ActionRow[]>([]);
 const foodRows = ref<FoodRow[]>([]);
 /** 大类周期行（ADR 0008）：恒三行固定序，随食物区批量「保存」一并落库 */
@@ -1160,7 +1163,7 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
 
       <!-- 更新（release-update 票 06）：检查更新 / 确认安装 / 升级残留引导 -->
       <div v-show="activeTab === 'update'" class="tab-body">
-        <UpdatePanel />
+        <UpdatePanel :auto-check="autoUpdateCheck" />
       </div>
 
       <!-- 只剩字段级校验错误走这里（票 03 通道迁移）：非校验失败一律走轻提示 -->

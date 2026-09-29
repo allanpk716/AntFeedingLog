@@ -725,23 +725,31 @@ pub async fn manual_check(app: tauri::AppHandle) -> Result<CheckOutcome, String>
     manual_result(to_outcome(Ok(update.map(update_to_info))))
 }
 
+/// 「发现新版」通知正文（update-entry 票 01：指路主页面「检查更新」按钮，
+/// 不再指设置页）。说明非空带 80 字截断摘要，两条路径都指路。
+fn update_notify_body(version: &str, notes: Option<&str>) -> String {
+    const POINTER: &str = "点主窗口右上「检查更新」按钮即可安装";
+    match notes.map(str::trim).filter(|n| !n.is_empty()) {
+        None => format!("发现新版本 v{version}，{POINTER}。"),
+        Some(n) => {
+            let mut brief: String = n.chars().take(80).collect();
+            if brief.chars().count() < n.chars().count() {
+                brief.push('…');
+            }
+            format!("发现新版本 v{version}：{brief}。{POINTER}。")
+        }
+    }
+}
+
 /// 发现新版的系统通知（每日路径唯一的对外打扰；复用 tauri-plugin-notification，
 /// 与提醒同款；发送失败静默——通知是副产物）。
 fn notify_update(handle: &tauri::AppHandle, version: &str, notes: Option<&str>) {
     use tauri_plugin_notification::NotificationExt;
-    let mut body = format!("发现新版本 v{version}，可到设置页查看并安装。");
-    if let Some(n) = notes.map(str::trim).filter(|n| !n.is_empty()) {
-        let mut brief: String = n.chars().take(80).collect();
-        if brief.chars().count() < n.chars().count() {
-            brief.push('…');
-        }
-        body = format!("发现新版本 v{version}：{brief}");
-    }
     let _ = handle
         .notification()
         .builder()
         .title("蚂蚁饲养记录有更新")
-        .body(body)
+        .body(update_notify_body(version, notes))
         .show();
 }
 
@@ -1147,6 +1155,32 @@ mod tests {
         // 每日照常可查
         let out = run_daily_flow(&conn, &checker, D1).unwrap();
         assert_eq!(out, DailyOutcome::NoUpdate);
+    }
+
+    // ── 「发现新版」通知文案（update-entry 票 01：指路主页面新入口）──
+
+    #[test]
+    fn notify_body_points_to_main_page_entry() {
+        // 无说明：直接指路主页面按钮
+        assert_eq!(
+            update_notify_body("0.3.0", None),
+            "发现新版本 v0.3.0，点主窗口右上「检查更新」按钮即可安装。"
+        );
+        // 有说明：摘要 + 指路
+        assert_eq!(
+            update_notify_body("0.3.0", Some("修复若干问题")),
+            "发现新版本 v0.3.0：修复若干问题。点主窗口右上「检查更新」按钮即可安装。"
+        );
+        // 说明超 80 字：截断加省略号，指路仍在
+        let long = "字".repeat(100);
+        let body = update_notify_body("0.3.0", Some(&long));
+        assert!(body.contains('…'), "超长说明应截断加省略号");
+        assert!(body.contains("点主窗口右上「检查更新」按钮即可安装。"));
+        // 空白说明视同无说明
+        assert_eq!(
+            update_notify_body("0.3.0", Some("   ")),
+            "发现新版本 v0.3.0，点主窗口右上「检查更新」按钮即可安装。"
+        );
     }
 
     // ── 升级前快照与禁写窗口（票 04）──

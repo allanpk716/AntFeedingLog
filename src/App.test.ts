@@ -1663,6 +1663,47 @@ describe("浏览器模式入口可见性（终局评审 Important → 网页端�
   });
 });
 
+// ── 主页面「检查更新」按钮直达更新页签（update-entry 票 01）──
+
+describe("主页面「检查更新」按钮（update-entry 票 01）", () => {
+  it("桌面形态：⚙设置旁有「检查更新」按钮；点击打开设置弹窗直达「更新」页签并自动开始检查", async () => {
+    const wrapper = await mountApp();
+    const btn = wrapper.find(".topbar .update-top-btn");
+    expect(btn.exists()).toBe(true);
+    expect(btn.attributes("title")).toContain("检查更新");
+
+    // 设置链照常走 baseMock，只补检查结果
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "check_update_now" ? { status: "up_to_date" } : base(cmd),
+    );
+    invokeMock.mockClear();
+    await btn.trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".settings-dialog").exists()).toBe(true);
+    expect(wrapper.find(".tab-update").classes()).toContain("active");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "check_update_now")).toBe(true);
+    expect(wrapper.find(".update-ok").text()).toContain("已是最新");
+  });
+
+  it("「⚙设置」打开仍是默认「操作」页签（不因新入口改变旧路径）", async () => {
+    const wrapper = await mountApp();
+    await wrapper.find(".settings-btn").trigger("click");
+    await flushPromises();
+
+    expect(wrapper.find(".settings-dialog").exists()).toBe(true);
+    expect(wrapper.find(".tab-actions").classes()).toContain("active");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "check_update_now")).toBe(false);
+  });
+
+  it("浏览器形态：不渲染「检查更新」按钮（更新是桌面端专属）", async () => {
+    delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+    const wrapper = await mountApp();
+    expect(wrapper.find(".topbar .update-top-btn").exists()).toBe(false);
+  });
+});
+
 // ── 轻提示宿主挂应用根（保湿方式+轻提示票 03）──
 
 describe("轻提示宿主挂应用根（票 03）", () => {

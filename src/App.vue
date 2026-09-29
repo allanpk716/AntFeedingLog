@@ -40,6 +40,10 @@ const pageError = ref("");
 const showForm = ref(false);
 const editing = ref<Colony | null>(null);
 const showSettings = ref(false);
+/** 直达设置「更新」页签（update-entry 票 01）：主页面「检查更新」按钮一步进升级流 */
+const settingsInitialTab = ref<"actions" | "update">("actions");
+/** 与直达配套的自动检查；关弹窗即复位（⚙设置 旧路径永远是手动检查） */
+const settingsAutoCheck = ref(false);
 const endedOpen = ref(false);
 /** 网页端首启向导（webui-checkin 票 03）：启动时查到「未做」才弹一次。 */
 const showWebUiWizard = ref(false);
@@ -84,12 +88,22 @@ function onSaved() {
   void refresh();
 }
 
+/** 主页面「检查更新」按钮：设置弹窗开在「更新」页签并自动开始检查（一步到位） */
+function openUpdateCheck() {
+  settingsInitialTab.value = "update";
+  settingsAutoCheck.value = true;
+  showSettings.value = true;
+}
+
 function onSettingsChanged() {
   void refresh();
 }
 
 function onSettingsClosed() {
   showSettings.value = false;
+  // 直达参数复位：下次无论从哪进都是默认「操作」页签、手动检查
+  settingsInitialTab.value = "actions";
+  settingsAutoCheck.value = false;
   void refresh();
 }
 
@@ -164,8 +178,17 @@ onBeforeUnmount(() => stopTodayClock());
       </nav>
       <div class="today">{{ todayText }}</div>
       <div class="tools">
-        <!-- 网页端窝编辑票 02：「＋ 新建窝」放开双端渲染；⚙ 设置仍桌面专属，浏览器不渲染 -->
+        <!-- 网页端窝编辑票 02：「＋ 新建窝」放开双端渲染；⚙ 设置与「检查更新」仍桌面专属，浏览器不渲染 -->
         <button class="ghost-btn new-top-btn" type="button" @click="openCreate">＋ 新建窝</button>
+        <button
+          v-if="isTauri()"
+          class="ghost-btn update-top-btn"
+          type="button"
+          title="检查更新：直达设置「更新」页签并自动检查"
+          @click="openUpdateCheck"
+        >
+          ↑
+        </button>
         <button v-if="isTauri()" class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
           ⚙ 设置
         </button>
@@ -243,6 +266,8 @@ onBeforeUnmount(() => stopTodayClock());
     />
     <SettingsDialog
       v-if="showSettings"
+      :initial-tab="settingsInitialTab"
+      :auto-update-check="settingsAutoCheck"
       @close="onSettingsClosed"
       @changed="onSettingsChanged"
     />

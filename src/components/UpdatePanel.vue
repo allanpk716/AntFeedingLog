@@ -11,6 +11,8 @@
  * - 挂载查 get_update_state：升级未完成残留 → 节顶引导（重试在下方检查流 /
  *   手动下载按钮直发 open_releases_page）；升级成功 → 平静的「已升级到 vX」。
  * - 前端不经 updater JS API，全部走 Tauri command（capabilities 无 updater 权限）。
+ * - 直达自动检查（update-entry 票 01）：autoCheck 入参 = 经主页面按钮/托盘直达
+ *   「更新」页签时挂载即自动检查一次；平时从设置翻进来不自动发网络请求。
  */
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import {
@@ -36,6 +38,8 @@ import {
   type StateBannerView,
 } from "../lib/updaterUi";
 import LoadingHint from "./LoadingHint.vue";
+
+const props = defineProps<{ autoCheck?: boolean }>();
 
 const currentVersion = ref("");
 const banner = ref<StateBannerView>({ kind: "none" });
@@ -104,6 +108,8 @@ onMounted(async () => {
   }
   unlistenProgress = unlisten;
   await loadVersionAndState();
+  // 直达自动检查：版本/状态首读完成后发起（首读失败也照查——检查不依赖版本）
+  if (props.autoCheck) void checkNow();
 });
 
 onUnmounted(() => {
