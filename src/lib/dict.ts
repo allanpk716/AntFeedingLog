@@ -4,7 +4,8 @@
  * 后端权威校验在 src-tauri/src/dict.rs，这里的预检只为少跑一趟 IPC。
  */
 
-import type { ActionInput, ActionKind, CareActionItem, FoodInput, FoodItem } from "../types";
+import type { ActionInput, ActionKind, CareActionItem, FoodCategory, FoodInput, FoodItem } from "../types";
+import { FOOD_CATEGORY_ORDER } from "./foodCategories";
 
 // ── 操作 ─────────────────────────────────────────────────────────────────
 
@@ -95,7 +96,9 @@ export function moveRow<T>(rows: T[], index: number, direction: -1 | 1): void {
 
 /** 食物行本地编辑态：间隔用输入框原文承载（空串=未设，F3），保存时才解析。
  * 易腐位与撤食间隔（票 01）：撤食间隔同为输入框原文（小时，1–168），
- * 关易腐时清空并置灰、保存一律落 null。 */
+ * 关易腐时清空并置灰、保存一律落 null。
+ * category（ADR 0007）：行内可改；新增行走设置的新增必选下拉，正常不会为空——
+ * 类型上仍容空（防夹具/脏数据），validateFoodRows 运行时守护。 */
 export interface FoodRow {
   id: number | null;
   name: string;
@@ -109,6 +112,8 @@ export interface FoodRow {
   /** 预置项禁删可停用（反馈第二轮 F2） */
   isPreset: boolean;
   referenced: boolean;
+  /** 食物大类 key（ADR 0007）：'seed' | 'protein' | 'sugar' */
+  category: FoodCategory | "";
 }
 
 /** 字典（含停用）→ 行列表，按 sort、id 排。
@@ -126,6 +131,7 @@ export function buildFoodRows(foods: FoodItem[]): FoodRow[] {
       retrievalHoursText: f.retrieval_hours == null ? "" : String(f.retrieval_hours),
       isPreset: f.is_preset,
       referenced: f.referenced,
+      category: f.category ?? "",
     }));
 }
 
@@ -140,6 +146,7 @@ export function toFoodInputs(rows: FoodRow[]): FoodInput[] {
     suggested_interval_days: parseInterval(r.intervalText),
     perishable: r.perishable,
     retrieval_hours: r.perishable ? parseInterval(r.retrievalHoursText) : null,
+    category: r.category === "" ? null : r.category,
   }));
 }
 
@@ -155,6 +162,14 @@ export function validateFoodRows(rows: FoodRow[]): string {
   }
   for (const r of rows) {
     const label = r.name.trim();
+    // 大类必选守护（ADR 0007，与后端 save_food 同口径）：正常经新增下拉必有值，
+    // 这里拦夹具缺口/脏数据绕过
+    if (r.category === "") {
+      return `食物「${label}」必须选择大类（种子/蛋白质/糖水）`;
+    }
+    if (!(FOOD_CATEGORY_ORDER as readonly string[]).includes(r.category)) {
+      return `食物「${label}」的大类不合法（应为 种子/蛋白质/糖水）`;
+    }
     const interval = parseInterval(r.intervalText);
     if (interval !== null && (!Number.isInteger(interval) || interval < 1)) {
       return `食物「${label}」的建议间隔应是不小于 1 的整数天数`;

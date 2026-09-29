@@ -72,7 +72,7 @@ export function perishableChipTitle(f: PerishableProbe): string | null {
 
 <script setup lang="ts">
 /**
- * 喂食弹窗：食物多选 chips（仅启用食物）+ 时间（默认现在、可补录）+ 备注（可选）。
+ * 喂食弹窗：食物多选 chips（仅启用食物；按大类分组一屏直选，ADR 0007）+ 时间（默认现在、可补录）+ 备注（可选）。
  * 本组件自持状态、自己发 IPC（list_foods / log_care），成功后抛 saved 让外层关窗刷新；
  * 停用食物不进新建入口（规则 10）。
  * 交互第三轮：换 DateTimeField（标记日历：橙点=当前操作/灰点=其它/悬停明细）+
@@ -87,6 +87,7 @@ import { colonyMonthRecords, listActions, listFoods, logCare } from "../lib/ipc"
 import type { CareActionItem, Colony, ColonyAction, FoodItem, MonthDayRecords } from "../types";
 import { nowLocalDateTime } from "../lib/care";
 import { todayIso } from "../lib/dates";
+import { groupFoodsByCategory } from "../lib/foodCategories";
 import { buildMarkers, duplicateInfo, dupWarningText } from "../lib/monthview";
 import DateTimeField from "./DateTimeField.vue";
 import LoadingHint from "./LoadingHint.vue";
@@ -105,6 +106,9 @@ const formError = ref("");
 const busy = ref(false);
 
 const enabledFoods = computed(() => foods.value.filter((f) => f.enabled));
+
+/** 大类分组（ADR 0007）：种子→蛋白质→糖水一屏直选，空组不渲染组头 */
+const groupedEnabledFoods = computed(() => groupFoodsByCategory(enabledFoods.value));
 
 // ── 票 07：字典首读占位判定 ──
 /** foods 与操作名字表（loadActions 内的 list_actions）都落地（含各自失败语义）
@@ -256,17 +260,22 @@ async function submit() {
            首读完成标志而非列表长度（空字典合法，不能永久卡加载中）。 -->
       <LoadingHint v-if="!dictLoaded" />
       <div v-else class="foods">
-        <button
-          v-for="f in enabledFoods"
-          :key="f.id"
-          class="food"
-          :class="{ selected: selectedIds.includes(f.id), perishable: f.perishable === true }"
-          :title="perishableChipTitle(f) ?? undefined"
-          type="button"
-          @click="toggleFood(f.id)"
-        >
-          {{ f.name }}<span v-if="f.perishable === true" class="p-dot" aria-hidden="true"></span>
-        </button>
+        <div v-for="g in groupedEnabledFoods" :key="g.key" class="food-group">
+          <span class="food-group-label">{{ g.label }}</span>
+          <div class="food-group-items">
+            <button
+              v-for="f in g.items"
+              :key="f.id"
+              class="food"
+              :class="{ selected: selectedIds.includes(f.id), perishable: f.perishable === true }"
+              :title="perishableChipTitle(f) ?? undefined"
+              type="button"
+              @click="toggleFood(f.id)"
+            >
+              {{ f.name }}<span v-if="f.perishable === true" class="p-dot" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
       </div>
 
       <div class="field-label">时间（默认现在，可补录）</div>
@@ -328,6 +337,27 @@ async function submit() {
 }
 
 .foods {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 大类分组（ADR 0007）：组标签 + 组内 chips 一屏直选 */
+.food-group {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.food-group-label {
+  flex: 0 0 auto;
+  min-width: 3em;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 7px 0;
+}
+
+.food-group-items {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;

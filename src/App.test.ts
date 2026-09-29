@@ -41,10 +41,10 @@ const locations: LocationItem[] = [
 ];
 
 const foods: FoodItem[] = [
-  { id: 1, name: "种子", enabled: true, sort: 1, suggested_interval_days: 3, referenced: false, is_preset: true },
-  { id: 2, name: "干虾仁", enabled: true, sort: 2, suggested_interval_days: 7, referenced: false, is_preset: true },
-  { id: 3, name: "面包虫", enabled: true, sort: 3, suggested_interval_days: 7, referenced: false, is_preset: true },
-  { id: 4, name: "蚕蛹", enabled: false, sort: 4, suggested_interval_days: null, referenced: false, is_preset: false },
+  { id: 1, name: "种子", enabled: true, sort: 1, suggested_interval_days: 3, referenced: false, is_preset: true, category: "seed" },
+  { id: 2, name: "干虾仁", enabled: true, sort: 2, suggested_interval_days: 7, referenced: false, is_preset: true, category: "protein" },
+  { id: 3, name: "面包虫", enabled: true, sort: 3, suggested_interval_days: 7, referenced: false, is_preset: true, category: "protein" },
+  { id: 4, name: "蚕蛹", enabled: false, sort: 4, suggested_interval_days: null, referenced: false, is_preset: false, category: "protein" },
 ];
 
 const actions: CareActionItem[] = [
@@ -682,7 +682,7 @@ describe("设置 · 字典管理（票 04）", () => {
     await dlg.find(".tab-body .btn.primary").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("save_food", {
-      input: { id: 1, name: "瓜子", sort: 0, suggested_interval_days: 5, perishable: false, retrieval_hours: null },
+      input: { id: 1, name: "瓜子", sort: 0, suggested_interval_days: 5, perishable: false, retrieval_hours: null, category: "seed" },
     });
 
     invokeMock.mockClear();

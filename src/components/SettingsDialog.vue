@@ -114,6 +114,7 @@ import {
   type ActionRow,
   type FoodRow,
 } from "../lib/dict";
+import { FOOD_CATEGORY_ORDER, foodCategoryLabel } from "../lib/foodCategories";
 import {
   DAYS_AHEAD_ERROR,
   toForm,
@@ -155,6 +156,8 @@ const foodRows = ref<FoodRow[]>([]);
 const locations = ref<LocationItem[]>([]);
 const addActionName = ref("");
 const addFoodName = ref("");
+/** 新增食物的大类（ADR 0007）：必选、不预填；选中后保持（连加同组省手） */
+const addFoodCategory = ref("");
 const error = ref("");
 const busy = ref(false);
 
@@ -277,7 +280,11 @@ async function addActionRow(kind: "actions" | "foods") {
     });
     addActionName.value = "";
   } else {
-    foodRows.value.push({ id: null, name: raw, enabled: true, intervalText: "", perishable: false, retrievalHoursText: "", isPreset: false, referenced: false });
+    if (!addFoodCategory.value) {
+      error.value = "新食物必须先选大类（种子/蛋白质/糖水）";
+      return;
+    }
+    foodRows.value.push({ id: null, name: raw, enabled: true, intervalText: "", perishable: false, retrievalHoursText: "", isPreset: false, referenced: false, category: addFoodCategory.value as FoodRow["category"] });
     addFoodName.value = "";
   }
   error.value = "";
@@ -832,6 +839,13 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
               <button type="button" :disabled="index === foodRows.length - 1" @click="moveRow(foodRows, index, 1)">↓</button>
             </span>
             <input v-model="row.name" class="name-input" type="text" />
+            <select
+              v-model="row.category"
+              class="cat-select"
+              title="食物大类：固定三种（种子/蛋白质/糖水），行内可改"
+            >
+              <option v-for="c in FOOD_CATEGORY_ORDER" :key="c" :value="c">{{ foodCategoryLabel(c) }}</option>
+            </select>
             <input
               v-model="row.intervalText"
               class="interval-input"
@@ -861,11 +875,16 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
           </div>
 
           <div class="add-row">
-            <input v-model="addFoodName" class="add-input" type="text" placeholder="新食物，如：糖水" @keyup.enter="addActionRow('foods')" />
+            <!-- ADR 0007：新增必选大类、不预填；选中后保持，连加同组省手 -->
+            <select v-model="addFoodCategory" class="add-cat-select" title="新食物的大类（必选）">
+              <option value="" disabled>大类</option>
+              <option v-for="c in FOOD_CATEGORY_ORDER" :key="c" :value="c">{{ foodCategoryLabel(c) }}</option>
+            </select>
+            <input v-model="addFoodName" class="add-input" type="text" placeholder="新食物，如：蟋蟀" @keyup.enter="addActionRow('foods')" />
             <button class="add-btn" type="button" @click="addActionRow('foods')">＋ 添加</button>
           </div>
 
-          <p class="hint">设了间隔的食物各自算「距上次」，任一超期喂食块就变红并单独提醒。勾「易腐」的食物必须填 1–168 的整数小时（喂下后到点提醒收走残食），取消勾选会清空间隔。</p>
+          <p class="hint">每样食物归一个大类（种子/蛋白质/糖水，行内可改）；预置七项：种子、虾干、面包虫干、樱桃蟑螂、蜂蜜、冰糖水、白糖水。设了间隔的食物各自算「距上次」，任一超期喂食块就变红并单独提醒。勾「易腐」的食物必须填 1–168 的整数小时（喂下后到点提醒收走残食），取消勾选会清空间隔。</p>
 
           <div class="dlg-btns">
             <span class="spacer"></span>
@@ -1542,6 +1561,17 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
 .interval-input {
   width: 64px;
   padding: 6px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  font: inherit;
+  background: var(--card);
+  color: var(--text);
+}
+
+/* 食物大类下拉（ADR 0007）：行内编辑与新增行同款 */
+.cat-select,
+.add-cat-select {
+  padding: 6px 6px;
   border: 1px solid var(--border-strong);
   border-radius: 8px;
   font: inherit;

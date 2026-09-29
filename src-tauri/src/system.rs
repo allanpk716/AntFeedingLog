@@ -22,7 +22,15 @@ const CSV_HEADER: [&str; 7] = ["id", "窝", "操作", "发生时间", "录入时
 
 /// 巢况区表头（webui-checkin 票 02）：记录区之后空一行接巢况区，同文件同 BOM。
 const CHECKIN_CSV_HEADER: [&str; 9] = [
-    "巢况id", "窝", "日期", "蚁后数", "工蚁数", "换巢", "备注", "录入时间", "照片数",
+    "巢况id",
+    "窝",
+    "日期",
+    "蚁后数",
+    "工蚁数",
+    "换巢",
+    "备注",
+    "录入时间",
+    "照片数",
 ];
 
 // ── CSV ──────────────────────────────────────────────────────────────────
@@ -36,7 +44,10 @@ pub fn csv_escape(field: &str) -> String {
         Some('=') | Some('+') | Some('-') | Some('@') => format!("'{field}"),
         _ => field.to_string(),
     };
-    if guarded.contains(',') || guarded.contains('"') || guarded.contains('\n') || guarded.contains('\r')
+    if guarded.contains(',')
+        || guarded.contains('"')
+        || guarded.contains('\n')
+        || guarded.contains('\r')
     {
         format!("\"{}\"", guarded.replace('"', "\"\""))
     } else {
@@ -92,8 +103,7 @@ pub fn build_csv(rows: &[crate::care::LogRow], checkins: &[CheckinExportRow]) ->
 /// 配合调用方短暂拿锁挡住并发写，拷贝即完整（评审附录规则 11）。
 pub fn backup_db_file(db_path: &Path, target: &Path) -> Result<(), String> {
     if let Some(parent) = target.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建备份目录失败: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建备份目录失败: {e}"))?;
     }
     std::fs::copy(db_path, target)
         .map(|_| ())
@@ -221,9 +231,8 @@ pub fn json_dump(conn: &Connection) -> Result<serde_json::Value, String> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
         for h in rows {
-            hibernations.push(
-                serde_json::to_value(&h).map_err(|e| format!("序列化冬眠段失败: {e}"))?,
-            );
+            hibernations
+                .push(serde_json::to_value(&h).map_err(|e| format!("序列化冬眠段失败: {e}"))?);
         }
     }
 
@@ -261,7 +270,17 @@ pub fn json_dump(conn: &Connection) -> Result<serde_json::Value, String> {
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
-        for (id, colony_id, colony_name, date, queen_count, worker_count, moved_nest, note, created_at) in rows
+        for (
+            id,
+            colony_id,
+            colony_name,
+            date,
+            queen_count,
+            worker_count,
+            moved_nest,
+            note,
+            created_at,
+        ) in rows
         {
             let mut ps = conn
                 .prepare(
@@ -388,15 +407,19 @@ mod tests {
     }
 
     fn action_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM care_action WHERE name = ?1", params![name], |r| {
-            r.get(0)
-        })
+        conn.query_row(
+            "SELECT id FROM care_action WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
         .expect("查操作失败")
     }
 
     fn food_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| r.get(0))
-            .expect("查食物失败")
+        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| {
+            r.get(0)
+        })
+        .expect("查食物失败")
     }
 
     fn log(
@@ -443,12 +466,41 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute("INSERT INTO food (name, enabled, sort) VALUES ('蚕蛹', 1, 4)", []).unwrap();
-        conn.execute("INSERT INTO location (name, enabled, sort) VALUES ('阳台', 1, 3)", []).unwrap();
+        conn.execute(
+            "INSERT INTO food (name, enabled, sort) VALUES ('蚕蛹', 1, 4)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO location (name, enabled, sort) VALUES ('阳台', 1, 3)",
+            [],
+        )
+        .unwrap();
 
-        log(conn, c, "喂食", "2026-09-10 08:00", Some("补录,含逗号"), &[]);
-        log(conn, c, "喂食", "2026-09-15 20:30:00", None, &["种子", "蚕蛹"]);
-        log(conn, c, "垃圾清理", "2026-09-16 09:00:00", Some("清理残渣"), &[]);
+        log(
+            conn,
+            c,
+            "喂食",
+            "2026-09-10 08:00",
+            Some("补录,含逗号"),
+            &[],
+        );
+        log(
+            conn,
+            c,
+            "喂食",
+            "2026-09-15 20:30:00",
+            None,
+            &["种子", "蚕蛹"],
+        );
+        log(
+            conn,
+            c,
+            "垃圾清理",
+            "2026-09-16 09:00:00",
+            Some("清理残渣"),
+            &[],
+        );
 
         crate::settings::set_settings(
             conn,
@@ -540,7 +592,11 @@ mod tests {
         let header = lines.next().unwrap().trim_start_matches(UTF8_BOM);
         assert_eq!(header, "id,窝,操作,发生时间,录入时间,备注,食物");
         let body: Vec<&str> = lines.collect();
-        assert_eq!(body.len(), 5, "3 条记录 + 空行分隔 + 巢况区表头（本测试无巢况数据）");
+        assert_eq!(
+            body.len(),
+            5,
+            "3 条记录 + 空行分隔 + 巢况区表头（本测试无巢况数据）"
+        );
         assert_eq!(body[3], "", "记录区与巢况区空一行分隔");
         assert!(body[4].starts_with("巢况id,窝,日期"), "巢况区表头");
         let log_rows = &body[..3];
@@ -550,7 +606,10 @@ mod tests {
             .iter()
             .find(|l| l.contains("2026-09-15 20:30:00"))
             .expect("含喂食行");
-        assert!(feeding.contains("种子;蚕蛹"), "食物分号连接，实际：{feeding}");
+        assert!(
+            feeding.contains("种子;蚕蛹"),
+            "食物分号连接，实际：{feeding}"
+        );
         assert!(feeding.contains("大头一号"), "窝列 = 窝名展示值");
 
         // 备注含逗号 → 整段加引号（转义生效，列不错位）
@@ -565,7 +624,8 @@ mod tests {
             let fields = split_csv_line(line);
             assert_eq!(fields.len(), 7, "应为 7 列，实际：{fields:?}");
         }
-        let noted_fields = split_csv_line(log_rows.iter().find(|l| l.contains("2026-09-10")).unwrap());
+        let noted_fields =
+            split_csv_line(log_rows.iter().find(|l| l.contains("2026-09-10")).unwrap());
         assert_eq!(noted_fields[5], "补录,含逗号", "转义还原后备注原样");
     }
 
@@ -626,7 +686,8 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
 
         // 巢况区表头存在，且在记录区之后
-        let header_pos = text.find("巢况id,窝,日期,蚁后数,工蚁数,换巢,备注,录入时间,照片数")
+        let header_pos = text
+            .find("巢况id,窝,日期,蚁后数,工蚁数,换巢,备注,录入时间,照片数")
             .expect("巢况区表头");
         let log_header_pos = text.find("id,窝,操作,发生时间").expect("记录区表头");
         assert!(header_pos > log_header_pos, "巢况区在记录区之后");
@@ -681,8 +742,16 @@ mod tests {
         assert_eq!(checkins.len(), 2);
         let first = &checkins[0];
         for key in [
-            "id", "colony_id", "colony_name", "date", "queen_count", "worker_count",
-            "moved_nest", "note", "created_at", "photos",
+            "id",
+            "colony_id",
+            "colony_name",
+            "date",
+            "queen_count",
+            "worker_count",
+            "moved_nest",
+            "note",
+            "created_at",
+            "photos",
         ] {
             assert!(first.get(key).is_some(), "checkin 缺 {key}");
         }
@@ -722,13 +791,31 @@ mod tests {
             "checkins",
             "hibernations",
         ] {
-            assert!(v.get(key).and_then(|x| x.as_array()).is_some(), "缺 {key} 数组");
+            assert!(
+                v.get(key).and_then(|x| x.as_array()).is_some(),
+                "缺 {key} 数组"
+            );
         }
-        assert!(v.get("settings").and_then(|x| x.as_object()).is_some(), "缺 settings 对象");
+        assert!(
+            v.get("settings").and_then(|x| x.as_object()).is_some(),
+            "缺 settings 对象"
+        );
         assert_eq!(v["colonies"].as_array().unwrap().len(), 1);
-        assert_eq!(v["actions"].as_array().unwrap().len(), 6, "预置 5（v7 起含撤食）+ 自建 1");
-        assert_eq!(v["foods"].as_array().unwrap().len(), 4, "预置 3 + 自建 1");
-        assert_eq!(v["locations"].as_array().unwrap().len(), 3, "预置 2 + 自建 1");
+        assert_eq!(
+            v["actions"].as_array().unwrap().len(),
+            6,
+            "预置 5（v7 起含撤食）+ 自建 1"
+        );
+        assert_eq!(
+            v["foods"].as_array().unwrap().len(),
+            8,
+            "预置 7（v13 起两层分类）+ 自建 1"
+        );
+        assert_eq!(
+            v["locations"].as_array().unwrap().len(),
+            3,
+            "预置 2 + 自建 1"
+        );
         assert_eq!(v["logs"].as_array().unwrap().len(), 3, "全部记录");
         assert_eq!(v["hibernations"].as_array().unwrap().len(), 1);
         assert_eq!(v["settings"]["wake_remind_days_ahead"], 3);
@@ -736,7 +823,16 @@ mod tests {
 
         // 单条 log 结构完整（含窝名/操作名/食物名展示值，归档自足可读）
         let log = &v["logs"][0];
-        for key in ["id", "colony_id", "colony_name", "action_name", "occurred_at", "created_at", "note", "food_names"] {
+        for key in [
+            "id",
+            "colony_id",
+            "colony_name",
+            "action_name",
+            "occurred_at",
+            "created_at",
+            "note",
+            "food_names",
+        ] {
             assert!(log.get(key).is_some(), "log 缺 {key}");
         }
         let with_food = v["logs"]
@@ -754,7 +850,13 @@ mod tests {
             assert!(colony.get(key).is_some(), "colony 缺 {key}");
         }
         let hiber = &v["hibernations"][0];
-        for key in ["id", "colony_id", "start_date", "expected_end_date", "actual_end_date"] {
+        for key in [
+            "id",
+            "colony_id",
+            "start_date",
+            "expected_end_date",
+            "actual_end_date",
+        ] {
             assert!(hiber.get(key).is_some(), "hibernation 缺 {key}");
         }
     }

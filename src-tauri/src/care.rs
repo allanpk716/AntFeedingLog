@@ -37,6 +37,9 @@ pub struct Food {
     pub perishable: bool,
     /// 撤食间隔（小时，1–168 整数）；NULL = 未设（派生时按不存在处理，脏数据自愈）。
     pub retrieval_hours: Option<i64>,
+    /// 食物大类 key（ADR 0007）：'seed' | 'protein' | 'sugar'，固定三种；
+    /// 展示层映射中文（种子/蛋白质/糖水），大类只是分组容器、不参与提醒。
+    pub category: String,
 }
 
 /// 喂食块里单个食物的「距上次」明细（反馈第二轮 F3）。
@@ -90,8 +93,11 @@ impl ActionTile {
     /// 提醒引擎不能用 `overdue`（已含食物层），否则食物层顶红时会把操作层
     /// 不超期的窝也当超期发出去。
     pub fn operation_overdue(&self) -> bool {
-        let per_colony =
-            if self.interval_from_colony { self.effective_interval_days } else { None };
+        let per_colony = if self.interval_from_colony {
+            self.effective_interval_days
+        } else {
+            None
+        };
         is_overdue_effective(
             &self.kind,
             self.days_since_last,
@@ -132,7 +138,12 @@ pub fn now_local() -> String {
 /// 规整发生时间为 `YYYY-MM-DD HH:MM:SS`（库内统一格式，保证文本比较 = 时间比较）。
 pub fn normalize_happened_at(s: &str) -> Result<String, String> {
     let trimmed = s.trim();
-    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"] {
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ] {
         if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, fmt) {
             return Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string());
         }
@@ -165,8 +176,7 @@ pub fn days_since_last(last_occurred_at: Option<&str>, today: &str) -> Result<Op
     };
     let last = parse_iso_date(last.get(0..10).unwrap_or(""))
         .map_err(|_| "记录发生时间格式异常".to_string())?;
-    let today =
-        parse_iso_date(today).map_err(|_| "日期格式应为 YYYY-MM-DD".to_string())?;
+    let today = parse_iso_date(today).map_err(|_| "日期格式应为 YYYY-MM-DD".to_string())?;
     Ok(Some((today - last).num_days()))
 }
 
@@ -248,7 +258,12 @@ pub fn log_care_linked(
 
     let happened_at = normalize_happened_at(&input.happened_at)?;
     ensure_not_future(&happened_at, now)?;
-    let note = input.note.as_deref().map(str::trim).unwrap_or("").to_string();
+    let note = input
+        .note
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
 
     // 顺带撤食前置判定（全在事务外查，插人在事务内）：停用/无旗标/时刻无效都拒绝
     let linked_follow: Option<i64> = if also_retrieval {
@@ -282,7 +297,12 @@ pub fn log_care_linked(
 
     // 食物：去重（保序）+ 逐个校验存在且启用
     let mut seen = HashSet::new();
-    let food_ids: Vec<i64> = input.food_ids.iter().filter(|id| seen.insert(**id)).copied().collect();
+    let food_ids: Vec<i64> = input
+        .food_ids
+        .iter()
+        .filter(|id| seen.insert(**id))
+        .copied()
+        .collect();
     for food_id in &food_ids {
         let food_enabled: Option<i64> = conn
             .query_row(
@@ -421,16 +441,34 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
         args.push(action_id.into());
         wheres.push(format!("l.action_id = ?{}", args.len()));
     }
-    if let Some(s) = filter.start.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = filter
+        .start
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         args.push(parse_filter_date(s)?.into());
         wheres.push(format!("substr(l.occurred_at, 1, 10) >= ?{}", args.len()));
     }
-    if let Some(e) = filter.end.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(e) = filter
+        .end
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         args.push(parse_filter_date(e)?.into());
         wheres.push(format!("substr(l.occurred_at, 1, 10) <= ?{}", args.len()));
     }
-    if let Some(kw) = filter.note_keyword.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let escaped = kw.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+    if let Some(kw) = filter
+        .note_keyword
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let escaped = kw
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
         args.push(format!("%{escaped}%").into());
         wheres.push(format!("l.note LIKE ?{} ESCAPE '\\'", args.len()));
     }
@@ -444,7 +482,9 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
 
     let total: i64 = conn
         .query_row(
-            &format!("SELECT COUNT(*) FROM care_log l JOIN colony c ON c.id = l.colony_id {where_sql}"),
+            &format!(
+                "SELECT COUNT(*) FROM care_log l JOIN colony c ON c.id = l.colony_id {where_sql}"
+            ),
             rusqlite::params_from_iter(args.iter()),
             |row| row.get(0),
         )
@@ -481,7 +521,18 @@ pub fn list_logs(conn: &Connection, filter: &LogFilter) -> Result<LogPage, Strin
         .map_err(db_err)?;
 
     let mut out = Vec::with_capacity(rows.len());
-    for (id, colony_id, colony_name, location_name, action_id, action_name, occurred_at, note, created_at) in rows {
+    for (
+        id,
+        colony_id,
+        colony_name,
+        location_name,
+        action_id,
+        action_name,
+        occurred_at,
+        note,
+        created_at,
+    ) in rows
+    {
         let mut stmt_food = conn
             .prepare(
                 "SELECT lf.food_id, f.name FROM log_food lf JOIN food f ON f.id = lf.food_id
@@ -535,7 +586,11 @@ pub fn colony_month_records(
     if !(1..=12).contains(&month) {
         return Err(format!("月份应在 1–12：{year}-{month}"));
     }
-    let (next_y, next_m) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let (next_y, next_m) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
     let range_start = format!("{year:04}-{month:02}-01 00:00:00");
     let range_end = format!("{next_y:04}-{next_m:02}-01 00:00:00");
 
@@ -581,7 +636,12 @@ pub fn colony_month_records(
 /// （票 04 停靠②同口径）、is_feeding 位约束、字典引用规则——并与 log_food 关联
 /// 同事务重写，任一失败整体不动。规则 10 裁定：该记录**原引用**的停用操作/食物
 /// 可以原样保留；**新挂**的停用项一律拒绝。
-pub fn update_log(conn: &Connection, id: i64, input: &LogUpdateInput, now: &str) -> Result<(), String> {
+pub fn update_log(
+    conn: &Connection,
+    id: i64,
+    input: &LogUpdateInput,
+    now: &str,
+) -> Result<(), String> {
     let (cur_action_id, cur_occurred_at, cur_note): (i64, String, String) = conn
         .query_row(
             "SELECT action_id, occurred_at, note FROM care_log WHERE id = ?1",
@@ -638,7 +698,10 @@ pub fn update_log(conn: &Connection, id: i64, input: &LogUpdateInput, now: &str)
     let food_ids: Vec<i64> = match &input.food_ids {
         Some(list) => {
             let mut seen = HashSet::new();
-            list.iter().filter(|fid| seen.insert(**fid)).copied().collect()
+            list.iter()
+                .filter(|fid| seen.insert(**fid))
+                .copied()
+                .collect()
         }
         None => original_foods.iter().copied().collect(),
     };
@@ -672,7 +735,8 @@ pub fn update_log(conn: &Connection, id: i64, input: &LogUpdateInput, now: &str)
         params![new_action_id, occurred_at, note, id],
     )
     .map_err(db_err)?;
-    tx.execute("DELETE FROM log_food WHERE log_id = ?1", params![id]).map_err(db_err)?;
+    tx.execute("DELETE FROM log_food WHERE log_id = ?1", params![id])
+        .map_err(db_err)?;
     for fid in &food_ids {
         tx.execute(
             "INSERT INTO log_food (log_id, food_id) VALUES (?1, ?2)",
@@ -697,8 +761,10 @@ pub fn delete_log(conn: &Connection, id: i64) -> Result<(), String> {
         return Err("记录不存在".into());
     }
     let tx = conn.unchecked_transaction().map_err(db_err)?;
-    tx.execute("DELETE FROM log_food WHERE log_id = ?1", params![id]).map_err(db_err)?;
-    tx.execute("DELETE FROM care_log WHERE id = ?1", params![id]).map_err(db_err)?;
+    tx.execute("DELETE FROM log_food WHERE log_id = ?1", params![id])
+        .map_err(db_err)?;
+    tx.execute("DELETE FROM care_log WHERE id = ?1", params![id])
+        .map_err(db_err)?;
     tx.commit().map_err(db_err)?;
     Ok(())
 }
@@ -776,7 +842,11 @@ pub fn retrieval_due_for_colony(
     let due_at = (fed + chrono::Duration::hours(min_hours))
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
-    Ok(Some(RetrievalDue { fed_at, created_at, due_at }))
+    Ok(Some(RetrievalDue {
+        fed_at,
+        created_at,
+        due_at,
+    }))
 }
 
 /// 垃圾清理顺带撤食的联动判定（ADR 0006）：给定打卡面板所选的发生时刻，
@@ -784,11 +854,7 @@ pub fn retrieval_due_for_colony(
 /// 记了也清不掉待撤）/ `pending`=可附带但未到撤食间隔（面板默认不勾）/
 /// `overdue`=可附带且已到期（面板默认勾）。与卡片撤食三态同一派生源
 /// （[`retrieval_due_for_colony`]），到期边界同口径：at >= due_at 即 overdue。
-pub fn retrieval_link_state(
-    conn: &Connection,
-    colony_id: i64,
-    at: &str,
-) -> Result<String, String> {
+pub fn retrieval_link_state(conn: &Connection, colony_id: i64, at: &str) -> Result<String, String> {
     let at = normalize_happened_at(at)?;
     let Some(due) = retrieval_due_for_colony(conn, colony_id)? else {
         return Ok("none".into());
@@ -798,7 +864,12 @@ pub fn retrieval_link_state(
     if at.as_str() < due.fed_at.as_str() {
         return Ok("none".into());
     }
-    Ok(if at.as_str() >= due.due_at.as_str() { "overdue" } else { "pending" }.into())
+    Ok(if at.as_str() >= due.due_at.as_str() {
+        "overdue"
+    } else {
+        "pending"
+    }
+    .into())
 }
 
 /// 某窝每个「启用中」操作一块，按 sort、id 排序（字典新增操作自动出现）。
@@ -898,7 +969,9 @@ fn tiles_for_colony_at(
         };
         let mut latest: Option<chrono::NaiveDate> = None;
         for occurred in &occurred_rows {
-            if let Ok(d) = chrono::NaiveDate::parse_from_str(occurred.get(0..10).unwrap_or(""), "%Y-%m-%d") {
+            if let Ok(d) =
+                chrono::NaiveDate::parse_from_str(occurred.get(0..10).unwrap_or(""), "%Y-%m-%d")
+            {
                 latest = Some(match latest {
                     Some(prev) if prev >= d => prev,
                     _ => d,
@@ -936,14 +1009,19 @@ fn tiles_for_colony_at(
                 };
                 let food_latest = occurred
                     .iter()
-                    .filter_map(|s| chrono::NaiveDate::parse_from_str(s.get(0..10).unwrap_or(""), "%Y-%m-%d").ok())
+                    .filter_map(|s| {
+                        chrono::NaiveDate::parse_from_str(s.get(0..10).unwrap_or(""), "%Y-%m-%d")
+                            .ok()
+                    })
                     .max();
                 let food_base = match (food_latest, wake) {
                     (Some(log), Some(w)) => Some(log.max(w)),
                     (log, w) => log.or(w),
                 };
                 let food_days = days_since_last(
-                    food_base.map(|d| d.format("%Y-%m-%d").to_string()).as_deref(),
+                    food_base
+                        .map(|d| d.format("%Y-%m-%d").to_string())
+                        .as_deref(),
                     today,
                 )?;
                 let food_overdue = if kind == "reminding" {
@@ -1033,7 +1111,11 @@ pub fn recent_for_colony(
             .map_err(db_err)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db_err)?;
-        recent.push(RecentLog { happened_at, action_name, food_names: foods });
+        recent.push(RecentLog {
+            happened_at,
+            action_name,
+            food_names: foods,
+        });
     }
     Ok(recent)
 }
@@ -1044,7 +1126,7 @@ const FOOD_SQL: &str = concat!(
     "SELECT f.id, f.name, f.enabled, f.sort, f.suggested_interval_days, f.is_preset, ",
     "(EXISTS(SELECT 1 FROM log_food lf WHERE lf.food_id = f.id) ",
     "OR EXISTS(SELECT 1 FROM reminder_ledger g WHERE g.food_id = f.id)), ",
-    "f.perishable, f.retrieval_hours ",
+    "f.perishable, f.retrieval_hours, f.category ",
     "FROM food f ",
 );
 
@@ -1059,6 +1141,7 @@ fn row_to_food(row: &rusqlite::Row<'_>) -> rusqlite::Result<Food> {
         referenced: row.get::<_, i64>(6)? != 0,
         perishable: row.get::<_, i64>(7)? != 0,
         retrieval_hours: row.get(8)?,
+        category: row.get(9)?,
     })
 }
 
@@ -1115,13 +1198,19 @@ mod tests {
     }
 
     fn action_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM care_action WHERE name = ?1", params![name], |r| r.get(0))
-            .expect("查操作失败")
+        conn.query_row(
+            "SELECT id FROM care_action WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .expect("查操作失败")
     }
 
     fn food_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| r.get(0))
-            .expect("查食物失败")
+        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| {
+            r.get(0)
+        })
+        .expect("查食物失败")
     }
 
     fn log(conn: &Connection, colony_id: i64, action: &str, happened_at: &str) -> i64 {
@@ -1140,7 +1229,8 @@ mod tests {
     }
 
     fn count(conn: &Connection, sql: &str) -> i64 {
-        conn.query_row(sql, [], |row| row.get(0)).expect("标量查询失败")
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("标量查询失败")
     }
 
     fn tile<'a>(tiles: &'a [ActionTile], name: &str) -> &'a ActionTile {
@@ -1151,10 +1241,22 @@ mod tests {
 
     #[test]
     fn normalize_happened_at_accepts_common_formats() {
-        assert_eq!(normalize_happened_at("2026-09-18T20:00").unwrap(), "2026-09-18 20:00:00");
-        assert_eq!(normalize_happened_at("2026-09-18T20:00:05").unwrap(), "2026-09-18 20:00:05");
-        assert_eq!(normalize_happened_at(" 2026-09-18 20:00 ").unwrap(), "2026-09-18 20:00:00");
-        assert_eq!(normalize_happened_at("2026-09-18").unwrap(), "2026-09-18 00:00:00");
+        assert_eq!(
+            normalize_happened_at("2026-09-18T20:00").unwrap(),
+            "2026-09-18 20:00:00"
+        );
+        assert_eq!(
+            normalize_happened_at("2026-09-18T20:00:05").unwrap(),
+            "2026-09-18 20:00:05"
+        );
+        assert_eq!(
+            normalize_happened_at(" 2026-09-18 20:00 ").unwrap(),
+            "2026-09-18 20:00:00"
+        );
+        assert_eq!(
+            normalize_happened_at("2026-09-18").unwrap(),
+            "2026-09-18 00:00:00"
+        );
         assert!(normalize_happened_at("2026/09/18").is_err());
         assert!(normalize_happened_at("昨天晚上").is_err());
     }
@@ -1164,7 +1266,10 @@ mod tests {
         // 库内统一 `YYYY-MM-DD HH:MM:SS`，字典序 = 时间序（票 04 停靠②：拒绝未来时间）
         assert!(ensure_not_future("2026-09-18 08:00:01", "2026-09-18 08:00:00").is_err());
         assert!(ensure_not_future("2026-09-19 00:00:00", "2026-09-18 08:00:00").is_err());
-        assert!(ensure_not_future("2026-09-18 08:00:00", "2026-09-18 08:00:00").is_ok(), "同刻允许");
+        assert!(
+            ensure_not_future("2026-09-18 08:00:00", "2026-09-18 08:00:00").is_ok(),
+            "同刻允许"
+        );
         assert!(ensure_not_future("2026-09-17 23:59:59", "2026-09-18 08:00:00").is_ok());
     }
 
@@ -1187,7 +1292,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("未来"), "实际错误：{err}");
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 0, "被拒的记账不落库");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM care_log"),
+            0,
+            "被拒的记账不落库"
+        );
 
         // 同刻与过去照常可记
         assert!(log_care(
@@ -1221,11 +1330,20 @@ mod tests {
     #[test]
     fn days_since_last_counts_natural_days_from_occurrence() {
         // 补录昨天 → 距上次按发生时间算 = 1（验收 3）
-        assert_eq!(days_since_last(Some("2026-09-17 21:30:00"), TODAY).unwrap(), Some(1));
+        assert_eq!(
+            days_since_last(Some("2026-09-17 21:30:00"), TODAY).unwrap(),
+            Some(1)
+        );
         // 今天记的 → 0
-        assert_eq!(days_since_last(Some("2026-09-18 08:00:00"), TODAY).unwrap(), Some(0));
+        assert_eq!(
+            days_since_last(Some("2026-09-18 08:00:00"), TODAY).unwrap(),
+            Some(0)
+        );
         // 4 天前（验收 4 的数据）
-        assert_eq!(days_since_last(Some("2026-09-14 20:00:00"), TODAY).unwrap(), Some(4));
+        assert_eq!(
+            days_since_last(Some("2026-09-14 20:00:00"), TODAY).unwrap(),
+            Some(4)
+        );
         // 从未记录
         assert_eq!(days_since_last(None, TODAY).unwrap(), None);
     }
@@ -1249,11 +1367,22 @@ mod tests {
     fn is_overdue_effective_set_unset_and_boundaries() {
         // 设了即提醒：登记类也按每窝周期判（严格大于两侧边界）
         assert!(is_overdue_effective("log_only", Some(4), Some(3), None));
-        assert!(!is_overdue_effective("log_only", Some(3), Some(3), None), "days==周期 不红");
-        assert!(!is_overdue_effective("log_only", None, Some(3), None), "从未做过不红");
+        assert!(
+            !is_overdue_effective("log_only", Some(3), Some(3), None),
+            "days==周期 不红"
+        );
+        assert!(
+            !is_overdue_effective("log_only", None, Some(3), None),
+            "从未做过不红"
+        );
         // 提醒类设了每窝周期即取代操作层建议间隔（4>3 但 4≤5 → 不红）
         assert!(is_overdue_effective("reminding", Some(6), Some(5), Some(3)));
-        assert!(!is_overdue_effective("reminding", Some(4), Some(5), Some(3)));
+        assert!(!is_overdue_effective(
+            "reminding",
+            Some(4),
+            Some(5),
+            Some(3)
+        ));
         // 撤食（follow）永不参与——设了周期行也不判
         assert!(!is_overdue_effective("follow", Some(100), Some(1), None));
         // 未设沿用操作层性质：登记类即使字典里保留着建议间隔值也永不催（现状一致）
@@ -1271,7 +1400,7 @@ mod tests {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
         let seed = food_id(&conn, "种子");
-        let shrimp = food_id(&conn, "干虾仁");
+        let shrimp = food_id(&conn, "虾干");
 
         let id = log_care(
             &conn,
@@ -1288,7 +1417,13 @@ mod tests {
 
         // 一条记录、两个食物关联（验收 2）
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 1);
-        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")), 2);
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")
+            ),
+            2
+        );
         let (note, occurred, created): (String, String, String) = conn
             .query_row(
                 "SELECT note, occurred_at, created_at FROM care_log WHERE id = ?1",
@@ -1321,7 +1456,11 @@ mod tests {
         .unwrap();
 
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
-        assert_eq!(tile(&tiles, "喂食").days_since_last, Some(1), "距上次按发生时间算");
+        assert_eq!(
+            tile(&tiles, "喂食").days_since_last,
+            Some(1),
+            "距上次按发生时间算"
+        );
         assert!(!tile(&tiles, "喂食").overdue);
     }
 
@@ -1340,26 +1479,47 @@ mod tests {
             food_ids: foods,
         };
 
-        assert!(log_care(&conn, &input(999, feed, vec![]), "2026-09-18 08:00:00")
-            .unwrap_err()
-            .contains("窝不存在"));
-        assert!(log_care(&conn, &input(c, 999, vec![]), "2026-09-18 08:00:00")
-            .unwrap_err()
-            .contains("操作不存在"));
+        assert!(
+            log_care(&conn, &input(999, feed, vec![]), "2026-09-18 08:00:00")
+                .unwrap_err()
+                .contains("窝不存在")
+        );
+        assert!(
+            log_care(&conn, &input(c, 999, vec![]), "2026-09-18 08:00:00")
+                .unwrap_err()
+                .contains("操作不存在")
+        );
 
         // 停用的操作/食物不能进新记录（规则 10：停用项不出现在新建记录入口）
-        conn.execute("UPDATE care_action SET enabled = 0 WHERE id = ?1", params![feed]).unwrap();
-        assert!(log_care(&conn, &input(c, feed, vec![]), "2026-09-18 08:00:00")
-            .unwrap_err()
-            .contains("停用"));
-        conn.execute("UPDATE care_action SET enabled = 1 WHERE id = ?1", params![feed]).unwrap();
+        conn.execute(
+            "UPDATE care_action SET enabled = 0 WHERE id = ?1",
+            params![feed],
+        )
+        .unwrap();
+        assert!(
+            log_care(&conn, &input(c, feed, vec![]), "2026-09-18 08:00:00")
+                .unwrap_err()
+                .contains("停用")
+        );
+        conn.execute(
+            "UPDATE care_action SET enabled = 1 WHERE id = ?1",
+            params![feed],
+        )
+        .unwrap();
 
         let water = food_id(&conn, "种子");
-        conn.execute("UPDATE food SET enabled = 0 WHERE id = ?1", params![water]).unwrap();
-        assert!(log_care(&conn, &input(c, feed, vec![water]), "2026-09-18 08:00:00")
-            .unwrap_err()
-            .contains("停用"));
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 0, "被拒的记账不落库");
+        conn.execute("UPDATE food SET enabled = 0 WHERE id = ?1", params![water])
+            .unwrap();
+        assert!(
+            log_care(&conn, &input(c, feed, vec![water]), "2026-09-18 08:00:00")
+                .unwrap_err()
+                .contains("停用")
+        );
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM care_log"),
+            0,
+            "被拒的记账不落库"
+        );
     }
 
     #[test]
@@ -1379,7 +1539,13 @@ mod tests {
             "2026-09-18 08:00:00",
         )
         .unwrap();
-        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")), 1);
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")
+            ),
+            1
+        );
     }
 
     #[test]
@@ -1404,7 +1570,11 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("食物"), "实际错误：{err}");
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 0, "被拒的记账不落库");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM care_log"),
+            0,
+            "被拒的记账不落库"
+        );
 
         // 不带食物照常可记
         assert!(log_care(
@@ -1445,7 +1615,11 @@ mod tests {
             "2026-09-18 08:00:00",
         );
         assert!(result.is_err());
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 0, "主记录应随事务回滚");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM care_log"),
+            0,
+            "主记录应随事务回滚"
+        );
     }
 
     // ── 卡片展示数据 ──
@@ -1490,10 +1664,18 @@ mod tests {
 
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         let names: Vec<&str> = tiles.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["喂食", "撤食", "活动区换水", "巢穴保湿", "垃圾清理"], "按 sort 排（撤食预置 v7 起 sort=2）");
+        assert_eq!(
+            names,
+            vec!["喂食", "撤食", "活动区换水", "巢穴保湿", "垃圾清理"],
+            "按 sort 排（撤食预置 v7 起 sort=2）"
+        );
 
         // 停用的操作不再出现（验收 6）
-        conn.execute("UPDATE care_action SET enabled = 0 WHERE name = '巢穴保湿'", []).unwrap();
+        conn.execute(
+            "UPDATE care_action SET enabled = 0 WHERE name = '巢穴保湿'",
+            [],
+        )
+        .unwrap();
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         let names: Vec<&str> = tiles.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, vec!["喂食", "撤食", "活动区换水", "垃圾清理"]);
@@ -1507,7 +1689,11 @@ mod tests {
         log(&conn, c, "喂食", "2026-09-16 20:00:00");
 
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
-        assert_eq!(tile(&tiles, "喂食").days_since_last, Some(2), "取最近一次发生");
+        assert_eq!(
+            tile(&tiles, "喂食").days_since_last,
+            Some(2),
+            "取最近一次发生"
+        );
     }
 
     #[test]
@@ -1610,7 +1796,11 @@ mod tests {
         )
         .unwrap();
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
-        assert_eq!(tile(&tiles, "喂食").days_since_last, Some(4), "开放段不改基线");
+        assert_eq!(
+            tile(&tiles, "喂食").days_since_last,
+            Some(4),
+            "开放段不改基线"
+        );
 
         // 脏数据：actual_end_date 非法 → 跳过，不毒死整页（票 04 停靠①口径）
         let c2 = colony(&conn, "倒霉二号");
@@ -1622,7 +1812,11 @@ mod tests {
         )
         .unwrap();
         let tiles = tiles_for_colony(&conn, c2, TODAY).unwrap();
-        assert_eq!(tile(&tiles, "喂食").days_since_last, Some(4), "脏出眠日被跳过");
+        assert_eq!(
+            tile(&tiles, "喂食").days_since_last,
+            Some(4),
+            "脏出眠日被跳过"
+        );
     }
 
     #[test]
@@ -1630,7 +1824,7 @@ mod tests {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
         let seed = food_id(&conn, "种子");
-        let shrimp = food_id(&conn, "干虾仁");
+        let shrimp = food_id(&conn, "虾干");
         log(&conn, c, "喂食", "2026-09-17 20:00:00");
         log_care(
             &conn,
@@ -1650,19 +1844,51 @@ mod tests {
         assert_eq!(recent.len(), 2, "只取最近 1-2 条");
         assert_eq!(recent[0].action_name, "喂食");
         assert_eq!(recent[0].happened_at, "2026-09-18 08:00:00");
-        assert_eq!(recent[0].food_names, vec!["种子", "干虾仁"], "log_food 无顺序列，按字典顺序展示");
+        assert_eq!(
+            recent[0].food_names,
+            vec!["种子", "虾干"],
+            "log_food 无顺序列，按字典顺序展示"
+        );
         assert_eq!(recent[1].action_name, "喂食");
-        assert_eq!(recent[1].food_names, Vec::<String>::new(), "无食物关联为空数组");
+        assert_eq!(
+            recent[1].food_names,
+            Vec::<String>::new(),
+            "无食物关联为空数组"
+        );
     }
 
     #[test]
     fn list_foods_returns_all_presets_including_disabled() {
         let conn = mem_conn();
-        conn.execute("UPDATE food SET enabled = 0 WHERE name = '面包虫'", []).unwrap();
+        conn.execute("UPDATE food SET enabled = 0 WHERE name = '面包虫干'", [])
+            .unwrap();
         let foods = list_foods(&conn).unwrap();
         let names: Vec<&str> = foods.iter().map(|f| f.name.as_str()).collect();
-        assert_eq!(names, vec!["种子", "干虾仁", "面包虫"]);
-        assert!(!foods.iter().find(|f| f.name == "面包虫").unwrap().enabled);
+        assert_eq!(
+            names,
+            vec![
+                "种子",
+                "虾干",
+                "面包虫干",
+                "樱桃蟑螂",
+                "蜂蜜",
+                "冰糖水",
+                "白糖水"
+            ]
+        );
+        assert!(!foods.iter().find(|f| f.name == "面包虫干").unwrap().enabled);
+        // ADR 0007：读回链带大类（DTO/SELECT/行映射三处）
+        let by_name = |n: &str| {
+            foods
+                .iter()
+                .find(|f| f.name == n)
+                .unwrap()
+                .category
+                .as_str()
+        };
+        assert_eq!(by_name("种子"), "seed");
+        assert_eq!(by_name("樱桃蟑螂"), "protein");
+        assert_eq!(by_name("蜂蜜"), "sugar");
     }
 
     #[test]
@@ -1685,7 +1911,7 @@ mod tests {
 
         let foods = list_foods(&conn).unwrap();
         assert!(foods.iter().find(|f| f.name == "种子").unwrap().referenced);
-        assert!(!foods.iter().find(|f| f.name == "干虾仁").unwrap().referenced);
+        assert!(!foods.iter().find(|f| f.name == "虾干").unwrap().referenced);
     }
 
     #[test]
@@ -1697,13 +1923,19 @@ mod tests {
         conn.execute(
             "INSERT INTO reminder_ledger (colony_id, kind, action_id, food_id, base_date, sent_at)
              VALUES (?1, 'food_overdue', ?2, ?3, '2026-09-11', '2026-09-18 08:00:00')",
-            params![c, action_id(&conn, "喂食"), food_id(&conn, "面包虫")],
+            params![c, action_id(&conn, "喂食"), food_id(&conn, "面包虫干")],
         )
         .unwrap();
 
         let foods = list_foods(&conn).unwrap();
-        assert!(foods.iter().find(|f| f.name == "面包虫").unwrap().referenced);
-        assert!(!foods.iter().find(|f| f.name == "干虾仁").unwrap().referenced);
+        assert!(
+            foods
+                .iter()
+                .find(|f| f.name == "面包虫干")
+                .unwrap()
+                .referenced
+        );
+        assert!(!foods.iter().find(|f| f.name == "虾干").unwrap().referenced);
     }
 
     // ── 记录列表 / 编辑 / 删除（票 08）──
@@ -1735,9 +1967,21 @@ mod tests {
         let conn = mem_conn();
         let c1 = colony(&conn, "大头一号");
         let c2 = colony(&conn, "针毛一号");
-        let feed_latest = feed_log(&conn, c1, "2026-09-17 20:00:00", Some("换了水盆"), &["种子"]);
+        let feed_latest = feed_log(
+            &conn,
+            c1,
+            "2026-09-17 20:00:00",
+            Some("换了水盆"),
+            &["种子"],
+        );
         let water = log(&conn, c1, "活动区换水", "2026-09-10 09:00:00");
-        let feed_old = feed_log(&conn, c1, "2026-09-05 08:00:00", Some("加餐面包虫"), &["面包虫"]);
+        let feed_old = feed_log(
+            &conn,
+            c1,
+            "2026-09-05 08:00:00",
+            Some("加餐面包虫干"),
+            &["面包虫干"],
+        );
         let c2_feed = log(&conn, c2, "喂食", "2026-09-16 21:00:00");
 
         // 无筛选：total 全量、occurred_at DESC（同刻再按 id DESC）
@@ -1764,14 +2008,24 @@ mod tests {
         assert_eq!(first.food_ids, vec![food_id(&conn, "种子")]);
 
         // 窝筛选
-        let only_c2 = list_logs(&conn, &LogFilter { colony_id: Some(c2), ..Default::default() }).unwrap();
+        let only_c2 = list_logs(
+            &conn,
+            &LogFilter {
+                colony_id: Some(c2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(only_c2.total, 1);
         assert_eq!(only_c2.rows[0].id, c2_feed);
 
         // 操作筛选
         let water_only = list_logs(
             &conn,
-            &LogFilter { action_id: Some(action_id(&conn, "活动区换水")), ..Default::default() },
+            &LogFilter {
+                action_id: Some(action_id(&conn, "活动区换水")),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(water_only.total, 1);
@@ -1793,15 +2047,32 @@ mod tests {
         assert_eq!(ids, vec![c2_feed, water]);
 
         // 只给一端
-        let from_10 = list_logs(&conn, &LogFilter { start: Some("2026-09-10".into()), ..Default::default() }).unwrap();
+        let from_10 = list_logs(
+            &conn,
+            &LogFilter {
+                start: Some("2026-09-10".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(from_10.total, 3);
-        let to_16 = list_logs(&conn, &LogFilter { end: Some("2026-09-16".into()), ..Default::default() }).unwrap();
+        let to_16 = list_logs(
+            &conn,
+            &LogFilter {
+                end: Some("2026-09-16".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(to_16.total, 3);
 
         // 备注关键词（子串）
         let kw = list_logs(
             &conn,
-            &LogFilter { note_keyword: Some("面包虫".into()), ..Default::default() },
+            &LogFilter {
+                note_keyword: Some("面包虫干".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(kw.total, 1);
@@ -1814,10 +2085,28 @@ mod tests {
         let conn = mem_conn();
         let c1 = colony(&conn, "大头一号");
         let c2 = colony(&conn, "针毛一号");
-        feed_log(&conn, c1, "2026-09-17 20:00:00", Some("换了水盆"), &["种子"]);
-        let target = feed_log(&conn, c1, "2026-09-05 08:00:00", Some("加餐面包虫"), &["面包虫"]);
+        feed_log(
+            &conn,
+            c1,
+            "2026-09-17 20:00:00",
+            Some("换了水盆"),
+            &["种子"],
+        );
+        let target = feed_log(
+            &conn,
+            c1,
+            "2026-09-05 08:00:00",
+            Some("加餐面包虫干"),
+            &["面包虫干"],
+        );
         log(&conn, c1, "活动区换水", "2026-09-10 09:00:00");
-        feed_log(&conn, c2, "2026-09-06 08:00:00", Some("面包虫大餐"), &["面包虫"]);
+        feed_log(
+            &conn,
+            c2,
+            "2026-09-06 08:00:00",
+            Some("面包虫干大餐"),
+            &["面包虫干"],
+        );
 
         let combined = list_logs(
             &conn,
@@ -1826,7 +2115,7 @@ mod tests {
                 action_id: Some(action_id(&conn, "喂食")),
                 start: Some("2026-09-01".into()),
                 end: Some("2026-09-18".into()),
-                note_keyword: Some("面包虫".into()),
+                note_keyword: Some("面包虫干".into()),
                 ..Default::default()
             },
         )
@@ -1842,16 +2131,42 @@ mod tests {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
         let underscore = feed_log(&conn, c, "2026-09-10 08:00:00", Some("配方 a_b 升级"), &[]);
-        let _similar = feed_log(&conn, c, "2026-09-11 08:00:00", Some("配方 axb 试运行"), &[]);
+        let _similar = feed_log(
+            &conn,
+            c,
+            "2026-09-11 08:00:00",
+            Some("配方 axb 试运行"),
+            &[],
+        );
         let pct = feed_log(&conn, c, "2026-09-12 08:00:00", Some("剩余 50% 量"), &[]);
-        let _no_pct = feed_log(&conn, c, "2026-09-13 08:00:00", Some("投喂 50 只面包虫"), &[]);
+        let _no_pct = feed_log(
+            &conn,
+            c,
+            "2026-09-13 08:00:00",
+            Some("投喂 50 只面包虫干"),
+            &[],
+        );
 
         // `_`/`%` 按字面匹配：不转义时 LIKE 会把 axb / 50 只 也捞进来
-        let kw1 = list_logs(&conn, &LogFilter { note_keyword: Some("a_b".into()), ..Default::default() }).unwrap();
+        let kw1 = list_logs(
+            &conn,
+            &LogFilter {
+                note_keyword: Some("a_b".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(kw1.total, 1);
         assert_eq!(kw1.rows[0].id, underscore);
 
-        let kw2 = list_logs(&conn, &LogFilter { note_keyword: Some("50%".into()), ..Default::default() }).unwrap();
+        let kw2 = list_logs(
+            &conn,
+            &LogFilter {
+                note_keyword: Some("50%".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(kw2.total, 1);
         assert_eq!(kw2.rows[0].id, pct);
     }
@@ -1866,7 +2181,11 @@ mod tests {
 
         let page1 = list_logs(
             &conn,
-            &LogFilter { limit: Some(3), offset: Some(0), ..Default::default() },
+            &LogFilter {
+                limit: Some(3),
+                offset: Some(0),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(page1.total, 8, "total 恒为命中总数，不随分页变");
@@ -1875,7 +2194,11 @@ mod tests {
 
         let page2 = list_logs(
             &conn,
-            &LogFilter { limit: Some(3), offset: Some(3), ..Default::default() },
+            &LogFilter {
+                limit: Some(3),
+                offset: Some(3),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(page2.rows.len(), 3);
@@ -1883,14 +2206,22 @@ mod tests {
 
         let tail = list_logs(
             &conn,
-            &LogFilter { limit: Some(3), offset: Some(6), ..Default::default() },
+            &LogFilter {
+                limit: Some(3),
+                offset: Some(6),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(tail.rows.len(), 2, "不足一页给余量");
 
         let past_end = list_logs(
             &conn,
-            &LogFilter { limit: Some(3), offset: Some(99), ..Default::default() },
+            &LogFilter {
+                limit: Some(3),
+                offset: Some(99),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert_eq!(past_end.rows.len(), 0);
@@ -1903,8 +2234,10 @@ mod tests {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
         let id = feed_log(&conn, c, "2026-09-15 08:00:00", None, &["种子"]);
-        conn.execute("UPDATE care_action SET enabled = 0 WHERE name = '喂食'", []).unwrap();
-        conn.execute("UPDATE food SET enabled = 0 WHERE name = '种子'", []).unwrap();
+        conn.execute("UPDATE care_action SET enabled = 0 WHERE name = '喂食'", [])
+            .unwrap();
+        conn.execute("UPDATE food SET enabled = 0 WHERE name = '种子'", [])
+            .unwrap();
 
         let page = list_logs(&conn, &LogFilter::default()).unwrap();
         assert_eq!(page.total, 1);
@@ -1924,7 +2257,12 @@ mod tests {
         conn.last_insert_rowid()
     }
     fn loc_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM location WHERE name = ?1", params![name], |r| r.get(0)).expect("查地点失败")
+        conn.query_row(
+            "SELECT id FROM location WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .expect("查地点失败")
     }
 
     #[test]
@@ -1936,7 +2274,14 @@ mod tests {
         log(&conn, c1, "喂食", "2026-09-17 20:00:00");
         log(&conn, c2, "喂食", "2026-09-16 20:00:00");
 
-        let page = list_logs(&conn, &LogFilter { location_id: Some(home), ..Default::default() }).unwrap();
+        let page = list_logs(
+            &conn,
+            &LogFilter {
+                location_id: Some(home),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.rows[0].colony_name, "大头一号");
         assert_eq!(page.rows[0].location_name.as_deref(), Some("家"));
@@ -1957,11 +2302,15 @@ mod tests {
         log(&conn, c1, "喂食", "2026-09-17 20:00:00");
         log(&conn, c2, "喂食", "2026-09-16 20:00:00");
 
-        let page = list_logs(&conn, &LogFilter {
-            location_id: Some(home),
-            colony_id: Some(c1),
-            ..Default::default()
-        }).unwrap();
+        let page = list_logs(
+            &conn,
+            &LogFilter {
+                location_id: Some(home),
+                colony_id: Some(c1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert_eq!(page.total, 1);
         assert_eq!(page.rows[0].colony_name, "家A");
     }
@@ -1971,16 +2320,22 @@ mod tests {
         // 验收 2：编辑喂食记录更换食物生效（log_food 关联同事务重写）
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        let id = feed_log(&conn, c, "2026-09-17 08:00:00", Some("  原备注  "), &["种子"]);
+        let id = feed_log(
+            &conn,
+            c,
+            "2026-09-17 08:00:00",
+            Some("  原备注  "),
+            &["种子"],
+        );
 
         update_log(
             &conn,
             id,
             &LogUpdateInput {
                 occurred_at: Some("2026-09-10T08:30".into()),
-                note: Some("  改投干虾仁和面包虫  ".into()),
+                note: Some("  改投虾干和面包虫干  ".into()),
                 action_id: None,
-                food_ids: Some(vec![food_id(&conn, "干虾仁"), food_id(&conn, "面包虫")]),
+                food_ids: Some(vec![food_id(&conn, "虾干"), food_id(&conn, "面包虫干")]),
             },
             "2026-09-18 08:00:00",
         )
@@ -1995,7 +2350,7 @@ mod tests {
             .unwrap();
         assert_eq!(action, action_id(&conn, "喂食"), "action_id None = 保持");
         assert_eq!(occurred, "2026-09-10 08:30:00", "发生时间规整后落库");
-        assert_eq!(note, "改投干虾仁和面包虫", "备注 trim");
+        assert_eq!(note, "改投虾干和面包虫干", "备注 trim");
 
         let links: Vec<i64> = {
             let mut stmt = conn
@@ -2008,13 +2363,13 @@ mod tests {
         };
         assert_eq!(
             links,
-            vec![food_id(&conn, "干虾仁"), food_id(&conn, "面包虫")],
+            vec![food_id(&conn, "虾干"), food_id(&conn, "面包虫干")],
             "旧关联删净、新关联写入（验收 2）"
         );
 
         // 列表读回也是新食物
         let page = list_logs(&conn, &LogFilter::default()).unwrap();
-        assert_eq!(page.rows[0].food_names, vec!["干虾仁", "面包虫"]);
+        assert_eq!(page.rows[0].food_names, vec!["虾干", "面包虫干"]);
     }
 
     #[test]
@@ -2023,7 +2378,7 @@ mod tests {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
         let seed = food_id(&conn, "种子");
-        let mealworm = food_id(&conn, "面包虫");
+        let mealworm = food_id(&conn, "面包虫干");
         let feed = action_id(&conn, "喂食");
         let water = action_id(&conn, "活动区换水");
         let id = feed_log(&conn, c, "2026-09-15 08:00:00", None, &["种子"]);
@@ -2053,7 +2408,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            count(&conn, &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")),
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")
+            ),
             1
         );
 
@@ -2102,7 +2460,11 @@ mod tests {
         assert!(err.contains("停用"), "实际错误：{err}");
 
         // ⑤ 启用后新挂 → OK
-        conn.execute("UPDATE care_action SET enabled = 1 WHERE id = ?1", params![water]).unwrap();
+        conn.execute(
+            "UPDATE care_action SET enabled = 1 WHERE id = ?1",
+            params![water],
+        )
+        .unwrap();
         update_log(
             &conn,
             id,
@@ -2116,7 +2478,11 @@ mod tests {
         )
         .unwrap();
         let action: i64 = conn
-            .query_row("SELECT action_id FROM care_log WHERE id = ?1", params![id], |r| r.get(0))
+            .query_row(
+                "SELECT action_id FROM care_log WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(action, water);
     }
@@ -2131,7 +2497,12 @@ mod tests {
         let id = feed_log(&conn, c, "2026-09-17 08:00:00", None, &["种子"]);
 
         let input = |occurred: Option<String>, action: Option<i64>, foods: Option<Vec<i64>>| {
-            LogUpdateInput { occurred_at: occurred, note: None, action_id: action, food_ids: foods }
+            LogUpdateInput {
+                occurred_at: occurred,
+                note: None,
+                action_id: action,
+                food_ids: foods,
+            }
         };
 
         // 未来发生时间（票 04 停靠②同口径：编辑也不许预记未来）
@@ -2194,7 +2565,13 @@ mod tests {
             .unwrap();
         assert_eq!(action, feed);
         assert_eq!(occurred, "2026-09-17 08:00:00");
-        assert_eq!(count(&conn, &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")), 1);
+        assert_eq!(
+            count(
+                &conn,
+                &format!("SELECT COUNT(*) FROM log_food WHERE log_id = {id}")
+            ),
+            1
+        );
     }
 
     #[test]
@@ -2221,7 +2598,11 @@ mod tests {
         .unwrap();
 
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
-        assert_eq!(tile(&tiles, "喂食").days_since_last, Some(10), "距上次跟随新发生时间");
+        assert_eq!(
+            tile(&tiles, "喂食").days_since_last,
+            Some(10),
+            "距上次跟随新发生时间"
+        );
         assert!(tile(&tiles, "喂食").overdue, "10 天 > 建议 3 天 → 超期红");
     }
 
@@ -2229,24 +2610,34 @@ mod tests {
     fn feeding_tile_lists_per_food_days_and_flags_food_overdue() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        // 2 天前喂了种子；8 天前喂过面包虫（周期 7 → 面包虫超期）
+        // 2 天前喂了种子；8 天前喂过面包虫干（周期 3 → 面包虫干超期）
         feed_log(&conn, c, "2026-09-16 20:00:00", None, &["种子"]);
-        feed_log(&conn, c, "2026-09-10 20:00:00", None, &["面包虫"]);
+        feed_log(&conn, c, "2026-09-10 20:00:00", None, &["面包虫干"]);
 
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         let feed = tile(&tiles, "喂食");
-        // 统一层 2 ≤ 3 自身不红，但面包虫食物层超期 → 任一层超期即红（Q2 决议；
+        // 统一层 2 ≤ 3 自身不红，但面包虫干食物层超期 → 任一层超期即红（Q2 决议；
         // 简报原文此处误写 !feed.overdue，与下方 Q2 测试同数据互斥，按 Q2 修正）
-        assert!(feed.overdue, "面包虫食物层超期 → 整块红（Q2 决议）");
+        assert!(feed.overdue, "面包虫干食物层超期 → 整块红（Q2 决议）");
         assert_eq!(feed.days_since_last, Some(2));
 
-        let foods: Vec<(String, Option<i64>, bool)> = feed.foods.iter()
-            .map(|f| (f.name.clone(), f.days_since_last, f.overdue)).collect();
-        assert_eq!(foods, vec![
-            ("种子".into(), Some(2), false),
-            ("干虾仁".into(), None, false),   // 从未喂过且设了周期 → None 不超期（同"从未记录"口径）
-            ("面包虫".into(), Some(8), true), // 8 > 7 → 食物层超期
-        ]);
+        let foods: Vec<(String, Option<i64>, bool)> = feed
+            .foods
+            .iter()
+            .map(|f| (f.name.clone(), f.days_since_last, f.overdue))
+            .collect();
+        assert_eq!(
+            foods,
+            vec![
+                ("种子".into(), Some(2), false),
+                ("虾干".into(), None, false), // 从未喂过且设了周期 → None 不超期（同"从未记录"口径）
+                ("面包虫干".into(), Some(8), true), // 8 > 3 → 食物层超期
+                ("樱桃蟑螂".into(), None, false),
+                ("蜂蜜".into(), None, false),
+                ("冰糖水".into(), None, false),
+                ("白糖水".into(), None, false),
+            ]
+        );
 
         // 非喂食 tile 不带食物明细
         assert!(tile(&tiles, "垃圾清理").foods.is_empty());
@@ -2257,7 +2648,7 @@ mod tests {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
         feed_log(&conn, c, "2026-09-16 20:00:00", None, &["种子"]);
-        feed_log(&conn, c, "2026-09-10 20:00:00", None, &["面包虫"]);
+        feed_log(&conn, c, "2026-09-10 20:00:00", None, &["面包虫干"]);
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         assert!(tile(&tiles, "喂食").overdue, "任一层超期即红（Q2 决议）");
     }
@@ -2266,11 +2657,22 @@ mod tests {
     fn food_without_interval_never_flags_and_wake_resets_food_clock() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        conn.execute("UPDATE food SET suggested_interval_days = NULL WHERE name = '种子'", []).unwrap();
+        conn.execute(
+            "UPDATE food SET suggested_interval_days = NULL WHERE name = '种子'",
+            [],
+        )
+        .unwrap();
         feed_log(&conn, c, "2026-08-01 20:00:00", None, &["种子"]); // 48 天前
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
-        let seed = tile(&tiles, "喂食").foods.iter().find(|f| f.name == "种子").unwrap();
-        assert!(!seed.overdue, "未设周期只受统一周期管（统一层 48>3 会红，但食物项自身不标）");
+        let seed = tile(&tiles, "喂食")
+            .foods
+            .iter()
+            .find(|f| f.name == "种子")
+            .unwrap();
+        assert!(
+            !seed.overdue,
+            "未设周期只受统一周期管（统一层 48>3 会红，但食物项自身不标）"
+        );
 
         // 出眠基线同样作用于食物层：出眠当天全部归零
         conn.execute(
@@ -2280,7 +2682,11 @@ mod tests {
         )
         .unwrap();
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
-        let worm = tile(&tiles, "喂食").foods.iter().find(|f| f.name == "面包虫").unwrap();
+        let worm = tile(&tiles, "喂食")
+            .foods
+            .iter()
+            .find(|f| f.name == "面包虫干")
+            .unwrap();
         assert_eq!(worm.days_since_last, Some(0), "从未喂过的食物从出眠日起算");
     }
 
@@ -2300,7 +2706,10 @@ mod tests {
         set_interval(&conn, c, "喂食", Some(5));
         log(&conn, c, "喂食", "2026-09-14 20:00:00"); // 4 天前
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
-        assert!(!tile(&tiles, "喂食").overdue, "4 ≤ 每窝周期 5 → 不红（取代建议 3）");
+        assert!(
+            !tile(&tiles, "喂食").overdue,
+            "4 ≤ 每窝周期 5 → 不红（取代建议 3）"
+        );
     }
 
     #[test]
@@ -2327,14 +2736,22 @@ mod tests {
 
         let tiles = tiles_for_colony(&conn, gypsum, TODAY).unwrap();
         let feed = tile(&tiles, "喂食");
-        assert_eq!(feed.suggested_interval_days, Some(3), "操作层建议间隔字段不动");
+        assert_eq!(
+            feed.suggested_interval_days,
+            Some(3),
+            "操作层建议间隔字段不动"
+        );
         assert_eq!(feed.effective_interval_days, Some(5), "有效周期 = 每窝周期");
         assert!(feed.interval_from_colony, "设了每窝周期 → 标记来自每窝");
         assert_eq!(feed.days_since_last, Some(4));
 
         let tiles = tiles_for_colony(&conn, tower, TODAY).unwrap();
         let feed = tile(&tiles, "喂食");
-        assert_eq!(feed.effective_interval_days, Some(3), "未设 → 沿用操作层建议间隔");
+        assert_eq!(
+            feed.effective_interval_days,
+            Some(3),
+            "未设 → 沿用操作层建议间隔"
+        );
         assert!(!feed.interval_from_colony);
         assert!(feed.overdue, "4 > 3 → 照旧红（未设窝行为与现状一致）");
 
@@ -2365,22 +2782,29 @@ mod tests {
 
     #[test]
     fn tiles_feeding_per_colony_replaces_unified_but_food_layer_stacks() {
-        // 设了每窝 7（取代统一 3）：操作层 2 ≤ 7 自身不红；面包虫 8 > 7 食物层
+        // 设了每窝 7（取代统一 3）：操作层 2 ≤ 7 自身不红；面包虫干 8 > 7 食物层
         // 照旧叠加 → 整块红（食物周期不因每窝周期而废）
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
         set_interval(&conn, c, "喂食", Some(7));
         feed_log(&conn, c, "2026-09-16 20:00:00", None, &["种子"]);
-        feed_log(&conn, c, "2026-09-10 20:00:00", None, &["面包虫"]);
+        feed_log(&conn, c, "2026-09-10 20:00:00", None, &["面包虫干"]);
 
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         let feed = tile(&tiles, "喂食");
         assert_eq!(feed.effective_interval_days, Some(7));
         assert!(feed.interval_from_colony);
-        assert!(!feed.operation_overdue(), "操作层 OR 项 = 每窝周期 7，2 ≤ 7 不红");
-        assert!(feed.overdue, "面包虫食物层超期 → 整块红（OR 叠加照旧）");
-        let worm = feed.foods.iter().find(|f| f.name == "面包虫").unwrap();
-        assert_eq!(worm.suggested_interval_days, Some(7), "食物行仍带自己的周期");
+        assert!(
+            !feed.operation_overdue(),
+            "操作层 OR 项 = 每窝周期 7，2 ≤ 7 不红"
+        );
+        assert!(feed.overdue, "面包虫干食物层超期 → 整块红（OR 叠加照旧）");
+        let worm = feed.foods.iter().find(|f| f.name == "面包虫干").unwrap();
+        assert_eq!(
+            worm.suggested_interval_days,
+            Some(3),
+            "食物行仍带自己的周期"
+        );
         assert!(worm.overdue);
 
         // 对照：只喂种子（2 ≤ 3）→ 每窝 7 下整块安静（若仍看统一 3 会整块红）
@@ -2388,7 +2812,10 @@ mod tests {
         set_interval(&conn, quiet, "喂食", Some(7));
         feed_log(&conn, quiet, "2026-09-16 20:00:00", None, &["种子"]);
         let tiles = tiles_for_colony(&conn, quiet, TODAY).unwrap();
-        assert!(!tile(&tiles, "喂食").overdue, "统一层不参与、食物层不超 → 不红");
+        assert!(
+            !tile(&tiles, "喂食").overdue,
+            "统一层不参与、食物层不超 → 不红"
+        );
     }
 
     #[test]
@@ -2397,8 +2824,11 @@ mod tests {
         // 仍按性质判定（登记类永不红），不能因为间隔值还在就误用
         let conn = mem_conn();
         let c = colony(&conn, "水塔一号");
-        conn.execute("UPDATE care_action SET kind = 'log_only' WHERE name = '垃圾清理'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE care_action SET kind = 'log_only' WHERE name = '垃圾清理'",
+            [],
+        )
+        .unwrap();
         log(&conn, c, "垃圾清理", "2026-06-01 08:00:00"); // 100+ 天前，建议 7 仍在库
 
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
@@ -2445,7 +2875,11 @@ mod tests {
         delete_log(&conn, id).unwrap();
 
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 0);
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM log_food"), 0, "食物关联一并删除");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM log_food"),
+            0,
+            "食物关联一并删除"
+        );
         let tiles = tiles_for_colony(&conn, c, TODAY).unwrap();
         assert_eq!(tile(&tiles, "喂食").days_since_last, None, "回到无记录态");
         assert!(!tile(&tiles, "喂食").overdue);
@@ -2478,7 +2912,10 @@ mod tests {
 
         let rows = month_rows(&conn, c, 2026, 9, None);
         assert_eq!(rows.len(), 3, "3 个 (day, action) 组");
-        let trash = rows.iter().find(|r| r.action_id == action_id(&conn, "垃圾清理")).unwrap();
+        let trash = rows
+            .iter()
+            .find(|r| r.action_id == action_id(&conn, "垃圾清理"))
+            .unwrap();
         assert_eq!(trash.day, 12);
         assert_eq!(trash.count, 2);
         assert_eq!(trash.last_time, "2026-09-12 19:40:00"); // 最近一条的时刻
@@ -2491,7 +2928,7 @@ mod tests {
         let c2 = colony(&conn, "大头二号");
         log(&conn, c1, "喂食", "2026-09-17 20:00:00");
         log(&conn, c1, "喂食", "2026-08-31 23:59:59"); // 上月
-        // 次月：票 04 起写入层拒未来时间，log_care 写不进——查询边界直接落库验证
+                                                       // 次月：票 04 起写入层拒未来时间，log_care 写不进——查询边界直接落库验证
         conn.execute(
             "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
              VALUES (?1, ?2, '2026-10-01 00:00:00', '', '2026-09-18 08:00:00')",
@@ -2602,7 +3039,7 @@ mod tests {
 
     #[test]
     fn retrieval_due_takes_shortest_interval_across_foods_fed_together() {
-        // 验收：种子(不易腐)+面包虫24h+湿食6h 同喂 → 到期 = 喂食 + 6h（同喂取最短，F2）
+        // 验收：种子(不易腐)+面包虫干24h+湿食6h 同喂 → 到期 = 喂食 + 6h（同喂取最短，F2）
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
         let wet = perishable_food(&conn, "湿食", Some(6));
@@ -2610,10 +3047,12 @@ mod tests {
             &conn,
             c,
             "2026-09-19 08:00:00",
-            &[food_id(&conn, "种子"), food_id(&conn, "面包虫"), wet],
+            &[food_id(&conn, "种子"), food_id(&conn, "面包虫干"), wet],
         );
 
-        let due = retrieval_due_for_colony(&conn, c).unwrap().expect("易腐喂食后应待撤");
+        let due = retrieval_due_for_colony(&conn, c)
+            .unwrap()
+            .expect("易腐喂食后应待撤");
         assert_eq!(due.fed_at, "2026-09-19 08:00:00");
         assert_eq!(due.due_at, "2026-09-19 14:00:00", "min(24, 6) = 6h 到期");
 
@@ -2629,15 +3068,24 @@ mod tests {
         // 验收：再喂易腐按最新一次重算；只喂不易腐食物不重置基准
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        feed_foods(&conn, c, "2026-09-17 12:00:00", &[food_id(&conn, "面包虫")]);
+        feed_foods(
+            &conn,
+            c,
+            "2026-09-17 12:00:00",
+            &[food_id(&conn, "面包虫干")],
+        );
         feed_foods(&conn, c, "2026-09-18 12:00:00", &[food_id(&conn, "种子")]);
 
-        let due = retrieval_due_for_colony(&conn, c).unwrap().expect("种子不撤待撤");
+        let due = retrieval_due_for_colony(&conn, c)
+            .unwrap()
+            .expect("种子不撤待撤");
         assert_eq!(due.fed_at, "2026-09-17 12:00:00", "非易腐喂食不重算基准");
 
         let wet = perishable_food(&conn, "湿食", Some(6));
         feed_foods(&conn, c, "2026-09-19 07:00:00", &[wet]);
-        let due = retrieval_due_for_colony(&conn, c).unwrap().expect("再喂易腐重算");
+        let due = retrieval_due_for_colony(&conn, c)
+            .unwrap()
+            .expect("再喂易腐重算");
         assert_eq!(due.fed_at, "2026-09-19 07:00:00", "按最新一次易腐喂食重算");
         assert_eq!(due.due_at, "2026-09-19 13:00:00");
     }
@@ -2648,7 +3096,12 @@ mod tests {
         // 同刻不清（喂食须严格晚于撤食才算待撤）
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        feed_foods(&conn, c, "2026-09-18 08:00:00", &[food_id(&conn, "面包虫")]);
+        feed_foods(
+            &conn,
+            c,
+            "2026-09-18 08:00:00",
+            &[food_id(&conn, "面包虫干")],
+        );
 
         retrieval_log(&conn, c, "2026-09-17 08:00:00");
         assert!(
@@ -2663,7 +3116,12 @@ mod tests {
             "撤食一次清空"
         );
 
-        feed_foods(&conn, c, "2026-09-19 10:00:00", &[food_id(&conn, "面包虫")]);
+        feed_foods(
+            &conn,
+            c,
+            "2026-09-19 10:00:00",
+            &[food_id(&conn, "面包虫干")],
+        );
         retrieval_log(&conn, c, "2026-09-19 10:00:00");
         assert_eq!(
             retrieval_due_for_colony(&conn, c).unwrap(),
@@ -2686,16 +3144,26 @@ mod tests {
             "无间隔易腐不派生"
         );
 
-        feed_foods(&conn, c, "2026-09-19 08:00:00", &[bad, food_id(&conn, "面包虫")]);
-        let due = retrieval_due_for_colony(&conn, c).unwrap().expect("有效易腐照常派生");
+        feed_foods(
+            &conn,
+            c,
+            "2026-09-19 08:00:00",
+            &[bad, food_id(&conn, "面包虫干")],
+        );
+        let due = retrieval_due_for_colony(&conn, c)
+            .unwrap()
+            .expect("有效易腐照常派生");
         assert_eq!(due.fed_at, "2026-09-19 08:00:00");
-        assert_eq!(due.due_at, "2026-09-20 08:00:00", "面包虫 24h");
+        assert_eq!(due.due_at, "2026-09-20 08:00:00", "面包虫干 24h");
 
         feed_foods(&conn, c, "2026-09-19 11:00:00", &[bad]);
         let due = retrieval_due_for_colony(&conn, c)
             .unwrap()
             .expect("回退最近一条有效易腐喂食");
-        assert_eq!(due.fed_at, "2026-09-19 08:00:00", "11:00 一喂只有无效易腐，视同不存在");
+        assert_eq!(
+            due.fed_at, "2026-09-19 08:00:00",
+            "11:00 一喂只有无效易腐，视同不存在"
+        );
     }
 
     // ── 垃圾清理顺带撤食（ADR 0006）──
@@ -2706,17 +3174,49 @@ mod tests {
         // 清不掉）、同刻 pending、到期前 pending、恰在到期时刻 overdue、已撤 none
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        assert_eq!(retrieval_link_state(&conn, c, "2026-09-19 12:00").unwrap(), "none", "无易腐喂食");
+        assert_eq!(
+            retrieval_link_state(&conn, c, "2026-09-19 12:00").unwrap(),
+            "none",
+            "无易腐喂食"
+        );
 
-        feed_foods(&conn, c, "2026-09-18 08:00:00", &[food_id(&conn, "面包虫")]); // 24h → 09-19 08:00 到期
-        assert_eq!(retrieval_link_state(&conn, c, "2026-09-18 07:59:59").unwrap(), "none", "早于基准喂食");
-        assert_eq!(retrieval_link_state(&conn, c, "2026-09-18 08:00:00").unwrap(), "pending", "同刻喂食可撤（同刻即清）");
-        assert_eq!(retrieval_link_state(&conn, c, "2026-09-19 07:59:59").unwrap(), "pending", "到期前未逾期");
-        assert_eq!(retrieval_link_state(&conn, c, "2026-09-19 08:00:00").unwrap(), "overdue", "恰在到期时刻即逾期");
+        feed_foods(
+            &conn,
+            c,
+            "2026-09-18 08:00:00",
+            &[food_id(&conn, "面包虫干")],
+        ); // 24h → 09-19 08:00 到期
+        assert_eq!(
+            retrieval_link_state(&conn, c, "2026-09-18 07:59:59").unwrap(),
+            "none",
+            "早于基准喂食"
+        );
+        assert_eq!(
+            retrieval_link_state(&conn, c, "2026-09-18 08:00:00").unwrap(),
+            "pending",
+            "同刻喂食可撤（同刻即清）"
+        );
+        assert_eq!(
+            retrieval_link_state(&conn, c, "2026-09-19 07:59:59").unwrap(),
+            "pending",
+            "到期前未逾期"
+        );
+        assert_eq!(
+            retrieval_link_state(&conn, c, "2026-09-19 08:00:00").unwrap(),
+            "overdue",
+            "恰在到期时刻即逾期"
+        );
 
         retrieval_log(&conn, c, "2026-09-19 09:00:00");
-        assert_eq!(retrieval_link_state(&conn, c, "2026-09-19 10:00:00").unwrap(), "none", "已撤清空");
-        assert!(retrieval_link_state(&conn, c, "不是时间").is_err(), "垃圾时间报错");
+        assert_eq!(
+            retrieval_link_state(&conn, c, "2026-09-19 10:00:00").unwrap(),
+            "none",
+            "已撤清空"
+        );
+        assert!(
+            retrieval_link_state(&conn, c, "不是时间").is_err(),
+            "垃圾时间报错"
+        );
     }
 
     #[test]
@@ -2724,7 +3224,12 @@ mod tests {
         // 验收：勾选顺带 → 同事务两条记录、同一发生时刻、撤食自动备注、待撤清空
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        feed_foods(&conn, c, "2026-09-18 08:00:00", &[food_id(&conn, "面包虫")]);
+        feed_foods(
+            &conn,
+            c,
+            "2026-09-18 08:00:00",
+            &[food_id(&conn, "面包虫干")],
+        );
         let trash = action_id(&conn, "垃圾清理");
         let input = CareLogInput {
             colony_id: c,
@@ -2743,7 +3248,14 @@ mod tests {
             .collect::<Result<_, _>>()
             .expect("收集失败");
         assert_eq!(rows.len(), 3, "喂食 + 垃圾清理 + 联动撤食");
-        assert_eq!(rows[2], ("follow".into(), "2026-09-19 09:30:00".into(), "随垃圾清理一并撤除".into()));
+        assert_eq!(
+            rows[2],
+            (
+                "follow".into(),
+                "2026-09-19 09:30:00".into(),
+                "随垃圾清理一并撤除".into()
+            )
+        );
         assert_eq!(rows[1].2, "顺手清了", "主记录备注不被联动覆盖");
 
         let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", "2026-09-19 23:00:00").unwrap();
@@ -2765,24 +3277,66 @@ mod tests {
         };
 
         // 无易腐喂食：不存在可附带时刻
-        let err = log_care_linked(&conn, &input_for(trash, "2026-09-19 09:00:00"), true, "2026-09-19 23:00:00").unwrap_err();
+        let err = log_care_linked(
+            &conn,
+            &input_for(trash, "2026-09-19 09:00:00"),
+            true,
+            "2026-09-19 23:00:00",
+        )
+        .unwrap_err();
         assert!(err.contains("没有待撤"), "实际：{err}");
 
-        feed_foods(&conn, c, "2026-09-19 08:00:00", &[food_id(&conn, "面包虫")]);
+        feed_foods(
+            &conn,
+            c,
+            "2026-09-19 08:00:00",
+            &[food_id(&conn, "面包虫干")],
+        );
         // 非 linkage 操作（未插旗标）
-        let err = log_care_linked(&conn, &input_for(water, "2026-09-19 09:00:00"), true, "2026-09-19 23:00:00").unwrap_err();
+        let err = log_care_linked(
+            &conn,
+            &input_for(water, "2026-09-19 09:00:00"),
+            true,
+            "2026-09-19 23:00:00",
+        )
+        .unwrap_err();
         assert!(err.contains("不支持顺带撤食"), "实际：{err}");
         // 所选时刻早于基准喂食 → 记了清不掉，拒
-        let err = log_care_linked(&conn, &input_for(trash, "2026-09-19 07:00:00"), true, "2026-09-19 23:00:00").unwrap_err();
+        let err = log_care_linked(
+            &conn,
+            &input_for(trash, "2026-09-19 07:00:00"),
+            true,
+            "2026-09-19 23:00:00",
+        )
+        .unwrap_err();
         assert!(err.contains("没有待撤"), "实际：{err}");
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_log"), 1, "被拒的联动不落任何记录");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM care_log"),
+            1,
+            "被拒的联动不落任何记录"
+        );
 
         // 撤食停用 = 联动整体关闭（ADR 0006）；主记录照常
-        conn.execute("UPDATE care_action SET enabled = 0 WHERE kind = 'follow'", [])
-            .expect("停用撤食失败");
-        let err = log_care_linked(&conn, &input_for(trash, "2026-09-19 09:00:00"), true, "2026-09-19 23:00:00").unwrap_err();
+        conn.execute(
+            "UPDATE care_action SET enabled = 0 WHERE kind = 'follow'",
+            [],
+        )
+        .expect("停用撤食失败");
+        let err = log_care_linked(
+            &conn,
+            &input_for(trash, "2026-09-19 09:00:00"),
+            true,
+            "2026-09-19 23:00:00",
+        )
+        .unwrap_err();
         assert!(err.contains("撤食已停用"), "实际：{err}");
-        assert!(log_care_linked(&conn, &input_for(trash, "2026-09-19 09:00:00"), false, "2026-09-19 23:00:00").is_ok());
+        assert!(log_care_linked(
+            &conn,
+            &input_for(trash, "2026-09-19 09:00:00"),
+            false,
+            "2026-09-19 23:00:00"
+        )
+        .is_ok());
     }
 
     #[test]
@@ -2806,15 +3360,26 @@ mod tests {
         let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", NOW).unwrap();
         assert_eq!(retrieval_state_of(&tiles), "none", "无待撤 → 置灰档");
         assert!(
-            tiles.iter().all(|t| t.kind == "follow" || t.retrieval_state == "none"),
+            tiles
+                .iter()
+                .all(|t| t.kind == "follow" || t.retrieval_state == "none"),
             "非 follow 块恒 none"
         );
         let follow = tiles.iter().find(|t| t.kind == "follow").unwrap();
         assert!(!follow.overdue, "follow 性质 is_overdue 恒 false");
 
-        feed_foods(&conn, c, "2026-09-18 20:00:00", &[food_id(&conn, "面包虫")]);
+        feed_foods(
+            &conn,
+            c,
+            "2026-09-18 20:00:00",
+            &[food_id(&conn, "面包虫干")],
+        );
         let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", NOW).unwrap();
-        assert_eq!(retrieval_state_of(&tiles), "pending", "NOW 12:00 < 到期 20:00");
+        assert_eq!(
+            retrieval_state_of(&tiles),
+            "pending",
+            "NOW 12:00 < 到期 20:00"
+        );
         let follow = tiles.iter().find(|t| t.kind == "follow").unwrap();
         assert!(!follow.overdue, "待撤也不走 overdue 通道");
 
@@ -2822,7 +3387,11 @@ mod tests {
         let tiles = tiles_for_colony_at(&conn, c, "2026-09-19", NOW).unwrap();
         assert_eq!(retrieval_state_of(&tiles), "none", "撤食后回置灰档");
         let follow = tiles.iter().find(|t| t.kind == "follow").unwrap();
-        assert_eq!(follow.days_since_last, Some(0), "days_since 通道照旧（自然日语义）");
+        assert_eq!(
+            follow.days_since_last,
+            Some(0),
+            "days_since 通道照旧（自然日语义）"
+        );
         assert!(!follow.overdue);
     }
 
@@ -2843,10 +3412,10 @@ mod tests {
         };
         assert!(!by_name("种子").perishable, "种子预置不易腐");
         assert_eq!(by_name("种子").retrieval_hours, None);
-        assert!(by_name("干虾仁").perishable);
-        assert_eq!(by_name("干虾仁").retrieval_hours, Some(24));
-        assert!(by_name("面包虫").perishable);
-        assert_eq!(by_name("面包虫").retrieval_hours, Some(24));
+        assert!(by_name("虾干").perishable);
+        assert_eq!(by_name("虾干").retrieval_hours, Some(24));
+        assert!(by_name("面包虫干").perishable);
+        assert_eq!(by_name("面包虫干").retrieval_hours, Some(24));
         assert!(by_name("湿食").perishable);
         assert_eq!(by_name("湿食").retrieval_hours, Some(6));
         assert!(by_name("坏鲜食").perishable);

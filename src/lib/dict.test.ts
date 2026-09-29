@@ -34,6 +34,7 @@ function foodItem(partial: Partial<FoodItem> & { id: number }): FoodItem {
     suggested_interval_days: null,
     referenced: false,
     is_preset: false,
+    category: "seed",
     ...partial,
   };
 }
@@ -149,12 +150,12 @@ describe("食物行", () => {
     expect(rows[2]!.enabled).toBe(false);
     expect(rows[2]!.intervalText).toBe("");
 
-    rows.push({ id: null, name: " 糖水 ", enabled: true, intervalText: "", referenced: false, isPreset: false, perishable: false, retrievalHoursText: "" });
+    rows.push({ id: null, name: " 糖水 ", enabled: true, intervalText: "", referenced: false, isPreset: false, perishable: false, retrievalHoursText: "", category: "sugar" });
     expect(toFoodInputs(rows)).toEqual([
-      { id: 1, name: "种子", sort: 0, suggested_interval_days: 3, perishable: false, retrieval_hours: null },
-      { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7, perishable: false, retrieval_hours: null },
-      { id: 5, name: "面包虫", sort: 2, suggested_interval_days: null, perishable: false, retrieval_hours: null },
-      { id: null, name: "糖水", sort: 3, suggested_interval_days: null, perishable: false, retrieval_hours: null },
+      { id: 1, name: "种子", sort: 0, suggested_interval_days: 3, perishable: false, retrieval_hours: null, category: "seed" },
+      { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7, perishable: false, retrieval_hours: null, category: "seed" },
+      { id: 5, name: "面包虫", sort: 2, suggested_interval_days: null, perishable: false, retrieval_hours: null, category: "seed" },
+      { id: null, name: "糖水", sort: 3, suggested_interval_days: null, perishable: false, retrieval_hours: null, category: "sugar" },
     ]);
     rows[3]!.intervalText = " 5 ";
     expect(toFoodInputs(rows)[3]!.suggested_interval_days).toBe(5);
@@ -198,7 +199,7 @@ describe("食物行", () => {
     expect(
       validateFoodRows([
         ...rows,
-        { id: null, name: " 种子 ", enabled: true, intervalText: "", referenced: false, isPreset: false, perishable: false, retrievalHoursText: "" },
+        { id: null, name: " 种子 ", enabled: true, intervalText: "", referenced: false, isPreset: false, perishable: false, retrievalHoursText: "", category: "seed" },
       ]),
     ).toContain("已存在");
     expect(validateFoodRows(rows)).toBe("");
@@ -240,6 +241,28 @@ describe("食物行", () => {
     // 关易腐：间隔文本无论什么都不拦（保存时归 null）
     rows[0]!.perishable = false;
     rows[0]!.retrievalHoursText = "0";
+    expect(validateFoodRows(rows)).toBe("");
+  });
+
+  it("食物大类（ADR 0007）：buildFoodRows 携带大类，toFoodInputs 透传、空串转 null", () => {
+    const rows = buildFoodRows([
+      foodItem({ id: 1, name: "种子", category: "seed" }),
+      foodItem({ id: 2, name: "虾干", category: "protein" }),
+      foodItem({ id: 3, name: "蜂蜜", category: "sugar" }),
+    ]);
+    expect(rows.map((r) => r.category)).toEqual(["seed", "protein", "sugar"]);
+    expect(toFoodInputs(rows).map((i) => i.category)).toEqual(["seed", "protein", "sugar"]);
+    expect(toFoodInputs([{ ...rows[0]!, category: "" }])[0]!.category).toBeNull();
+  });
+
+  it("食物大类（ADR 0007）：validateFoodRows 拦缺大类与非法大类", () => {
+    const rows = buildFoodRows([foodItem({ id: 1, name: "蟋蟀" })]);
+    expect(validateFoodRows([{ ...rows[0]!, category: "" }])).toBe(
+      "食物「蟋蟀」必须选择大类（种子/蛋白质/糖水）",
+    );
+    expect(validateFoodRows([{ ...rows[0]!, category: "fruit" as never }])).toBe(
+      "食物「蟋蟀」的大类不合法（应为 种子/蛋白质/糖水）",
+    );
     expect(validateFoodRows(rows)).toBe("");
   });
 });

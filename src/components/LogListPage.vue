@@ -46,6 +46,7 @@ import {
   type LogFilterForm,
 } from "../lib/loglist";
 import { todayIso } from "../lib/dates";
+import { groupFoodsByCategory } from "../lib/foodCategories";
 import { buildMarkers, duplicateInfo, dupWarningText } from "../lib/monthview";
 import DatePickerPop from "./DatePickerPop.vue";
 import DateTimeField from "./DateTimeField.vue";
@@ -57,6 +58,9 @@ const colonies = ref<Colony[]>([]);
 const locations = ref<LocationItem[]>([]);
 const actions = ref<CareActionItem[]>([]);
 const foods = ref<FoodItem[]>([]);
+
+/** 编辑弹窗的食物分组（ADR 0007）：含停用项（保留原值的场景），空组不渲染组头 */
+const groupedFoods = computed(() => groupFoodsByCategory(foods.value));
 
 const form = ref<LogFilterForm>(emptyFilterForm());
 const filterError = ref("");
@@ -498,18 +502,23 @@ onBeforeUnmount(() => {
           <template v-if="editIsFeeding">
             <div class="field-label">食物（可多选；停用项仅原值可保留）</div>
             <div class="foods">
-              <button
-                v-for="f in foods"
-                :key="f.id"
-                class="food"
-                :class="{ selected: editFoodIds.includes(f.id), off: !f.enabled }"
-                type="button"
-                :disabled="!pickable(f)"
-                :title="!f.enabled ? (pickable(f) ? '已停用 · 保留原值' : '已停用 · 不能新选') : ''"
-                @click="toggleFood(f.id)"
-              >
-                {{ dictLabel(f.name, f.enabled) }}
-              </button>
+              <div v-for="g in groupedFoods" :key="g.key" class="food-group">
+                <span class="food-group-label">{{ g.label }}</span>
+                <div class="food-group-items">
+                  <button
+                    v-for="f in g.items"
+                    :key="f.id"
+                    class="food"
+                    :class="{ selected: editFoodIds.includes(f.id), off: !f.enabled }"
+                    type="button"
+                    :disabled="!pickable(f)"
+                    :title="!f.enabled ? (pickable(f) ? '已停用 · 保留原值' : '已停用 · 不能新选') : ''"
+                    @click="toggleFood(f.id)"
+                  >
+                    {{ dictLabel(f.name, f.enabled) }}
+                  </button>
+                </div>
+              </div>
             </div>
           </template>
 
@@ -791,6 +800,27 @@ onBeforeUnmount(() => {
 }
 
 .foods {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 大类分组（ADR 0007）：组标签 + 组内 chips，与打卡弹窗同款 */
+.food-group {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.food-group-label {
+  flex: 0 0 auto;
+  min-width: 3em;
+  font-size: 12px;
+  color: var(--muted);
+  padding: 7px 0;
+}
+
+.food-group-items {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;

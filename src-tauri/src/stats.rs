@@ -258,7 +258,10 @@ pub fn get_stats(
     loop {
         let count = counts.get(&day).copied().unwrap_or(0);
         *weekly_map.entry(monday_of(day)).or_insert(0) += count;
-        daily.push(DailyCount { date: fmt_d(day), count });
+        daily.push(DailyCount {
+            date: fmt_d(day),
+            count,
+        });
         if day == end {
             break;
         }
@@ -267,12 +270,18 @@ pub fn get_stats(
 
     let daily_detail = detail_map
         .into_iter()
-        .map(|(day, entries)| DayDetail { date: fmt_d(day), entries })
+        .map(|(day, entries)| DayDetail {
+            date: fmt_d(day),
+            entries,
+        })
         .collect();
 
     let weekly = weekly_map
         .into_iter()
-        .map(|(week_start, count)| WeeklyCount { week_start: fmt_d(week_start), count })
+        .map(|(week_start, count)| WeeklyCount {
+            week_start: fmt_d(week_start),
+            count,
+        })
         .collect();
 
     // 食物出现次数（分母 = 合计，前端归一化），按次数降序、字典顺序破平
@@ -324,7 +333,10 @@ pub fn get_stats(
         let Some(day) = parse_date_part(&date_part) else {
             continue;
         };
-        dates_per_pair.entry((colony, action)).or_default().push(day);
+        dates_per_pair
+            .entry((colony, action))
+            .or_default()
+            .push(day);
     }
     for dates in dates_per_pair.values_mut() {
         dates.sort_unstable();
@@ -394,7 +406,10 @@ pub fn get_stats(
             if *act != action_id {
                 continue;
             }
-            let segments = segments_per_colony.get(colony).map(Vec::as_slice).unwrap_or(&[]);
+            let segments = segments_per_colony
+                .get(colony)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             samples.extend(interval_samples(dates, segments));
         }
         let (avg, min, max) = summarize(&samples);
@@ -447,13 +462,19 @@ mod tests {
     }
 
     fn action_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM care_action WHERE name = ?1", params![name], |r| r.get(0))
-            .expect("查操作失败")
+        conn.query_row(
+            "SELECT id FROM care_action WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .expect("查操作失败")
     }
 
     fn food_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| r.get(0))
-            .expect("查食物失败")
+        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| {
+            r.get(0)
+        })
+        .expect("查食物失败")
     }
 
     /// 记一笔（created_at 用远期固定值：录入时间不参与统计，只绕开“不能记未来”校验，
@@ -473,12 +494,7 @@ mod tests {
         .expect("记账失败")
     }
 
-    fn log_with_foods(
-        conn: &Connection,
-        colony_id: i64,
-        happened_at: &str,
-        foods: &[&str],
-    ) -> i64 {
+    fn log_with_foods(conn: &Connection, colony_id: i64, happened_at: &str, foods: &[&str]) -> i64 {
         crate::care::log_care(
             conn,
             &crate::care::CareLogInput {
@@ -528,7 +544,10 @@ mod tests {
         // 跨 30 天冬眠的两次喂食：68 − 30 = 38（与 hibernation 模块验收用例同数据）
         let samples = interval_samples(
             &[d("2026-11-01"), d("2027-01-08")],
-            &[crate::hibernation::Segment::closed(d("2026-11-10"), d("2026-12-09"))],
+            &[crate::hibernation::Segment::closed(
+                d("2026-11-10"),
+                d("2026-12-09"),
+            )],
         );
         assert_eq!(samples, vec![38]);
     }
@@ -564,8 +583,14 @@ mod tests {
     fn get_stats_rejects_bad_format_and_reversed_range() {
         let conn = mem_conn();
         assert!(get_stats(&conn, None, "2026/09/01", "2026-09-18").is_err());
-        assert!(get_stats(&conn, None, "2026-09-18", "2026-09-01").is_err(), "end < start 拒绝");
-        assert!(get_stats(&conn, None, "2026-09-01", "2026-09-01").is_ok(), "单天范围合法");
+        assert!(
+            get_stats(&conn, None, "2026-09-18", "2026-09-01").is_err(),
+            "end < start 拒绝"
+        );
+        assert!(
+            get_stats(&conn, None, "2026-09-01", "2026-09-01").is_ok(),
+            "单天范围合法"
+        );
     }
 
     #[test]
@@ -598,7 +623,7 @@ mod tests {
     fn daily_detail_hover_carries_food_names_and_skips_recordless_days() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        log_with_foods(&conn, c, "2026-09-10 09:00:00", &["种子", "干虾仁"]);
+        log_with_foods(&conn, c, "2026-09-10 09:00:00", &["种子", "虾干"]);
         log(&conn, c, "巢穴保湿", "2026-09-10 10:00:00");
 
         let stats = get_stats(&conn, None, "2026-09-08", "2026-09-14").unwrap();
@@ -609,7 +634,7 @@ mod tests {
         assert_eq!(day.entries[0].action_name, "喂食");
         assert_eq!(
             day.entries[0].food_names,
-            vec!["种子", "干虾仁"],
+            vec!["种子", "虾干"],
             "悬停明细含喂食的食物（验收 3），按字典顺序"
         );
         assert_eq!(day.entries[1].action_name, "巢穴保湿");
@@ -621,13 +646,21 @@ mod tests {
         // 规则 8：一次多选投喂每种所选食物各计 1 次
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        log_with_foods(&conn, c, "2026-09-10 09:00:00", &["种子", "干虾仁"]);
+        log_with_foods(&conn, c, "2026-09-10 09:00:00", &["种子", "虾干"]);
         log_with_foods(&conn, c, "2026-09-12 09:00:00", &["种子"]);
         log(&conn, c, "巢穴保湿", "2026-09-12 10:00:00"); // 非喂食不影响食物占比
 
         let stats = get_stats(&conn, None, "2026-09-01", "2026-09-30").unwrap();
-        let seed = stats.food_share.iter().find(|f| f.food_name == "种子").unwrap();
-        let shrimp = stats.food_share.iter().find(|f| f.food_name == "干虾仁").unwrap();
+        let seed = stats
+            .food_share
+            .iter()
+            .find(|f| f.food_name == "种子")
+            .unwrap();
+        let shrimp = stats
+            .food_share
+            .iter()
+            .find(|f| f.food_name == "虾干")
+            .unwrap();
         assert_eq!(seed.occurrences, 2);
         assert_eq!(shrimp.occurrences, 1);
         assert!(
@@ -674,20 +707,39 @@ mod tests {
         let stats = get_stats(&conn, Some(c), "2026-09-01", "2027-02-01").unwrap();
         let feed = stats.intervals.iter().find(|i| i.name == "喂食").unwrap();
         assert_eq!(feed.sample_count, 1);
-        assert_eq!(feed.avg_days, Some(38.0), "间隔扣冬眠重叠天数（规则 6/验收 2）");
+        assert_eq!(
+            feed.avg_days,
+            Some(38.0),
+            "间隔扣冬眠重叠天数（规则 6/验收 2）"
+        );
         assert_eq!(feed.min_days, Some(38));
         assert_eq!(feed.max_days, Some(38));
-        assert_eq!(feed.suggested_interval_days, Some(3), "提醒类带建议间隔供画刻度");
+        assert_eq!(
+            feed.suggested_interval_days,
+            Some(3),
+            "提醒类带建议间隔供画刻度"
+        );
         assert_eq!(feed.kind, "reminding");
 
-        let trash = stats.intervals.iter().find(|i| i.name == "垃圾清理").unwrap();
+        let trash = stats
+            .intervals
+            .iter()
+            .find(|i| i.name == "垃圾清理")
+            .unwrap();
         assert_eq!(trash.avg_days, Some(7.0), "无冬眠交叉不扣减");
         assert_eq!(trash.suggested_interval_days, Some(7));
 
-        let water = stats.intervals.iter().find(|i| i.name == "活动区换水").unwrap();
+        let water = stats
+            .intervals
+            .iter()
+            .find(|i| i.name == "活动区换水")
+            .unwrap();
         assert_eq!(water.sample_count, 0, "没记录的操作也给行，样本 0");
         assert_eq!(water.avg_days, None);
-        assert_eq!(water.suggested_interval_days, None, "登记类不带建议间隔（前端标「仅登记」）");
+        assert_eq!(
+            water.suggested_interval_days, None,
+            "登记类不带建议间隔（前端标「仅登记」）"
+        );
         assert_eq!(water.kind, "log_only");
     }
 
@@ -730,7 +782,11 @@ mod tests {
         let stats = get_stats(&conn, Some(c), "2026-09-01", "2026-09-30").unwrap();
         let feed = stats.intervals.iter().find(|i| i.name == "喂食").unwrap();
         assert_eq!(feed.sample_count, 1, "脏行不参与配对");
-        assert_eq!(feed.avg_days, Some(2.0), "开放段视为延伸到间隔右端之外（规则 6）");
+        assert_eq!(
+            feed.avg_days,
+            Some(2.0),
+            "开放段视为延伸到间隔右端之外（规则 6）"
+        );
 
         // 脏行同样不进按日/明细/占比
         assert!(stats.daily.iter().all(|x| x.count <= 1));
@@ -785,20 +841,38 @@ mod tests {
         assert_eq!(day("2026-09-15"), 1);
 
         // 每周（周一为周首）：09-12 落 09-07 周、09-15 落 09-14 周
-        let week = |ws: &str| stats.weekly.iter().find(|w| w.week_start == ws).unwrap().count;
+        let week = |ws: &str| {
+            stats
+                .weekly
+                .iter()
+                .find(|w| w.week_start == ws)
+                .unwrap()
+                .count
+        };
         assert_eq!(week("2026-09-07"), 2, "撤食进每周操作次数");
         assert_eq!(week("2026-09-14"), 1);
 
         // 悬停明细：撤食条目可见、无食物括注
-        let day12 = stats.daily_detail.iter().find(|d| d.date == "2026-09-12").unwrap();
+        let day12 = stats
+            .daily_detail
+            .iter()
+            .find(|d| d.date == "2026-09-12")
+            .unwrap();
         assert_eq!(day12.entries.len(), 2);
-        let retrieval_entry = day12.entries.iter().find(|e| e.action_name == "撤食").unwrap();
+        let retrieval_entry = day12
+            .entries
+            .iter()
+            .find(|e| e.action_name == "撤食")
+            .unwrap();
         assert!(retrieval_entry.food_names.is_empty(), "撤食无食物括注");
 
         // 间隔：follow 无建议间隔（不参与超期/建议口径），实际间隔照常算
         let retrieval = stats.intervals.iter().find(|i| i.name == "撤食").unwrap();
         assert_eq!(retrieval.kind, "follow");
-        assert_eq!(retrieval.suggested_interval_days, None, "follow 无建议间隔口径");
+        assert_eq!(
+            retrieval.suggested_interval_days, None,
+            "follow 无建议间隔口径"
+        );
         assert_eq!(retrieval.sample_count, 1);
         assert_eq!(retrieval.avg_days, Some(3.0), "09-12 → 09-15 = 3 天");
 
@@ -818,8 +892,15 @@ mod tests {
         assert_eq!(stats.weekly.len(), 1);
         assert!(stats.daily_detail.is_empty());
         assert!(stats.food_share.is_empty());
-        assert_eq!(stats.intervals.len(), 5, "预置 5 个启用操作都给行（v7 起含撤食）");
-        assert!(stats.intervals.iter().all(|i| i.sample_count == 0 && i.avg_days.is_none()));
+        assert_eq!(
+            stats.intervals.len(),
+            5,
+            "预置 5 个启用操作都给行（v7 起含撤食）"
+        );
+        assert!(stats
+            .intervals
+            .iter()
+            .all(|i| i.sample_count == 0 && i.avg_days.is_none()));
 
         // 同一天两条记录：间隔样本 0 对（同天不成对）、当天计数 2
         let c = colony(&conn, "大头一号");

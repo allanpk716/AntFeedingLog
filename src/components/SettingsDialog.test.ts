@@ -889,15 +889,16 @@ function foodFixture(overrides: Partial<FoodItem> & { id: number }): FoodItem {
     suggested_interval_days: 7,
     is_preset: true,
     referenced: false,
+    category: "seed",
     ...overrides,
   };
 }
 
 function foodsFixture(): FoodItem[] {
   return [
-    foodFixture({ id: 1, name: "种子", sort: 1, suggested_interval_days: 3, perishable: false, retrieval_hours: null }),
-    foodFixture({ id: 2, name: "干虾仁", sort: 2, perishable: true, retrieval_hours: 24 }),
-    foodFixture({ id: 3, name: "面包虫", sort: 3, perishable: false, retrieval_hours: null }),
+    foodFixture({ id: 1, name: "种子", sort: 1, suggested_interval_days: 3, perishable: false, retrieval_hours: null, category: "seed" }),
+    foodFixture({ id: 2, name: "干虾仁", sort: 2, perishable: true, retrieval_hours: 24, category: "protein" }),
+    foodFixture({ id: 3, name: "面包虫", sort: 3, perishable: false, retrieval_hours: null, category: "protein" }),
   ];
 }
 
@@ -973,7 +974,7 @@ describe("设置弹窗·食物易腐配置（票 01）", () => {
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("save_food", {
-      input: { id: 3, name: "面包虫", sort: 2, suggested_interval_days: 7, perishable: true, retrieval_hours: 24 },
+      input: { id: 3, name: "面包虫", sort: 2, suggested_interval_days: 7, perishable: true, retrieval_hours: 24, category: "protein" },
     });
   });
 
@@ -1009,7 +1010,45 @@ describe("设置弹窗·食物易腐配置（票 01）", () => {
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("save_food", {
-      input: { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7, perishable: false, retrieval_hours: null },
+      input: { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7, perishable: false, retrieval_hours: null, category: "protein" },
+    });
+  });
+});
+
+describe("设置弹窗·食物大类（ADR 0007）", () => {
+  it("行内大类下拉回显并可改：保存入参带新大类", async () => {
+    const wrapper = await openDictTab("foods", foodsFixture(), actionsFixture());
+    const rows = rowsOf(wrapper);
+    expect((rows[0]!.find(".cat-select").element as HTMLSelectElement).value).toBe("seed");
+
+    await rows[0]!.find(".cat-select").setValue("sugar");
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (cmd: string) => dictMock(cmd, foodsFixture(), actionsFixture()));
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("save_food", {
+      input: expect.objectContaining({ id: 1, category: "sugar" }),
+    });
+  });
+
+  it("新增行必选大类：不选点添加 → 内联错误、不产生行；选大类后新行落对大类并随保存透传", async () => {
+    const wrapper = await openDictTab("foods", foodsFixture(), actionsFixture());
+    await wrapper.find(".add-input").setValue("蟋蟀");
+    await wrapper.find(".add-btn").trigger("click");
+    expect(wrapper.find(".form-error").text()).toContain("大类");
+    expect(rowsOf(wrapper)).toHaveLength(3); // 未选大类不产生新行
+
+    await wrapper.find(".add-cat-select").setValue("protein");
+    await wrapper.find(".add-btn").trigger("click");
+    expect(rowsOf(wrapper)).toHaveLength(4);
+
+    invokeMock.mockClear();
+    invokeMock.mockImplementation(async (cmd: string) => dictMock(cmd, foodsFixture(), actionsFixture()));
+    await wrapper.find(".tab-body .btn.primary").trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("save_food", {
+      input: expect.objectContaining({ id: null, name: "蟋蟀", category: "protein" }),
     });
   });
 });

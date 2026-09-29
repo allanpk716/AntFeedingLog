@@ -43,7 +43,16 @@ use rusqlite::{params, Connection};
 ///     crop_x/crop_y/crop_size（归一化方形区域 x/y/边长，REAL 可空，NULL = 默认
 ///     居中）；只加列不回填，存量行保持 NULL；头像投影与照片墙载荷是纯查询，
 ///     不落库、无迁移动作。
-pub const SCHEMA_VERSION: i64 = 12;
+/// v13：食物两层分类（ADR 0007）——food 加 category 归属列（'seed' | 'protein' |
+///     'sugar'，CHECK 锁死三种大类，存稳定英文 key、展示层映射中文）；按名归组
+///     （干虾仁/面包虫 → protein，种子与其余归 seed；改名过的预置匹配不到为已知
+///     边界，同 v4/v6/v8 先例）；预置改名（干虾仁→虾干、面包虫→面包虫干，目标名
+///     已被占用则不改，防 UNIQUE 撞名炸迁移）；插入四个新预置（樱桃蟑螂、蜂蜜、
+///     冰糖水、白糖水，均易腐 24h；自建行与新预置同名时原位升格，v8 撤食先例）；
+///     建议间隔改值（种子 3→7、蛋白质类 7→3、糖水类 3）；sort 按分组重排（自建行
+///     整体挪到预置之后，相对序保留）。大类不参与提醒（距上次/食物周期/待撤食仍
+///     按子项算）；历史记录按 id 引用，改名不断链。
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -95,8 +104,7 @@ pub fn open_and_migrate(db_path: &Path) -> DbResult<Connection> {
     }
     let conn = Connection::open(db_path)?;
     // journal_mode 是查询型 PRAGMA（返回新模式），用 query_row 接住并断言生效。
-    let mode: String =
-        conn.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
+    let mode: String = conn.query_row("PRAGMA journal_mode = DELETE", [], |row| row.get(0))?;
     if !mode.eq_ignore_ascii_case("delete") {
         return Err(rusqlite::Error::InvalidParameterName(format!(
             "journal_mode 应为 delete，实际为 {mode}"
@@ -140,6 +148,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             9 => migrate_v9_to_v10(conn)?,
             10 => migrate_v10_to_v11(conn)?,
             11 => migrate_v11_to_v12(conn)?,
+            12 => migrate_v12_to_v13(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -302,10 +311,7 @@ fn local_timestamp_now() -> String {
 /// care_action 被 care_log / reminder_ledger 外键引用，父表重建须临时关外键
 /// （PRAGMA foreign_keys 在事务内是 no-op，故在开事务前切换、提交后还原）；
 /// 行按 id 原样拷贝，拷贝语义保证子表引用在还原后仍然成立。
-fn migrate_v7_to_v8(
-    conn: &Connection,
-    fresh_install: bool,
-) -> Result<(), rusqlite::Error> {
+fn migrate_v7_to_v8(conn: &Connection, fresh_install: bool) -> Result<(), rusqlite::Error> {
     migrate_v7_to_v8_at(conn, fresh_install, &local_timestamp_now())
 }
 
@@ -366,10 +372,7 @@ fn migrate_v7_to_v8_at(
                 [],
             )?;
         } else {
-            tx.execute(
-                "UPDATE care_action SET sort = sort + 1 WHERE sort >= 2",
-                [],
-            )?;
+            tx.execute("UPDATE care_action SET sort = sort + 1 WHERE sort >= 2", [])?;
             tx.execute(
                 "INSERT INTO care_action
                     (name, icon, kind, suggested_interval_days, enabled, is_feeding, is_preset, sort)
@@ -561,6 +564,81 @@ fn migrate_v11_to_v12(conn: &Connection) -> Result<(), rusqlite::Error> {
     tx.commit()
 }
 
+/// v13（食物两层分类，ADR 0007）：见 [`SCHEMA_VERSION`] 文档注释链 v13 条目。
+/// 归组与升格全部按名锚定；撞名不改（保留旧名继续按旧名语义归组）；单事务原子
+/// 完成；列已存在则跳过 ALTER（v9→v10 同款幂等，防降版本打开后再升级的重复加列）。
+fn migrate_v12_to_v13(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_col = {
+        let mut stmt = conn.prepare("PRAGMA table_info(food)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == "category" {
+                found = true;
+            }
+        }
+        found
+    };
+    let tx = conn.unchecked_transaction()?;
+    if !has_col {
+        // CHECK 拦非枚举值；DEFAULT 'seed' 让 ALTER 对存量行直接落值（种子与其余
+        // 未匹配行归 seed，protein 由下方按名回填覆盖）
+        tx.execute(
+            "ALTER TABLE food ADD COLUMN category TEXT NOT NULL DEFAULT 'seed'
+             CHECK (category IN ('seed', 'protein', 'sugar'))",
+            [],
+        )?;
+    }
+    tx.execute_batch(
+        r#"
+        -- 归组回填（按名；种子已由列默认值归 seed）
+        UPDATE food SET category = 'protein' WHERE name IN ('干虾仁', '面包虫');
+
+        -- 预置改名（目标名已被自建行占用则不改，防 UNIQUE 撞名使迁移失败）
+        UPDATE food SET name = '虾干'
+         WHERE name = '干虾仁' AND NOT EXISTS(SELECT 1 FROM food WHERE name = '虾干');
+        UPDATE food SET name = '面包虫干'
+         WHERE name = '面包虫' AND NOT EXISTS(SELECT 1 FROM food WHERE name = '面包虫干');
+
+        -- 新预置子项：INSERT OR IGNORE 撞名时保留自建行，再按名升格吃预置属性
+        -- （v8 撤食原位升格先例；enabled 不动——升格不复活被停用的行）
+        INSERT OR IGNORE INTO food
+            (name, category, enabled, sort, is_preset, suggested_interval_days, perishable, retrieval_hours)
+        VALUES
+            ('樱桃蟑螂', 'protein', 1, 4, 1, 3, 1, 24),
+            ('蜂蜜',     'sugar',   1, 5, 1, 3, 1, 24),
+            ('冰糖水',   'sugar',   1, 6, 1, 3, 1, 24),
+            ('白糖水',   'sugar',   1, 7, 1, 3, 1, 24);
+        UPDATE food SET category = 'protein', is_preset = 1, suggested_interval_days = 3,
+                        perishable = 1, retrieval_hours = 24
+         WHERE name = '樱桃蟑螂';
+        UPDATE food SET category = 'sugar', is_preset = 1, suggested_interval_days = 3,
+                        perishable = 1, retrieval_hours = 24
+         WHERE name IN ('蜂蜜', '冰糖水', '白糖水');
+
+        -- 间隔改值（用户定案：种子 7；蛋白质与糖水 3——一周两喂的节奏）
+        UPDATE food SET suggested_interval_days = 7 WHERE name = '种子';
+        UPDATE food SET suggested_interval_days = 3 WHERE name IN ('虾干', '面包虫干');
+
+        -- 预置易腐口径对齐（虾干/面包虫干多来自 v8 回填已有值；撞名升格外的
+        -- 边缘行在此统一，is_preset 限定不碰自建行）
+        UPDATE food SET perishable = 1, retrieval_hours = 24
+         WHERE name IN ('虾干', '面包虫干', '樱桃蟑螂', '蜂蜜', '冰糖水', '白糖水')
+           AND is_preset = 1;
+
+        -- sort 分组重排：自建行整体挪到预置之后（+100，相对序保留），七个预置归位
+        UPDATE food SET sort = sort + 100 WHERE is_preset = 0;
+        UPDATE food SET sort = CASE name
+            WHEN '种子' THEN 1 WHEN '虾干' THEN 2 WHEN '面包虫干' THEN 3 WHEN '樱桃蟑螂' THEN 4
+            WHEN '蜂蜜' THEN 5 WHEN '冰糖水' THEN 6 WHEN '白糖水' THEN 7
+            ELSE sort END
+         WHERE name IN ('种子', '虾干', '面包虫干', '樱桃蟑螂', '蜂蜜', '冰糖水', '白糖水');
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 13)?;
+    tx.commit()
+}
+
 /// v1 预置数据：四操作（喂食/活动区换水/巢穴保湿/垃圾清理）、三食物、两地点、五项设置默认值。
 /// pub(crate)：restore.rs 的旧 schema 备份测试要搭真实 v1 库（票 04 验收 3）。
 pub(crate) fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -701,8 +779,8 @@ mod tests {
     /// 刻意用两级子目录，顺带验证父目录不存在时会自动创建。
     fn fresh_conn() -> (Connection, TempDir) {
         let dir = TempDir::new().expect("创建临时目录失败");
-        let conn = open_and_migrate(&dir.path().join("data").join(DB_FILE_NAME))
-            .expect("空库迁移失败");
+        let conn =
+            open_and_migrate(&dir.path().join("data").join(DB_FILE_NAME)).expect("空库迁移失败");
         (conn, dir)
     }
 
@@ -757,14 +835,15 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 12);
+        assert_eq!(SCHEMA_VERSION, 13);
     }
 
     /// 按真实迁移函数链手工搭到 v7 的库（票 01 v8 迁移测试地基；含 webui-checkin
     /// 的 v7 三表，保证改名后的 v8 迁移在真实前置形态上跑）。
     fn v7_conn() -> Connection {
         let conn = Connection::open_in_memory().expect("内存库打开失败");
-        conn.execute_batch(V1_SCHEMA_SQL).expect("建 v1 schema 失败");
+        conn.execute_batch(V1_SCHEMA_SQL)
+            .expect("建 v1 schema 失败");
         seed_v1_presets(&conn).expect("灌 v1 预置数据失败");
         migrate_v1_to_v2(&conn).expect("升 v2 失败");
         migrate_v2_to_v3(&conn).expect("升 v3 失败");
@@ -845,13 +924,23 @@ mod tests {
             .collect();
         assert_eq!(
             new_names,
-            vec!["data_meta", "idx_nest_checkin_colony", "idx_nest_photo_checkin", "nest_checkin", "nest_photo"],
+            vec![
+                "data_meta",
+                "idx_nest_checkin_colony",
+                "idx_nest_photo_checkin",
+                "nest_checkin",
+                "nest_photo"
+            ],
             "v7 恰好新增三表两索引"
         );
 
         // 旧数据原样
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_log"), 1);
-        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM settings"), 5, "settings 键值表无结构变更，pushover 键不在此建行");
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM settings"),
+            5,
+            "settings 键值表无结构变更，pushover 键不在此建行"
+        );
 
         // 新表可写：登记（全可空字段走默认）、照片元数据、键值
         conn.execute(
@@ -889,7 +978,11 @@ mod tests {
         migrate_v1_to_v2(&conn).unwrap();
         migrate_v2_to_v3(&conn).unwrap();
         migrate_v3_to_v4(&conn).unwrap();
-        conn.execute("INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')", []).unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
              VALUES (1, 'overdue', 1, '2026-09-15', '2026-09-15 08:00:00')",
@@ -900,11 +993,19 @@ mod tests {
 
         migrate(&conn).unwrap();
         // 历史行只走过桌面通道：直接视为已了结，不参与补发
-        let done: i64 = conn.query_row("SELECT pushover_done FROM reminder_ledger", [], |r| r.get(0)).unwrap();
+        let done: i64 = conn
+            .query_row("SELECT pushover_done FROM reminder_ledger", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(done, 1);
         // 新列存在且可为空
         let (title, body): (Option<String>, Option<String>) = conn
-            .query_row("SELECT push_title, push_body FROM reminder_ledger", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .query_row(
+                "SELECT push_title, push_body FROM reminder_ledger",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!((title, body), (None, None));
     }
@@ -931,20 +1032,35 @@ mod tests {
         )
         .unwrap();
 
-        migrate(&conn).unwrap();
+        // 只升到 v6：v13 会改预置名与间隔值，隔离验证 v6 回填本身
+        migrate_v5_to_v6(&conn).unwrap();
 
         // 食物周期：预置三样按名回填，自建为 NULL
         let intervals: Vec<(String, Option<i64>)> = {
-            let mut stmt = conn.prepare("SELECT name, suggested_interval_days FROM food ORDER BY sort").unwrap();
-            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+            let mut stmt = conn
+                .prepare("SELECT name, suggested_interval_days FROM food ORDER BY sort")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         };
-        assert_eq!(intervals, vec![
-            ("种子".into(), Some(3)), ("干虾仁".into(), Some(7)), ("面包虫".into(), Some(7)),
-        ]);
+        assert_eq!(
+            intervals,
+            vec![
+                ("种子".into(), Some(3)),
+                ("干虾仁".into(), Some(7)),
+                ("面包虫".into(), Some(7)),
+            ]
+        );
 
         // 台账重建后：旧行与推送列原样保留 + 新 food_id 列（NULL）
         let row: (Option<i64>, Option<String>, i64) = conn
-            .query_row("SELECT food_id, push_title, pushover_done FROM reminder_ledger", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .query_row(
+                "SELECT food_id, push_title, pushover_done FROM reminder_ledger",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
             .unwrap();
         assert_eq!(row, (None, Some("喂食超期".into()), 1));
 
@@ -1001,7 +1117,8 @@ mod tests {
     fn v2_ledger_rows_survive_migration_to_v3() {
         // 手工搭 v2 库（真实迁移链 v0→v1→v2），灌 v2 时期合法的台账行，升 v3 后原样保留。
         let conn = Connection::open_in_memory().expect("内存库打开失败");
-        conn.execute_batch(V1_SCHEMA_SQL).expect("建 v1 schema 失败");
+        conn.execute_batch(V1_SCHEMA_SQL)
+            .expect("建 v1 schema 失败");
         seed_v1_presets(&conn).expect("灌 v1 预置数据失败");
         migrate_v1_to_v2(&conn).expect("升 v2 失败");
         conn.execute(
@@ -1058,12 +1175,10 @@ mod tests {
                      WHERE name = 'is_feeding'",
                 )
                 .expect("prepare 失败");
-            stmt.query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .expect("query_map 失败")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("读取列信息失败")
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .expect("query_map 失败")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("读取列信息失败")
         };
         assert_eq!(cols.len(), 1, "care_action 应有 is_feeding 列");
         assert_eq!(cols[0].1, 1, "is_feeding 应为 NOT NULL");
@@ -1080,7 +1195,10 @@ mod tests {
         };
         assert_eq!(flagged, vec!["喂食"]);
         assert_eq!(
-            scalar_i64(&conn, "SELECT COUNT(*) FROM care_action WHERE is_feeding = 0"),
+            scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM care_action WHERE is_feeding = 0"
+            ),
             4,
             "撤食预置同为非喂食类"
         );
@@ -1091,7 +1209,8 @@ mod tests {
         // 手工搭一个 v1 库（旧 schema + 预置数据 + 用户在 v1 时期自建的操作 + 历史记录），
         // 版本停在 1，跑 migrate 应升到 v2 并正确回填 is_feeding。
         let conn = Connection::open_in_memory().expect("内存库打开失败");
-        conn.execute_batch(V1_SCHEMA_SQL).expect("建 v1 schema 失败");
+        conn.execute_batch(V1_SCHEMA_SQL)
+            .expect("建 v1 schema 失败");
         seed_v1_presets(&conn).expect("灌 v1 预置数据失败");
         conn.execute(
             "INSERT INTO care_action (name, kind, enabled, sort) VALUES ('降温', 'log_only', 1, 5)",
@@ -1109,7 +1228,8 @@ mod tests {
             [],
         )
         .expect("建历史记录失败");
-        conn.pragma_update(None, "user_version", 1).expect("置 v1 失败");
+        conn.pragma_update(None, "user_version", 1)
+            .expect("置 v1 失败");
 
         migrate(&conn).expect("v1 → v2 升级失败");
 
@@ -1144,15 +1264,40 @@ mod tests {
     fn v4_flags_preset_actions_and_foods() {
         let (conn, _dir) = fresh_conn();
         let action_names: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort").unwrap();
-            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+            let mut stmt = conn
+                .prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         };
-        assert_eq!(action_names, vec!["喂食", "撤食", "活动区换水", "巢穴保湿", "垃圾清理"]);
+        assert_eq!(
+            action_names,
+            vec!["喂食", "撤食", "活动区换水", "巢穴保湿", "垃圾清理"]
+        );
         let food_names: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT name FROM food WHERE is_preset = 1 ORDER BY sort").unwrap();
-            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+            let mut stmt = conn
+                .prepare("SELECT name FROM food WHERE is_preset = 1 ORDER BY sort")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         };
-        assert_eq!(food_names, vec!["种子", "干虾仁", "面包虫"]);
+        assert_eq!(
+            food_names,
+            vec![
+                "种子",
+                "虾干",
+                "面包虫干",
+                "樱桃蟑螂",
+                "蜂蜜",
+                "冰糖水",
+                "白糖水"
+            ],
+            "v13 后预置七项（干虾仁/面包虫 已在链上改名）"
+        );
     }
 
     #[test]
@@ -1163,15 +1308,28 @@ mod tests {
         seed_v1_presets(&conn).unwrap();
         migrate_v1_to_v2(&conn).unwrap();
         migrate_v2_to_v3(&conn).unwrap();
-        conn.execute("UPDATE care_action SET name = '换水' WHERE name = '活动区换水'", []).unwrap();
-        conn.execute("INSERT INTO care_action (name, kind, enabled, sort) VALUES ('降温', 'log_only', 1, 5)", []).unwrap();
+        conn.execute(
+            "UPDATE care_action SET name = '换水' WHERE name = '活动区换水'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO care_action (name, kind, enabled, sort) VALUES ('降温', 'log_only', 1, 5)",
+            [],
+        )
+        .unwrap();
         conn.pragma_update(None, "user_version", 3).unwrap();
 
         migrate(&conn).unwrap();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
         let flagged: Vec<String> = {
-            let mut stmt = conn.prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort").unwrap();
-            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+            let mut stmt = conn
+                .prepare("SELECT name FROM care_action WHERE is_preset = 1 ORDER BY sort")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
         };
         // 已改名的预置匹配不到（已知边界，接受）；自建项不误标；
         // 撤食预置由 v7 迁移插入（sort=2，列在喂食之后）
@@ -1184,8 +1342,11 @@ mod tests {
         // 预置+reminding+非喂食 兜底锚中；其他预置/自建项不误标。
         // （预置五操作里 reminding+非喂食只有垃圾清理一个，不歧义）
         let (conn, _tmp) = fresh_conn();
-        conn.execute("UPDATE care_action SET name = '清垃圾' WHERE name = '垃圾清理'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE care_action SET name = '清垃圾' WHERE name = '垃圾清理'",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO care_action (name, kind, is_feeding, enabled, is_preset, sort)
              VALUES ('降温', 'reminding', 0, 1, 0, 9)",
@@ -1197,7 +1358,11 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
         let flagged: i64 = conn
-            .query_row("SELECT implies_retrieval FROM care_action WHERE name = '清垃圾'", [], |r| r.get(0))
+            .query_row(
+                "SELECT implies_retrieval FROM care_action WHERE name = '清垃圾'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(flagged, 1, "改名后按 kind 锚点仍置位");
         let others: i64 = conn
@@ -1500,7 +1665,10 @@ mod tests {
             ddl_after.starts_with(ddl_before.trim_end_matches(')')),
             "nest_photo 旧列序被改动：{ddl_after}"
         );
-        assert!(ddl_after.contains("crop_x"), "nest_photo 未追加裁剪列：{ddl_after}");
+        assert!(
+            ddl_after.contains("crop_x"),
+            "nest_photo 未追加裁剪列：{ddl_after}"
+        );
 
         // 新行可写裁剪值（可空列照常收数）
         conn.execute(
@@ -1588,11 +1756,8 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO log_food (log_id, food_id) VALUES (1, 2)",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO log_food (log_id, food_id) VALUES (1, 2)", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO reminder_ledger (colony_id, kind, action_id, base_date, sent_at)
              VALUES (1, 'overdue', 1, '2026-09-10', '2026-09-10 08:00:00')",
@@ -1609,12 +1774,17 @@ mod tests {
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM log_food"), 1);
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM reminder_ledger"), 1);
         assert_eq!(
-            scalar_i64(&conn, "SELECT COUNT(*) FROM settings WHERE key = 'retrieval_baseline_at'"),
+            scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM settings WHERE key = 'retrieval_baseline_at'"
+            ),
             1,
             "升级库写存量基线键"
         );
 
         // 食物按名回填：预置两样易腐 24h，种子/自建不动
+        // （v13 叠加后：预置改名、四新预置插入、糖水自建行挪 sort 104——虾干/面包虫干
+        //   的易腐值正是 v8 回填的传递，回填坏了这里会露馅）
         let foods: Vec<(String, i64, Option<i64>)> = {
             let mut stmt = conn
                 .prepare("SELECT name, perishable, retrieval_hours FROM food ORDER BY sort")
@@ -1628,8 +1798,12 @@ mod tests {
             foods,
             vec![
                 ("种子".into(), 0, None),
-                ("干虾仁".into(), 1, Some(24)),
-                ("面包虫".into(), 1, Some(24)),
+                ("虾干".into(), 1, Some(24)),
+                ("面包虫干".into(), 1, Some(24)),
+                ("樱桃蟑螂".into(), 1, Some(24)),
+                ("蜂蜜".into(), 1, Some(24)),
+                ("冰糖水".into(), 1, Some(24)),
+                ("白糖水".into(), 1, Some(24)),
                 ("糖水".into(), 0, None),
             ]
         );
@@ -1670,7 +1844,10 @@ mod tests {
 
         // 撤食预置不可删（沿用 is_preset 守护——字典层同一条 SQL，这里验证行标记）
         assert_eq!(
-            scalar_i64(&conn, "SELECT is_preset FROM care_action WHERE name = '撤食'"),
+            scalar_i64(
+                &conn,
+                "SELECT is_preset FROM care_action WHERE name = '撤食'"
+            ),
             1
         );
     }
@@ -1679,7 +1856,8 @@ mod tests {
     fn v7_renamed_preset_food_misses_perishable_backfill() {
         // 已改名的预置匹配不到（已知边界，同 v4/v6 按名回填先例）
         let conn = v7_conn();
-        conn.execute("UPDATE food SET name = '黄粉虫' WHERE name = '面包虫'", []).unwrap();
+        conn.execute("UPDATE food SET name = '黄粉虫' WHERE name = '面包虫'", [])
+            .unwrap();
         conn.pragma_update(None, "user_version", 7).unwrap();
 
         migrate(&conn).unwrap();
@@ -1691,6 +1869,157 @@ mod tests {
             )
             .unwrap();
         assert_eq!((perishable, hours), (0, None), "改名预置不回填");
+    }
+
+    /// 按真实迁移函数链手工搭到 v12 的库（v13 迁移测试地基）。
+    fn v12_conn() -> Connection {
+        let conn = v7_conn();
+        migrate_v7_to_v8(&conn, false).expect("升 v8 失败");
+        migrate_v8_to_v9(&conn).expect("升 v9 失败");
+        migrate_v9_to_v10(&conn).expect("升 v10 失败");
+        migrate_v10_to_v11(&conn).expect("升 v11 失败");
+        migrate_v11_to_v12(&conn).expect("升 v12 失败");
+        conn
+    }
+
+    #[test]
+    fn v12_db_upgrades_to_v13_food_categories() {
+        // ADR 0007：归组 + 预置改名 + 四新预置 + 间隔改值 + sort 分组重排一次到位；
+        // 历史记录按 id 引用，改名后联查显示新名（id 未变，引用不断链）。
+        let conn = v12_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        let mealworm: i64 = conn
+            .query_row("SELECT id FROM food WHERE name = '面包虫'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        conn.execute(
+            "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
+             VALUES (1, 1, '2026-09-20 08:00:00', '', '2026-09-20 08:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO log_food (log_id, food_id) VALUES (1, ?1)",
+            params![mealworm],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO food (name, enabled, sort, is_preset, suggested_interval_days, perishable, retrieval_hours)
+             VALUES ('蚕蛹', 1, 4, 0, NULL, 0, NULL)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+
+        // 七预置 + 自建行：name / category / 间隔 / sort 全对表
+        // （自建蚕蛹：归 seed 兜底、间隔不动、sort +100 挪到预置之后）
+        let foods: Vec<(String, String, Option<i64>, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT name, category, suggested_interval_days, sort FROM food ORDER BY sort",
+                )
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            foods,
+            vec![
+                ("种子".into(), "seed".into(), Some(7), 1),
+                ("虾干".into(), "protein".into(), Some(3), 2),
+                ("面包虫干".into(), "protein".into(), Some(3), 3),
+                ("樱桃蟑螂".into(), "protein".into(), Some(3), 4),
+                ("蜂蜜".into(), "sugar".into(), Some(3), 5),
+                ("冰糖水".into(), "sugar".into(), Some(3), 6),
+                ("白糖水".into(), "sugar".into(), Some(3), 7),
+                ("蚕蛹".into(), "seed".into(), None, 104),
+            ]
+        );
+
+        // 历史引用显示新名（面包虫改名面包虫干，id 原样）
+        let fed: String = conn
+            .query_row(
+                "SELECT f.name FROM log_food lf JOIN food f ON f.id = lf.food_id WHERE lf.log_id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fed, "面包虫干");
+
+        // 新预置落预置保护位
+        assert_eq!(
+            scalar_i64(&conn, "SELECT is_preset FROM food WHERE name = '蜂蜜'"),
+            1
+        );
+        assert_eq!(
+            scalar_i64(&conn, "SELECT is_preset FROM food WHERE name = '蚕蛹'"),
+            0
+        );
+    }
+
+    #[test]
+    fn v13_same_name_custom_food_upgrades_in_place() {
+        // 自建「蜂蜜」与 v13 新预置撞名 → 原位升格（v8 撤食先例）：
+        // 吃预置属性（大类/间隔/易腐）、is_preset 落位、不重复插行、停用态保留。
+        let conn = v12_conn();
+        conn.execute(
+            "INSERT INTO food (name, enabled, sort, is_preset, suggested_interval_days, perishable, retrieval_hours)
+             VALUES ('蜂蜜', 0, 9, 0, NULL, 0, NULL)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM food WHERE name = '蜂蜜'"),
+            1
+        );
+        let row: (i64, String, Option<i64>, i64, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT is_preset, category, suggested_interval_days, perishable, retrieval_hours, enabled
+                 FROM food WHERE name = '蜂蜜'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (1, "sugar".into(), Some(3), 1, Some(24), 0));
+    }
+
+    #[test]
+    fn v13_rename_skipped_when_target_name_taken() {
+        // 自建「虾干」占了目标名 → 预置不改名（防 UNIQUE 撞名炸迁移），
+        // 旧名行仍按 protein 归组，自建行保持 is_preset=0。
+        let conn = v12_conn();
+        conn.execute(
+            "INSERT INTO food (name, enabled, sort, is_preset) VALUES ('虾干', 1, 9, 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cat: String = conn
+            .query_row(
+                "SELECT category FROM food WHERE name = '干虾仁'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(cat, "protein", "撞名不改，旧名行照旧归组");
+        assert_eq!(
+            scalar_i64(&conn, "SELECT is_preset FROM food WHERE name = '虾干'"),
+            0
+        );
     }
 
     #[test]
@@ -1710,7 +2039,11 @@ mod tests {
         )
         .unwrap();
         let custom_id: i64 = conn
-            .query_row("SELECT id FROM care_action WHERE name = '撤食'", [], |r| r.get(0))
+            .query_row(
+                "SELECT id FROM care_action WHERE name = '撤食'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         conn.execute(
             "INSERT INTO care_log (colony_id, action_id, occurred_at, note, created_at)
@@ -1730,7 +2063,10 @@ mod tests {
 
         // 无重复行，同一 id 原位升格
         assert_eq!(
-            scalar_i64(&conn, "SELECT COUNT(*) FROM care_action WHERE name = '撤食'"),
+            scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM care_action WHERE name = '撤食'"
+            ),
             1
         );
         let row: (i64, String, i64, i64, i64) = conn
@@ -1879,7 +2215,10 @@ mod tests {
                     new_sql.starts_with(old_sql.trim_end_matches(')')),
                     "care_action 旧列序被改动：{new_sql}"
                 );
-                assert!(new_sql.contains("implies_retrieval"), "care_action 未追加 implies_retrieval：{new_sql}");
+                assert!(
+                    new_sql.contains("implies_retrieval"),
+                    "care_action 未追加 implies_retrieval：{new_sql}"
+                );
                 continue;
             }
             if name == "colony" {
@@ -1891,7 +2230,10 @@ mod tests {
                     new_sql.starts_with(old_sql.trim_end_matches(')')),
                     "colony 旧列序被改动：{new_sql}"
                 );
-                assert!(new_sql.contains("hydration_method"), "colony 未追加 hydration_method：{new_sql}");
+                assert!(
+                    new_sql.contains("hydration_method"),
+                    "colony 未追加 hydration_method：{new_sql}"
+                );
                 continue;
             }
             if name == "nest_photo" {
@@ -1902,7 +2244,24 @@ mod tests {
                     new_sql.starts_with(old_sql.trim_end_matches(')')),
                     "nest_photo 旧列序被改动：{new_sql}"
                 );
-                assert!(new_sql.contains("crop_x"), "nest_photo 未追加裁剪列：{new_sql}");
+                assert!(
+                    new_sql.contains("crop_x"),
+                    "nest_photo 未追加裁剪列：{new_sql}"
+                );
+                continue;
+            }
+            if name == "food" {
+                // v13（ADR 0007）合法改动：ALTER 追加 category 归属列，断言口径同上
+                let old_sql = sql.as_deref().unwrap_or("");
+                let new_sql = found.1.as_deref().unwrap_or("");
+                assert!(
+                    new_sql.starts_with(old_sql.trim_end_matches(')')),
+                    "food 旧列序被改动：{new_sql}"
+                );
+                assert!(
+                    new_sql.contains("category"),
+                    "food 未追加 category：{new_sql}"
+                );
                 continue;
             }
             assert_eq!(found.1, *sql, "旧对象 {name} 的 DDL 被改动");
@@ -1912,10 +2271,17 @@ mod tests {
             .filter(|(n, _)| !before.iter().any(|(b, _)| b == n))
             .map(|(n, _)| n.as_str())
             .collect();
-        assert_eq!(new_names, vec!["colony_action_interval"], "v9 恰好新增一张表");
+        assert_eq!(
+            new_names,
+            vec!["colony_action_interval"],
+            "v9 恰好新增一张表"
+        );
 
         // 表为空、旧数据原样（不预置任何行，spec D1）
-        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"), 0);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"),
+            0
+        );
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony"), 1);
 
         // 结构四要素（验收 1）：裸外键 ×2、CHECK 1..365、复合主键
@@ -1937,7 +2303,10 @@ mod tests {
 
         // 幂等：已是 v9 再 migrate 不重跑（版本门卫），表仍空
         migrate(&conn).unwrap();
-        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"), 0);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"),
+            0
+        );
         assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
     }
 
@@ -1956,7 +2325,10 @@ mod tests {
         migrate(&conn).unwrap();
 
         assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
-        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"), 0);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"),
+            0
+        );
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony"), 1);
     }
 
@@ -1981,9 +2353,11 @@ mod tests {
 
         // 边界内合法：1 与 365 都放行（先删再插绕开主键）
         assert_eq!(insert(1).unwrap(), 1);
-        conn.execute("DELETE FROM colony_action_interval", []).unwrap();
+        conn.execute("DELETE FROM colony_action_interval", [])
+            .unwrap();
         assert_eq!(insert(365).unwrap(), 1);
-        conn.execute("DELETE FROM colony_action_interval", []).unwrap();
+        conn.execute("DELETE FROM colony_action_interval", [])
+            .unwrap();
 
         // CHECK 拦越界：0、负数、366
         for bad in [0, -1, 366, 10000] {
@@ -2026,7 +2400,6 @@ mod tests {
             )
             .is_err());
     }
-
 
     #[test]
     fn journal_mode_is_delete() {
@@ -2079,12 +2452,25 @@ mod tests {
             .expect("query_map 失败")
             .collect::<Result<Vec<String>, _>>()
             .expect("读取食物失败");
-        assert_eq!(names, vec!["种子", "干虾仁", "面包虫"]);
+        assert_eq!(
+            names,
+            vec![
+                "种子",
+                "虾干",
+                "面包虫干",
+                "樱桃蟑螂",
+                "蜂蜜",
+                "冰糖水",
+                "白糖水"
+            ],
+            "全新安装走迁移链，v13 后与升级库同一套七预置"
+        );
     }
 
     #[test]
     fn seeds_perishable_defaults_on_preset_foods() {
-        // 票 01：种子不易腐；干虾仁/面包虫易腐 + 24h（全新安装走迁移链回填，同一条路）
+        // 票 01：种子不易腐；其余预置易腐 + 24h（全新安装走迁移链回填，同一条路；
+        // v13 后预置扩为七项，蛋白质与糖水全部 24h——ADR 0007 定案口径）
         let (conn, _dir) = fresh_conn();
         let mut stmt = conn
             .prepare("SELECT name, perishable, retrieval_hours FROM food ORDER BY sort")
@@ -2104,8 +2490,12 @@ mod tests {
             rows,
             vec![
                 ("种子".into(), 0, None),
-                ("干虾仁".into(), 1, Some(24)),
-                ("面包虫".into(), 1, Some(24)),
+                ("虾干".into(), 1, Some(24)),
+                ("面包虫干".into(), 1, Some(24)),
+                ("樱桃蟑螂".into(), 1, Some(24)),
+                ("蜂蜜".into(), 1, Some(24)),
+                ("冰糖水".into(), 1, Some(24)),
+                ("白糖水".into(), 1, Some(24)),
             ]
         );
     }
@@ -2140,10 +2530,13 @@ mod tests {
         let (conn, _dir) = fresh_conn();
         migrate(&conn).expect("对已迁移库再次 migrate 不应失败");
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM care_action"), 5);
-        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM food"), 3);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM food"), 7);
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM location"), 2);
         // 每窝周期表不预置任何行（每窝周期票 01，spec D1）
-        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"), 0);
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM colony_action_interval"),
+            0
+        );
         // 全新安装不写存量基线键（F4）
         assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM settings"), 5);
         assert!(conn

@@ -141,6 +141,10 @@ export interface LocationInput {
   sort: number;
 }
 
+/** 食物大类 key（ADR 0007）：固定三种——'seed'=种子 | 'protein'=蛋白质 | 'sugar'=糖水。
+ *  大类不可增删改名，只作分组容器、不参与提醒；可扩展的是大类之下的食物项。 */
+export type FoodCategory = "seed" | "protein" | "sugar";
+
 /** 食物（含停用的：新建入口前端过滤 enabled；referenced=被历史记录或提醒台账引用，只能停用不能删） */
 export interface FoodItem {
   id: number;
@@ -156,6 +160,8 @@ export interface FoodItem {
   perishable?: boolean;
   /** 撤食间隔（小时，1–168 整数）；null/缺省 = 未设（易腐食物必须配有效间隔） */
   retrieval_hours?: number | null;
+  /** 食物大类 key（ADR 0007） */
+  category: FoodCategory;
 }
 
 /** 维护操作字典项（含停用的；referenced=被记录/提醒台账引用，只能停用不能删） */
@@ -202,6 +208,8 @@ export interface FoodInput {
   perishable: boolean;
   /** 撤食间隔（小时）；关易腐时传 null（后端兜底落 NULL） */
   retrieval_hours: number | null;
+  /** 食物大类 key（ADR 0007）：新增必填（后端拒收缺省）；修改传当前值 */
+  category?: FoodCategory | null;
 }
 
 /** 记账入参：喂食才带 food_ids（其余操作传空数组）；happened_at 可补录过去 */

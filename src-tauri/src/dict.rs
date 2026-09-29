@@ -60,10 +60,16 @@ pub struct ActionPolicyInput {
     pub is_feeding: Option<bool>,
 }
 
+/// 食物大类合法域（ADR 0007）：固定三种，'seed'=种子 | 'protein'=蛋白质 | 'sugar'=糖水。
+/// 大类不可增删改名，只作分组容器；可扩展的是大类之下的食物项。
+pub const FOOD_CATEGORIES: [&str; 3] = ["seed", "protein", "sugar"];
+
 /// 新增/修改食物的入参：id 为空=新增，否则改名+排序+建议间隔（停用走单独命令）。
 /// suggested_interval_days = 食物各自超期周期（F3）；None = 未设，只受喂食统一周期管。
 /// perishable = 易腐（票 01）；开易腐必须配 1–168 整数小时的撤食间隔（缺失/越界
 /// 拒收），关易腐时间隔一律落 NULL（清空由前端触发，后端兜底归空）。
+/// category = 食物大类 key（ADR 0007）：新增必填（None 拒收）；修改时 None =
+/// 保留原大类（前端恒传当前值，缺省仅为兼容旧调用）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct FoodInput {
     pub id: Option<i64>,
@@ -78,6 +84,9 @@ pub struct FoodInput {
     /// 撤食间隔（小时）；仅易腐有意义。
     #[serde(default)]
     pub retrieval_hours: Option<i64>,
+    /// 食物大类 key：'seed' | 'protein' | 'sugar'（ADR 0007）。
+    #[serde(default)]
+    pub category: Option<String>,
 }
 
 fn db_err(e: rusqlite::Error) -> String {
@@ -119,6 +128,18 @@ fn validate_interval(days: Option<i64>) -> Result<(), String> {
         None => Ok(()),
         Some(n) if n >= 1 => Ok(()),
         Some(n) => Err(format!("建议间隔应是不小于 1 的天数（收到 {n}）")),
+    }
+}
+
+/// 食物大类守护（ADR 0007）：给了就必须是三种合法 key 之一；None 通过
+/// （新增路径的必填检查在 save_food 里按 id 分支做）。
+fn validate_food_category(category: Option<&str>) -> Result<(), String> {
+    match category {
+        None => Ok(()),
+        Some(c) if FOOD_CATEGORIES.contains(&c) => Ok(()),
+        Some(c) => Err(format!(
+            "无效的食物大类：{c}（应为 seed / protein / sugar）"
+        )),
     }
 }
 
@@ -248,7 +269,11 @@ pub fn set_action_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(
 /// 行（票 05）引用则拒绝（友好文案，规则 10）。
 pub fn erase_action(conn: &Connection, id: i64) -> Result<(), String> {
     let preset: i64 = conn
-        .query_row("SELECT is_preset FROM care_action WHERE id = ?1", params![id], |r| r.get(0))
+        .query_row(
+            "SELECT is_preset FROM care_action WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => "操作不存在".to_string(),
             other => db_err(other),
@@ -264,7 +289,9 @@ pub fn erase_action(conn: &Connection, id: i64) -> Result<(), String> {
         )
         .map_err(db_err)?;
     if logs > 0 {
-        return Err(format!("该操作已被 {logs} 条记录使用，不能删除；可改为停用"));
+        return Err(format!(
+            "该操作已被 {logs} 条记录使用，不能删除；可改为停用"
+        ));
     }
     let ledger: i64 = conn
         .query_row(
@@ -274,7 +301,9 @@ pub fn erase_action(conn: &Connection, id: i64) -> Result<(), String> {
         )
         .map_err(db_err)?;
     if ledger > 0 {
-        return Err(format!("该操作仍被 {ledger} 条提醒台账引用，不能删除；可改为停用"));
+        return Err(format!(
+            "该操作仍被 {ledger} 条提醒台账引用，不能删除；可改为停用"
+        ));
     }
     let intervals: i64 = conn
         .query_row(
@@ -314,7 +343,12 @@ pub fn set_action_policy(
                  suggested_interval_days = COALESCE(?2, suggested_interval_days),
                  is_feeding = COALESCE(?3, is_feeding)
              WHERE id = ?4",
-            params![input.kind, input.suggested_interval_days, input.is_feeding, id],
+            params![
+                input.kind,
+                input.suggested_interval_days,
+                input.is_feeding,
+                id
+            ],
         )
         .map_err(db_err)?;
     if changed == 0 {
@@ -327,11 +361,13 @@ pub fn set_action_policy(
 
 /// 新增（enabled=1）或修改（改名+排序+建议间隔；enabled 不在编辑面）。
 /// suggested_interval_days 走与操作同款的 validate_interval（F3）；
-/// 易腐与撤食间隔走 validate_retrieval_hours 守护（票 01）。
+/// 易腐与撤食间隔走 validate_retrieval_hours 守护（票 01）；
+/// 大类走 validate_food_category 守护——新增必填、修改可改、缺省保留原值（ADR 0007）。
 pub fn save_food(conn: &Connection, input: &FoodInput) -> Result<crate::care::Food, String> {
     let name = validate_name(&input.name, "食物")?;
     validate_interval(input.suggested_interval_days)?;
     validate_retrieval_hours(input.perishable, input.retrieval_hours)?;
+    validate_food_category(input.category.as_deref())?;
     let retrieval_hours = if input.perishable {
         input.retrieval_hours
     } else {
@@ -350,10 +386,14 @@ pub fn save_food(conn: &Connection, input: &FoodInput) -> Result<crate::care::Fo
 
     match input.id {
         None => {
+            let category = input
+                .category
+                .as_deref()
+                .ok_or_else(|| "新食物必须指定大类（种子/蛋白质/糖水）".to_string())?;
             conn.execute(
-                "INSERT INTO food (name, enabled, sort, suggested_interval_days, perishable, retrieval_hours)
-                 VALUES (?1, 1, ?2, ?3, ?4, ?5)",
-                params![name, input.sort, input.suggested_interval_days, input.perishable, retrieval_hours],
+                "INSERT INTO food (name, enabled, sort, suggested_interval_days, perishable, retrieval_hours, category)
+                 VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6)",
+                params![name, input.sort, input.suggested_interval_days, input.perishable, retrieval_hours, category],
             )
             .map_err(|e| friendly_unique_err(e, "food.name", &name))?;
             crate::care::get_food(conn, conn.last_insert_rowid())
@@ -362,8 +402,17 @@ pub fn save_food(conn: &Connection, input: &FoodInput) -> Result<crate::care::Fo
             let changed = conn
                 .execute(
                     "UPDATE food SET name = ?1, sort = ?2, suggested_interval_days = ?3,
-                     perishable = ?4, retrieval_hours = ?5 WHERE id = ?6",
-                    params![name, input.sort, input.suggested_interval_days, input.perishable, retrieval_hours, id],
+                     perishable = ?4, retrieval_hours = ?5, category = COALESCE(?6, category)
+                     WHERE id = ?7",
+                    params![
+                        name,
+                        input.sort,
+                        input.suggested_interval_days,
+                        input.perishable,
+                        retrieval_hours,
+                        input.category,
+                        id
+                    ],
                 )
                 .map_err(|e| friendly_unique_err(e, "food.name", &name))?;
             if changed == 0 {
@@ -392,7 +441,11 @@ pub fn set_food_enabled(conn: &Connection, id: i64, enabled: bool) -> Result<(),
 /// F3）引用则拒绝（友好文案，规则 10）。
 pub fn erase_food(conn: &Connection, id: i64) -> Result<(), String> {
     let preset: i64 = conn
-        .query_row("SELECT is_preset FROM food WHERE id = ?1", params![id], |r| r.get(0))
+        .query_row(
+            "SELECT is_preset FROM food WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
         .map_err(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => "食物不存在".to_string(),
             other => db_err(other),
@@ -408,7 +461,9 @@ pub fn erase_food(conn: &Connection, id: i64) -> Result<(), String> {
         )
         .map_err(db_err)?;
     if used_by > 0 {
-        return Err(format!("该食物已被 {used_by} 条记录使用，不能删除；可改为停用"));
+        return Err(format!(
+            "该食物已被 {used_by} 条记录使用，不能删除；可改为停用"
+        ));
     }
     let ledger: i64 = conn
         .query_row(
@@ -418,7 +473,9 @@ pub fn erase_food(conn: &Connection, id: i64) -> Result<(), String> {
         )
         .map_err(db_err)?;
     if ledger > 0 {
-        return Err(format!("该食物仍被 {ledger} 条提醒台账引用，不能删除；可改为停用"));
+        return Err(format!(
+            "该食物仍被 {ledger} 条提醒台账引用，不能删除；可改为停用"
+        ));
     }
     let changed = conn
         .execute("DELETE FROM food WHERE id = ?1", params![id])
@@ -444,13 +501,19 @@ mod tests {
     const TODAY: &str = "2026-09-18";
 
     fn action_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM care_action WHERE name = ?1", params![name], |r| r.get(0))
-            .expect("查操作失败")
+        conn.query_row(
+            "SELECT id FROM care_action WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .expect("查操作失败")
     }
 
     fn food_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| r.get(0))
-            .expect("查食物失败")
+        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| {
+            r.get(0)
+        })
+        .expect("查食物失败")
     }
 
     fn colony(conn: &Connection, name: &str) -> i64 {
@@ -493,7 +556,8 @@ mod tests {
     }
 
     fn count(conn: &Connection, sql: &str) -> i64 {
-        conn.query_row(sql, [], |row| row.get(0)).expect("标量查询失败")
+        conn.query_row(sql, [], |row| row.get(0))
+            .expect("标量查询失败")
     }
 
     fn count_where_id(conn: &Connection, table: &str, id: i64) -> i64 {
@@ -518,11 +582,19 @@ mod tests {
     #[test]
     fn list_actions_returns_all_presets_including_disabled_in_dict_order() {
         let conn = mem_conn();
-        conn.execute("UPDATE care_action SET enabled = 0 WHERE name = '巢穴保湿'", []).unwrap();
+        conn.execute(
+            "UPDATE care_action SET enabled = 0 WHERE name = '巢穴保湿'",
+            [],
+        )
+        .unwrap();
 
         let actions = list_actions(&conn).unwrap();
         let names: Vec<&str> = actions.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(names, vec!["喂食", "撤食", "活动区换水", "巢穴保湿", "垃圾清理"], "含停用、按 sort 排");
+        assert_eq!(
+            names,
+            vec!["喂食", "撤食", "活动区换水", "巢穴保湿", "垃圾清理"],
+            "含停用、按 sort 排"
+        );
 
         let retrieval = by_name(&actions, "撤食");
         assert_eq!(retrieval.kind, "follow", "撤食预置为跟随喂食性质");
@@ -534,7 +606,10 @@ mod tests {
         assert!(feed.is_feeding, "预置喂食的 is_feeding 位为真");
         assert_eq!(feed.suggested_interval_days, Some(3));
         assert!(actions.iter().all(|a| a.enabled == (a.name != "巢穴保湿")));
-        assert!(!actions.iter().any(|a| a.referenced), "无记录时 referenced 全 false");
+        assert!(
+            !actions.iter().any(|a| a.referenced),
+            "无记录时 referenced 全 false"
+        );
     }
 
     #[test]
@@ -551,7 +626,10 @@ mod tests {
 
         let actions = list_actions(&conn).unwrap();
         assert!(by_name(&actions, "喂食").referenced);
-        assert!(by_name(&actions, "垃圾清理").referenced, "提醒台账引用也算被引用");
+        assert!(
+            by_name(&actions, "垃圾清理").referenced,
+            "提醒台账引用也算被引用"
+        );
         assert!(!by_name(&actions, "活动区换水").referenced);
     }
 
@@ -608,7 +686,11 @@ mod tests {
         assert_eq!(updated.id, feed, "改名不改 id");
         let recent = crate::care::recent_for_colony(&conn, c, 5).unwrap();
         assert_eq!(recent[0].action_name, "投喂", "历史跟随新显示名");
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_action"), 5, "改名不增行");
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM care_action"),
+            5,
+            "改名不增行"
+        );
     }
 
     #[test]
@@ -651,7 +733,9 @@ mod tests {
             .contains("不能为空"));
         let err = save_action(&conn, &input(None, "喂食", "reminding")).unwrap_err();
         assert!(err.contains("已存在"), "实际错误：{err}");
-        assert!(save_action(&conn, &input(None, "糖水", "remind")).unwrap_err().contains("性质"));
+        assert!(save_action(&conn, &input(None, "糖水", "remind"))
+            .unwrap_err()
+            .contains("性质"));
         assert!(save_action(&conn, &input(Some(999), "幽灵", "log_only"))
             .unwrap_err()
             .contains("操作不存在"));
@@ -668,8 +752,12 @@ mod tests {
             suggested_interval_days: days,
             sort: 0,
         };
-        assert!(save_action(&conn, &input(Some(0))).unwrap_err().contains("建议间隔"));
-        assert!(save_action(&conn, &input(Some(-3))).unwrap_err().contains("建议间隔"));
+        assert!(save_action(&conn, &input(Some(0)))
+            .unwrap_err()
+            .contains("建议间隔"));
+        assert!(save_action(&conn, &input(Some(-3)))
+            .unwrap_err()
+            .contains("建议间隔"));
         assert!(save_action(&conn, &input(None)).is_ok());
     }
 
@@ -683,7 +771,10 @@ mod tests {
 
         set_action_enabled(&conn, hydrate, false).unwrap();
         let tiles = crate::care::tiles_for_colony(&conn, c, TODAY).unwrap();
-        assert!(!tiles.iter().any(|t| t.name == "巢穴保湿"), "停用后不再出块");
+        assert!(
+            !tiles.iter().any(|t| t.name == "巢穴保湿"),
+            "停用后不再出块"
+        );
 
         set_action_enabled(&conn, hydrate, true).unwrap();
         let tiles = crate::care::tiles_for_colony(&conn, c, TODAY).unwrap();
@@ -693,7 +784,9 @@ mod tests {
     #[test]
     fn set_action_enabled_missing_rejected() {
         let conn = mem_conn();
-        assert!(set_action_enabled(&conn, 999, false).unwrap_err().contains("操作不存在"));
+        assert!(set_action_enabled(&conn, 999, false)
+            .unwrap_err()
+            .contains("操作不存在"));
     }
 
     // ── erase_action（验收 3：未引用可删、被引用拒绝）──
@@ -854,15 +947,21 @@ mod tests {
 
         let before = crate::care::tiles_for_colony(&conn, c, TODAY).unwrap();
         assert!(!tile(&before, "活动区换水").overdue, "登记类不红");
-        assert_eq!(before.iter().find(|t| t.action_id == water).unwrap().kind, "log_only");
+        assert_eq!(
+            before.iter().find(|t| t.action_id == water).unwrap().kind,
+            "log_only"
+        );
 
-        let updated =
-            set_action_policy(&conn, water, &ActionPolicyInput {
+        let updated = set_action_policy(
+            &conn,
+            water,
+            &ActionPolicyInput {
                 kind: "reminding".into(),
                 suggested_interval_days: Some(3),
                 is_feeding: None,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(updated.kind, "reminding");
         assert_eq!(updated.suggested_interval_days, Some(3));
 
@@ -879,15 +978,22 @@ mod tests {
         let feed = action_id(&conn, "喂食");
         log(&conn, c, "喂食", "2026-06-01 09:00:00"); // 远超 3 天
 
-        let updated =
-            set_action_policy(&conn, feed, &ActionPolicyInput {
+        let updated = set_action_policy(
+            &conn,
+            feed,
+            &ActionPolicyInput {
                 kind: "log_only".into(),
                 suggested_interval_days: None, // 不带新值 → 保留现值，不清空
                 is_feeding: None,
-            })
-            .unwrap();
+            },
+        )
+        .unwrap();
         assert_eq!(updated.kind, "log_only");
-        assert_eq!(updated.suggested_interval_days, Some(3), "切登记类不清空间隔");
+        assert_eq!(
+            updated.suggested_interval_days,
+            Some(3),
+            "切登记类不清空间隔"
+        );
 
         let tiles = crate::care::tiles_for_colony(&conn, c, TODAY).unwrap();
         assert!(!tile(&tiles, "喂食").overdue, "登记类永不红");
@@ -901,11 +1007,15 @@ mod tests {
         let seed = food_id(&conn, "种子");
 
         // 换水位标成喂食类 → 记账可带食物
-        set_action_policy(&conn, water, &ActionPolicyInput {
-            kind: "log_only".into(),
-            suggested_interval_days: None,
-            is_feeding: Some(true),
-        })
+        set_action_policy(
+            &conn,
+            water,
+            &ActionPolicyInput {
+                kind: "log_only".into(),
+                suggested_interval_days: None,
+                is_feeding: Some(true),
+            },
+        )
         .unwrap();
         log_feeding(&conn, c, "2026-09-17 09:00:00", vec![]); // 占位，确保窝有记录不碍事
         crate::care::log_care(
@@ -923,11 +1033,15 @@ mod tests {
 
         // 喂食位取消 → 带食物被拒
         let feed = action_id(&conn, "喂食");
-        set_action_policy(&conn, feed, &ActionPolicyInput {
-            kind: "reminding".into(),
-            suggested_interval_days: None,
-            is_feeding: Some(false),
-        })
+        set_action_policy(
+            &conn,
+            feed,
+            &ActionPolicyInput {
+                kind: "reminding".into(),
+                suggested_interval_days: None,
+                is_feeding: Some(false),
+            },
+        )
         .unwrap();
         let err = crate::care::log_care(
             &conn,
@@ -969,12 +1083,36 @@ mod tests {
     #[test]
     fn save_food_creates_and_renames() {
         let conn = mem_conn();
-        let created = save_food(&conn, &FoodInput { id: None, name: " 糖水 ".into(), sort: 9, suggested_interval_days: None, perishable: false, retrieval_hours: None }).unwrap();
+        let created = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: " 糖水 ".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: Some("sugar".into()),
+            },
+        )
+        .unwrap();
         assert_eq!(created.name, "糖水");
         assert!(created.enabled);
         assert!(!created.referenced);
 
-        let updated = save_food(&conn, &FoodInput { id: Some(created.id), name: "蜂蜜水".into(), sort: 0, suggested_interval_days: None, perishable: false, retrieval_hours: None }).unwrap();
+        let updated = save_food(
+            &conn,
+            &FoodInput {
+                id: Some(created.id),
+                name: "蜂蜜水".into(),
+                sort: 0,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: None,
+            },
+        )
+        .unwrap();
         assert_eq!(updated.name, "蜂蜜水");
         assert_eq!(updated.id, created.id, "改名不改 id");
     }
@@ -982,47 +1120,136 @@ mod tests {
     #[test]
     fn save_food_rejects_blank_duplicate_and_missing_id() {
         let conn = mem_conn();
-        assert!(save_food(&conn, &FoodInput { id: None, name: "  ".into(), sort: 0, suggested_interval_days: None, perishable: false, retrieval_hours: None })
-            .unwrap_err()
-            .contains("不能为空"));
-        let err = save_food(&conn, &FoodInput { id: None, name: "种子".into(), sort: 0, suggested_interval_days: None, perishable: false, retrieval_hours: None }).unwrap_err();
+        assert!(save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "  ".into(),
+                sort: 0,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: None
+            }
+        )
+        .unwrap_err()
+        .contains("不能为空"));
+        let err = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "种子".into(),
+                sort: 0,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: None,
+            },
+        )
+        .unwrap_err();
         assert!(err.contains("已存在"), "实际错误：{err}");
-        assert!(save_food(&conn, &FoodInput { id: Some(999), name: "幽灵".into(), sort: 0, suggested_interval_days: None, perishable: false, retrieval_hours: None })
-            .unwrap_err()
-            .contains("食物不存在"));
+        assert!(save_food(
+            &conn,
+            &FoodInput {
+                id: Some(999),
+                name: "幽灵".into(),
+                sort: 0,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: None
+            }
+        )
+        .unwrap_err()
+        .contains("食物不存在"));
     }
 
     #[test]
     fn save_food_sets_and_clears_interval() {
         let conn = mem_conn();
         let seed = food_id(&conn, "种子");
-        save_food(&conn, &FoodInput { id: Some(seed), name: "种子".into(), sort: 1, suggested_interval_days: Some(5), perishable: false, retrieval_hours: None }).unwrap();
-        assert_eq!(crate::care::list_foods(&conn).unwrap().iter().find(|f| f.id == seed).unwrap().suggested_interval_days, Some(5));
-        save_food(&conn, &FoodInput { id: Some(seed), name: "种子".into(), sort: 1, suggested_interval_days: None, perishable: false, retrieval_hours: None }).unwrap();
-        assert_eq!(crate::care::list_foods(&conn).unwrap().iter().find(|f| f.id == seed).unwrap().suggested_interval_days, None);
-        assert!(save_food(&conn, &FoodInput { id: None, name: "糖水".into(), sort: 9, suggested_interval_days: Some(0), perishable: false, retrieval_hours: None })
-            .unwrap_err()
-            .contains("建议间隔"));
+        save_food(
+            &conn,
+            &FoodInput {
+                id: Some(seed),
+                name: "种子".into(),
+                sort: 1,
+                suggested_interval_days: Some(5),
+                perishable: false,
+                retrieval_hours: None,
+                category: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            crate::care::list_foods(&conn)
+                .unwrap()
+                .iter()
+                .find(|f| f.id == seed)
+                .unwrap()
+                .suggested_interval_days,
+            Some(5)
+        );
+        save_food(
+            &conn,
+            &FoodInput {
+                id: Some(seed),
+                name: "种子".into(),
+                sort: 1,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            crate::care::list_foods(&conn)
+                .unwrap()
+                .iter()
+                .find(|f| f.id == seed)
+                .unwrap()
+                .suggested_interval_days,
+            None
+        );
+        assert!(save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "糖水".into(),
+                sort: 9,
+                suggested_interval_days: Some(0),
+                perishable: false,
+                retrieval_hours: None,
+                category: None
+            }
+        )
+        .unwrap_err()
+        .contains("建议间隔"));
     }
 
     #[test]
     fn save_food_rejects_perishable_without_valid_retrieval_hours() {
         // 票 01 验收：开易腐 + 空/0/负/越界 → 拒收；1–168 整数 → 通过
         let conn = mem_conn();
-        let mealworm = food_id(&conn, "面包虫");
+        let mealworm = food_id(&conn, "面包虫干");
         let input = |hours: Option<i64>| FoodInput {
             id: Some(mealworm),
-            name: "面包虫".into(),
+            name: "面包虫干".into(),
             sort: 3,
             suggested_interval_days: Some(7),
             perishable: true,
             retrieval_hours: hours,
+            category: None,
         };
 
         // 拒收矩阵：缺失 / 0 / 负 / 越界（169）
         for bad in [None, Some(0), Some(-3), Some(169)] {
             let err = save_food(&conn, &input(bad)).unwrap_err();
-            assert!(err.contains("撤食间隔"), "hours={bad:?} 应拒收，实际：{err}");
+            assert!(
+                err.contains("撤食间隔"),
+                "hours={bad:?} 应拒收，实际：{err}"
+            );
         }
         // 边界内通过：1 / 24 / 168
         for good in [Some(1), Some(24), Some(168)] {
@@ -1033,17 +1260,21 @@ mod tests {
     #[test]
     fn save_food_persists_perishable_and_normalizes_hours_when_off() {
         let conn = mem_conn();
-        let mealworm = food_id(&conn, "面包虫");
+        let mealworm = food_id(&conn, "面包虫干");
 
         // 开易腐 + 24h → 落库
-        save_food(&conn, &FoodInput {
-            id: Some(mealworm),
-            name: "面包虫".into(),
-            sort: 3,
-            suggested_interval_days: Some(7),
-            perishable: true,
-            retrieval_hours: Some(24),
-        })
+        save_food(
+            &conn,
+            &FoodInput {
+                id: Some(mealworm),
+                name: "面包虫干".into(),
+                sort: 3,
+                suggested_interval_days: Some(7),
+                perishable: true,
+                retrieval_hours: Some(24),
+                category: None,
+            },
+        )
         .unwrap();
         let (perishable, hours): (i64, Option<i64>) = conn
             .query_row(
@@ -1055,14 +1286,18 @@ mod tests {
         assert_eq!((perishable, hours), (1, Some(24)));
 
         // 关易腐 → 后端兜底归空（前端清空触发，这里验证绕过前端的直调也安全）
-        save_food(&conn, &FoodInput {
-            id: Some(mealworm),
-            name: "面包虫".into(),
-            sort: 3,
-            suggested_interval_days: Some(7),
-            perishable: false,
-            retrieval_hours: Some(24),
-        })
+        save_food(
+            &conn,
+            &FoodInput {
+                id: Some(mealworm),
+                name: "面包虫干".into(),
+                sort: 3,
+                suggested_interval_days: Some(7),
+                perishable: false,
+                retrieval_hours: Some(24),
+                category: None,
+            },
+        )
         .unwrap();
         let (perishable, hours): (i64, Option<i64>) = conn
             .query_row(
@@ -1074,14 +1309,18 @@ mod tests {
         assert_eq!((perishable, hours), (0, None), "关易腐时间隔一律归空");
 
         // 新建自建食物可直接带易腐
-        let created = save_food(&conn, &FoodInput {
-            id: None,
-            name: "鲜果".into(),
-            sort: 9,
-            suggested_interval_days: None,
-            perishable: true,
-            retrieval_hours: Some(12),
-        })
+        let created = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "鲜果".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: true,
+                retrieval_hours: Some(12),
+                category: Some("protein".into()),
+            },
+        )
         .unwrap();
         let (perishable, hours): (i64, Option<i64>) = conn
             .query_row(
@@ -1094,6 +1333,95 @@ mod tests {
     }
 
     #[test]
+    fn save_food_new_requires_category() {
+        // ADR 0007：新增缺大类 → 拒收（前端新增行必选下拉，这里验后端兜底）
+        let conn = mem_conn();
+        let err = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "蟋蟀".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("大类"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn save_food_rejects_unknown_category() {
+        let conn = mem_conn();
+        let err = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "蟋蟀".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: Some("fruit".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("无效的食物大类"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn save_food_inserts_updates_and_keeps_category() {
+        // 新增带大类落库；行内可改大类；修改缺省 = 保留原值（旧调用兼容）
+        let conn = mem_conn();
+        let created = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "蟋蟀".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: Some("protein".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(created.category, "protein");
+
+        let moved = save_food(
+            &conn,
+            &FoodInput {
+                id: Some(created.id),
+                name: "蟋蟀".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: Some("seed".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(moved.category, "seed", "行内可改大类");
+
+        let kept = save_food(
+            &conn,
+            &FoodInput {
+                id: Some(created.id),
+                name: "蟋蟀".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(kept.category, "seed", "缺省保留原大类");
+    }
+
+    #[test]
     fn set_food_enabled_round_trip() {
         let conn = mem_conn();
         let seed = food_id(&conn, "种子");
@@ -1103,15 +1431,29 @@ mod tests {
         set_food_enabled(&conn, seed, true).unwrap();
         let foods = crate::care::list_foods(&conn).unwrap();
         assert!(foods.iter().find(|f| f.id == seed).unwrap().enabled);
-        assert!(set_food_enabled(&conn, 999, false).unwrap_err().contains("食物不存在"));
+        assert!(set_food_enabled(&conn, 999, false)
+            .unwrap_err()
+            .contains("食物不存在"));
     }
 
     #[test]
     fn erase_food_unreferenced_succeeds() {
         let conn = mem_conn();
-        let created = save_food(&conn, &FoodInput { id: None, name: "糖水".into(), sort: 9, suggested_interval_days: None, perishable: false, retrieval_hours: None }).unwrap();
+        let created = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "糖水".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: Some("sugar".into()),
+            },
+        )
+        .unwrap();
         erase_food(&conn, created.id).unwrap();
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM food"), 3);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM food"), 7);
     }
 
     #[test]
@@ -1120,7 +1462,19 @@ mod tests {
         // F2 起预置食物由预置守护先拒删；log_food 引用分支改用自建食物验证
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        let custom = save_food(&conn, &FoodInput { id: None, name: "糖水".into(), sort: 9, suggested_interval_days: None, perishable: false, retrieval_hours: None }).unwrap();
+        let custom = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "糖水".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: Some("sugar".into()),
+            },
+        )
+        .unwrap();
         log_feeding(&conn, c, "2026-09-17 20:00:00", vec![custom.id]);
 
         let err = erase_food(&conn, custom.id).unwrap_err();
@@ -1159,7 +1513,19 @@ mod tests {
         // reminder_ledger.food_id 外键，只会报原始"数据库操作失败"
         let conn = mem_conn();
         let c = colony(&conn, "大头一号");
-        let custom = save_food(&conn, &FoodInput { id: None, name: "糖水".into(), sort: 9, suggested_interval_days: None, perishable: false, retrieval_hours: None }).unwrap();
+        let custom = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "糖水".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: Some("sugar".into()),
+            },
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO reminder_ledger (colony_id, kind, action_id, food_id, base_date, sent_at)
              VALUES (?1, 'food_overdue', ?2, ?3, '2026-09-11', '2026-09-18 08:00:00')",
@@ -1194,30 +1560,78 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM care_action"), 5);
         // 改名/停用不受影响
         let water = action_id(&conn, "活动区换水");
-        save_action(&conn, &ActionInput { id: Some(water), name: "换水".into(), kind: "log_only".into(), is_feeding: false, suggested_interval_days: None, sort: 2 }).unwrap();
+        save_action(
+            &conn,
+            &ActionInput {
+                id: Some(water),
+                name: "换水".into(),
+                kind: "log_only".into(),
+                is_feeding: false,
+                suggested_interval_days: None,
+                sort: 2,
+            },
+        )
+        .unwrap();
         set_action_enabled(&conn, water, false).unwrap();
     }
 
     #[test]
-    fn erase_food_rejects_three_presets() {
+    fn erase_food_rejects_all_preset_foods() {
         let conn = mem_conn();
-        for name in ["种子", "干虾仁", "面包虫"] {
+        for name in [
+            "种子",
+            "虾干",
+            "面包虫干",
+            "樱桃蟑螂",
+            "蜂蜜",
+            "冰糖水",
+            "白糖水",
+        ] {
             let err = erase_food(&conn, food_id(&conn, name)).unwrap_err();
             assert!(err.contains("预置"), "{name} 应拒删，实际：{err}");
         }
-        assert_eq!(count(&conn, "SELECT COUNT(*) FROM food"), 3);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM food"), 7);
     }
 
     #[test]
     fn list_actions_and_foods_expose_is_preset() {
         let conn = mem_conn();
-        let created = save_action(&conn, &ActionInput { id: None, name: "降温".into(), kind: "log_only".into(), is_feeding: false, suggested_interval_days: None, sort: 5 }).unwrap();
+        let created = save_action(
+            &conn,
+            &ActionInput {
+                id: None,
+                name: "降温".into(),
+                kind: "log_only".into(),
+                is_feeding: false,
+                suggested_interval_days: None,
+                sort: 5,
+            },
+        )
+        .unwrap();
         let actions = list_actions(&conn).unwrap();
         assert!(by_name(&actions, "喂食").is_preset);
-        assert!(!actions.iter().find(|a| a.id == created.id).unwrap().is_preset);
+        assert!(
+            !actions
+                .iter()
+                .find(|a| a.id == created.id)
+                .unwrap()
+                .is_preset
+        );
         let foods = crate::care::list_foods(&conn).unwrap();
         assert!(foods.iter().find(|f| f.name == "种子").unwrap().is_preset);
-        let custom = save_food(&conn, &FoodInput { id: None, name: "糖水".into(), sort: 9, suggested_interval_days: None, perishable: false, retrieval_hours: None }).unwrap();
+        let custom = save_food(
+            &conn,
+            &FoodInput {
+                id: None,
+                name: "糖水".into(),
+                sort: 9,
+                suggested_interval_days: None,
+                perishable: false,
+                retrieval_hours: None,
+                category: Some("sugar".into()),
+            },
+        )
+        .unwrap();
         assert!(!custom.is_preset);
     }
 }

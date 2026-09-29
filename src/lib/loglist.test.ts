@@ -40,6 +40,7 @@ function food(overrides: Partial<FoodItem>): FoodItem {
     suggested_interval_days: null,
     referenced: false,
     is_preset: true,
+    category: "seed",
     ...overrides,
   };
 }

@@ -176,7 +176,9 @@ impl Reminder {
                 let fed = self
                     .fed_at
                     .as_deref()
-                    .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok())
+                    .and_then(|s| {
+                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok()
+                    })
                     .map(|dt| format!("{}月{}日 {}", dt.month(), dt.day(), dt.format("%H:%M")))
                     .unwrap_or_else(|| self.fed_at.clone().unwrap_or_default());
                 (
@@ -287,7 +289,9 @@ pub fn compute_due_reminders(
                         let Some(interval) = f.suggested_interval_days else {
                             continue;
                         };
-                        let base = (today - Duration::days(interval.max(0))).format("%Y-%m-%d").to_string();
+                        let base = (today - Duration::days(interval.max(0)))
+                            .format("%Y-%m-%d")
+                            .to_string();
                         due.push(Reminder {
                             colony_id,
                             colony_name: colony_name.clone(),
@@ -402,8 +406,7 @@ fn retrieval_reminder_if_due(
     }
     // ①② 新鲜/补录分野：录入时已逾期（due ≤ created + 分钟级容差）为补录——
     // 录入当轮不补发，自录入次日起每日催促（通知日须晚于 created_at 所在自然日）
-    let fresh_at_entry =
-        due_at > created_at + Duration::minutes(RETRIEVAL_FRESH_TOLERANCE_MINUTES);
+    let fresh_at_entry = due_at > created_at + Duration::minutes(RETRIEVAL_FRESH_TOLERANCE_MINUTES);
     if !fresh_at_entry && now.date() <= created_at.date() {
         return Ok(None);
     }
@@ -518,7 +521,11 @@ pub fn run_check(conn: &Connection, today: &str, now: &str) -> Result<CheckOutco
 
     // 事务提交后跑补发扫描（新登记的行已在上面收编，这里按 id 去重不重复收）
     for job in collect_retry_jobs(conn, today)? {
-        if !outcome.push_jobs.iter().any(|j| j.ledger_id == job.ledger_id) {
+        if !outcome
+            .push_jobs
+            .iter()
+            .any(|j| j.ledger_id == job.ledger_id)
+        {
             outcome.push_jobs.push(job);
         }
     }
@@ -564,8 +571,11 @@ fn collect_retry_jobs(conn: &Connection, today: &str) -> Result<Vec<PushJob>, St
 /// 手机侧了结（送达或放弃）——由调用方在发送拿到结果后调用。
 pub fn settle_pushover(conn: &Connection, ids: &[i64]) -> Result<(), String> {
     for id in ids {
-        conn.execute("UPDATE reminder_ledger SET pushover_done = 1 WHERE id = ?1", params![id])
-            .map_err(db_err)?;
+        conn.execute(
+            "UPDATE reminder_ledger SET pushover_done = 1 WHERE id = ?1",
+            params![id],
+        )
+        .map_err(db_err)?;
     }
     Ok(())
 }
@@ -585,7 +595,10 @@ pub fn tray_summary(colonies: &[crate::colony::Colony]) -> String {
     let mut parts: Vec<String> = Vec::new();
     let active = colonies.iter().filter(|c| c.status == "active").count();
     parts.push(format!("{active} 窝活跃"));
-    let hibernating = colonies.iter().filter(|c| c.status == "hibernating").count();
+    let hibernating = colonies
+        .iter()
+        .filter(|c| c.status == "hibernating")
+        .count();
     if hibernating > 0 {
         parts.push(format!("{hibernating} 窝冬眠中"));
     }
@@ -606,9 +619,11 @@ pub fn tray_summary(colonies: &[crate::colony::Colony]) -> String {
         }
     }
     // 撤食（票 05）：红态（已超到期时刻）才提示——pending 未到期不算「该收食」
-    for c in colonies.iter().filter(|c| c.status == "active" || c.status == "hibernating") {
-        if c
-            .actions
+    for c in colonies
+        .iter()
+        .filter(|c| c.status == "active" || c.status == "hibernating")
+    {
+        if c.actions
             .iter()
             .any(|t| t.kind == "follow" && t.retrieval_state == "overdue")
         {
@@ -689,9 +704,16 @@ pub fn send_test_notification_dual(handle: &tauri::AppHandle) -> TestNotifyOutco
         pushover_config(&conn)
     })()
     .map(|cfg| {
-        match crate::pushover::send(&cfg, "测试通知", "蚂蚁饲养记录：手机通道正常。") {
-            Ok(()) => PushoverTestResult { ok: true, error: None },
-            Err(e) => PushoverTestResult { ok: false, error: Some(e) },
+        match crate::pushover::send(&cfg, "测试通知", "蚂蚁饲养记录：手机通道正常。")
+        {
+            Ok(()) => PushoverTestResult {
+                ok: true,
+                error: None,
+            },
+            Err(e) => PushoverTestResult {
+                ok: false,
+                error: Some(e),
+            },
         }
     });
     TestNotifyOutcome {
@@ -727,7 +749,9 @@ pub fn check_and_notify(handle: &tauri::AppHandle) {
             Ok(outcome) => outcome,
             Err(e) => {
                 // 终局评审 D7：台账/设置读失败不再无声吞掉（窗口化应用 stderr 不可见）
-                crate::applog::log_error(&format!("提醒检查失败（本轮跳过，下个 30 分钟周期重试）: {e}"));
+                crate::applog::log_error(&format!(
+                    "提醒检查失败（本轮跳过，下个 30 分钟周期重试）: {e}"
+                ));
                 return;
             }
         }
@@ -902,14 +926,18 @@ mod tests {
     }
 
     fn food_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| r.get(0))
-            .expect("查食物失败")
+        conn.query_row("SELECT id FROM food WHERE name = ?1", params![name], |r| {
+            r.get(0)
+        })
+        .expect("查食物失败")
     }
 
     fn action_id(conn: &Connection, name: &str) -> i64 {
-        conn.query_row("SELECT id FROM care_action WHERE name = ?1", params![name], |r| {
-            r.get(0)
-        })
+        conn.query_row(
+            "SELECT id FROM care_action WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
         .expect("查操作失败")
     }
 
@@ -977,13 +1005,17 @@ mod tests {
         assert_eq!(sent[0].days_since_last, Some(4));
 
         // 同日再查：台账身份相同 → 不重发
-        let again = run_check(&conn, TODAY, "2026-09-18 12:00:00").unwrap().toasts;
+        let again = run_check(&conn, TODAY, "2026-09-18 12:00:00")
+            .unwrap()
+            .toasts;
         assert!(again.is_empty(), "同日不重发");
         assert_eq!(ledger_count(&conn), 1);
 
         // 第二天仍超期：新基准日 → 再发一条（每个超期日最多一条）
         let tomorrow = fmt(day(TODAY) + Duration::days(1));
-        let sent = run_check(&conn, &tomorrow, "2026-09-19 08:00:00").unwrap().toasts;
+        let sent = run_check(&conn, &tomorrow, "2026-09-19 08:00:00")
+            .unwrap()
+            .toasts;
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].base_date, fmt(day(TODAY) - Duration::days(2)));
         assert_eq!(ledger_count(&conn), 2);
@@ -1042,7 +1074,10 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].kind, ReminderKind::WakeDay);
         // 同日再查不重发
-        assert!(run_check(&conn, &fmt(end), "2026-09-28 20:00:00").unwrap().toasts.is_empty());
+        assert!(run_check(&conn, &fmt(end), "2026-09-28 20:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
         assert_eq!(ledger_count(&conn), 2, "临近一条 + 出眠日一条");
     }
 
@@ -1082,10 +1117,15 @@ mod tests {
             params![fmt(e2), c],
         )
         .unwrap();
-        assert!(run_check(&conn, TODAY, NOW).unwrap().toasts.is_empty(), "新日期未到窗内，不发");
+        assert!(
+            run_check(&conn, TODAY, NOW).unwrap().toasts.is_empty(),
+            "新日期未到窗内，不发"
+        );
 
         // 到新窗内（E2−7）→ 按新日期发（未发的按新日期重算）
-        let sent = run_check(&conn, &fmt(e2 - Duration::days(7)), NOW).unwrap().toasts;
+        let sent = run_check(&conn, &fmt(e2 - Duration::days(7)), NOW)
+            .unwrap()
+            .toasts;
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].base_date, fmt(e2), "按新出眠日发");
 
@@ -1111,14 +1151,23 @@ mod tests {
 
         // 推进到预计出眠日当天：临近/出眠日不再触发（规则 4）。
         // 出眠后「距上次」从出眠日重新起算（5 天没喂 → 统一层超期；
-        // F3：种子（周期 3）同样从出眠日起算 5 > 3，食物层各自再发一条）。
+        // ADR 0007 后种子周期 7（5 < 7 静默），蛋白质/糖水预置周期 3
+        //（5 > 3 各自再发一条）→ 统一 1 + 食物层 6。
         let due = compute_due_reminders(&conn, &fmt(end), NOW, 7).unwrap();
-        assert_eq!(due.len(), 2, "统一超期 + 种子食物层各一条，实际：{due:?}");
+        assert_eq!(
+            due.len(),
+            7,
+            "统一超期 + 六个 3 天周期预置食物层，实际：{due:?}"
+        );
         assert_eq!(due[0].kind, ReminderKind::Overdue);
         assert_eq!(due[0].base_date, fmt(end - Duration::days(3)));
-        assert_eq!(due[1].kind, ReminderKind::FoodOverdue);
-        assert_eq!(due[1].food_name.as_deref(), Some("种子"));
-        assert_eq!(due[1].base_date, fmt(end - Duration::days(3)));
+        assert!(due[1..].iter().all(|r| r.kind == ReminderKind::FoodOverdue));
+        assert!(
+            due[1..]
+                .iter()
+                .all(|r| r.food_name.as_deref() != Some("种子")),
+            "种子周期 7，5 天未超期不提醒"
+        );
     }
 
     // ── 补发上限（规则 3）──
@@ -1143,7 +1192,10 @@ mod tests {
             assert_eq!(r.base_date, fmt(day(TODAY) - Duration::days(3)));
         }
         // 重查不重发：每窝每种只补一次
-        assert!(run_check(&conn, TODAY, "2026-09-18 21:00:00").unwrap().toasts.is_empty());
+        assert!(run_check(&conn, TODAY, "2026-09-18 21:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
         assert_eq!(ledger_count(&conn), 2);
     }
 
@@ -1169,7 +1221,14 @@ mod tests {
         feed(&conn, c, "喂食", "2026-09-10 08:00:00"); // 8 天前，超期
 
         // 总开关关：不发也不写台账
-        settings::set_settings(&conn, &AppSettings { notify_master_enabled: false, ..Default::default() }).unwrap();
+        settings::set_settings(
+            &conn,
+            &AppSettings {
+                notify_master_enabled: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let sent = run_check(&conn, TODAY, NOW).unwrap().toasts;
         assert!(sent.is_empty());
         assert_eq!(ledger_count(&conn), 0, "静默期不写台账");
@@ -1191,11 +1250,19 @@ mod tests {
         open_seg(&conn, h, TODAY);
         settings::set_settings(
             &conn,
-            &AppSettings { notify_overdue_enabled: false, notify_hibernation_enabled: false, ..Default::default() },
+            &AppSettings {
+                notify_overdue_enabled: false,
+                notify_hibernation_enabled: false,
+                ..Default::default()
+            },
         )
         .unwrap();
         let out = run_check(&conn, TODAY, NOW).unwrap();
-        assert_eq!(out.toasts.len(), 3, "超期 1 + 临近/出眠日 2，分类开关不再过滤");
+        assert_eq!(
+            out.toasts.len(),
+            3,
+            "超期 1 + 临近/出眠日 2，分类开关不再过滤"
+        );
     }
 
     #[test]
@@ -1239,7 +1306,9 @@ mod tests {
         let out = run_check(&conn, TODAY, NOW).unwrap();
         assert!(out.push_jobs.is_empty(), "超窗不再补发");
         let done: i64 = conn
-            .query_row("SELECT pushover_done FROM reminder_ledger", [], |r| r.get(0))
+            .query_row("SELECT pushover_done FROM reminder_ledger", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(done, 1, "超窗自动了结");
     }
@@ -1250,24 +1319,27 @@ mod tests {
     fn food_overdue_fires_independently_of_operation_layer() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
-        // 只喂种子（2 天前）：统一层不超期；面包虫 8 天前喂过 → 食物层超期
+        // 只喂种子（2 天前）：统一层不超期；面包虫干 8 天前喂过 → 食物层超期
         feed_foods(&conn, c, "2026-09-16 20:00:00", &["种子"]);
-        feed_foods(&conn, c, "2026-09-10 20:00:00", &["面包虫"]);
+        feed_foods(&conn, c, "2026-09-10 20:00:00", &["面包虫干"]);
 
         let out = run_check(&conn, TODAY, NOW).unwrap();
-        assert_eq!(out.toasts.len(), 1, "只有面包虫食物层一条");
+        assert_eq!(out.toasts.len(), 1, "只有面包虫干食物层一条");
         let r = &out.toasts[0];
         assert_eq!(r.kind, ReminderKind::FoodOverdue);
         assert_eq!(r.action_name.as_deref(), Some("喂食"));
-        assert_eq!(r.food_name.as_deref(), Some("面包虫"));
+        assert_eq!(r.food_name.as_deref(), Some("面包虫干"));
         assert_eq!(r.days_since_last, Some(8));
-        assert_eq!(r.base_date, fmt(day(TODAY) - Duration::days(7)));
+        assert_eq!(r.base_date, fmt(day(TODAY) - Duration::days(3)));
         let (title, body) = r.notification_text();
-        assert_eq!(title, "该喂面包虫了");
-        assert_eq!(body, "「大头一号」已 8 天没喂面包虫（建议 7 天一次）");
+        assert_eq!(title, "该喂面包虫干了");
+        assert_eq!(body, "「大头一号」已 8 天没喂面包虫干（建议 3 天一次）");
 
         // 同日重查不重发；台账 food 维度去重
-        assert!(run_check(&conn, TODAY, "2026-09-18 12:00:00").unwrap().toasts.is_empty());
+        assert!(run_check(&conn, TODAY, "2026-09-18 12:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
         let kinds = ledger_rows(&conn);
         assert_eq!(kinds.len(), 1);
     }
@@ -1276,9 +1348,13 @@ mod tests {
     fn operation_and_food_layers_same_day_both_fire() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
-        feed_foods(&conn, c, "2026-09-10 20:00:00", &["种子", "面包虫"]); // 8 天 → 两层全超
+        feed_foods(&conn, c, "2026-09-10 20:00:00", &["种子", "面包虫干"]); // 8 天 → 两层全超
         let out = run_check(&conn, TODAY, NOW).unwrap();
-        assert_eq!(out.toasts.len(), 3, "统一层 1 + 种子 1 + 面包虫 1，各记各的");
+        assert_eq!(
+            out.toasts.len(),
+            3,
+            "统一层 1 + 种子 1 + 面包虫干 1，各记各的"
+        );
     }
 
     #[test]
@@ -1286,7 +1362,7 @@ mod tests {
         let conn = mem_conn();
         let h = colony(&conn, "冬眠一号", "hibernating");
         open_seg(&conn, h, "2027-03-01");
-        feed_foods(&conn, h, "2026-06-01 08:00:00", &["面包虫"]);
+        feed_foods(&conn, h, "2026-06-01 08:00:00", &["面包虫干"]);
         assert!(run_check(&conn, TODAY, NOW).unwrap().toasts.is_empty());
     }
 
@@ -1315,7 +1391,11 @@ mod tests {
         assert_eq!(out.toasts.len(), 1, "设了即提醒：登记类也发操作超期");
         assert_eq!(out.toasts[0].kind, ReminderKind::Overdue);
         assert_eq!(out.toasts[0].action_name.as_deref(), Some("巢穴保湿"));
-        assert_eq!(out.toasts[0].suggested_interval_days, Some(5), "文案周期值取有效周期");
+        assert_eq!(
+            out.toasts[0].suggested_interval_days,
+            Some(5),
+            "文案周期值取有效周期"
+        );
         assert_eq!(out.toasts[0].base_date, fmt(day(TODAY) - Duration::days(5)));
         let (title, body) = out.toasts[0].notification_text();
         assert_eq!(title, "巢穴保湿超期");
@@ -1344,7 +1424,10 @@ mod tests {
         let out = run_check(&conn, TODAY, NOW).unwrap();
         assert_eq!(out.toasts.len(), 1);
         // 同日重查：台账 (窝, 操作, 基准日) 去重 → 不重发
-        assert!(run_check(&conn, TODAY, "2026-09-18 20:00:00").unwrap().toasts.is_empty());
+        assert!(run_check(&conn, TODAY, "2026-09-18 20:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
         assert_eq!(ledger_count(&conn), 1);
         // 次日仍超期：新基准日 → 再一条
         let out = run_check(&conn, "2026-09-19", "2026-09-19 08:00:00").unwrap();
@@ -1363,8 +1446,14 @@ mod tests {
             "2026-09-19 07:30:00",
         )
         .unwrap();
-        assert!(run_check(&conn, "2026-09-20", "2026-09-20 08:00:00").unwrap().toasts.is_empty());
-        assert!(run_check(&conn, "2026-09-21", "2026-09-21 08:00:00").unwrap().toasts.is_empty());
+        assert!(run_check(&conn, "2026-09-20", "2026-09-20 08:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
+        assert!(run_check(&conn, "2026-09-21", "2026-09-21 08:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
     }
 
     #[test]
@@ -1375,7 +1464,9 @@ mod tests {
         set_interval(&conn, c, "巢穴保湿", 3);
         feed(&conn, c, "巢穴保湿", "2026-09-15 08:00:00"); // TODAY 时恰 3 天
         assert!(
-            compute_due_reminders(&conn, TODAY, NOW, 7).unwrap().is_empty(),
+            compute_due_reminders(&conn, TODAY, NOW, 7)
+                .unwrap()
+                .is_empty(),
             "days==周期 → 不发"
         );
 
@@ -1404,25 +1495,32 @@ mod tests {
         feed(&conn, follower, "撤食", "2026-06-01 08:00:00"); // follow 永不参与
 
         let due = compute_due_reminders(&conn, TODAY, NOW, 7).unwrap();
-        assert!(due.is_empty(), "冬眠静音、已结束、从未做过、撤食全不发：{due:?}");
+        assert!(
+            due.is_empty(),
+            "冬眠静音、已结束、从未做过、撤食全不发：{due:?}"
+        );
     }
 
     #[test]
     fn food_layer_still_stacks_when_feeding_has_per_colony_interval() {
-        // 喂食设了每窝 10：操作层 2 ≤ 10 不发；面包虫 8 > 7 食物层照旧各发各的，
+        // 喂食设了每窝 10：操作层 2 ≤ 10 不发；面包虫干 8 > 3 食物层照旧各发各的，
         // 台账按 food 维度去重，食物行文案仍是食物自己的周期
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
         set_interval(&conn, c, "喂食", 10);
         feed_foods(&conn, c, "2026-09-16 20:00:00", &["种子"]);
-        feed_foods(&conn, c, "2026-09-10 20:00:00", &["面包虫"]);
+        feed_foods(&conn, c, "2026-09-10 20:00:00", &["面包虫干"]);
 
         let due = compute_due_reminders(&conn, TODAY, NOW, 7).unwrap();
-        assert_eq!(due.len(), 1, "只有面包虫食物层一条：{due:?}");
+        assert_eq!(due.len(), 1, "只有面包虫干食物层一条：{due:?}");
         assert_eq!(due[0].kind, ReminderKind::FoodOverdue);
-        assert_eq!(due[0].food_name.as_deref(), Some("面包虫"));
-        assert_eq!(due[0].suggested_interval_days, Some(7), "食物层文案仍取食物自己的周期");
-        assert_eq!(due[0].base_date, fmt(day(TODAY) - Duration::days(7)));
+        assert_eq!(due[0].food_name.as_deref(), Some("面包虫干"));
+        assert_eq!(
+            due[0].suggested_interval_days,
+            Some(3),
+            "食物层文案仍取食物自己的周期"
+        );
+        assert_eq!(due[0].base_date, fmt(day(TODAY) - Duration::days(3)));
     }
 
     // ── 撤食提醒（票 05）──
@@ -1477,7 +1575,11 @@ mod tests {
 
     /// 只留撤食类的 toasts（补录/存量场景里操作层超期会照发，各算各的）。
     fn retrieval_kinds(out: &CheckOutcome) -> Vec<ReminderKind> {
-        out.toasts.iter().map(|r| r.kind).filter(|k| *k == ReminderKind::RetrievalDue).collect()
+        out.toasts
+            .iter()
+            .map(|r| r.kind)
+            .filter(|k| *k == ReminderKind::RetrievalDue)
+            .collect()
     }
 
     #[test]
@@ -1485,8 +1587,8 @@ mod tests {
         // 验收 1：新鲜喂食（录入时未逾期）→ 到期后每日一条，打卡撤食即停
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
-        // 09-17 09:00 喂面包虫（24h）；录入 NOW（09-18 08:00）时 due（09-18 09:00）还在未来 → 新鲜
-        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫"]);
+        // 09-17 09:00 喂面包虫干（24h）；录入 NOW（09-18 08:00）时 due（09-18 09:00）还在未来 → 新鲜
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫干"]);
 
         // 喂后 25 小时检查（now = 09-18 10:00 ≥ due）：桌面 toast + 手机推送任务各一条
         let out = run_check(&conn, TODAY, "2026-09-18 10:00:00").unwrap();
@@ -1496,10 +1598,16 @@ mod tests {
         assert_eq!(out.toasts[0].base_date, TODAY, "台账基准日 = 当前自然日");
         let (title, body) = out.toasts[0].notification_text();
         assert_eq!(title, "该撤食了");
-        assert_eq!(body, "「大头一号」该撤食了：9月17日 09:00 喂的面包虫已超过 1 小时");
+        assert_eq!(
+            body,
+            "「大头一号」该撤食了：9月17日 09:00 喂的面包虫干已超过 1 小时"
+        );
 
         // 同日再查：台账 (窝, 当日) 去重 → 不重发（验收 6）
-        assert!(run_check(&conn, TODAY, "2026-09-18 20:00:00").unwrap().toasts.is_empty());
+        assert!(run_check(&conn, TODAY, "2026-09-18 20:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
         assert_eq!(ledger_count(&conn), 1);
 
         // 再过 24 小时未撤 → 又一条
@@ -1509,8 +1617,14 @@ mod tests {
 
         // 打卡撤食 → 不再发
         retrieve(&conn, c, "2026-09-19 11:00:00");
-        assert!(run_check(&conn, "2026-09-19", "2026-09-19 12:00:00").unwrap().toasts.is_empty());
-        assert!(run_check(&conn, "2026-09-20", "2026-09-20 08:00:00").unwrap().toasts.is_empty());
+        assert!(run_check(&conn, "2026-09-19", "2026-09-19 12:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
+        assert!(run_check(&conn, "2026-09-20", "2026-09-20 08:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
     }
 
     #[test]
@@ -1519,9 +1633,9 @@ mod tests {
         let conn = mem_conn();
         let h = colony(&conn, "冬眠一号", "hibernating");
         open_seg(&conn, h, "2027-03-01");
-        feed_foods_created(&conn, h, "2026-09-17 09:00:00", NOW, &["面包虫"]);
+        feed_foods_created(&conn, h, "2026-09-17 09:00:00", NOW, &["面包虫干"]);
         let e = colony(&conn, "结束一号", "ended");
-        feed_foods_created(&conn, e, "2026-09-17 09:00:00", NOW, &["面包虫"]);
+        feed_foods_created(&conn, e, "2026-09-17 09:00:00", NOW, &["面包虫干"]);
 
         let due = compute_due_reminders(&conn, TODAY, "2026-09-18 10:00:00", 7).unwrap();
         assert_eq!(due.len(), 1, "只有冬眠窝的撤食一条：{due:?}");
@@ -1531,14 +1645,16 @@ mod tests {
 
     #[test]
     fn backlogged_retrieval_waits_until_day_after_entry() {
-        // 验收 3：补录 3 天前的面包虫 → 录入当天零通知，次日起每日一条直到撤食
+        // 验收 3：补录 3 天前的面包虫干 → 录入当天零通知，次日起每日一条直到撤食
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
-        feed_foods_created(&conn, c, "2026-09-15 09:00:00", NOW, &["面包虫"]);
+        feed_foods_created(&conn, c, "2026-09-15 09:00:00", NOW, &["面包虫干"]);
 
-        assert!(compute_due_reminders(&conn, TODAY, "2026-09-18 08:30:00", 7)
-            .unwrap()
-            .is_empty());
+        assert!(
+            compute_due_reminders(&conn, TODAY, "2026-09-18 08:30:00", 7)
+                .unwrap()
+                .is_empty()
+        );
         let out = run_check(&conn, TODAY, "2026-09-18 23:00:00").unwrap();
         assert!(out.toasts.is_empty(), "录入当天不追溯补发");
         assert_eq!(ledger_count(&conn), 0, "静默期不写台账");
@@ -1562,7 +1678,7 @@ mod tests {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
         set_baseline(&conn, NOW); // created_at = NOW ≤ 基线（同刻含边界）→ 存量
-        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫"]);
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫干"]);
 
         for (d, now) in [
             ("2026-09-18", "2026-09-18 10:00:00"),
@@ -1570,7 +1686,11 @@ mod tests {
             ("2026-09-25", "2026-09-25 08:00:00"),
         ] {
             let out = run_check(&conn, d, now).unwrap();
-            assert!(retrieval_kinds(&out).is_empty(), "存量永不推送：{d}，实际 {:#?}", out.toasts);
+            assert!(
+                retrieval_kinds(&out).is_empty(),
+                "存量永不推送：{d}，实际 {:#?}",
+                out.toasts
+            );
         }
         let retrieval_rows: i64 = conn
             .query_row(
@@ -1579,7 +1699,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(retrieval_rows, 0, "存量不落撤食台账（状态红与托盘概要另行体现）");
+        assert_eq!(
+            retrieval_rows, 0,
+            "存量不落撤食台账（状态红与托盘概要另行体现）"
+        );
     }
 
     #[test]
@@ -1590,11 +1713,14 @@ mod tests {
         // 操作层超期用「垃圾清理」（8 天 > 7）承担——喂食本身会被下面的易腐喂食刷新，
         // 两个场景得分开搭
         feed(&conn, c, "垃圾清理", "2026-09-10 08:00:00");
-        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫"]); // 撤食到期
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫干"]); // 撤食到期
 
         settings::set_settings(
             &conn,
-            &AppSettings { notify_retrieval_enabled: false, ..Default::default() },
+            &AppSettings {
+                notify_retrieval_enabled: false,
+                ..Default::default()
+            },
         )
         .unwrap();
         let out = run_check(&conn, TODAY, "2026-09-18 10:00:00").unwrap();
@@ -1612,10 +1738,16 @@ mod tests {
         // 总开关关 → 全静默（既有语义不变）
         settings::set_settings(
             &conn,
-            &AppSettings { notify_master_enabled: false, ..Default::default() },
+            &AppSettings {
+                notify_master_enabled: false,
+                ..Default::default()
+            },
         )
         .unwrap();
-        assert!(run_check(&conn, "2026-09-19", "2026-09-19 08:00:00").unwrap().toasts.is_empty());
+        assert!(run_check(&conn, "2026-09-19", "2026-09-19 08:00:00")
+            .unwrap()
+            .toasts
+            .is_empty());
 
         // 双开 → 撤食与其它都发
         settings::set_settings(&conn, &AppSettings::default()).unwrap();
@@ -1629,13 +1761,17 @@ mod tests {
         // 晚 6 分钟（> 容差）→ 新鲜口径，到期即发
         let conn = mem_conn();
         let tight = colony(&conn, "贴边一号", "active");
-        feed_foods_created(&conn, tight, "2026-09-17 08:02:00", NOW, &["面包虫"]); // due 09-18 08:02
+        feed_foods_created(&conn, tight, "2026-09-17 08:02:00", NOW, &["面包虫干"]); // due 09-18 08:02
         let clear = colony(&conn, "过界一号", "active");
-        feed_foods_created(&conn, clear, "2026-09-17 08:06:00", NOW, &["面包虫"]); // due 09-18 08:06
+        feed_foods_created(&conn, clear, "2026-09-17 08:06:00", NOW, &["面包虫干"]); // due 09-18 08:06
 
         let out = run_check(&conn, TODAY, "2026-09-18 10:00:00").unwrap();
         let names: Vec<&str> = out.toasts.iter().map(|r| r.colony_name.as_str()).collect();
-        assert_eq!(names, vec!["过界一号"], "容差内按补录不发，超出容差按新鲜发：{names:?}");
+        assert_eq!(
+            names,
+            vec!["过界一号"],
+            "容差内按补录不发，超出容差按新鲜发：{names:?}"
+        );
 
         // 次日：贴边窝按补录次日起催，过界窝照常每日一条
         let out = run_check(&conn, "2026-09-19", "2026-09-19 08:00:00").unwrap();
@@ -1647,8 +1783,12 @@ mod tests {
         // 用户故事 12：停用「撤食」操作 = 撤食功能整体关闭（历史记录保留）
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
-        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫"]);
-        conn.execute("UPDATE care_action SET enabled = 0 WHERE kind = 'follow'", []).unwrap();
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫干"]);
+        conn.execute(
+            "UPDATE care_action SET enabled = 0 WHERE kind = 'follow'",
+            [],
+        )
+        .unwrap();
         let due = compute_due_reminders(&conn, TODAY, "2026-09-18 10:00:00", 7).unwrap();
         assert!(due.is_empty(), "撤食操作停用 → 引擎不再产撤食提醒：{due:?}");
     }
@@ -1658,11 +1798,14 @@ mod tests {
         // 文案食物名 = 该次喂食所选有效易腐食物（可多食物并列，按字典序）
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
-        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫", "干虾仁"]);
+        feed_foods_created(&conn, c, "2026-09-17 09:00:00", NOW, &["面包虫干", "虾干"]);
         let out = run_check(&conn, TODAY, "2026-09-18 10:00:00").unwrap();
         assert_eq!(out.toasts.len(), 1);
         let (_, body) = out.toasts[0].notification_text();
-        assert_eq!(body, "「大头一号」该撤食了：9月17日 09:00 喂的干虾仁、面包虫已超过 1 小时");
+        assert_eq!(
+            body,
+            "「大头一号」该撤食了：9月17日 09:00 喂的虾干、面包虫干已超过 1 小时"
+        );
     }
 
     // ── 通知文案 ──
@@ -1699,9 +1842,15 @@ mod tests {
         };
         let (title, body) = r.notification_text();
         assert_eq!(title, "临近出眠");
-        assert!(body.contains("大头一号") && body.contains("2026-10-01"), "{body}");
+        assert!(
+            body.contains("大头一号") && body.contains("2026-10-01"),
+            "{body}"
+        );
 
-        let r = Reminder { kind: ReminderKind::WakeDay, ..r };
+        let r = Reminder {
+            kind: ReminderKind::WakeDay,
+            ..r
+        };
         let (title, body) = r.notification_text();
         assert_eq!(title, "出眠日");
         assert!(body.contains("2026-10-01"), "{body}");
@@ -1721,21 +1870,28 @@ mod tests {
             days_since_last: None,
             suggested_interval_days: None,
             fed_at: Some("2026-09-17 09:00:00".into()),
-            retrieval_food_names: Some(vec!["面包虫".into()]),
+            retrieval_food_names: Some(vec!["面包虫干".into()]),
             hours_overdue: Some(25),
         };
         let (title, body) = r.notification_text();
         assert_eq!(title, "该撤食了");
-        assert_eq!(body, "「大头一号」该撤食了：9月17日 09:00 喂的面包虫已超过 25 小时");
+        assert_eq!(
+            body,
+            "「大头一号」该撤食了：9月17日 09:00 喂的面包虫干已超过 25 小时"
+        );
 
         // 多食物并列；字段缺省的兜底：无食物名 → 「易腐食物」、无小时 → 0
         let r = Reminder {
-            retrieval_food_names: Some(vec!["干虾仁".into(), "面包虫".into()]),
+            retrieval_food_names: Some(vec!["虾干".into(), "面包虫干".into()]),
             ..r
         };
         let (_, body) = r.notification_text();
-        assert!(body.contains("喂的干虾仁、面包虫已超过 25 小时"), "{body}");
-        let r = Reminder { retrieval_food_names: None, hours_overdue: None, ..r };
+        assert!(body.contains("喂的虾干、面包虫干已超过 25 小时"), "{body}");
+        let r = Reminder {
+            retrieval_food_names: None,
+            hours_overdue: None,
+            ..r
+        };
         let (_, body) = r.notification_text();
         assert!(body.contains("喂的易腐食物已超过 0 小时"), "{body}");
     }
@@ -1756,11 +1912,15 @@ mod tests {
             overdue,
             foods: vec![],
             retrieval_state: "none".into(), // 票 02 新字段；托盘概要测试用不到三态
-            implies_retrieval: false,        // ADR 0006 新字段；提醒引擎不消费
+            implies_retrieval: false,       // ADR 0006 新字段；提醒引擎不消费
         }
     }
 
-    fn col(name: &str, status: &str, actions: Vec<crate::care::ActionTile>) -> crate::colony::Colony {
+    fn col(
+        name: &str,
+        status: &str,
+        actions: Vec<crate::care::ActionTile>,
+    ) -> crate::colony::Colony {
         crate::colony::Colony {
             id: 1,
             name: name.into(),
@@ -1790,11 +1950,22 @@ mod tests {
         let a = col(
             "大头一号",
             "active",
-            vec![tile("喂食", "reminding", true, Some(4)), tile("垃圾清理", "reminding", false, Some(2))],
+            vec![
+                tile("喂食", "reminding", true, Some(4)),
+                tile("垃圾清理", "reminding", false, Some(2)),
+            ],
         );
-        let b = col("针毛一号", "active", vec![tile("喂食", "reminding", false, Some(1))]);
+        let b = col(
+            "针毛一号",
+            "active",
+            vec![tile("喂食", "reminding", false, Some(1))],
+        );
         let h = col("冬眠一号", "hibernating", vec![]);
-        let e = col("老窝", "ended", vec![tile("喂食", "reminding", true, Some(99))]);
+        let e = col(
+            "老窝",
+            "ended",
+            vec![tile("喂食", "reminding", true, Some(99))],
+        );
 
         assert_eq!(
             tray_summary(&[a.clone(), b, h, e]),
@@ -1803,14 +1974,21 @@ mod tests {
         );
 
         // 无任何超期：只报窝数
-        let quiet = col("安静一号", "active", vec![tile("喂食", "reminding", false, Some(1))]);
+        let quiet = col(
+            "安静一号",
+            "active",
+            vec![tile("喂食", "reminding", false, Some(1))],
+        );
         assert_eq!(tray_summary(&[quiet]), "1 窝活跃");
 
         // 一窝两条超期：顿号列举
         let busy = col(
             "忙窝",
             "active",
-            vec![tile("喂食", "reminding", true, Some(5)), tile("垃圾清理", "reminding", true, Some(9))],
+            vec![
+                tile("喂食", "reminding", true, Some(5)),
+                tile("垃圾清理", "reminding", true, Some(9)),
+            ],
         );
         assert_eq!(
             tray_summary(&[busy]),
@@ -1826,7 +2004,7 @@ mod tests {
         feed.foods = vec![
             crate::care::FoodTileStatus {
                 food_id: 1,
-                name: "面包虫".into(),
+                name: "面包虫干".into(),
                 suggested_interval_days: Some(7),
                 days_since_last: Some(8),
                 overdue: true,
@@ -1842,7 +2020,7 @@ mod tests {
         let c = col("大头一号", "active", vec![feed]);
         assert_eq!(
             tray_summary(&[c]),
-            "1 窝活跃 · 大头一号喂食超期 4 天 · 大头一号该喂面包虫了",
+            "1 窝活跃 · 大头一号喂食超期 4 天 · 大头一号该喂面包虫干了",
             "统一层句式不变 + 食物层各补一条；不超期的食物不报"
         );
 
@@ -1882,7 +2060,10 @@ mod tests {
         let a = col(
             "大头一号",
             "active",
-            vec![tile("喂食", "reminding", false, Some(1)), follow_tile("overdue")],
+            vec![
+                tile("喂食", "reminding", false, Some(1)),
+                follow_tile("overdue"),
+            ],
         );
         let h = col("冬眠一号", "hibernating", vec![follow_tile("overdue")]);
         let pending = col("针毛一号", "active", vec![follow_tile("pending")]);
@@ -1905,6 +2086,10 @@ mod tests {
             vec![tile("喂食", "reminding", true, Some(9))],
         );
         let text = tray_summary(&[c]);
-        assert!(text.chars().count() <= 128, "Windows tooltip 上限 128 字符，实际 {}", text.chars().count());
+        assert!(
+            text.chars().count() <= 128,
+            "Windows tooltip 上限 128 字符，实际 {}",
+            text.chars().count()
+        );
     }
 }

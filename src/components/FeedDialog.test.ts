@@ -24,13 +24,14 @@ const action: ColonyAction = {
   suggested_interval_days: null, days_since_last: 1, overdue: false, foods: [],
 };
 
-/** id=4 是脏数据（易腐但没配间隔）；id=5 停用（不该出现在多选列表） */
+/** id=4 是脏数据（易腐但没配间隔，且挂了个非法大类 key——分组兜底用）；
+ *  id=5 停用（不该出现在多选列表） */
 const foods: FoodItem[] = [
-  { id: 1, name: "面包虫", enabled: true, sort: 1, suggested_interval_days: null, is_preset: true, referenced: true, perishable: true, retrieval_hours: 24 },
-  { id: 2, name: "湿食", enabled: true, sort: 2, suggested_interval_days: null, is_preset: false, referenced: false, perishable: true, retrieval_hours: 6 },
-  { id: 3, name: "种子", enabled: true, sort: 3, suggested_interval_days: 7, is_preset: true, referenced: true, perishable: false, retrieval_hours: null },
-  { id: 4, name: "脏数据", enabled: true, sort: 4, suggested_interval_days: null, is_preset: false, referenced: false, perishable: true, retrieval_hours: null },
-  { id: 5, name: "停用蜂蜜", enabled: false, sort: 5, suggested_interval_days: null, is_preset: false, referenced: false, perishable: true, retrieval_hours: 12 },
+  { id: 1, name: "面包虫", enabled: true, sort: 1, suggested_interval_days: null, is_preset: true, referenced: true, perishable: true, retrieval_hours: 24, category: "protein" },
+  { id: 2, name: "湿食", enabled: true, sort: 2, suggested_interval_days: null, is_preset: false, referenced: false, perishable: true, retrieval_hours: 6, category: "protein" },
+  { id: 3, name: "种子", enabled: true, sort: 3, suggested_interval_days: 7, is_preset: true, referenced: true, perishable: false, retrieval_hours: null, category: "seed" },
+  { id: 4, name: "脏数据", enabled: true, sort: 4, suggested_interval_days: null, is_preset: false, referenced: false, perishable: true, retrieval_hours: null, category: "junk" as never },
+  { id: 5, name: "停用蜂蜜", enabled: false, sort: 5, suggested_interval_days: null, is_preset: false, referenced: false, perishable: true, retrieval_hours: 12, category: "sugar" },
 ];
 
 function mockInvoke() {
@@ -198,6 +199,20 @@ describe("FeedDialog 提交反馈分支", () => {
     expect(w.find(".form-error").exists()).toBe(true);
     expect(w.find(".save-ok").exists()).toBe(false);
     expect(w.emitted("saved")).toBeUndefined();
+  });
+});
+
+describe("食物大类分组（ADR 0007）", () => {
+  it("一屏直选：组头 种子→蛋白质；糖水整组停用不渲染组头；未知大类兜底尾组；停用项不出现", async () => {
+    mockInvoke();
+    const w = await mountDlg();
+    const groups = w.findAll(".food-group");
+    expect(groups.map((g) => g.find(".food-group-label").text())).toEqual(["种子", "蛋白质", "junk"]);
+    const names = (g: number) => groups[g]!.findAll(".food").map((c) => c.text());
+    expect(names(0)).toEqual(["种子"]);
+    expect(names(1)).toEqual(["面包虫", "湿食"]);
+    expect(names(2)).toEqual(["脏数据"]);
+    expect(w.text()).not.toContain("停用蜂蜜");
   });
 });
 
