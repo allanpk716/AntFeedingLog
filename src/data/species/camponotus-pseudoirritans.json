@@ -1,0 +1,48 @@
+{
+  "key": "camponotus-pseudoirritans",
+  "cnName": "拟光腹弓背蚁",
+  "latinName": "Camponotus pseudoirritans",
+  "aliases": [],
+  "type": "弓背蚁",
+  "hibernation": "不冬眠",
+  "hibernationNote": "不冬眠；专种冬眠资料查无实据（适宜 20~30°C，商家单源）",
+  "difficulty": 2,
+  "beginnerRecommended": true,
+  "recommendReason": "不冬眠路线首选：爆产皮实、性情温和胆大（多源），国内社群资料多、上手快",
+  "queenSize": "约 14~15mm（单源，两处略出入）",
+  "workerSize": "中小工 6.9~8.9、大工 11.8~12.2mm（多源）",
+  "queenSystem": "单后制（单源）；国内未见合后实践",
+  "activityRhythm": "",
+  "tempRange": "适宜 20~30°C（商家单源）",
+  "humidity": "湿 30~50%、喜阴蔽土巢（商家单源）",
+  "diet": "",
+  "price": "几十元（1后30~50工小群，原调研）",
+  "distribution": "中国特有（土栖）",
+  "appearance": "",
+  "purchaseWarning": "英文圈几乎无饲养资料，选购以国内商家渠道为主；新后阶段约 12% 陷吃卵—产卵循环不出工（单源统计）——属统计内现象，别急着反复开盖",
+  "growth": {
+    "eggLaying": "繁殖速度快、社群口径爆产（多源）；新后统计：首批工蚁 0~14 只呈正态分布、仅 7.5% 新后达 11~14 工、约 12% 新后陷吃卵—产卵循环（单源统计）",
+    "eggToWorkerDays": "约 30°C 下 28~30 天、25°C 下 40~50 天（单源经验）；各阶段拆分查无实据",
+    "firstWorkersDays": "直接记录查无实据（仅有首批工蚁数分布统计）",
+    "broodSurvival": "查无实据（仅群落级结果：约 12% 新后不出工）",
+    "firstYearSize": "一年之内可从新后到几百工（单源）；实录：1 后 200 工起步 4 个月到 500+ 工（单源）",
+    "secondYearSize": "",
+    "matureSize": "成熟至少数千工（单源）",
+    "castes": "大中小三型：大工 11.8~12.2、中小工 6.9~8.9mm（多源）；无专职兵级为单源说法",
+    "queenLifespan": "专种查无实据；泛参考蚁后几年到十几年（泛物种经验）",
+    "workerLifespan": "专种查无实据；泛参考约 10 个月（泛物种经验）"
+  },
+  "risks": {
+    "stressNew": 2,
+    "stressColony": 1,
+    "stressNote": "性情温和、胆大、行动敏捷（多源）；受扰时喷射蚁酸（单源）；新后约 2/5、成群约 1/5（经验估计）",
+    "escapeTendency": "会弹跳：遇障碍不绕行直接跳过去（多源）——活动区需防跳出；光滑面攀爬无特殊记录",
+    "healthRisks": "专种专项查无实据；案例级有新后喝太多营养液暴毙（单源视频）",
+    "tempRedline": "适宜 20~30°C（商家单源）；本种停产/致死温度查无实据（泛参考：超 38°C 或低于 0°C 多数蚂蚁无法存活）"
+  },
+  "careNotes": [
+    "遇障碍直接弹跳过去，活动区要防跳出（多源）",
+    "受扰时喷射蚁酸（单源）",
+    "新后约 12% 陷吃卵—产卵循环不出工，属统计内正常现象（单源）"
+  ]
+}
