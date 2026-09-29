@@ -19,7 +19,8 @@ const existing: Colony[] = [
   {
     id: 1,
     name: "大头一号",
-    species: "大头收获蚁",
+    species: "肯尼亚收获蚁",
+    species_key: "messor-cephalotes",
     location_id: 1,
     start_date: "2026-01-20",
     status: "active",
@@ -63,32 +64,34 @@ describe("窝表单校验（与 Rust 层同规则的前端拦截）", () => {
 });
 
 describe("表单 ↔ IPC 入参映射", () => {
-  it("emptyForm 默认今天开养、默认地点、活跃", () => {
+  it("emptyForm 默认今天开养、默认地点、活跃、物种未指定", () => {
     const form = emptyForm("2026-09-18", 7);
     expect(form).toEqual({
       name: "",
-      species: "",
+      speciesKey: "",
       locationId: 7,
       startDate: "2026-09-18",
       status: "active",
     });
   });
 
-  it("formFromColony 从窝回填（编辑场景）", () => {
+  it("formFromColony 从窝回填（编辑场景）：speciesKey 取 species_key，键缺失回空串", () => {
     const form = formFromColony(existing[0]);
     expect(form).toEqual({
       name: "大头一号",
-      species: "大头收获蚁",
+      speciesKey: "messor-cephalotes",
       locationId: 1,
       startDate: "2026-01-20",
       status: "active",
     });
+    const noKey: Colony = { ...existing[0], species_key: undefined };
+    expect(formFromColony(noKey).speciesKey).toBe("");
   });
 
-  it("formToInput trim 名字与物种、空物种转 null、键名转 snake_case", () => {
+  it("formToInput：speciesKey 空白 = 未指定（键与文本都不给，两列皆空）、键名转 snake_case", () => {
     const input = formToInput({
       name: "  新窝  ",
-      species: "   ",
+      speciesKey: "   ",
       locationId: null,
       startDate: " 2026-09-18 ",
       status: "hibernating",
@@ -96,10 +99,23 @@ describe("表单 ↔ IPC 入参映射", () => {
     expect(input).toEqual({
       name: "新窝",
       species: null,
+      species_key: null,
       location_id: null,
       start_date: "2026-09-18",
       status: "hibernating",
     });
+  });
+
+  it("formToInput：选了物种 → species_key trim 后原样、species 恒 null（快照由后端按 key 推导）", () => {
+    const input = formToInput({
+      name: "新窝",
+      speciesKey: " custom-3 ",
+      locationId: 1,
+      startDate: "2026-09-18",
+      status: "active",
+    });
+    expect(input.species_key).toBe("custom-3");
+    expect(input.species).toBeNull();
   });
 });
 

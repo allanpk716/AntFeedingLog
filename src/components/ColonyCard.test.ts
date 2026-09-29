@@ -5,6 +5,7 @@ import type { Colony, ColonyAction, NestPhotoMeta } from "../types";
 // 拍一张（checkin-photo-entry 票 02）：轻提示走全局唯一 toast 模块，断言真实状态
 import { clearToasts, toastItems } from "../lib/toast";
 import { todayIso } from "../lib/dates";
+import { getSpeciesProfile } from "../lib/speciesProfiles";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（沿 QuickLogDialog.test.ts 先例）
 const { invokeMock, loadPhotoBlobUrlMock, revokeObjectUrlMock, createCheckinPhotosHttpMock } =
@@ -242,6 +243,74 @@ describe("窝卡片头像（窝头像票 02）", () => {
       expect(img.attributes("src")).toBe("C:/data/photos/1/abc.jpg");
       expect(loadPhotoBlobUrlMock).not.toHaveBeenCalled();
     });
+  });
+});
+
+// ── 物种徽章（species-profile 票 03）：key 实时解析优先/快照兜底/两皆空/悬停 ──
+
+describe("物种徽章（species-profile 票 03）", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    loadPhotoBlobUrlMock.mockReset();
+    revokeObjectUrlMock.mockReset();
+  });
+
+  it("解析优先：内置 key 显示当前中文名，不显示旧快照；悬停=拉丁名 · 类型 · 冬眠需求", () => {
+    const w = mountCard({ ...colony, species: "旧快照文本", species_key: "messor-barbarus" });
+    const badge = w.find('[data-testid="species-badge"]');
+    expect(badge.exists()).toBe(true);
+    expect(badge.text()).toBe("红头收获蚁");
+    const p = getSpeciesProfile("messor-barbarus")!;
+    expect(badge.attributes("title")).toBe(`${p.latinName} · ${p.type} · ${p.hibernation}`);
+  });
+
+  it("自建 key 经自建清单解析：显示当前名，悬停=名字 · 类型", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_custom_species"
+        ? [
+            {
+              id: 3,
+              key: "custom-3",
+              name: "蜜罐蚁",
+              type: "蜜罐蚁科",
+              created_at: "2026-09-29 10:00:00",
+              referenced: true,
+            },
+          ]
+        : null,
+    );
+    const w = mountCard({ ...colony, species: "蜜罐蚁", species_key: "custom-3" });
+    await flushPromises();
+
+    const badge = w.find('[data-testid="species-badge"]');
+    expect(badge.exists()).toBe(true);
+    expect(badge.text()).toBe("蜜罐蚁");
+    expect(badge.attributes("title")).toBe("蜜罐蚁 · 蜜罐蚁科");
+  });
+
+  it("快照兜底：key 不可解析（自建清单查无/未知内置 key）显示快照列", async () => {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_custom_species" ? [] : null,
+    );
+    const w = mountCard({ ...colony, species: "旧文本", species_key: "custom-99" });
+    await flushPromises();
+    expect(w.find('[data-testid="species-badge"]').text()).toBe("旧文本");
+
+    const w2 = mountCard({ ...colony, species: "未来蚂蚁", species_key: "future-ant" });
+    expect(w2.find('[data-testid="species-badge"]').text()).toBe("未来蚂蚁");
+  });
+
+  it("两皆空：不渲染物种徽章，状态徽章保留", () => {
+    const w = mountCard({ ...colony, species: null, species_key: null });
+    expect(w.find('[data-testid="species-badge"]').exists()).toBe(false);
+    expect(w.find(".bchip.st").exists()).toBe(true);
+  });
+
+  it("key 为空但快照在（旧数据）：按快照显示，不额外请求自建清单", () => {
+    invokeMock.mockClear();
+    const w = mountCard(colony);
+    expect(w.find('[data-testid="species-badge"]').text()).toBe("大头收获蚁");
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });
 
