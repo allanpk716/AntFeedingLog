@@ -1942,6 +1942,7 @@ mod tests {
             id: 1,
             name: name.into(),
             species: None,
+            species_key: None, // 物种档案票 02 新字段；托盘概要测试用不到
             location_id: None,
             start_date: "2026-01-20".into(),
             status: status.into(),

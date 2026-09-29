@@ -495,6 +495,9 @@ pub const WEBUI_COMMANDS: &[&str] = &[
     "delete_colony",
     // 每窝周期行（终局修复）：编辑表单保存是两段式，非保湿周期行逐行走此命令
     "set_colony_action_interval",
+    // 物种选择器（species-profile 票 02）：自建物种清单**只读**放行——网页端
+    // 建窝/编辑可选用自建物种；写命令（建/改名/删）桌面端专属，不入表
+    "list_custom_species",
     // 打卡：字典读 + 提交（colony_month_records 为交互第三轮日历标记数据源，
     // 打卡面板与记录页在用，网页端同样可达）
     "list_actions",
@@ -613,6 +616,10 @@ pub fn dispatch_command(
         })),
         "list_locations" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
             crate::colony::list_locations(conn)
+        })),
+        // 物种选择器的自建清单（species-profile 票 02）：只读；写命令桌面端专属
+        "list_custom_species" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
+            crate::species::list_custom_species(conn)
         })),
         // ── 窝资料维护（web-colony-edit 票 01，与桌面 IPC 同形）──
         "create_colony" => Some(write_cmd(
@@ -3088,6 +3095,7 @@ mod tests {
             &crate::colony::ColonyInput {
                 name: name.to_string(),
                 species: None,
+                species_key: None,
                 location_id: None,
                 start_date: today.clone(),
                 status: "active".to_string(),
@@ -4767,6 +4775,141 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM colony", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "窝行已删");
+    }
+
+    // ── 自建物种（species-profile 票 02）：清单只读放行，写命令桌面专属 ──
+
+    #[test]
+    fn http_custom_species_list_whitelisted_and_writes_forbidden() {
+        // list 在白名单（选择器下拉数据源）；建/改名/删不入表（deny-by-default，
+        // 未登记派发为 None → 404）
+        assert!(WEBUI_COMMANDS.contains(&"list_custom_species"));
+        for forbidden in [
+            "create_custom_species",
+            "rename_custom_species",
+            "delete_custom_species",
+        ] {
+            assert!(
+                !WEBUI_COMMANDS.contains(&forbidden),
+                "自建物种写命令 {forbidden} 不得入网页端白名单"
+            );
+        }
+
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
+        // 桌面通道先建两行（模拟桌面端建好、手机端选用）
+        {
+            let conn = deps.conn.lock().unwrap();
+            crate::species::create_custom_species(&conn, "蜜罐蚁", None).unwrap();
+            let sp = crate::species::create_custom_species(&conn, "阿根廷蚁", None).unwrap();
+            conn.execute(
+                "INSERT INTO colony (name, start_date, status, species, species_key)
+                 VALUES ('甲', '2026-01-20', 'active', '阿根廷蚁', ?1)",
+                rusqlite::params![sp.key],
+            )
+            .unwrap();
+        }
+
+        let out = dispatch_command(&deps, "list_custom_species", &serde_json::json!({}))
+            .expect("list_custom_species 已登记，应有派发");
+        let list = match out {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("list_custom_species 应成功，实际 {other:?}"),
+        };
+        let rows = list.as_array().expect("数组");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["key"], "custom-1");
+        assert_eq!(rows[0]["referenced"], false);
+        assert_eq!(rows[1]["referenced"], true, "被窝引用的自建物种带标记");
+        assert_eq!(rows[1]["type"], "自定义", "序列化键对齐档案包的 type");
+
+        // 写命令未登记 → None（HTTP 层 404）
+        assert!(dispatch_command(&deps, "create_custom_species", &serde_json::json!({})).is_none());
+        assert!(dispatch_command(&deps, "rename_custom_species", &serde_json::json!({})).is_none());
+        assert!(dispatch_command(&deps, "delete_custom_species", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn http_colony_species_key_passes_mirror_and_semantic_layers() {
+        // 评审点名的防漏行：create/update_colony 带 species_key 经参数镜像
+        // （ColonyInputArgs）收下不丢；幽灵自建 key 被纯核语义层拦下（500），
+        // 类型错挡在形状层（400）
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &"a".repeat(32));
+        let today = crate::colony::today_iso();
+        {
+            let conn = deps.conn.lock().unwrap();
+            crate::species::create_custom_species(&conn, "蜜罐蚁", None).unwrap();
+        }
+
+        // 内置 key：镜像放行，快照由纯核按注册表规范化
+        let out = dispatch_command(
+            &deps,
+            "create_colony",
+            &serde_json::json!({
+                "input": {"name": "选种窝", "species": "巴巴拉", "species_key": "messor-barbarus",
+                          "location_id": null, "start_date": today, "status": "active",
+                          "interval_changes": []}
+            }),
+        )
+        .unwrap();
+        let created = match out {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("带 species_key 的 create_colony 应过镜像层，实际 {other:?}"),
+        };
+        let id = created["id"].as_i64().unwrap();
+        assert_eq!(created["species_key"], "messor-barbarus");
+        assert_eq!(created["species"], "红头收获蚁");
+
+        // 自建 key：同一条命令可选用（清单来自 list_custom_species）
+        let out = dispatch_command(
+            &deps,
+            "update_colony",
+            &serde_json::json!({
+                "id": id,
+                "input": {"name": "选种窝", "species_key": "custom-1",
+                          "location_id": null, "start_date": today, "status": "active",
+                          "interval_changes": []}
+            }),
+        )
+        .unwrap();
+        let updated = match out {
+            CmdOutcome::Ok(v) => v,
+            other => panic!("换自建物种应成功，实际 {other:?}"),
+        };
+        assert_eq!(updated["species_key"], "custom-1");
+        assert_eq!(updated["species"], "蜜罐蚁", "自建 key 快照=当前名（纯核权威）");
+
+        // 幽灵自建 key：形状过、语义层拒绝（Failed = 500，与桌面同款人话错误）
+        let out = dispatch_command(
+            &deps,
+            "update_colony",
+            &serde_json::json!({
+                "id": id,
+                "input": {"name": "选种窝", "species_key": "custom-404",
+                          "location_id": null, "start_date": today, "status": "active",
+                          "interval_changes": []}
+            }),
+        )
+        .unwrap();
+        match out {
+            CmdOutcome::Failed(e) => assert!(e.contains("不存在"), "实际：{e}"),
+            other => panic!("幽灵自建 key 应被纯核拒绝，实际 {other:?}"),
+        }
+
+        // 类型错（数字）：形状层 400，不进库
+        let out = dispatch_command(
+            &deps,
+            "create_colony",
+            &serde_json::json!({
+                "input": {"name": "垃圾窝", "species_key": 123,
+                          "location_id": null, "start_date": today, "status": "active",
+                          "interval_changes": []}
+            }),
+        )
+        .unwrap();
+        match out {
+            CmdOutcome::Rejected(msg) => assert!(msg.contains("不正确") || msg.contains("不合法"), "实际：{msg}"),
+            other => panic!("species_key 类型错应 400，实际 {other:?}"),
+        }
     }
 
     #[test]
