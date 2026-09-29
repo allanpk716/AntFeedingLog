@@ -23,7 +23,12 @@ pub const STATUSES: [&str; 3] = ["active", "hibernating", "ended"];
 pub struct Colony {
     pub id: i64,
     pub name: String,
+    /// 显示名快照（v15 起语义）：key 不可解析时的兜底显示 + 纯 SQL 可读性。
     pub species: Option<String>,
+    /// 物种 key（species-profile 票 02）：内置档案 slug（如 messor-barbarus）
+    /// 或自建 `custom-N`；None = 未选。渲染按 key 实时解析（内置档案∪自建表）
+    /// 优先、快照兜底；species_key 一律存 key 绝不存名字。
+    pub species_key: Option<String>,
     pub location_id: Option<i64>,
     pub start_date: String,
     pub status: String,
@@ -54,10 +59,16 @@ pub struct Colony {
 /// - `interval_changes`：本次保存要增删的每窝周期行（只提交变化的行，未列出的
 ///   行零改动）。历史 create-then-set 两步 IPC（set_colony_action_interval）
 ///   不再用于窝表单的保湿写入，但该命令本身原样保留（其余读写维持现状）。
+/// - `species_key`（species-profile 票 02）：选定物种的 key（内置 slug 或
+///   `custom-N`）；None = 未选（清除 = 键与 species 文本都不给）。给了 key，
+///   显示名快照由后端按 key 推导（内置=注册表 cnName / 自建=当前名），前端
+///   提交的 species 文本仅在「未来 JSON 新增档案的未知 key」时作快照兜底。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ColonyInput {
     pub name: String,
     pub species: Option<String>,
+    #[serde(default)]
+    pub species_key: Option<String>,
     pub location_id: Option<i64>,
     pub start_date: String,
     pub status: String,
@@ -186,7 +197,7 @@ fn friendly_unique_err(e: rusqlite::Error, what: &str, name: &str) -> String {
 
 fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String> {
     conn.query_row(
-        "SELECT id, name, species, location_id, start_date, status, hydration_method
+        "SELECT id, name, species, location_id, start_date, status, hydration_method, species_key
          FROM colony WHERE id = ?1",
         params![id],
         |row| {
@@ -198,6 +209,7 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
                 start_date: row.get(4)?,
                 status: row.get(5)?,
                 hydration_method: row.get(6)?,
+                species_key: row.get(7)?,
                 days_raised: 0,
                 actions: Vec::new(),
                 recent: Vec::new(),
@@ -226,23 +238,74 @@ fn get_colony(conn: &Connection, id: i64, today: &str) -> Result<Colony, String>
     })
 }
 
-/// 校验并规整入参，返回 (trim 后名字, trim 非空物种或 NULL, 校验过的开始日期)。
+/// 校验并规整物种入参 → `(species_key, 显示名快照)`（species-profile 票 02）：
+/// - `Some(key)`（trim 后非空）：
+///   - `custom-` 前缀 → 自建表必须存在（幽灵 key 人话拒），快照 = 该行**当前名**
+///     （服务端权威——自建物种改名后随窗保存即对齐）；
+///   - 其余 → 内置档案 key：已知的 12 种快照 = Rust 注册表 cnName（与迁移别名表
+///     同源）；未知的（未来 JSON 新增档案，零代码承诺：加档案零代码即可选）不拒，
+///     快照回落前端随窗提交的 species 文本，再回落 key 本身。
+/// - `None`：旧自由文本语义原样保留（species trim 非空照存、键列置 NULL）——
+///   兼容路径；清除物种 = 键与文本都不给，两列皆空（快照生命周期 §5.7）。
+fn normalize_species(
+    conn: &Connection,
+    species_key: Option<&str>,
+    species: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
+    let key = species_key.map(str::trim).filter(|k| !k.is_empty());
+    match key {
+        None => {
+            let text = species
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            Ok((None, text))
+        }
+        Some(k) => {
+            if crate::species::is_custom_key(k) {
+                let name: Option<String> = conn
+                    .query_row(
+                        "SELECT name FROM custom_species WHERE key = ?1",
+                        params![k],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(db_err)?;
+                match name {
+                    Some(n) => Ok((Some(k.to_string()), Some(n))),
+                    None => Err(format!(
+                        "所选自建物种不存在（key={k}）；可能已被删除，请重新选择"
+                    )),
+                }
+            } else {
+                let snapshot = crate::species::builtin_cn_name(k)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        species
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_else(|| k.to_string());
+                Ok((Some(k.to_string()), Some(snapshot)))
+            }
+        }
+    }
+}
+
+/// 校验并规整入参，返回 (trim 后名字, 物种 key, 显示名快照, 校验过的开始日期)。
 fn normalize_colony_input(
     conn: &Connection,
     input: &ColonyInput,
     exclude_id: Option<i64>,
-) -> Result<(String, Option<String>, String), String> {
+) -> Result<(String, Option<String>, Option<String>, String), String> {
     let name = validate_colony_name(conn, &input.name, exclude_id)?;
-    let species = input
-        .species
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
+    let (species_key, species) =
+        normalize_species(conn, input.species_key.as_deref(), input.species.as_deref())?;
     let start_date = validate_start_date(&input.start_date)?;
     validate_status(&input.status)?;
     validate_location_id(conn, input.location_id)?;
-    Ok((name, species, start_date))
+    Ok((name, species_key, species, start_date))
 }
 
 /// 首页数据源：全部窝（已结束的也返回，前端归入底部折叠区），按 sort、id 排序。
@@ -382,16 +445,24 @@ fn delete_hydration_interval_row(tx: &Connection, colony_id: i64) -> Result<(), 
 }
 
 pub fn create_colony(conn: &Connection, input: &ColonyInput, today: &str) -> Result<Colony, String> {
-    let (name, species, start_date) = normalize_colony_input(conn, input, None)?;
+    let (name, species_key, species, start_date) = normalize_colony_input(conn, input, None)?;
     let hydration_method = validate_hydration_method(input.hydration_method.as_deref())?;
     validate_interval_changes(conn, input)?;
     // 原子性（spec F2）：建窝 + 方式 + 初始周期同一条命令、同一事务，任一步
     // 失败整体回滚——绝无「窝建了但周期没落」的半截状态。
     let tx = conn.unchecked_transaction().map_err(db_err)?;
     tx.execute(
-        "INSERT INTO colony (name, species, location_id, start_date, status, hydration_method)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![name, species, input.location_id, start_date, input.status, hydration_method],
+        "INSERT INTO colony (name, species, species_key, location_id, start_date, status, hydration_method)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            name,
+            species,
+            species_key,
+            input.location_id,
+            start_date,
+            input.status,
+            hydration_method
+        ],
     )
     .map_err(|e| friendly_unique_err(e, "colony.name", &name))?;
     let id = tx.last_insert_rowid();
@@ -406,7 +477,7 @@ pub fn update_colony(
     input: &ColonyInput,
     today: &str,
 ) -> Result<Colony, String> {
-    let (name, species, start_date) = normalize_colony_input(conn, input, Some(id))?;
+    let (name, species_key, species, start_date) = normalize_colony_input(conn, input, Some(id))?;
     let hydration_method = validate_hydration_method(input.hydration_method.as_deref())?;
     validate_interval_changes(conn, input)?;
     // 库内方式原值（状态矩阵判定基准，spec 判定提示：不收前端旗标）
@@ -430,9 +501,18 @@ pub fn update_colony(
     let tx = conn.unchecked_transaction().map_err(db_err)?;
     let changed = tx
         .execute(
-            "UPDATE colony SET name = ?1, species = ?2, location_id = ?3, start_date = ?4,
-             status = ?5, hydration_method = ?6 WHERE id = ?7",
-            params![name, species, input.location_id, start_date, input.status, hydration_method, id],
+            "UPDATE colony SET name = ?1, species = ?2, species_key = ?3, location_id = ?4,
+             start_date = ?5, status = ?6, hydration_method = ?7 WHERE id = ?8",
+            params![
+                name,
+                species,
+                species_key,
+                input.location_id,
+                start_date,
+                input.status,
+                hydration_method,
+                id
+            ],
         )
         .map_err(|e| friendly_unique_err(e, "colony.name", &name))?;
     if changed == 0 {
@@ -722,6 +802,7 @@ mod tests {
         ColonyInput {
             name: name.into(),
             species: Some("大头收获蚁".into()),
+            species_key: None,
             location_id,
             start_date: "2026-01-20".into(),
             status: "active".into(),
@@ -865,6 +946,123 @@ mod tests {
     fn update_colony_missing_id_rejected() {
         let conn = mem_conn();
         assert!(update_colony(&conn, 42, &input("幽灵", None), TODAY).is_err());
+    }
+
+    // ── 物种 key（species-profile 票 02）──
+
+    /// 读窝行的 (species 快照, species_key)。
+    fn species_row(conn: &Connection, id: i64) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT species, species_key FROM colony WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("读窝物种失败")
+    }
+
+    #[test]
+    fn create_colony_with_builtin_species_key_normalizes_snapshot() {
+        let conn = mem_conn();
+        let mut inp = input("大头一号", Some(1));
+        inp.species = Some("巴巴拉".into()); // 随窗旧文本不影响：内置 key 快照=注册表 cnName
+        inp.species_key = Some("messor-barbarus".into());
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+        assert_eq!(c.species_key.as_deref(), Some("messor-barbarus"));
+        assert_eq!(c.species.as_deref(), Some("红头收获蚁"));
+        assert_eq!(
+            species_row(&conn, c.id),
+            (
+                Some("红头收获蚁".into()),
+                Some("messor-barbarus".into())
+            )
+        );
+    }
+
+    #[test]
+    fn create_colony_with_custom_species_key_snapshots_current_name() {
+        let conn = mem_conn();
+        let sp = crate::species::create_custom_species(&conn, "蜜罐蚁", None).unwrap();
+        let mut inp = input("蜜罐窝", None);
+        inp.species_key = Some(sp.key.clone());
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+        assert_eq!(c.species_key.as_deref(), Some(sp.key.as_str()));
+        assert_eq!(c.species.as_deref(), Some("蜜罐蚁"), "自建 key 快照=当前名");
+    }
+
+    #[test]
+    fn create_colony_rejects_unknown_custom_key_without_row() {
+        let conn = mem_conn();
+        let mut inp = input("甲", None);
+        inp.species_key = Some("custom-99".into());
+        let err = create_colony(&conn, &inp, TODAY).unwrap_err();
+        assert!(err.contains("不存在"), "实际：{err}");
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM colony", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 0, "整体不落库");
+    }
+
+    #[test]
+    fn create_colony_accepts_future_builtin_key_with_submitted_display_name() {
+        // 零代码承诺：未来 JSON 新增档案的 key 不在 Rust 注册表，照收不拒；
+        // 快照回落前端随窗提交的显示名
+        let conn = mem_conn();
+        let mut inp = input("未来窝", None);
+        inp.species = Some("未来蚁".into());
+        inp.species_key = Some("future-ant-test".into());
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+        assert_eq!(c.species_key.as_deref(), Some("future-ant-test"));
+        assert_eq!(c.species.as_deref(), Some("未来蚁"));
+    }
+
+    #[test]
+    fn species_key_blank_treated_as_unset_and_legacy_text_still_works() {
+        let conn = mem_conn();
+        let mut inp = input("甲", None);
+        inp.species = Some("随便写".into());
+        inp.species_key = Some("   ".into()); // 空串/空白 = 未选（归一）
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+        assert_eq!(c.species_key, None);
+        assert_eq!(c.species.as_deref(), Some("随便写"), "旧自由文本语义保留");
+    }
+
+    #[test]
+    fn update_colony_switches_and_clears_species() {
+        let conn = mem_conn();
+        let sp = crate::species::create_custom_species(&conn, "蜜罐蚁", None).unwrap();
+        let mut inp = input("大头一号", Some(1));
+        inp.species_key = Some("messor-aciculatus".into());
+        let c = create_colony(&conn, &inp, TODAY).unwrap();
+        assert_eq!(c.species.as_deref(), Some("针毛收获蚁"));
+
+        // 换成自建：快照随 key 推导
+        let mut upd = input("大头一号", Some(1));
+        upd.species_key = Some(sp.key.clone());
+        let u = update_colony(&conn, c.id, &upd, TODAY).unwrap();
+        assert_eq!(u.species_key.as_deref(), Some(sp.key.as_str()));
+        assert_eq!(u.species.as_deref(), Some("蜜罐蚁"));
+
+        // 清除：键与文本都不给 → 两列皆空
+        let mut clear = input("大头一号", Some(1));
+        clear.species = None;
+        let u = update_colony(&conn, c.id, &clear, TODAY).unwrap();
+        assert_eq!(u.species_key, None);
+        assert_eq!(u.species, None);
+        assert_eq!(species_row(&conn, c.id), (None, None));
+    }
+
+    #[test]
+    fn update_colony_rejects_unknown_custom_key_leaving_row_intact() {
+        let conn = mem_conn();
+        let c = create_colony(&conn, &input("大头一号", Some(1)), TODAY).unwrap();
+        let mut upd = input("大头一号", Some(1));
+        upd.species_key = Some("custom-404".into());
+        assert!(update_colony(&conn, c.id, &upd, TODAY).is_err());
+        assert_eq!(
+            species_row(&conn, c.id),
+            (Some("大头收获蚁".into()), None),
+            "拒绝时库内原样"
+        );
     }
 
     // ── 列表 ──

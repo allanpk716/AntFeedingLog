@@ -1,0 +1,48 @@
+{
+  "key": "camponotus-japonicus",
+  "cnName": "日本弓背蚁",
+  "latinName": "Camponotus japonicus",
+  "aliases": [],
+  "type": "弓背蚁",
+  "hibernation": "冬眠",
+  "hibernationNote": "10月中下旬 ≈10°C 入眠，群落含幼虫整体越冬，翌春苏醒",
+  "difficulty": 2,
+  "beginnerRecommended": false,
+  "recommendReason": "",
+  "queenSize": "15~17mm",
+  "workerSize": "7.4~13.8mm，连续多型",
+  "queenSystem": "单后",
+  "activityRhythm": "昼行",
+  "tempRange": "适宜 15~30°C",
+  "humidity": "中湿；土壤含水量 60~200g/kg 才能正常繁殖（文献）",
+  "diet": "糖水 + 冻干面包虫",
+  "price": "十几~几十元",
+  "distribution": "中国广布、日本、朝鲜半岛",
+  "appearance": "黑亮稳重",
+  "purchaseWarning": "",
+  "growth": {
+    "eggLaying": "平常日产 0~50 粒、巅峰日产 209 粒（文献）；季节性产卵",
+    "eggToWorkerDays": "46~73 天（文献：卵16~19/幼虫10~28/茧14~19）",
+    "firstWorkersDays": "40~60 天（多源）",
+    "broodSurvival": "量化未找到；弓背属新后约2~3成养不到首工（属级经验）",
+    "firstYearSize": "20~50 工（原调研）",
+    "secondYearSize": "",
+    "matureSize": "属级口径 2000+ 工算成熟；野外整巢 42~4012 工（文献）",
+    "castes": "小工育幼、中工觅食筑巢、大工保卫搬运",
+    "queenLifespan": "10~20 年（多源）",
+    "workerLifespan": "1~2 年（多源）"
+  },
+  "risks": {
+    "stressNew": 4,
+    "stressColony": 3,
+    "stressNote": "出了名的神经质：突发声响/震动→吃卵吃幼甚至吓绝育；喂饱+少开盖可缓解",
+    "escapeTendency": "低（稳重不易越狱）",
+    "healthRisks": "虫草菌、褶翅小蜂寄生（野外记录）；食物霉变",
+    "tempRedline": "<15°C 停卵，<10°C 入眠"
+  },
+  "careNotes": [
+    "年节律：5 月末~6 月最频繁、7~8 月略减、9 月增强、10 月中旬入眠（文献）",
+    "群落够大后会驻扎分巢（文献）",
+    "婚飞：5 月下旬~7 月上旬温暖晴天午后，地区差异大（文献）"
+  ]
+}

@@ -18,6 +18,7 @@ mod reminder;
 mod restore;
 mod restore_pkg;
 mod settings;
+mod species;
 mod stats;
 mod system;
 mod updater;
@@ -741,6 +742,67 @@ fn save_location(
 #[tauri::command]
 fn erase_location(state: tauri::State<DbState>, app: tauri::AppHandle, id: i64) -> Result<(), String> {
     let result = with_conn(state, |conn| colony::erase_location(conn, id));
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+// ── 自建物种（species-profile 票 02）──
+// 桌面端命令（设置·物种 tab 与选择器内联新建）；物种不参与提醒 → 写命令不刷
+// 托盘，只走自动备份。网页端只放行 list（只读），写命令不进白名单
+//（webui_server.rs WEBUI_COMMANDS 与 registry 测试钉死）。
+
+#[tauri::command]
+fn list_custom_species(
+    state: tauri::State<DbState>,
+) -> Result<Vec<species::CustomSpecies>, String> {
+    with_conn(state, species::list_custom_species)
+}
+
+/// 新建自建物种；名字已存在时**返回已存在行不报错**（选择器「同名即选用」）。
+#[tauri::command]
+fn create_custom_species(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    name: String,
+    species_type: Option<String>,
+) -> Result<species::CustomSpecies, String> {
+    let result = with_conn(state, |conn| {
+        species::create_custom_species(conn, &name, species_type.as_deref())
+    });
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+/// 改名：只改 name + 级联刷新引用窝的快照列（单条 UPDATE 覆盖全部引用窝）；
+/// key 永不改变。
+#[tauri::command]
+fn rename_custom_species(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    key: String,
+    new_name: String,
+) -> Result<species::CustomSpecies, String> {
+    let result = with_conn(state, |conn| {
+        species::rename_custom_species(conn, &key, &new_name)
+    });
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
+/// 删除：按 key 查引用，被窝引用禁删。
+#[tauri::command]
+fn delete_custom_species(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    key: String,
+) -> Result<(), String> {
+    let result = with_conn(state, |conn| species::delete_custom_species(conn, &key));
     if result.is_ok() {
         trigger_after_write(&app);
     }
@@ -1909,6 +1971,10 @@ pub fn run() {
             list_locations,
             save_location,
             erase_location,
+            list_custom_species,
+            create_custom_species,
+            rename_custom_species,
+            delete_custom_species,
             start_hibernation,
             confirm_wake,
             add_past_hibernation,

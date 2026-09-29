@@ -1,0 +1,48 @@
+{
+  "key": "camponotus-sericeiventris",
+  "cnName": "丝腹弓背蚁",
+  "latinName": "Camponotus sericeiventris",
+  "aliases": [],
+  "type": "弓背蚁",
+  "hibernation": "不冬眠",
+  "hibernationNote": "不冬眠：巢温 24~28°C（商家单源）；持续低于 20°C 拖慢育幼并可能导致死亡——不要降温冬眠（商家单源）",
+  "difficulty": 3,
+  "beginnerRecommended": false,
+  "recommendReason": "",
+  "queenSize": "17~19mm（文献）",
+  "workerSize": "7~16.5mm，强多型三型（文献多源）",
+  "queenSystem": "很可能单后、无正式记录（属级估计）",
+  "activityRhythm": "昼行、杂食、常访花外蜜腺（多源）",
+  "tempRange": "巢温 24~28°C（商家单源）；另有 22~28°C 口径（单源）",
+  "humidity": "巢湿 60~80%、需通风良好防过湿生真菌（商家单源）",
+  "diet": "杂食、野外常访花外蜜腺（多源）；人工饲养配方查无实据",
+  "price": "一两百元起（原调研）",
+  "distribution": "新热带：墨西哥至阿根廷（树栖）",
+  "appearance": "",
+  "purchaseWarning": "市售黑金俗名多指费氏弓背蚁；网上把本种称热带黑金的说法查无任何来源——按学名 Camponotus sericeiventris 购买防混",
+  "growth": {
+    "eggLaying": "",
+    "eggToWorkerDays": "约 6~10 周（24~28°C）——按弓背属一般规律推算、非实测（属级估计）",
+    "firstWorkersDays": "约 6~10 周（同上属级推算）；新后期建议减少检查频率（单源经验）",
+    "broodSurvival": "",
+    "firstYearSize": "",
+    "secondYearSize": "",
+    "matureSize": "成熟数千工（单源）与最高约 1 万工（另一单源）不一致——均单源低置信",
+    "castes": "强多型三型：工蚁 7~16.5mm、蚁后 17~19mm（文献多源）；大工守洞口（单源）",
+    "queenLifespan": "",
+    "workerLifespan": ""
+  },
+  "risks": {
+    "stressNew": 3,
+    "stressColony": 3,
+    "stressNote": "资料不足——按属级通例新后期按中等（3/5）对待（经验估计，明确标注推算）",
+    "escapeTendency": "高（预估）：树栖种、受扰坠落时能定向滑翔飞回树干（文献）——按高攀爬+会飞设防",
+    "healthRisks": "野外：僵尸真菌寄生、蚤蝇寄生受伤工蚁（文献记录）；人工：需通风良好避免过湿防真菌（商家单源）",
+    "tempRedline": "巢温 24~28°C、不冬眠（商家单源）；持续低于 20°C 拖慢育幼并可能致死（商家单源）；精确停产/致死温度查无实据"
+  },
+  "careNotes": [
+    "树栖种：自然巢在活树树洞（多源）",
+    "受扰坠落时能定向滑翔飞回树干（文献）",
+    "国内极冷门、中文饲养资料几乎为零"
+  ]
+}

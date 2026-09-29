@@ -60,7 +60,17 @@ use rusqlite::{params, Connection};
 ///     行改 kind='category_overdue'、category 由 food_id 关联回填，同（窝,操作,
 ///     基准日）多行归并留最早一条（防升级日重发）；顺带清 settings 的 avatar_shape
 ///     键（头像横幅改版：形状偏好失去作用对象，见 avatar-banner spec）。
-pub const SCHEMA_VERSION: i64 = 14;
+/// v15：物种档案（species-profile 票 02）——轻迁移不重建表：① 新表
+///     custom_species（自建物种：id AUTOINCREMENT / key=`custom-<id>` UNIQUE /
+///     name UNIQUE / type 默认'自定义' / created_at；key 永不复用永不改变）；
+///     ② colony 加 species_key TEXT NULL（只存 key：内置档案 slug 或 custom-N，
+///     绝不存名字）；③ 存量 species 自由文本按内置别名表归组（正式中文名+俗名+
+///     拉丁名，trim 后精确匹配、大小写不敏感；表在 species.rs，与 proposal §3.3
+///     一致）：命中 → species_key=档案 key、旧列快照规范化改写为 cnName；未命中
+///     的非空文本 → 自动转自建物种（name=trim 后原文本、同名归并 INSERT OR IGNORE
+///     一行），species_key=该行 key、快照=原文本；空保持两列皆空。旧 species 列
+///     保留不删，语义=显示名快照（key 不可解析时的兜底显示）。
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -158,6 +168,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             11 => migrate_v11_to_v12(conn)?,
             12 => migrate_v12_to_v13(conn)?,
             13 => migrate_v13_to_v14(conn)?,
+            14 => migrate_v14_to_v15(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -712,6 +723,88 @@ fn migrate_v13_to_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
     tx.commit()
 }
 
+/// v15（物种档案，票 02）：见 [`SCHEMA_VERSION`] 文档注释链 v15 条目。
+/// 只加表加列（轻迁移不重建表）；归组只碰 species_key 仍为 NULL 的行——
+/// 匹配确定性 + 同名归并 INSERT OR IGNORE + 命中行快照=cnName 再匹配结果不变，
+/// 整体天然幂等。列已存在则跳过 ALTER（v9→v10 同款，防降版本打开后再升级的
+/// 重复加列）。单事务原子完成。
+fn migrate_v14_to_v15(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let has_col = {
+        let mut stmt = conn.prepare("PRAGMA table_info(colony)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            if row.get::<_, String>(1)? == "species_key" {
+                found = true;
+            }
+        }
+        found
+    };
+    let now = local_timestamp_now();
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS custom_species (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            key        TEXT    NOT NULL UNIQUE,
+            name       TEXT    NOT NULL UNIQUE,
+            type       TEXT    NOT NULL DEFAULT '自定义',
+            created_at TEXT    NOT NULL
+        );
+        "#,
+    )?;
+    if !has_col {
+        // 可空、无枚举：合法域（内置 slug | custom-N）由应用层 normalize_species 把守
+        tx.execute("ALTER TABLE colony ADD COLUMN species_key TEXT", [])?;
+    }
+
+    // 别名归组（species.rs 注册表与 proposal §3.3 一致）：只看 species_key 仍为
+    // NULL 的行——已归组/已手动选定的行绝不重算（含「自建名撞别名」的行）
+    let pending: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, species FROM colony
+             WHERE species_key IS NULL AND species IS NOT NULL AND TRIM(species) != ''",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (id, text) in pending {
+        let trimmed = text.trim();
+        match crate::species::match_builtin(trimmed) {
+            Some((key, cn_name)) => {
+                // 命中：key=档案 key，旧列快照规范化改写为 cnName
+                tx.execute(
+                    "UPDATE colony SET species_key = ?1, species = ?2 WHERE id = ?3",
+                    params![key, cn_name, id],
+                )?;
+            }
+            None => {
+                // 未匹配的非空文本：自动转自建（name=trim 后原文本，同名归并一行）
+                let (_sp_id, sp_key) = crate::species::insert_custom_or_merge(
+                    &tx,
+                    trimmed,
+                    crate::species::DEFAULT_TYPE,
+                    &now,
+                )?;
+                // 快照=原文本原样（trim 后，与自建行名一致）
+                tx.execute(
+                    "UPDATE colony SET species_key = ?1, species = ?2 WHERE id = ?3",
+                    params![sp_key, trimmed, id],
+                )?;
+            }
+        }
+    }
+    // 纯空白的旧文本也是「空」：两列皆空（顺带消掉 truthy 空串会渲染空徽章的边界）
+    tx.execute_batch(
+        "UPDATE colony SET species = NULL
+         WHERE species_key IS NULL AND species IS NOT NULL AND TRIM(species) = '';",
+    )?;
+    tx.pragma_update(None, "user_version", 15)?;
+    tx.commit()
+}
+
 /// v1 预置数据：四操作（喂食/活动区换水/巢穴保湿/垃圾清理）、三食物、两地点、五项设置默认值。
 /// pub(crate)：restore.rs 的旧 schema 备份测试要搭真实 v1 库（票 04 验收 3）。
 pub(crate) fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -890,6 +983,7 @@ mod tests {    use super::*;
                 "care_log",
                 "colony",
                 "colony_action_interval",
+                "custom_species",
                 "data_meta",
                 "food",
                 "food_category_interval",
@@ -900,6 +994,8 @@ mod tests {    use super::*;
                 "nest_photo",
                 "reminder_ledger",
                 "settings",
+                // custom_species 的 AUTOINCREMENT 副产物（v15 起恒在）
+                "sqlite_sequence",
             ]
         );
     }
@@ -908,7 +1004,7 @@ mod tests {    use super::*;
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 14);
+        assert_eq!(SCHEMA_VERSION, 15);
     }
 
     /// 按真实迁移函数链手工搭到 v7 的库（票 01 v8 迁移测试地基；含 webui-checkin
@@ -2231,6 +2327,227 @@ mod tests {    use super::*;
             .is_err());
     }
 
+    // ── v15：物种档案（票 02）──
+
+    /// 按真实迁移函数链手工搭到 v14 的库（v15 迁移测试地基）。
+    fn v14_conn() -> Connection {
+        let conn = v13_conn();
+        migrate_v13_to_v14(&conn).expect("升 v14 失败");
+        conn
+    }
+
+    /// 读某窝的 (species 快照, species_key)。
+    fn colony_species(conn: &Connection, name: &str) -> (Option<String>, Option<String>) {
+        conn.query_row(
+            "SELECT species, species_key FROM colony WHERE name = ?1",
+            params![name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("读窝物种失败")
+    }
+
+    #[test]
+    fn v15_schema_adds_custom_species_table_and_key_column() {
+        // 全新安装走完整迁移链：自建表四要素 + colony.species_key 列齐备
+        let (conn, _dir) = fresh_conn();
+        let ddl: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'custom_species'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for piece in [
+            "INTEGER PRIMARY KEY AUTOINCREMENT",
+            "key        TEXT    NOT NULL UNIQUE",
+            "name       TEXT    NOT NULL UNIQUE",
+            "type       TEXT    NOT NULL DEFAULT '自定义'",
+        ] {
+            assert!(ddl.contains(piece), "DDL 缺「{piece}」，实际：{ddl}");
+        }
+        assert_eq!(
+            scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM pragma_table_info('colony') WHERE name = 'species_key'"
+            ),
+            1,
+            "colony 应有 species_key 列"
+        );
+        // 全新安装不预置任何自建物种（与每窝周期表同口径）
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM custom_species"), 0);
+    }
+
+    #[test]
+    fn v15_alias_grouping_maps_names_to_keys_and_normalizes_snapshot() {
+        // 正式名 / 俗名 / 拉丁名（大小写 + trim）各归其 key；快照规范化为 cnName
+        let conn = v14_conn();
+        let texts: [(&str, &str); 5] = [
+            ("窝甲", "针毛收获蚁"),
+            ("窝乙", "大头收获蚁"),
+            ("窝丙", "  Messor barbarus "),
+            ("窝丁", "camponotus nicobarensis"),
+            ("窝戊", "突厥弓背蚁"),
+        ];
+        for (name, text) in texts {
+            conn.execute(
+                "INSERT INTO colony (name, start_date, species) VALUES (?1, '2026-01-20', ?2)",
+                params![name, text],
+            )
+            .unwrap();
+        }
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+
+        assert_eq!(
+            colony_species(&conn, "窝甲"),
+            (
+                Some("针毛收获蚁".into()),
+                Some("messor-aciculatus".into())
+            )
+        );
+        assert_eq!(
+            colony_species(&conn, "窝乙"),
+            (
+                Some("肯尼亚收获蚁".into()),
+                Some("messor-cephalotes".into())
+            ),
+            "俗名归组且快照规范化为 cnName"
+        );
+        assert_eq!(
+            colony_species(&conn, "窝丙"),
+            (
+                Some("红头收获蚁".into()),
+                Some("messor-barbarus".into())
+            ),
+            "拉丁名 + 首尾空白 + 大小写归组"
+        );
+        assert_eq!(
+            colony_species(&conn, "窝丁"),
+            (
+                Some("尼科巴弓背蚁".into()),
+                Some("camponotus-nicobarensis".into())
+            )
+        );
+        assert_eq!(
+            colony_species(&conn, "窝戊"),
+            (
+                Some("中亚弓背蚁".into()),
+                Some("camponotus-turkestanus".into())
+            )
+        );
+        // 别名归组不产自建行
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM custom_species"), 0);
+    }
+
+    #[test]
+    fn v15_unmatched_text_becomes_custom_species_merged_by_name() {
+        let conn = v14_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, species) VALUES ('窝甲', '2026-01-20', ' 蜜罐一号蚁 ')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, species) VALUES ('窝乙', '2026-01-20', '蜜罐一号蚁')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, species) VALUES ('窝丙', '2026-01-20', '阿根廷蚁')",
+            [],
+        )
+        .unwrap();
+
+        migrate_v14_to_v15(&conn).unwrap();
+
+        // 两行自建：同名（trim 后）归并一行，key 按 id 顺延
+        let rows: Vec<(String, String, String)> = {
+            let mut stmt = conn
+                .prepare("SELECT key, name, type FROM custom_species ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("custom-1".into(), "蜜罐一号蚁".into(), "自定义".into()),
+                ("custom-2".into(), "阿根廷蚁".into(), "自定义".into()),
+            ]
+        );
+        assert_eq!(
+            colony_species(&conn, "窝甲"),
+            (Some("蜜罐一号蚁".into()), Some("custom-1".into())),
+            "未匹配文本名字原样保留（trim 后），key 指向自建行"
+        );
+        assert_eq!(
+            colony_species(&conn, "窝乙"),
+            (Some("蜜罐一号蚁".into()), Some("custom-1".into())),
+            "同名文本归并到同一行"
+        );
+        assert_eq!(
+            colony_species(&conn, "窝丙"),
+            (Some("阿根廷蚁".into()), Some("custom-2".into()))
+        );
+    }
+
+    #[test]
+    fn v15_keeps_empty_species_empty_in_both_columns() {
+        let conn = v14_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('窝甲', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, species) VALUES ('窝乙', '2026-01-20', '   ')",
+            [],
+        )
+        .unwrap();
+
+        migrate_v14_to_v15(&conn).unwrap();
+
+        assert_eq!(colony_species(&conn, "窝甲"), (None, None));
+        assert_eq!(colony_species(&conn, "窝乙"), (None, None));
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM custom_species"), 0);
+    }
+
+    #[test]
+    fn v15_is_idempotent_on_rerun() {
+        // 直接重复跑迁移函数：版本不倒退、自建行不重复、key 与快照稳定
+        let conn = v14_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, species) VALUES ('窝甲', '2026-01-20', '大头收获蚁')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO colony (name, start_date, species) VALUES ('窝乙', '2026-01-20', '蜜罐蚁')",
+            [],
+        )
+        .unwrap();
+        migrate_v14_to_v15(&conn).unwrap();
+
+        migrate_v14_to_v15(&conn).unwrap();
+
+        assert_eq!(schema_version_of(&conn).unwrap(), 15);
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM custom_species"), 1);
+        assert_eq!(
+            colony_species(&conn, "窝甲"),
+            (
+                Some("肯尼亚收获蚁".into()),
+                Some("messor-cephalotes".into())
+            )
+        );
+        assert_eq!(
+            colony_species(&conn, "窝乙"),
+            (Some("蜜罐蚁".into()), Some("custom-1".into()))
+        );
+    }
+
     #[test]
     fn v7_collision_with_custom_retrieval_upgrades_row_in_place() {
         // 验收 2：旧库已自建「撤食」→ 原位升格（id 不变、历史引用不断、无重复行、
@@ -2445,7 +2762,8 @@ mod tests {    use super::*;
             }
             if name == "colony" {
                 // v11（保湿方式票 01）合法改动：ALTER 追加 hydration_method 列，
-                // 断言口径同 care_action（旧列序原样 + 新列追加）
+                // 断言口径同 care_action（旧列序原样 + 新列追加）；v15（物种档案
+                // 票 02）同款再追加 species_key
                 let old_sql = sql.as_deref().unwrap_or("");
                 let new_sql = found.1.as_deref().unwrap_or("");
                 assert!(
@@ -2455,6 +2773,10 @@ mod tests {    use super::*;
                 assert!(
                     new_sql.contains("hydration_method"),
                     "colony 未追加 hydration_method：{new_sql}"
+                );
+                assert!(
+                    new_sql.contains("species_key"),
+                    "colony 未追加 species_key：{new_sql}"
                 );
                 continue;
             }
@@ -2507,8 +2829,13 @@ mod tests {    use super::*;
             .collect();
         assert_eq!(
             new_names,
-            vec!["colony_action_interval", "food_category_interval", "uq_ledger_category"],
-            "v9 新增每窝周期表；v14（ADR 0008）新增大类周期表并换大类去重索引"
+            vec![
+                "colony_action_interval",
+                "custom_species",
+                "food_category_interval",
+                "uq_ledger_category"
+            ],
+            "v9 新增每窝周期表；v14（ADR 0008）新增大类周期表并换大类去重索引；v15（物种档案票 02）新增自建物种表"
         );
 
         // 表为空、旧数据原样（不预置任何行，spec D1）

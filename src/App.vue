@@ -21,6 +21,7 @@ import SettingsDialog from "./components/SettingsDialog.vue";
 import StatsPage from "./components/StatsPage.vue";
 import LogListPage from "./components/LogListPage.vue";
 import PhotoWallPage from "./components/PhotoWallPage.vue";
+import SpeciesGuidePage from "./components/SpeciesGuidePage.vue";
 import ToastHost from "./components/ToastHost.vue";
 import WebUiWizard from "./components/WebUiWizard.vue";
 
@@ -30,8 +31,9 @@ import pkg from "../package.json";
  *  （env! 编译期常量）——两处与 tauri.conf.json 由发版流程四处同步保持一致。 */
 const appVersion = `v${pkg.version}`;
 
-/** 顶栏 nav（票 08 接活「记录」；窝头像票 05 接活「照片」，双端都有） */
-type Page = "home" | "stats" | "photos" | "logs";
+/** 顶栏 nav（票 08 接活「记录」；窝头像票 05 接活「照片」，双端都有；
+ *  物种档案票 04 接活「图鉴」——纯前端内容页，双端可见排最后） */
+type Page = "home" | "stats" | "photos" | "logs" | "guide";
 const page = ref<Page>("home");
 
 const colonies = ref<Colony[]>([]);
@@ -215,6 +217,15 @@ onBeforeUnmount(() => stopTodayClock());
         >
           记录
         </button>
+        <!-- 图鉴（物种档案票 04）：双端可见（无 isTauri 门槛），排最后（D12） -->
+        <button
+          class="tab"
+          :class="{ active: page === 'guide' }"
+          type="button"
+          @click="page = 'guide'"
+        >
+          图鉴
+        </button>
       </nav>
       <div class="today">{{ todayText }}</div>
       <div class="tools">
@@ -276,11 +287,12 @@ onBeforeUnmount(() => stopTodayClock());
       </section>
     </main>
 
-    <!-- 三页保活（票 04）：统计/照片/记录各自包一层 KeepAlive（page 四值单选，
-         任一时刻至多一个有活动子节点）。懒保活：会话内首次进入照常挂载读取
-         （各页自己的加载态负责占位），切走实例缓存（ECharts 等随实例保留），
-         再进即时——不重挂载、不重发 IPC；数据保鲜靠各页的数据版本订阅。
-         首页不保活：数据在根组件，切换本就不受影响。 -->
+    <!-- 页面保活（统计/照片/记录：交互第三轮票 04；图鉴：物种档案票 04）：各页
+         各自包一层 KeepAlive（page 五值单选，任一时刻至多一个有活动子节点）。
+         懒保活：会话内首次进入照常挂载读取（各页自己的加载态负责占位），切走
+         实例缓存（ECharts 等随实例保留），再进即时——不重挂载、不重发 IPC；
+         数据保鲜靠各页的数据版本订阅。图鉴纯前端静态内容+档案包，保活主要留
+         住展开状态等会话内状态。首页不保活：数据在根组件，切换本就不受影响。 -->
     <KeepAlive>
       <StatsPage v-if="page === 'stats'" />
     </KeepAlive>
@@ -293,6 +305,11 @@ onBeforeUnmount(() => stopTodayClock());
     <!-- 记录流水（票 08）：任何编辑/删除抛 changed → refresh，首页红绿态即时重算 -->
     <KeepAlive>
       <LogListPage v-if="page === 'logs'" @changed="void refresh()" />
+    </KeepAlive>
+
+    <!-- 图鉴（物种档案票 04）：双端内容页，档案来自前端包、零页面级 IPC -->
+    <KeepAlive>
+      <SpeciesGuidePage v-if="page === 'guide'" />
     </KeepAlive>
     </div>
 

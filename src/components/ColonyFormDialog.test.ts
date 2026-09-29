@@ -26,11 +26,16 @@ function tile(overrides: Partial<ColonyAction> & { action_id: number; name: stri
 
 const locations: LocationItem[] = [{ id: 1, name: "客厅", enabled: true, sort: 0 }];
 
-function colony(actions: ColonyAction[], hydration_method: Colony["hydration_method"] = null): Colony {
+function colony(
+  actions: ColonyAction[],
+  hydration_method: Colony["hydration_method"] = null,
+  species_key: string | null = null,
+): Colony {
   return {
     id: 1,
     name: "大头一号",
     species: null,
+    species_key,
     location_id: null,
     start_date: "2026-01-20",
     status: "active",
@@ -108,7 +113,12 @@ describe("ColonyFormDialog「周期提醒」小节（每窝周期票 04）", () 
 
     expect(w.find(".form-error").text()).toContain("1–365");
     expect(w.emitted("saved")).toBeUndefined();
-    expect(invokeMock).not.toHaveBeenCalled();
+    // 物种选择器挂载时会拉只读自建清单；任何写命令都不发（不落库）
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) =>
+        ["create_colony", "update_colony", "set_colony_action_interval"].includes(cmd as string),
+      ),
+    ).toHaveLength(0);
   });
 
   it("设周期：未设行填 7 保存 → update_colony 后调 set_colony_action_interval(7)，抛 saved", async () => {
@@ -409,7 +419,12 @@ describe("保湿方式：编辑交互（规则 2/3/4/6 + F4/F5）", () => {
 
     expect(w.find(".form-error").text()).toContain("巢穴保湿");
     expect(w.find(".form-error").text()).toContain("1–365");
-    expect(invokeMock).not.toHaveBeenCalled();
+    // 物种选择器挂载时会拉只读自建清单；任何写命令都不发（不落库）
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) =>
+        ["create_colony", "update_colony", "set_colony_action_interval"].includes(cmd as string),
+      ),
+    ).toHaveLength(0);
   });
 
   it("说明文案：选择器旁有「选方式→预填→可改」的提示", async () => {
@@ -516,6 +531,121 @@ describe("保湿方式：新建（D3 随建随落，create_colony 原子）", ()
     const input = colonyInputPayload(w, "create_colony");
     expect(input.hydration_method).toBe("tower");
     expect(input.interval_changes).toEqual([]);
+  });
+});
+
+// ── 物种选择集成（species-profile 票 03）──
+
+describe("物种选择集成（species-profile 票 03）", () => {
+  function customRow() {
+    return {
+      id: 7,
+      key: "custom-7",
+      name: "蜜罐蚁",
+      type: "自定义",
+      created_at: "2026-09-29 10:00:00",
+      referenced: true,
+    };
+  }
+
+  async function mountFor(editing: Colony | null, custom: unknown[] = []) {
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "list_custom_species" ? custom : null,
+    );
+    const w = mount(ColonyFormDialog, {
+      props: { editing, colonies: editing === null ? [] : [editing], locations },
+    });
+    await flushPromises();
+    return w;
+  }
+
+  async function pickOption(w: Awaited<ReturnType<typeof mountFor>>, label: string) {
+    await w.find(".species-trigger").trigger("click");
+    await flushPromises();
+    const option = w.findAll(".option").find((o) => o.text().includes(label));
+    expect(option, `应有「${label}」选项`).toBeDefined();
+    await option!.trigger("click");
+    await flushPromises();
+  }
+
+  it("未选物种也能保存：create_colony 载荷 species_key=null、species=null（两列皆空）", async () => {
+    const w = await mountFor(null);
+
+    await w.find("input.name-input").setValue("新窝");
+    await w.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    const payload = colonyInputPayload(w, "create_colony");
+    expect(payload.species_key).toBeNull();
+    expect(payload.species).toBeNull();
+    expect(w.emitted("saved")).toHaveLength(1);
+  });
+
+  it("选择内置物种：载荷 species_key=档案 key、species=null（快照由后端按 key 推导）", async () => {
+    const w = await mountFor(null);
+
+    await w.find("input.name-input").setValue("新窝");
+    await pickOption(w, "针毛收获蚁");
+    expect(w.find(".species-trigger").text()).toContain("针毛收获蚁");
+
+    await w.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    const payload = colonyInputPayload(w, "create_colony");
+    expect(payload.species_key).toBe("messor-aciculatus");
+    expect(payload.species).toBeNull();
+  });
+
+  it("编辑回填内置 key：触发器显示当前中文名；保存原样带回 species_key", async () => {
+    const editing = {
+      ...colony(sampleActions()),
+      species: "红头收获蚁",
+      species_key: "messor-barbarus",
+    };
+    const w = await mountFor(editing);
+
+    expect(w.find(".species-trigger").text()).toContain("红头收获蚁");
+    await w.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    const payload = colonyInputPayload(w, "update_colony");
+    expect(payload.species_key).toBe("messor-barbarus");
+    expect(payload.species).toBeNull();
+  });
+
+  it("编辑自建物种窝：经自建清单回显名字；保存带回 custom key", async () => {
+    const editing = {
+      ...colony(sampleActions()),
+      species: "蜜罐蚁",
+      species_key: "custom-7",
+    };
+    const w = await mountFor(editing, [customRow()]);
+
+    expect(w.find(".species-trigger").text()).toContain("蜜罐蚁");
+    await w.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    const payload = colonyInputPayload(w, "update_colony");
+    expect(payload.species_key).toBe("custom-7");
+  });
+
+  it("清除物种：选「不指定」→ update_colony 键与文本都不给（两列皆空）", async () => {
+    const editing = {
+      ...colony(sampleActions()),
+      species: "红头收获蚁",
+      species_key: "messor-barbarus",
+    };
+    const w = await mountFor(editing);
+
+    await pickOption(w, "不指定");
+    expect(w.find(".species-trigger").text()).toContain("未指定");
+
+    await w.find(".submit-btn").trigger("click");
+    await flushPromises();
+
+    const payload = colonyInputPayload(w, "update_colony");
+    expect(payload.species_key).toBeNull();
+    expect(payload.species).toBeNull();
   });
 });
 

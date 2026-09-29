@@ -16,6 +16,9 @@
  * （photoSrc + getPhotoAbsDir），网页 loadPhotoBlobUrl blob（凭证不进 URL，
  * 换头像/卸载释放）；加载失败回退 🐜 占位，不崩溃。形状偏好（圆/方遮罩）已随
  * 横幅改版移除（横幅是矩形，偏好无作用对象）。
+ * 物种徽章（species-profile 票 03）：按 species_key 实时解析优先（内置档案 ∪
+ * 自建清单），快照兜底，两皆空不显示；悬停 title="拉丁名 · 类型 · 冬眠需求"
+ * （自建无档案数据，给「名字 · 类型」两要素）。
  * 拍照直达票 02：「⋯」菜单置顶与横幅右上角都有「📷 拍一张」——不进弹窗直接调相机
  * （网页端隐藏 capture input / 桌面系统文件选择，分流同 NestCheckinDialog
  * onAddPhotos 先例），选定照片走新原子保存通道（桌面 save_checkin_with_photos /
@@ -23,7 +26,7 @@
  * （头像投影即时跟上），失败红色轻提示带原因；busy 期间菜单项禁用。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import type { Colony, ColonyAction, PhotoCrop } from "../types";
+import type { Colony, ColonyAction, CustomSpecies, PhotoCrop } from "../types";
 import {
   actionTile,
   feedingTooltip,
@@ -37,9 +40,11 @@ import {
 import {
   getPhotoAbsDir,
   isTauri,
+  listCustomSpecies,
   pickPhotoFiles,
   saveCheckinWithPhotos,
 } from "../lib/ipc";
+import { getSpeciesProfile } from "../lib/speciesProfiles";
 import {
   createCheckinPhotosHttp,
   loadPhotoBlobUrl,
@@ -87,6 +92,63 @@ const recentLine = computed(() => formatRecent(props.colony.recent));
 
 /** 巢况摘要行（webui-checkin 票 02）：最新一组数 + 距上次登记天数；从未登记为空串（隐藏）。 */
 const checkinLine = computed(() => checkinCardLine(props.colony.checkin));
+
+// ── 物种徽章（species-profile 票 03，快照生命周期 §5.7）────────────────────
+// 渲染按 species_key 实时解析优先：内置档案（构建期内存，同步可解）∪ 自建清单
+// （仅 custom- key 才异步拉取）；key 不可解析回落显示名快照，两皆空不渲染。
+// 自建清单随窝数据更新重拉（父层刷新会换 colony 对象），使改名后的当前名即时
+// 跟上；快照列在拉取期间天然兜底，因此卡片不进加载态。
+interface SpeciesBadgeView {
+  text: string;
+  title?: string;
+}
+
+const customRows = ref<CustomSpecies[] | null>(null);
+let customSeq = 0;
+
+async function loadCustomRows(): Promise<void> {
+  const seq = ++customSeq;
+  try {
+    const rows = await listCustomSpecies();
+    if (seq === customSeq) customRows.value = rows ?? [];
+  } catch {
+    // 清单失败保留快照兜底（不覆盖已有数据；下次窝刷新再试）
+    if (seq === customSeq && customRows.value === null) customRows.value = [];
+  }
+}
+
+watch(
+  () => props.colony,
+  (value) => {
+    if ((value.species_key ?? "").startsWith("custom-")) {
+      void loadCustomRows();
+    }
+  },
+  { immediate: true },
+);
+
+const speciesBadge = computed<SpeciesBadgeView | null>(() => {
+  const key = props.colony.species_key?.trim() ?? "";
+  const snapshot = props.colony.species?.trim() ?? "";
+  if (key === "") {
+    return snapshot === "" ? null : { text: snapshot };
+  }
+  const profile = getSpeciesProfile(key);
+  if (profile !== undefined) {
+    return {
+      text: profile.cnName,
+      title: `${profile.latinName} · ${profile.type} · ${profile.hibernation}`,
+    };
+  }
+  if (key.startsWith("custom-") && customRows.value !== null) {
+    const hit = customRows.value.find((c) => c.key === key);
+    if (hit !== undefined) {
+      // 自建物种无拉丁名/冬眠档案：title 给可用的名字 · 类型 两要素
+      return { text: hit.name, title: `${hit.name} · ${hit.type}` };
+    }
+  }
+  return snapshot === "" ? null : { text: snapshot };
+});
 
 // ── 窝头像横幅（窝头像票 02 → avatar-banner 乙-2）────────────────────
 // 头像引用 = 票 01 投影载荷 Colony.avatar（前端不重复推导）。跟随按 rel_path：
@@ -374,7 +436,12 @@ function onCheckinPhotoRotated() {
       </span>
       <span class="scrim">
         <span class="bname">{{ colony.name }}</span>
-        <span v-if="colony.species" class="bchip">{{ colony.species }}</span>
+        <span
+          v-if="speciesBadge !== null"
+          class="bchip"
+          data-testid="species-badge"
+          :title="speciesBadge.title"
+        >{{ speciesBadge.text }}</span>
         <span class="bchip st" :class="{ hib: colony.status === 'hibernating' }">
           {{ STATUS_TEXT[colony.status] }}
         </span>

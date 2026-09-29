@@ -99,7 +99,12 @@ export interface HibernationPreview {
 export interface Colony {
   id: number;
   name: string;
+  /** 显示名快照（v15 起语义）：species_key 不可解析时的兜底显示 */
   species: string | null;
+  /** 物种 key（species-profile 票 02）：内置档案 slug（如 messor-barbarus）或
+   *  自建 `custom-N`；null = 未选。渲染按 key 实时解析（内置档案 ∪ 自建清单）
+   *  优先、快照兜底。可选仅为旧测试载荷兜底——真实 IPC（Rust Colony）恒有值。 */
+  species_key?: string | null;
   location_id: number | null;
   start_date: string;
   status: ColonyStatus;
@@ -123,6 +128,11 @@ export interface Colony {
 export interface ColonyInput {
   name: string;
   species: string | null;
+  /** 物种 key（species-profile 票 03）：内置 slug 或 `custom-N`；null/缺省=未选
+   *  （serde default，与 Rust ColonyInput 同口径）。给了 key 时显示名快照由后端
+   *  按 key 推导（内置=cnName/自建=当前名），前端 species 恒传 null；清除物种 =
+   *  键与文本都不给（两列皆空）。 */
+  species_key?: string | null;
   location_id: number | null;
   start_date: string;
   status: ColonyStatus;
@@ -137,6 +147,18 @@ export interface ColonyInput {
 export interface ColonyIntervalChange {
   action_id: number;
   interval_days: number | null;
+}
+
+/** 自建物种行（species-profile 票 02，Rust species::CustomSpecies）。key =
+ *  `custom-<自增 id>` 永不复用永不改变；name 全局唯一；type 序列化键对齐档案包
+ *  的 `type`（列名是 Rust 关键字）。referenced = 被窝的 species_key 引用（禁删）。 */
+export interface CustomSpecies {
+  id: number;
+  key: string;
+  name: string;
+  type: string;
+  created_at: string;
+  referenced: boolean;
 }
 
 /** 地点（含停用的：首页分组仍按它排） */

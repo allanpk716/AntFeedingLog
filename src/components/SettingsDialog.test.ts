@@ -340,6 +340,49 @@ describe("设置弹窗「网页端」tab（webui-checkin 票 03）", () => {
   });
 });
 
+// ── 物种 tab（species-profile 票 05）：挂载面接线；面板细节在 SpeciesManagerPanel.test.ts ──
+
+describe("设置弹窗「物种」tab（species-profile 票 05）", () => {
+  it("新增「物种」tab：排在「地点」后，既有 tab 全数在位；弹窗打开即挂载面板并自读清单", async () => {
+    baseMock();
+    invokeMock.mockImplementation(async (cmd: string) => {
+      switch (cmd) {
+        case "list_actions":
+        case "list_foods":
+        case "list_locations":
+          return [];
+        case "list_food_categories":
+          return [
+            { category: "seed", interval_days: 7 },
+            { category: "protein", interval_days: 3 },
+            { category: "sugar", interval_days: 3 },
+          ];
+        case "get_settings":
+          return settingsFixture();
+        case "list_custom_species":
+          return [
+            { id: 1, key: "custom-1", name: "蜜罐蚁", type: "自定义", created_at: "2026-09-29 10:00:00", referenced: false },
+          ];
+        default:
+          return null;
+      }
+    });
+    const wrapper = mount(SettingsDialog);
+    await flushPromises();
+
+    // tab 条：既有七项不回归 + 物种插在地点与通知之间
+    const tabTexts = wrapper.findAll(".tabs .tab").map((b) => b.text());
+    expect(tabTexts).toEqual(["操作", "食物", "地点", "物种", "通知", "网页端", "数据", "更新"]);
+    // 保活面板：不点页签就已挂载、清单已读（与网页端/更新面板同批）
+    expect(wrapper.find(".species-panel").exists()).toBe(true);
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_custom_species")).toBe(true);
+
+    await wrapper.find(".tab-species").trigger("click");
+    await flushPromises();
+    expect(wrapper.findAll(".sp-row").length).toBe(1);
+  });
+});
+
 // ── 数据页签日志区（数据安全二期票 01）──
 
 async function openDataTab(logs?: { errors?: string[]; abnormal?: object | null }) {

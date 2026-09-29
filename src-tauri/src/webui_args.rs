@@ -42,6 +42,10 @@ pub const MAX_PAGE_LIMIT: i64 = 500;
 /// 蚁后/工蚁数上限（挡明显垃圾；下限 0 与纯核一致，负数即拒）。
 pub const MAX_COUNT: i64 = 1_000_000;
 
+/// species_key 长度上限（species-profile 票 02）：内置 slug 与 custom-N 都很短，
+/// 上限只挡 HTTP 侧的形状垃圾；取值语义（前缀/存在性）权威在纯核。
+pub const MAX_SPECIES_KEY_CHARS: usize = 100;
+
 /// ISO 日期合理年段（schema 层挡 `0001-01-01` 之类的范围垃圾；业务先后纯核管）。
 pub const MIN_YEAR: i32 = 1970;
 pub const MAX_YEAR: i32 = 2100;
@@ -626,11 +630,16 @@ impl ColonyIntervalChangeArgs {
 /// `colony::ColonyInput` 的服务端校验镜像（嵌套键 snake_case 与桌面 IPC 同形——
 /// 桌面 invoke 对嵌套键不做映射，无需 rename_all）。纯核同口径的必填键
 /// （name/species/location_id/start_date/status）不带 default：缺键 serde 层即拒。
+/// species_key（species-profile 票 02）带 default：缺省 = 未选（与纯核 serde 同
+/// 口径）；本层只挡形状垃圾（长度上限），key 的存在性/前缀语义权威在纯核
+/// `normalize_species`，本层不复制。
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ColonyInputArgs {
     pub name: String,
     pub species: Option<String>,
+    #[serde(default)]
+    pub species_key: Option<String>,
     pub location_id: Option<i64>,
     pub start_date: String,
     pub status: String,
@@ -657,6 +666,13 @@ impl ColonyInputArgs {
                 return Err(format!("无效的保湿方式：{m}（应为 未设/手动加水/水塔）"));
             }
         }
+        if let Some(k) = &self.species_key {
+            if k.chars().count() > MAX_SPECIES_KEY_CHARS {
+                return Err(format!(
+                    "species_key 长度超过上限（{MAX_SPECIES_KEY_CHARS} 字符）"
+                ));
+            }
+        }
         for change in &self.interval_changes {
             change.validate()?;
         }
@@ -667,6 +683,7 @@ impl ColonyInputArgs {
         colony::ColonyInput {
             name: self.name,
             species: self.species,
+            species_key: self.species_key,
             location_id: self.location_id,
             start_date: self.start_date,
             status: self.status,
@@ -1108,6 +1125,41 @@ mod tests {
         let core = a.input.into_core();
         assert!(core.hydration_method.is_none());
         assert!(core.interval_changes.is_empty());
+
+        // species_key（species-profile 票 02）：镜像必须收下这个键——缺了它
+        // deny_unknown_fields 会把网页端选好的物种静默拒成 400（评审点名的
+        // 防漏行）；缺省 = 未选
+        let a = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "选种窝", "species": "红头收获蚁", "species_key": "messor-barbarus",
+                      "location_id": null, "start_date": "2026-09-28", "status": "active"}
+        }))
+        .unwrap();
+        let core = a.input.into_core();
+        assert_eq!(core.species_key.as_deref(), Some("messor-barbarus"));
+        assert_eq!(core.species.as_deref(), Some("红头收获蚁"));
+
+        // 缺省 = None（旧载荷兼容）；null 同义；custom-N 形状照收（存在性纯核管）
+        let a = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "窝", "species": null, "species_key": null, "location_id": null,
+                      "start_date": "2026-09-28", "status": "active"}
+        }))
+        .unwrap();
+        assert!(a.input.into_core().species_key.is_none());
+        let a = checked::<UpdateColonyArgs>(&json!({
+            "id": 1,
+            "input": {"name": "自建窝", "species_key": "custom-3", "location_id": null,
+                      "start_date": "2026-09-28", "status": "active"}
+        }))
+        .unwrap();
+        assert_eq!(a.input.into_core().species_key.as_deref(), Some("custom-3"));
+
+        // 超长 key 挡在形状层（人话 400，不进库）
+        let err = checked::<CreateColonyArgs>(&json!({
+            "input": {"name": "垃圾窝", "species_key": "x".repeat(MAX_SPECIES_KEY_CHARS + 1),
+                      "location_id": null, "start_date": "2026-09-28", "status": "active"}
+        }))
+        .unwrap_err();
+        assert!(err.contains("species_key"), "实际：{err}");
     }
 
     #[test]
