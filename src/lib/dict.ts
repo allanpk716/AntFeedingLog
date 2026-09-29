@@ -4,8 +4,16 @@
  * 后端权威校验在 src-tauri/src/dict.rs，这里的预检只为少跑一趟 IPC。
  */
 
-import type { ActionInput, ActionKind, CareActionItem, FoodCategory, FoodInput, FoodItem } from "../types";
-import { FOOD_CATEGORY_ORDER } from "./foodCategories";
+import type {
+  ActionInput,
+  ActionKind,
+  CareActionItem,
+  FoodCategory,
+  FoodCategoryInterval,
+  FoodInput,
+  FoodItem,
+} from "../types";
+import { FOOD_CATEGORY_LABELS, FOOD_CATEGORY_ORDER } from "./foodCategories";
 
 // ── 操作 ─────────────────────────────────────────────────────────────────
 
@@ -92,19 +100,64 @@ export function moveRow<T>(rows: T[], index: number, direction: -1 | 1): void {
   rows[target] = tmp;
 }
 
+// ── 大类周期（ADR 0008）──────────────────────────────────────────────────
+
+/** 大类周期行本地编辑态：间隔用输入框原文承载（空串=未设＝不按周期提醒），
+ *  保存时才解析。三类固定、顺序固定（seed→protein→sugar）。 */
+export interface CategoryIntervalRow {
+  category: FoodCategory;
+  /** 展示标签（种子/蛋白质/糖水；中文不落库） */
+  label: string;
+  intervalText: string | number;
+}
+
+/** 后端大类周期（恒三行）→ 行列表；乱序载荷按 FOOD_CATEGORY_ORDER 归位。 */
+export function buildCategoryIntervalRows(
+  intervals: readonly FoodCategoryInterval[],
+): CategoryIntervalRow[] {
+  return FOOD_CATEGORY_ORDER.map((category) => ({
+    category,
+    label: FOOD_CATEGORY_LABELS[category],
+    intervalText: (() => {
+      const found = intervals.find((i) => i.category === category);
+      return found?.interval_days == null ? "" : String(found.interval_days);
+    })(),
+  }));
+}
+
+/** 行列表 → save_food_category_interval 入参（间隔文本转数字或 null）。 */
+export function toCategoryIntervalInputs(
+  rows: readonly CategoryIntervalRow[],
+): { category: FoodCategory; intervalDays: number | null }[] {
+  return rows.map((r) => ({
+    category: r.category,
+    intervalDays: parseInterval(r.intervalText),
+  }));
+}
+
+/** 大类周期保存前本地预检，返回首个错误文案；通过返回空串。 */
+export function validateCategoryIntervalRows(rows: readonly CategoryIntervalRow[]): string {
+  for (const r of rows) {
+    const interval = parseInterval(r.intervalText);
+    if (interval !== null && (!Number.isInteger(interval) || interval < 1)) {
+      return `「${r.label}」大类的周期应是不小于 1 的整数天数`;
+    }
+  }
+  return "";
+}
+
 // ── 食物 ─────────────────────────────────────────────────────────────────
 
-/** 食物行本地编辑态：间隔用输入框原文承载（空串=未设，F3），保存时才解析。
+/** 食物行本地编辑态。
  * 易腐位与撤食间隔（票 01）：撤食间隔同为输入框原文（小时，1–168），
  * 关易腐时清空并置灰、保存一律落 null。
+ * ADR 0008 起食物不再有建议间隔（提醒粒度在大类，见 CategoryIntervalRow）。
  * category（ADR 0007）：行内可改；新增行走设置的新增必选下拉，正常不会为空——
  * 类型上仍容空（防夹具/脏数据），validateFoodRows 运行时守护。 */
 export interface FoodRow {
   id: number | null;
   name: string;
   enabled: boolean;
-  /** 建议间隔输入框原文（空串=未设）；type=number 可能给回数字，同 ActionRow 口径 */
-  intervalText: string | number;
   /** 易腐：开启后必须配 1–168 整数小时的撤食间隔（票 01） */
   perishable: boolean;
   /** 撤食间隔输入框原文（小时；空串=未设）；关易腐时被清空置灰 */
@@ -116,9 +169,7 @@ export interface FoodRow {
   category: FoodCategory | "";
 }
 
-/** 字典（含停用）→ 行列表，按 sort、id 排。
- * perishable / retrieval_hours 为可选读取（Rust Food DTO 读取侧由后续票接通），
- * 缺省回退不易腐 / 空。 */
+/** 字典（含停用）→ 行列表，按 sort、id 排。 */
 export function buildFoodRows(foods: FoodItem[]): FoodRow[] {
   return [...foods]
     .sort((a, b) => a.sort - b.sort || a.id - b.id)
@@ -126,7 +177,6 @@ export function buildFoodRows(foods: FoodItem[]): FoodRow[] {
       id: f.id,
       name: f.name,
       enabled: f.enabled,
-      intervalText: f.suggested_interval_days === null ? "" : String(f.suggested_interval_days),
       perishable: f.perishable ?? false,
       retrievalHoursText: f.retrieval_hours == null ? "" : String(f.retrieval_hours),
       isPreset: f.is_preset,
@@ -135,7 +185,7 @@ export function buildFoodRows(foods: FoodItem[]): FoodRow[] {
     }));
 }
 
-/** 行列表 → save_food 入参：sort = 行下标，名字 trim，间隔文本转数字或 null（F3）。
+/** 行列表 → save_food 入参：sort = 行下标，名字 trim。
  * 撤食间隔（票 01）：开易腐按文本解析（空串=null、非法=NaN，交给校验拦），
  * 关易腐一律 null（后端兜底归空）。 */
 export function toFoodInputs(rows: FoodRow[]): FoodInput[] {
@@ -143,7 +193,6 @@ export function toFoodInputs(rows: FoodRow[]): FoodInput[] {
     id: r.id,
     name: r.name.trim(),
     sort: index,
-    suggested_interval_days: parseInterval(r.intervalText),
     perishable: r.perishable,
     retrieval_hours: r.perishable ? parseInterval(r.retrievalHoursText) : null,
     category: r.category === "" ? null : r.category,
@@ -169,10 +218,6 @@ export function validateFoodRows(rows: FoodRow[]): string {
     }
     if (!(FOOD_CATEGORY_ORDER as readonly string[]).includes(r.category)) {
       return `食物「${label}」的大类不合法（应为 种子/蛋白质/糖水）`;
-    }
-    const interval = parseInterval(r.intervalText);
-    if (interval !== null && (!Number.isInteger(interval) || interval < 1)) {
-      return `食物「${label}」的建议间隔应是不小于 1 的整数天数`;
     }
     // 易腐撤食间隔守护（票 01，与后端 save_food 同款）：开易腐必填 1–168 整数小时
     if (r.perishable) {

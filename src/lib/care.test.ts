@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ColonyAction, FoodTileInfo, RecentLog } from "../types";
+import type { CategoryTileInfo, ColonyAction, FoodTileInfo, RecentLog } from "../types";
 import {
   actionTile,
   feedingTooltip,
@@ -68,16 +68,18 @@ describe("操作块展示态", () => {
     ).toEqual({ tone: "reg", text: "今天 · 已记录" });
   });
 
-  it("食物层顶的红：报「该喂X了」，不拿统一层数字硬算（F3 评审：统一层新鲜时会出现负数）", () => {
-    const food = (id: number, name: string, overdue: boolean): FoodTileInfo => ({
-      food_id: id,
-      name,
-      suggested_interval_days: 7,
+  it("大类层顶的红：报「该喂X了」，不拿统一层数字硬算（ADR 0008；统一层新鲜时会出现负数）", () => {
+    const cat = (
+      category: "seed" | "protein" | "sugar",
+      overdue: boolean,
+    ): CategoryTileInfo => ({
+      category,
+      interval_days: 3,
       days_since_last: overdue ? 8 : 1,
       overdue,
     });
 
-    // 面包虫 8 > 7 食物超期、统一层 2 ≤ 3 新鲜 → 整块红但报「该喂面包虫了」
+    // protein 大类 8 > 3 超、统一层 2 ≤ 3 新鲜 → 整块红但报「该喂蛋白质了」
     expect(
       actionTile(
         action({
@@ -86,13 +88,14 @@ describe("操作块展示态", () => {
           days_since_last: 2,
           suggested_interval_days: 3,
           overdue: true,
-          foods: [food(3, "面包虫", true)],
+          foods: [{ food_id: 3, name: "面包虫干", days_since_last: 8 }],
+          categories: [cat("protein", true)],
         }),
         false,
       ),
-    ).toEqual({ tone: "bad", text: "⚠ 该喂面包虫了" });
+    ).toEqual({ tone: "bad", text: "⚠ 该喂蛋白质了" });
 
-    // 两种食物都超期：顿号连接
+    // 两个大类都超期：顿号连接
     expect(
       actionTile(
         action({
@@ -101,11 +104,15 @@ describe("操作块展示态", () => {
           days_since_last: 2,
           suggested_interval_days: 3,
           overdue: true,
-          foods: [food(1, "种子", true), food(3, "面包虫", true)],
+          foods: [
+            { food_id: 1, name: "种子", days_since_last: 8 },
+            { food_id: 3, name: "面包虫干", days_since_last: 8 },
+          ],
+          categories: [cat("seed", true), cat("protein", true)],
         }),
         false,
       ),
-    ).toEqual({ tone: "bad", text: "⚠ 该喂种子、面包虫了" });
+    ).toEqual({ tone: "bad", text: "⚠ 该喂种子、蛋白质了" });
 
     // 统一层自己也超（8 > 3）：维持「超期 N 天」原句式，操作层措辞优先
     expect(
@@ -116,7 +123,8 @@ describe("操作块展示态", () => {
           days_since_last: 8,
           suggested_interval_days: 3,
           overdue: true,
-          foods: [food(3, "面包虫", true)],
+          foods: [{ food_id: 3, name: "面包虫干", days_since_last: 8 }],
+          categories: [cat("protein", true)],
         }),
         false,
       ),
@@ -154,11 +162,21 @@ describe("每窝周期三形态（票 03）", () => {
     });
   }
 
-  function food(id: number, name: string, overdue: boolean): FoodTileInfo {
+  function food(id: number, name: string, days: number | null): FoodTileInfo {
     return {
       food_id: id,
       name,
-      suggested_interval_days: 7,
+      days_since_last: days,
+    };
+  }
+
+  function cat(
+    category: "seed" | "protein" | "sugar",
+    overdue: boolean,
+  ): CategoryTileInfo {
+    return {
+      category,
+      interval_days: 3,
       days_since_last: overdue ? 8 : 1,
       overdue,
     };
@@ -174,7 +192,7 @@ describe("每窝周期三形态（票 03）", () => {
     ).toEqual({ tone: "ok", text: "今天 · 已记录 / 周期 7 天" });
   });
 
-  it("形态①喂食类同样生效：每窝周期统一层新鲜、食物也新鲜 → 距上次 / 周期", () => {
+  it("形态①喂食类同样生效：每窝周期统一层新鲜、大类也新鲜 → 距上次 / 周期", () => {
     expect(
       actionTile(
         colonyIntervalAction({
@@ -182,7 +200,8 @@ describe("每窝周期三形态（票 03）", () => {
           is_feeding: true,
           days_since_last: 5,
           overdue: false,
-          foods: [food(3, "面包虫", false)],
+          foods: [food(3, "面包虫干", 5)],
+          categories: [cat("protein", false)],
         }),
         false,
       ),
@@ -292,7 +311,7 @@ describe("每窝周期三形态（票 03）", () => {
     ).toEqual({ tone: "bad", text: "⚠ 超期 6 天" });
   });
 
-  it("食物行照旧独立标超期：每窝周期统一层新鲜时红由食物层顶，口径不因每窝周期变", () => {
+  it("大类行照旧独立标超期：每窝周期统一层新鲜时红由大类层顶，口径不因每窝周期变（ADR 0008）", () => {
     expect(
       actionTile(
         colonyIntervalAction({
@@ -300,12 +319,13 @@ describe("每窝周期三形态（票 03）", () => {
           is_feeding: true,
           days_since_last: 2,
           overdue: true,
-          foods: [food(3, "面包虫", true)],
+          foods: [food(3, "面包虫干", 8)],
+          categories: [cat("protein", true)],
         }),
         false,
       ),
-    ).toEqual({ tone: "bad", text: "⚠ 该喂面包虫了" });
-    // 每窝周期统一层自己超了：维持「超期 N 天」原句式（措辞优先于食物层，与现状同构）
+    ).toEqual({ tone: "bad", text: "⚠ 该喂蛋白质了" });
+    // 每窝周期统一层自己超了：维持「超期 N 天」原句式（措辞优先于大类层，与现状同构）
     expect(
       actionTile(
         colonyIntervalAction({
@@ -314,7 +334,8 @@ describe("每窝周期三形态（票 03）", () => {
           effective_interval_days: 3,
           days_since_last: 8,
           overdue: true,
-          foods: [food(3, "面包虫", true)],
+          foods: [food(3, "面包虫干", 8)],
+          categories: [cat("protein", true)],
         }),
         false,
       ),
@@ -345,17 +366,29 @@ describe("喂食判定", () => {
   });
 });
 
-describe("喂食块悬停提示（反馈第二轮 F3）", () => {
-  it("feedingTooltip 逐食物三态：距上次 / 超期标注 / 尚未记录；空明细为空串", () => {
+describe("喂食块悬停提示（ADR 0008：大类口径在前、逐食物参考在后）", () => {
+  it("feedingTooltip：大类行带周期与超期态，逐食物只剩距上次；空明细只剩说明行", () => {
     const foods: FoodTileInfo[] = [
-      { food_id: 1, name: "种子", suggested_interval_days: 3, days_since_last: 2, overdue: false },
-      { food_id: 3, name: "面包虫", suggested_interval_days: 7, days_since_last: 8, overdue: true },
-      { food_id: 2, name: "干虾仁", suggested_interval_days: 7, days_since_last: null, overdue: false },
+      { food_id: 1, name: "种子", days_since_last: 2 },
+      { food_id: 3, name: "面包虫干", days_since_last: 8 },
+      { food_id: 2, name: "虾干", days_since_last: null },
     ];
-    expect(feedingTooltip(foods)).toBe(
-      "种子：距上次 2 天\n面包虫：距上次 8 天 · 超期\n干虾仁：尚未记录",
+    const categories: CategoryTileInfo[] = [
+      { category: "seed", interval_days: 7, days_since_last: 2, overdue: false },
+      { category: "protein", interval_days: 3, days_since_last: 8, overdue: true },
+    ];
+    expect(feedingTooltip(foods, categories)).toBe(
+      "种子：距上次 2 天 / 周期 7 天\n" +
+        "蛋白质：距上次 8 天 / 周期 3 天 · 超期\n" +
+        "种子：距上次 2 天\n" +
+        "面包虫干：距上次 8 天\n" +
+        "虾干：尚未记录\n" +
+        "（提醒按大类计，逐食物仅供参考）",
     );
-    expect(feedingTooltip([])).toBe("");
+    // 旧载荷无大类（可选参数）：只剩逐食物参考行
+    expect(feedingTooltip(foods)).toBe(
+      "种子：距上次 2 天\n面包虫干：距上次 8 天\n虾干：尚未记录\n（提醒按大类计，逐食物仅供参考）",
+    );
   });
 });
 

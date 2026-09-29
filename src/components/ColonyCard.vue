@@ -1,7 +1,9 @@
 <script setup lang="ts">
 /**
- * 窝卡片（交互第三轮 #7 紧凑版，视觉基线 mocks/mock-c-home-cards.html）：
- * 单行头（名字/物种徽章/状态徽章/饲养天数内联），去开始日期行；操作块单行 chip 两列；
+ * 窝卡片（头像横幅版，视觉基线 mocks/mock-avatar-enlarge.html 变体乙-2）：
+ * 顶部整条横幅大图（方形裁剪区放大铺满宽幅，裁剪编辑器仍是唯一真相），
+ * 名字/物种/状态/天数叠照片下沿暗色渐变，右上角「巢况 / 📷」玻璃按钮；
+ * 点横幅开巢况时间线。操作块单行 chip 两列；
  * 最近记录单行截断；低频操作（开始冬眠/确认出眠/补录冬眠/编辑）收进「⋯」菜单——
  * 动作执行即收（menuAction 包装）、点卡片外即收（document click 监听 + 卡片 contains
  * 自身守卫，dots 不拦冒泡，跨卡点 dots 时旧卡菜单即收=关旧开新）；
@@ -10,19 +12,15 @@
  * 冬眠横幅瘦成一条，「改期」入口保留。记账/冬眠成功抛 saved 让外层 refresh（数据驱动重算）。
  * 票 02：撤食块（follow）走三态——无待撤置灰禁点 / 待撤可点 / 逾期红，点击开通用
  * 打卡面板（QuickLogDialog）走 log_care 闭环；派生态随数据刷新自动重算。
- * 窝头像票 02：头部左侧头像（票 01 的 Colony.avatar 投影载荷），方形裁剪框按
- * crop 坐标定位 + 形状遮罩（默认圆形，全局偏好在票 03 接线）；点击 = 打开该窝
- * 巢况时间线（与「巢况」按钮同一弹窗）。取图双通路：桌面 asset 协议
+ * 窝头像（票 01 的 Colony.avatar 投影载荷）：取图双通路——桌面 asset 协议
  * （photoSrc + getPhotoAbsDir），网页 loadPhotoBlobUrl blob（凭证不进 URL，
- * 换头像/卸载释放）；加载失败回退 🐜 占位，不崩溃。
- * 窝头像票 03：形状接全局偏好——shape prop 缺省时跟随 ipc.ts 的全局镜像
- * （首个挂载的卡片经 get_avatar_shape 拉一次，多实例共享；设置页保存成功后
- * 镜像更新，已挂载卡片经响应性立即切换），显式传入的 prop 仍优先（票 02 契约）。
- * 拍照直达票 02：「⋯」菜单置顶「📷 拍一张」——不进弹窗直接调相机（网页端隐藏
- * capture input / 桌面系统文件选择，分流同 NestCheckinDialog onAddPhotos 先例），
- * 选定照片走新原子保存通道（桌面 save_checkin_with_photos / 网页端 multipart
- * 创建模式）自动建当天登记挂照片；成功轻提示 + 抛 saved（头像投影即时跟上），
- * 失败红色轻提示带原因；busy 期间菜单项禁用。
+ * 换头像/卸载释放）；加载失败回退 🐜 占位，不崩溃。形状偏好（圆/方遮罩）已随
+ * 横幅改版移除（横幅是矩形，偏好无作用对象）。
+ * 拍照直达票 02：「⋯」菜单置顶与横幅右上角都有「📷 拍一张」——不进弹窗直接调相机
+ * （网页端隐藏 capture input / 桌面系统文件选择，分流同 NestCheckinDialog
+ * onAddPhotos 先例），选定照片走新原子保存通道（桌面 save_checkin_with_photos /
+ * 网页端 multipart 创建模式）自动建当天登记挂照片；成功轻提示 + 抛 saved
+ * （头像投影即时跟上），失败红色轻提示带原因；busy 期间菜单项禁用。
  */
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import type { Colony, ColonyAction, PhotoCrop } from "../types";
@@ -37,14 +35,9 @@ import {
   type TileView,
 } from "../lib/care";
 import {
-  avatarShape,
-  claimAvatarShapePrefLoad,
-  getAvatarShape,
   getPhotoAbsDir,
   isTauri,
-  normalizeAvatarShape,
   pickPhotoFiles,
-  saveAvatarShapePref,
   saveCheckinWithPhotos,
 } from "../lib/ipc";
 import {
@@ -62,19 +55,8 @@ import HibernationDialog from "./HibernationDialog.vue";
 import NestCheckinDialog from "./NestCheckinDialog.vue";
 import QuickLogDialog from "./QuickLogDialog.vue";
 
-const props = withDefaults(
-  defineProps<{
-    colony: Colony;
-    /** 头像显示形状（窝头像票 02）：circle=圆形遮罩 / square=方形；缺省 =
-     *  跟随全局偏好（窝头像票 03），显式传入优先于全局（票 02 契约不破）。 */
-    shape?: "circle" | "square";
-  }>(),
-  { shape: undefined },
-);
+const props = defineProps<{ colony: Colony }>();
 const emit = defineEmits<{ edit: []; saved: [] }>();
-
-/** 实际渲染形状（窝头像票 03）：显式 prop 优先，否则跟随全局偏好镜像。 */
-const shapeClass = computed(() => props.shape ?? avatarShape.value);
 
 const STATUS_TEXT: Record<Colony["status"], string> = {
   active: "● 活跃",
@@ -106,12 +88,13 @@ const recentLine = computed(() => formatRecent(props.colony.recent));
 /** 巢况摘要行（webui-checkin 票 02）：最新一组数 + 距上次登记天数；从未登记为空串（隐藏）。 */
 const checkinLine = computed(() => checkinCardLine(props.colony.checkin));
 
-// ── 窝头像（窝头像票 02）──────────────────────────────────────
+// ── 窝头像横幅（窝头像票 02 → avatar-banner 乙-2）────────────────────
 // 头像引用 = 票 01 投影载荷 Colony.avatar（前端不重复推导）。跟随按 rel_path：
 // 首页刷新会重建 colony 对象，同一张照片不重取不重挂；裁剪改了（rel 不变）由
 // 下面的样式 computed 直接响应。取图双通路沿 NestCheckinDialog 先例：桌面
 // asset 协议（getPhotoAbsDir 一次 + photoSrc），网页 loadPhotoBlobUrl blob
 // （凭证不进 URL）；换头像与卸载经 revokeObjectUrl 释放，失败回退 🐜 占位。
+// 形状偏好（圆/方遮罩）已随横幅改版移除——横幅是矩形，偏好无作用对象。
 const avatarUrl = ref("");
 const avatarBroken = ref(false);
 /** 图片 natural 尺寸（load 后可得；裁剪定位的输入，happy-dom/真实浏览器一致） */
@@ -235,16 +218,6 @@ function onDocClick(e: MouseEvent) {
 
 onMounted(() => {
   document.addEventListener("click", onDocClick);
-  // 全局形状偏好启动读取（窝头像票 03）：首个挂载的卡片拉一次，后续卡片共享
-  // （含失败，不逐卡重试）；读不出保默认圆形——外观偏好失败不惊动、不挡头像渲染
-  if (claimAvatarShapePrefLoad()) return;
-  void (async () => {
-    try {
-      saveAvatarShapePref(normalizeAvatarShape(await getAvatarShape()));
-    } catch {
-      /* 保持默认 circle；镜像未被污染，冷启动再试 */
-    }
-  })();
 });
 onBeforeUnmount(() => {
   document.removeEventListener("click", onDocClick);
@@ -373,17 +346,20 @@ function onCheckinPhotoRotated() {
 
 <template>
   <article ref="cardRef" class="card" :class="{ hib: hibernating }" :data-colony-id="colony.id">
-    <div class="chead">
-      <!-- 窝头像（窝头像票 02）：点击 = 打开巢况时间线，与「巢况」按钮同一弹窗 -->
-      <button
-        class="avatar"
-        :class="shapeClass"
-        type="button"
-        data-testid="colony-avatar"
-        title="查看巢况时间线"
-        aria-label="查看该窝的巢况时间线"
-        @click="showCheckin = true"
-      >
+    <!-- 窝头像横幅（avatar-banner 乙-2，基线 mocks/mock-avatar-enlarge.html）：方形裁剪区
+         放大铺满宽幅——内嵌正方形容器（宽=横幅宽、aspect-ratio 1/1、垂直居中）沿用
+         avatarImgStyle 的百分比裁剪数学原样；点击开巢况时间线（沿旧头像行为） -->
+    <div
+      class="banner-img"
+      data-testid="colony-avatar"
+      role="button"
+      tabindex="0"
+      title="查看巢况时间线"
+      aria-label="查看该窝的巢况时间线"
+      @click="showCheckin = true"
+      @keydown.enter.prevent="showCheckin = true"
+    >
+      <span class="sq">
         <img
           v-if="avatarUrl !== '' && !avatarBroken"
           class="avatar-img"
@@ -395,13 +371,34 @@ function onCheckinPhotoRotated() {
           @error="onAvatarError"
         />
         <span v-else class="avatar-ph" data-testid="avatar-ph">🐜</span>
-      </button>
-      <span class="cname">{{ colony.name }}</span>
-      <span v-if="colony.species" class="chip sp">{{ colony.species }}</span>
-      <span class="chip st" :class="{ hib: colony.status === 'hibernating' }">
-        {{ STATUS_TEXT[colony.status] }}
       </span>
-      <span class="daysbox"><span class="n">{{ colony.days_raised }}</span> <span class="l">天</span></span>
+      <span class="scrim">
+        <span class="bname">{{ colony.name }}</span>
+        <span v-if="colony.species" class="bchip">{{ colony.species }}</span>
+        <span class="bchip st" :class="{ hib: colony.status === 'hibernating' }">
+          {{ STATUS_TEXT[colony.status] }}
+        </span>
+        <span class="bdays"><span class="n">{{ colony.days_raised }}</span> <span class="l">天</span></span>
+      </span>
+      <span class="bact">
+        <button
+          class="bact-btn"
+          type="button"
+          title="蚁口 / 换巢 / 备注的时间线"
+          @click.stop="showCheckin = true"
+        >
+          巢况
+        </button>
+        <button
+          class="bact-btn"
+          type="button"
+          :disabled="snapBusy"
+          title="拍一张自动登记到今天，头像即时更新"
+          @click.stop="onSnapPhoto"
+        >
+          📷
+        </button>
+      </span>
     </div>
 
     <div v-if="banner" class="banner" data-testid="hib-banner">
@@ -426,7 +423,7 @@ function onCheckinPhotoRotated() {
         :data-action-id="a.action_id"
         type="button"
         :disabled="disabled"
-        :title="a.is_feeding && a.foods.length > 0 ? feedingTooltip(a.foods) : undefined"
+        :title="a.is_feeding && a.foods.length > 0 ? feedingTooltip(a.foods, a.categories) : undefined"
         @click="onTile(a)"
       >
         <span class="t-top">
@@ -444,12 +441,6 @@ function onCheckinPhotoRotated() {
     </div>
 
     <div v-if="checkinLine" class="checkin-line" data-testid="checkin-line">{{ checkinLine }}</div>
-
-    <div class="card-actions">
-      <button class="checkin-btn" type="button" title="蚁口 / 换巢 / 备注的时间线" @click="showCheckin = true">
-        巢况
-      </button>
-    </div>
 
     <!-- 拍一张（checkin-photo-entry 票 02）：网页端隐藏 capture input（手机直调
          相机）；桌面忽略此 input（走 pick_photo_files 系统对话框）。视觉隐藏但可
@@ -552,35 +543,123 @@ function onCheckinPhotoRotated() {
   background: linear-gradient(180deg, var(--hib-soft), var(--card) 60%);
 }
 
-.chead {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap; /* 超长窝名/物种折行不截断（mock-d 治理，随变体 A 一并落地） */
-}
-
-/* ── 窝头像（窝头像票 02）：方形裁剪框 + 形状遮罩（默认圆形），点击开巢况时间线 ── */
-.avatar {
+/* ── 窝头像横幅（avatar-banner 乙-2）：满宽大图 + 信息叠照片下沿 ──
+   方形裁剪区放大铺满宽幅：.sq 是边长=横幅宽的正方形（aspect-ratio），垂直居中，
+   上下溢出由横幅 overflow hidden 裁掉——img 的百分比裁剪数学沿用旧方框口径原样。 */
+.banner-img {
   position: relative;
-  flex: none;
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  border: 1px solid var(--border);
-  background: var(--tile);
+  height: 118px;
+  margin: -10px -12px 8px; /* 溢出卡片内边距，与卡片圆角齐边 */
+  border-radius: 12px 12px 0 0;
   overflow: hidden;
   cursor: pointer;
+  background: var(--tile);
+  display: block;
+}
+
+.banner-img:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.banner-img .sq {
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  transform: translateY(-50%);
   display: grid;
-  place-items: center;
-  border-radius: 50%; /* 默认形状 circle：圆形遮罩挖角，裁剪数据不受影响 */
+  place-items: center; /* 🐜 占位居中（img 为绝对定位不受影响） */
 }
 
-.avatar.square {
+/* 冬眠卡：照片灰化（整卡冷灰系的一员），scrim 保持可读 */
+.card.hib .banner-img img {
+  filter: grayscale(0.55) brightness(1.04);
+}
+
+/* 信息层：照片下沿暗色渐变上的名字/徽章/天数 */
+.scrim {
+  position: absolute;
+  inset: auto 0 0 0;
+  min-height: 56px;
+  padding: 14px 12px 8px;
+  background: linear-gradient(180deg, transparent, rgba(20, 16, 10, 0.72));
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.bname {
+  color: #fff;
+  font-size: 16px;
+  font-weight: 700;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+  white-space: nowrap;
+}
+
+.bchip {
+  font-size: 11px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  white-space: nowrap;
+  backdrop-filter: blur(2px);
+}
+
+.bchip.hib {
+  background: rgba(120, 132, 150, 0.55);
+}
+
+.bdays {
+  margin-left: auto;
+  color: #fff;
+  text-align: right;
+  white-space: nowrap;
+  line-height: 1.15;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.5);
+}
+
+.bdays .n {
+  font-size: 18px;
+  font-weight: 800;
+}
+
+.bdays .l {
+  font-size: 10px;
+  opacity: 0.85;
+}
+
+/* 右上角玻璃按钮（巢况 / 拍一张） */
+.bact {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: flex;
+  gap: 6px;
+}
+
+.bact-btn {
+  border: 1px solid rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  font: inherit;
+  font-size: 11px;
+  padding: 2px 10px;
   border-radius: 8px;
+  cursor: pointer;
+  backdrop-filter: blur(2px);
 }
 
-.avatar:hover {
-  border-color: var(--accent);
+.bact-btn:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+
+.bact-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 /* 裁剪定位 img：绝对定位 + 百分比宽高/偏移（style 由 avatarImgStyle 计算）；
@@ -597,57 +676,13 @@ function onCheckinPhotoRotated() {
 }
 
 .avatar-ph {
-  font-size: 22px;
+  font-size: 44px;
   line-height: 1;
-}
-
-.cname {
-  font-size: 15px;
-  font-weight: 700;
-  white-space: nowrap;
-}
-
-.chip {
-  font-size: 11px;
-  padding: 0 8px;
-  border-radius: 999px;
-  border: 1px solid transparent;
-  white-space: nowrap;
-}
-
-.chip.sp {
-  background: var(--accent-soft);
-  color: var(--accent-deep);
-}
-
-.chip.st {
-  background: var(--ok-soft);
-  color: var(--ok);
-}
-
-.chip.st.hib {
-  background: var(--hib-soft);
-  color: var(--hib);
-}
-
-.daysbox {
-  margin-left: auto;
-  white-space: nowrap;
-}
-
-.daysbox .n {
-  font-size: 16px;
-  font-weight: 800;
-}
-
-.daysbox .l {
-  font-size: 10px;
-  color: var(--muted);
 }
 
 /* ── 冬眠横幅：瘦成一条 ── */
 .banner {
-  margin-top: 8px;
+  margin-top: 0;
   padding: 4px 10px;
   border-radius: 8px;
   background: var(--hib-soft);
@@ -813,26 +848,6 @@ function onCheckinPhotoRotated() {
   color: var(--muted);
 }
 
-.card-actions {
-  margin-top: 10px;
-  display: flex;
-  justify-content: flex-end;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-/* 巢况按钮沿用卡片按钮基样式（其余低频按钮已收进 ⋯ 菜单，样式随菜单） */
-.checkin-btn {
-  border: 1px solid var(--border-strong);
-  background: var(--card);
-  color: var(--muted);
-  font: inherit;
-  font-size: 12px;
-  padding: 2px 12px;
-  border-radius: 8px;
-  cursor: pointer;
-}
-
 .dots {
   flex: none;
   border: none;
@@ -901,5 +916,12 @@ function onCheckinPhotoRotated() {
   height: 1px;
   opacity: 0;
   pointer-events: none;
+}
+
+/* 手机（≤480px 单列，webui-checkin 票 08 断点同款）：横幅加高取景更从容 */
+@media (max-width: 480px) {
+  .banner-img {
+    height: 150px;
+  }
 }
 </style>

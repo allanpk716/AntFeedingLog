@@ -2,8 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount, type DOMWrapper } from "@vue/test-utils";
 import ColonyCard from "./ColonyCard.vue";
 import type { Colony, ColonyAction, NestPhotoMeta } from "../types";
-// 窝头像票 03：全局形状镜像直接操作（reset 复位 / save 模拟设置页保存后的更新）
-import { resetAvatarShapeForTests, saveAvatarShapePref } from "../lib/ipc";
 // 拍一张（checkin-photo-entry 票 02）：轻提示走全局唯一 toast 模块，断言真实状态
 import { clearToasts, toastItems } from "../lib/toast";
 import { todayIso } from "../lib/dates";
@@ -109,7 +107,6 @@ describe("窝卡片头像（窝头像票 02）", () => {
     invokeMock.mockReset();
     loadPhotoBlobUrlMock.mockReset();
     revokeObjectUrlMock.mockReset();
-    resetAvatarShapeForTests(); // 票 03：形状镜像/读取标志不跨测试泄漏
   });
 
   it("无照片窝（avatar 缺省/null）显示 🐜 占位，不渲染 img、不发取图请求", () => {
@@ -207,69 +204,23 @@ describe("窝卡片头像（窝头像票 02）", () => {
     expect(stylePct(img, "top")).toBeCloseTo(-50);
   });
 
-  it("点头像打开巢况时间线弹窗（与「巢况」按钮同一弹窗）", async () => {
+  it("点横幅或「巢况」按钮都打开巢况时间线弹窗（banner 上的两入口同一弹窗）", async () => {
     const byAvatar = mountCard(colonyWithAvatar);
     await byAvatar.find('[data-testid="colony-avatar"]').trigger("click");
     expect(byAvatar.find('[data-testid="checkin-dialog-stub"]').exists()).toBe(true);
     byAvatar.unmount();
 
     const byButton = mountCard(colonyWithAvatar);
-    await byButton.find(".checkin-btn").trigger("click");
+    await byButton.find(".bact-btn").trigger("click");
     expect(byButton.find('[data-testid="checkin-dialog-stub"]').exists()).toBe(true);
   });
 
-  it("显示形状默认圆形（shape 缺省 circle），传 square 渲染方形", () => {
+  it("横幅信息层：名字/物种徽章/状态徽章/天数叠在照片下沿（avatar-banner 乙-2）", () => {
     const w = mountCard(colonyWithAvatar);
-    expect(w.find(".avatar").classes()).toContain("circle");
-    const sq = mountCard(colonyWithAvatar, { shape: "square" });
-    expect(sq.find(".avatar").classes()).toContain("square");
-  });
-
-  // ── 全局形状偏好（窝头像票 03）────────────────────────────────────────
-
-  it("全局形状偏好启动加载：库里 square → 已挂载卡片渲染方形", async () => {
-    // 启动读取路径：首个挂载的卡片触发 get_avatar_shape，收敛进镜像后方形生效
-    invokeMock.mockImplementation(async (cmd: string) =>
-      cmd === "get_avatar_shape" ? "square" : undefined,
-    );
-    const w = mountCard(colonyWithAvatar);
-    // 读取落地前先按默认圆形渲染
-    expect(w.find(".avatar").classes()).not.toContain("square");
-    await flushPromises();
-    expect(w.find(".avatar").classes()).toContain("square");
-  });
-
-  it("全局形状偏好读不出脏值（非 square）→ 回退默认圆形，不毒死渲染", async () => {
-    invokeMock.mockImplementation(async () => "rectangle");
-    const w = mountCard(colonyWithAvatar);
-    await flushPromises();
-    expect(w.find(".avatar").classes()).toContain("circle");
-  });
-
-  it("设置变更即时生效：保存成功后的镜像更新让已挂载卡片立即切换，无需重挂", async () => {
-    const w = mountCard(colonyWithAvatar);
-    await flushPromises();
-    expect(w.find(".avatar").classes()).toContain("circle");
-
-    saveAvatarShapePref("square"); // 设置页保存成功后的镜像更新（ipc.ts 内部出口）
-    await flushPromises();
-    // 无需重挂即切换
-    expect(w.find(".avatar").classes()).toContain("square");
-
-    saveAvatarShapePref("circle");
-    await flushPromises();
-    expect(w.find(".avatar").classes()).toContain("circle");
-  });
-
-  it("shape prop 显式传入优先于全局偏好（票 02 契约不破）", async () => {
-    invokeMock.mockImplementation(async (cmd: string) =>
-      cmd === "get_avatar_shape" ? "square" : undefined,
-    );
-    const w = mountCard(colonyWithAvatar, { shape: "circle" });
-    await flushPromises();
-    // 显式 prop 覆盖全局 square
-    expect(w.find(".avatar").classes()).toContain("circle");
-    expect(w.find(".avatar").classes()).not.toContain("square");
+    expect(w.find(".banner-img .bname").text()).toBe("大头一号");
+    expect(w.find(".banner-img .bchip").text()).toBe("大头收获蚁");
+    expect(w.findAll(".banner-img .bchip")[1].text()).toContain("活跃");
+    expect(w.find(".banner-img .bdays .n").text()).toBe("241");
   });
 
   describe("桌面 asset 通路", () => {
@@ -497,7 +448,6 @@ describe("窝卡片头像旋转联动（头像旋转）", () => {
     invokeMock.mockReset();
     loadPhotoBlobUrlMock.mockReset();
     revokeObjectUrlMock.mockReset();
-    resetAvatarShapeForTests();
   });
 
   afterEach(() => {

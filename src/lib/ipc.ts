@@ -22,7 +22,6 @@
  */
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
-import { readonly, ref } from "vue";
 import type {
   AbnormalExitInfo,
   ActionInput,
@@ -36,6 +35,8 @@ import type {
   CheckinUpdateInput,
   Colony,
   ColonyInput,
+  FoodCategory,
+  FoodCategoryInterval,
   FoodInput,
   FoodItem,
   LocationInput,
@@ -419,52 +420,8 @@ export const rotatePhoto = cmdFn<
  *  按登记全序、登记内照片按上传序；分组带窝名与日期，照片带元数据（含裁剪）。 */
 export const photoWall = cmdFn<void, PhotoWallColony[]>("photo_wall");
 
-// ── 头像形状偏好（窝头像票 03）：双端读、桌面设置页写；网页端白名单只登记
-// get_avatar_shape 这条只读，写入只在桌面设置页 ──
-
-/** 头像显示形状（全局偏好）：circle=圆形遮罩（默认）/ square=方形。 */
-export type AvatarShape = "circle" | "square";
-
-export const AVATAR_SHAPE_CIRCLE: AvatarShape = "circle";
-export const AVATAR_SHAPE_SQUARE: AvatarShape = "square";
-
-export const getAvatarShape = cmdFn<void, string>("get_avatar_shape");
-/** 桌面设置页专用写命令（不入网页端白名单）。返回落库的规范值。 */
-export const setAvatarShape = cmdFn<{ shape: AvatarShape }, string>("set_avatar_shape");
-
-/** 收敛任意原始值为合法形状：只有字面 "square" 算方形，其余（缺行/脏值/读取
- *  失败占位）一律回退 circle——与 Rust 读侧同口径。 */
-export function normalizeAvatarShape(raw: unknown): AvatarShape {
-  return raw === AVATAR_SHAPE_SQUARE ? AVATAR_SHAPE_SQUARE : AVATAR_SHAPE_CIRCLE;
-}
-
-// 全局形状状态镜像（沿 toast.ts 的 lib 模块持有 ref 先例）：ColonyCard 渲染
-// 消费、SettingsDialog 保存成功后更新——已挂载卡片经 Vue 响应性立即切换，无需
-// 刷新页面。模块级状态只有这一处可写（saveAvatarShapePref），对外只读。
-const avatarShapeState = ref<AvatarShape>(AVATAR_SHAPE_CIRCLE);
-let avatarShapeLoadClaimed = false;
-
-/** 只读视图：头像形状全局偏好（ColonyCard 渲染消费；保存后全卡立即响应）。 */
-export const avatarShape = readonly(avatarShapeState);
-
-/** 启动读取去重（首页窝卡片多实例共享一次 IPC）：返回 true = 已有调用者认领
- *  （含失败——失败保默认 circle，不逐卡重试，冷启动再试）。 */
-export function claimAvatarShapePrefLoad(): boolean {
-  const claimed = avatarShapeLoadClaimed;
-  avatarShapeLoadClaimed = true;
-  return claimed;
-}
-
-/** 更新本地镜像（IPC 成功或读取收敛后由调用方调；纯内存，无 IO）。 */
-export function saveAvatarShapePref(shape: AvatarShape): void {
-  avatarShapeState.value = normalizeAvatarShape(shape);
-}
-
-/** 测试专用：复位镜像/读取标志（模块级状态不跨测试泄漏；运行时不接）。 */
-export function resetAvatarShapeForTests(shape: AvatarShape = AVATAR_SHAPE_CIRCLE): void {
-  avatarShapeLoadClaimed = false;
-  avatarShapeState.value = shape;
-}
+// 头像形状偏好（圆/方遮罩）已随头像横幅改版移除（avatar-banner 乙-2）：
+// 横幅是矩形，形状偏好无作用对象；settings 的 avatar_shape 键由 v14 迁移清理。
 
 // ── 冬眠（HibernationDialog；入参键沿用现状 camelCase，Tauri 侧自行映射）──
 
@@ -513,6 +470,19 @@ export const saveAction = cmdFn<{ input: ActionInput }, void>("save_action");
 export const setActionEnabled = cmdFn<{ id: number; enabled: boolean }, void>("set_action_enabled");
 export const eraseAction = cmdFn<{ id: number }, void>("erase_action");
 export const saveFood = cmdFn<{ input: FoodInput }, void>("save_food");
+
+// ── 大类周期（ADR 0008）：周期挂大类，喂大类内任一食物即刷新整类；
+//  桌面设置页专用（不入网页端白名单——系统管理桌面独占） ──
+
+/** 大类周期全表（恒三行固定序 seed→protein→sugar；缺行 = 未设）。 */
+export const listFoodCategories = cmdFn<void, FoodCategoryInterval[]>(
+  "list_food_categories",
+);
+/** 保存一条大类周期（intervalDays = null 清空＝不按周期提醒）。 */
+export const saveFoodCategoryInterval = cmdFn<
+  { category: FoodCategory; intervalDays: number | null },
+  FoodCategoryInterval
+>("save_food_category_interval");
 export const setFoodEnabled = cmdFn<{ id: number; enabled: boolean }, void>("set_food_enabled");
 export const eraseFood = cmdFn<{ id: number }, void>("erase_food");
 

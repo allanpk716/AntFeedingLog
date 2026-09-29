@@ -20,18 +20,17 @@ const colony: Colony = {
   checkin: { latest: null, baseline_date: null, days_since_last: null },
 };
 const action: ColonyAction = {
-  action_id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true,
-  suggested_interval_days: null, days_since_last: 1, overdue: false, foods: [],
+  action_id: 1, name: "喂食", icon: null, kind: "reminding", is_feeding: true, suggested_interval_days: null, days_since_last: 1, overdue: false, foods: [],
 };
 
 /** id=4 是脏数据（易腐但没配间隔，且挂了个非法大类 key——分组兜底用）；
  *  id=5 停用（不该出现在多选列表） */
 const foods: FoodItem[] = [
-  { id: 1, name: "面包虫", enabled: true, sort: 1, suggested_interval_days: null, is_preset: true, referenced: true, perishable: true, retrieval_hours: 24, category: "protein" },
-  { id: 2, name: "湿食", enabled: true, sort: 2, suggested_interval_days: null, is_preset: false, referenced: false, perishable: true, retrieval_hours: 6, category: "protein" },
-  { id: 3, name: "种子", enabled: true, sort: 3, suggested_interval_days: 7, is_preset: true, referenced: true, perishable: false, retrieval_hours: null, category: "seed" },
-  { id: 4, name: "脏数据", enabled: true, sort: 4, suggested_interval_days: null, is_preset: false, referenced: false, perishable: true, retrieval_hours: null, category: "junk" as never },
-  { id: 5, name: "停用蜂蜜", enabled: false, sort: 5, suggested_interval_days: null, is_preset: false, referenced: false, perishable: true, retrieval_hours: 12, category: "sugar" },
+  { id: 1, name: "面包虫", enabled: true, sort: 1, is_preset: true, referenced: true, perishable: true, retrieval_hours: 24, category: "protein" },
+  { id: 2, name: "湿食", enabled: true, sort: 2, is_preset: false, referenced: false, perishable: true, retrieval_hours: 6, category: "protein" },
+  { id: 3, name: "种子", enabled: true, sort: 3, is_preset: true, referenced: true, perishable: false, retrieval_hours: null, category: "seed" },
+  { id: 4, name: "脏数据", enabled: true, sort: 4, is_preset: false, referenced: false, perishable: true, retrieval_hours: null, category: "junk" as never },
+  { id: 5, name: "停用蜂蜜", enabled: false, sort: 5, is_preset: false, referenced: false, perishable: true, retrieval_hours: 12, category: "sugar" },
 ];
 
 function mockInvoke() {

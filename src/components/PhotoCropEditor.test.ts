@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { flushPromises, mount } from "@vue/test-utils";
 import PhotoCropEditor from "./PhotoCropEditor.vue";
-import { resetAvatarShapeForTests } from "../lib/ipc"; // 形状镜像透传（ipcMock 原样放行非命令导出）
 import type { NestPhotoMeta } from "../types";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（沿 NestCheckinDialog.test.ts 先例）
@@ -94,11 +93,11 @@ beforeEach(() => {
 });
 
 describe("PhotoCropEditor（窝头像票 04）", () => {
-  it("骨架：方形裁剪框 + 圆形遮罩预览 + 重置/取消/保存按钮", async () => {
+  it("骨架：方形裁剪框 + 重置/取消/保存按钮（形状预览遮罩已随头像横幅改版移除）", async () => {
     const w = await mountEditor(photo(), 2000, 1000);
 
     expect(w.find(".crop-frame").exists()).toBe(true);
-    expect(w.find(".crop-frame .crop-circle-mask").exists()).toBe(true);
+    expect(w.find(".crop-frame .crop-circle-mask").exists()).toBe(false);
     expect(w.find(".crop-reset-btn").text()).toBe("重置居中");
     expect(w.find(".crop-cancel-btn").text()).toBe("取消");
     expect(w.find(".crop-save-btn").text()).toBe("保存");
@@ -290,16 +289,6 @@ describe("PhotoCropEditor（窝头像票 04）", () => {
     expect(invokeMock).not.toHaveBeenCalled();
     expect(w.emitted("close")).toHaveLength(1);
     expect(w.emitted("saved")).toBeUndefined();
-  });
-
-  it("预览遮罩跟随全局形状偏好：square 时去圆角、circle 恢复（终局评审集成补）", async () => {
-    resetAvatarShapeForTests("square");
-    const square = await mountEditor(photo({ crop: null }), 2000, 1000);
-    expect(square.find(".crop-circle-mask").classes()).toContain("crop-mask-square");
-
-    resetAvatarShapeForTests(); // 默认 circle
-    const circle = await mountEditor(photo({ crop: null }), 2000, 1000);
-    expect(circle.find(".crop-circle-mask").classes()).not.toContain("crop-mask-square");
   });
 
   // ── 旋转（头像旋转：烧进文件）：立即生效，不等「保存」──

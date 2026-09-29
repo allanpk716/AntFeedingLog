@@ -34,10 +34,8 @@
  *   置顶标名，勾物理网段强制明文确认）/ 端口（1024–65535）/ 凭证（打码可看、
  *   只可重生成）/ 完整地址复制 + 风险提示；保存落 webui-config.json 并联动防火墙
  *   （失败给现成 netsh 手动命令）。面板本体在 WebUiPanel（首启向导复用其子组件）。
- * - 外观 tab（窝头像票 03）：窝卡片头像形状全局偏好（圆形/方形单选），选择即
- *   存即效——写 set_avatar_shape 落库（桌面专属命令）+ 更新 ipc.ts 全局镜像，
- *   已渲染头像立即切换；打开弹窗时 get_avatar_shape 回显，读不出保默认圆形。
- *   成败走轻提示（设置保存属「改了不关窗」写操作）。
+ * - 外观 tab 已随头像横幅改版移除（avatar-banner 乙-2）：横幅是矩形，
+ *   圆/方遮罩偏好无作用对象。
  * - 首开体验（界面切换卡顿票 02）：地点/网页端/更新三页签急挂载保活——独立
  *   v-show 块（置于 v-if 链后，链只摘三分支、完整性不受影响），弹窗一打开
  *   即后台挂载并与主加载同批读取；页签切换只切显隐不销毁面板（未保存表单、
@@ -66,7 +64,6 @@ import {
   eraseAction as eraseActionCmd,
   eraseFood as eraseFoodCmd,
   exportData as exportDataCmd,
-  getAvatarShape,
   getBackupConfig,
   getLastAbnormalExit,
   getRecentErrors,
@@ -84,16 +81,13 @@ import {
   revealDataFolder,
   saveAction,
   saveFood,
+  saveFoodCategoryInterval,
+  listFoodCategories,
   sendTestNotification,
   setActionEnabled as setActionEnabledCmd,
-  setAvatarShape,
   setBackupConfig,
   setFoodEnabled as setFoodEnabledCmd,
   setSettings,
-  avatarShape,
-  normalizeAvatarShape,
-  saveAvatarShapePref,
-  type AvatarShape,
 } from "../lib/ipc";
 import type {
   BackupConfigInput,
@@ -105,13 +99,17 @@ import type {
 } from "../types";
 import {
   buildActionRows,
+  buildCategoryIntervalRows,
   buildFoodRows,
   moveRow,
   toActionInputs,
+  toCategoryIntervalInputs,
   toFoodInputs,
   validateActionRows,
+  validateCategoryIntervalRows,
   validateFoodRows,
   type ActionRow,
+  type CategoryIntervalRow,
   type FoodRow,
 } from "../lib/dict";
 import { FOOD_CATEGORY_ORDER, foodCategoryLabel } from "../lib/foodCategories";
@@ -146,13 +144,15 @@ import UpdatePanel from "./UpdatePanel.vue";
 import WebUiPanel from "./WebUiPanel.vue";
 import { showError, showSuccess } from "../lib/toast";
 
-type Tab = "actions" | "foods" | "locations" | "appearance" | "notify" | "webui" | "data" | "update";
+type Tab = "actions" | "foods" | "locations" | "notify" | "webui" | "data" | "update";
 
 const emit = defineEmits<{ close: []; changed: [] }>();
 
 const activeTab = ref<Tab>("actions");
 const actionRows = ref<ActionRow[]>([]);
 const foodRows = ref<FoodRow[]>([]);
+/** 大类周期行（ADR 0008）：恒三行固定序，随食物区批量「保存」一并落库 */
+const categoryIntervalRows = ref<CategoryIntervalRow[]>([]);
 const locations = ref<LocationItem[]>([]);
 const addActionName = ref("");
 const addFoodName = ref("");
@@ -178,46 +178,20 @@ const pushoverStatus = ref<PushoverStatus | null>(null);
 const revealPushoverUser = ref(false);
 const revealPushoverToken = ref(false);
 
-// ── 外观 tab（窝头像票 03）：头像形状全局偏好，选择即存即效 ──
-const avatarShapeChoice = ref<AvatarShape>("circle");
-const shapeBusy = ref(false);
-
-/** 回显：读库内当前值进全局镜像（ColonyCard 消费同一镜像）与单选；
- *  读不出保持现状（默认圆形）——外观偏好加载失败不惊动、不挡其他功能区。 */
-async function refreshAvatarShape() {
-  try {
-    saveAvatarShapePref(normalizeAvatarShape(await getAvatarShape()));
-  } catch {
-    // 静默：镜像维持原值
-  }
-  avatarShapeChoice.value = avatarShape.value;
-}
-
-/** 单选切换即保存（桌面专属命令 set_avatar_shape）：成功更新全局镜像并轻提示
- *  （设置保存属「改了不关窗」写操作）；失败红色轻提示带原因，单选回弹已生效值。 */
-async function onAvatarShapeChange() {
-  if (shapeBusy.value) return;
-  shapeBusy.value = true;
-  try {
-    saveAvatarShapePref(normalizeAvatarShape(await setAvatarShape({ shape: avatarShapeChoice.value })));
-    showSuccess("头像形状已保存");
-  } catch (e) {
-    avatarShapeChoice.value = avatarShape.value;
-    showError("头像形状保存失败", String(e));
-  } finally {
-    shapeBusy.value = false;
-  }
-}
+// 外观 tab（头像形状偏好）已随头像横幅改版移除（avatar-banner 乙-2）：
+// 横幅是矩形，圆/方遮罩偏好无作用对象；settings 键由 v14 迁移清理。
 
 async function load() {
-  const [actions, foods, locs, s] = await Promise.all([
+  const [actions, foods, cats, locs, s] = await Promise.all([
     listActions(),
     listFoods(),
+    listFoodCategories(),
     listLocations(),
     getSettings(),
   ]);
   actionRows.value = buildActionRows(actions);
   foodRows.value = buildFoodRows(foods);
+  categoryIntervalRows.value = buildCategoryIntervalRows(cats);
   locations.value = locs;
   notifyForm.value = toForm(s);
   autostart.value = s.autostart_enabled;
@@ -246,7 +220,6 @@ onMounted(() => {
   void Promise.allSettled([
     main,
     refreshPushoverStatus(),
-    refreshAvatarShape(),
     loadLogSection(),
     loadBackupSection(),
     loadOrphanSection(),
@@ -284,7 +257,7 @@ async function addActionRow(kind: "actions" | "foods") {
       error.value = "新食物必须先选大类（种子/蛋白质/糖水）";
       return;
     }
-    foodRows.value.push({ id: null, name: raw, enabled: true, intervalText: "", perishable: false, retrievalHoursText: "", isPreset: false, referenced: false, category: addFoodCategory.value as FoodRow["category"] });
+    foodRows.value.push({ id: null, name: raw, enabled: true, perishable: false, retrievalHoursText: "", isPreset: false, referenced: false, category: addFoodCategory.value as FoodRow["category"] });
     addFoodName.value = "";
   }
   error.value = "";
@@ -392,7 +365,7 @@ async function saveActions() {
 }
 
 async function saveFoods() {
-  const invalid = validateFoodRows(foodRows.value);
+  const invalid = validateFoodRows(foodRows.value) || validateCategoryIntervalRows(categoryIntervalRows.value);
   if (invalid) {
     error.value = invalid; // 字段级校验维持内联红字（F3 例外），不进轻提示
     return;
@@ -402,6 +375,10 @@ async function saveFoods() {
   try {
     for (const input of toFoodInputs(foodRows.value)) {
       await saveFood({ input });
+    }
+    // 大类周期（ADR 0008）：三条逐一落库（null = 清空＝不按周期提醒）
+    for (const c of toCategoryIntervalInputs(categoryIntervalRows.value)) {
+      await saveFoodCategoryInterval({ category: c.category, intervalDays: c.intervalDays });
     }
     await load();
     emit("changed");
@@ -658,9 +635,9 @@ async function confirmRestoreApply() {
     restoreConfirming.value = false;
     // 库已整体替换：弹窗内字典/通知设置重拉自新库；备份配置在库外不受影响
     await load();
-    // 整库替换后通知凭据与头像形状可能来自不同的库（终局修复：打开链并行化
-    // 把这两段挪出 load() 后，恢复路径不再顺带刷新——此处补回，旧值不残留）
-    await Promise.all([refreshPushoverStatus(), refreshAvatarShape()]);
+    // 整库替换后通知凭据可能来自不同的库（终局修复：打开链并行化把这段挪出
+    // load() 后，恢复路径不再顺带刷新——此处补回，旧值不残留）
+    await refreshPushoverStatus();
     emit("changed");
   } catch (e) {
     restoreError.value = String(e);
@@ -753,9 +730,6 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         <button class="tab tab-locations" :class="{ active: activeTab === 'locations' }" type="button" @click="activeTab = 'locations'">
           地点
         </button>
-        <button class="tab tab-appearance" :class="{ active: activeTab === 'appearance' }" type="button" @click="activeTab = 'appearance'">
-          外观
-        </button>
         <button class="tab tab-notify" :class="{ active: activeTab === 'notify' }" type="button" @click="activeTab = 'notify'">
           通知
         </button>
@@ -833,6 +807,23 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
       <div v-else-if="activeTab === 'foods'" class="tab-body">
         <LoadingHint v-if="!firstLoadDone" />
         <template v-else>
+          <!-- 大类周期（ADR 0008）：提醒粒度在大类——喂大类内任一食物即刷新整类；
+               三类固定、顺序固定，随下方「保存」一并落库 -->
+          <div class="cat-interval-box" title="喂大类内任一食物即刷新整类的钟；距上次喂该大类超过周期就提醒「该喂蛋白质了」。留空 = 该大类不按周期提醒，只受喂食统一周期管">
+            <span class="cat-interval-title">大类周期</span>
+            <label v-for="row in categoryIntervalRows" :key="row.category" class="cat-interval-row">
+              <span class="cat-interval-label">{{ row.label }}</span>
+              <input
+                v-model="row.intervalText"
+                class="interval-input"
+                type="number"
+                min="1"
+                :title="`「${row.label}」的周期（天）：距上次喂该大类任一食物超过它就提醒；留空 = 不按周期提醒`"
+              />
+              <span class="cat-interval-unit">天</span>
+            </label>
+          </div>
+
           <div v-for="(row, index) in foodRows" :key="row.id ?? `new-${index}`" class="dict-row" :class="{ 'row-disabled': !row.enabled }">
             <span class="movers">
               <button type="button" :disabled="index === 0" @click="moveRow(foodRows, index, -1)">↑</button>
@@ -846,13 +837,6 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
             >
               <option v-for="c in FOOD_CATEGORY_ORDER" :key="c" :value="c">{{ foodCategoryLabel(c) }}</option>
             </select>
-            <input
-              v-model="row.intervalText"
-              class="interval-input"
-              type="number"
-              min="1"
-              title="食物建议间隔：距上次喂该食物超过它就单独提醒；留空 = 只按喂食统一周期"
-            />
             <label class="perish-flag" title="易腐：喂下后超过撤食间隔就提醒收走残食">
               <input v-model="row.perishable" class="perish-input" type="checkbox" @change="onPerishableChange(row)" />
               易腐
@@ -884,43 +868,13 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
             <button class="add-btn" type="button" @click="addActionRow('foods')">＋ 添加</button>
           </div>
 
-          <p class="hint">每样食物归一个大类（种子/蛋白质/糖水，行内可改）；预置七项：种子、虾干、面包虫干、樱桃蟑螂、蜂蜜、冰糖水、白糖水。设了间隔的食物各自算「距上次」，任一超期喂食块就变红并单独提醒。勾「易腐」的食物必须填 1–168 的整数小时（喂下后到点提醒收走残食），取消勾选会清空间隔。</p>
+          <p class="hint">每样食物归一个大类（种子/蛋白质/糖水，行内可改）；预置七项：种子、虾干、面包虫干、樱桃蟑螂、蜂蜜、冰糖水、白糖水。提醒按大类计：喂大类内任一食物就刷新整类（如喂了虾干，面包虫的钟一并归零），距上次超过上方「大类周期」就提醒该喂这一类；逐食物「距上次」只在喂食块悬停里作参考。勾「易腐」的食物必须填 1–168 的整数小时（喂下后到点提醒收走残食），取消勾选会清空间隔。</p>
 
           <div class="dlg-btns">
             <span class="spacer"></span>
             <button class="btn primary" type="button" :disabled="busy" @click="saveFoods">保存</button>
           </div>
         </template>
-      </div>
-
-      <!-- 外观（窝头像票 03）：头像形状全局偏好，选择即存即效（读写与轻提示见 script） -->
-      <div v-else-if="activeTab === 'appearance'" class="tab-body">
-        <div class="notify-row">
-          <span>窝卡片头像形状：</span>
-          <label class="shape-choice" title="圆形 = 方形裁剪框挖圆角显示">
-            <input
-              v-model="avatarShapeChoice"
-              class="shape-radio shape-radio-circle"
-              type="radio"
-              value="circle"
-              :disabled="shapeBusy"
-              @change="onAvatarShapeChange"
-            />
-            圆形
-          </label>
-          <label class="shape-choice" title="方形 = 圆角方框显示">
-            <input
-              v-model="avatarShapeChoice"
-              class="shape-radio shape-radio-square"
-              type="radio"
-              value="square"
-              :disabled="shapeBusy"
-              @change="onAvatarShapeChange"
-            />
-            方形
-          </label>
-        </div>
-        <p class="hint">全局生效：桌面与网页端所有窝卡片头像立即切换；已有头像裁剪不重算，只换遮罩形状。</p>
       </div>
 
       <!-- 通知（票 06 + 票 09 + 票 05 撤食开关）+ Pushover 双通道（反馈第二轮 F4） -->
@@ -1339,18 +1293,6 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   color: var(--text);
 }
 
-/* 外观 tab（窝头像票 03）：形状单选标签，与既有 checkbox 标签同款手感 */
-.shape-choice {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  cursor: pointer;
-}
-
-.shape-choice input:disabled {
-  cursor: default;
-}
-
 .saved-hint {
   margin-top: 10px;
   font-size: 13px;
@@ -1566,6 +1508,42 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
   font: inherit;
   background: var(--card);
   color: var(--text);
+}
+
+/* 大类周期区（ADR 0008）：三类固定一行排开，随「保存」批量落库 */
+.cat-interval-box {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 8px 12px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--tile);
+}
+
+.cat-interval-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-deep);
+  white-space: nowrap;
+}
+
+.cat-interval-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.cat-interval-label {
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.cat-interval-unit {
+  font-size: 11px;
+  color: var(--muted);
 }
 
 /* 食物大类下拉（ADR 0007）：行内编辑与新增行同款 */

@@ -19,15 +19,25 @@ export const HYDRATION_METHOD_LABELS: Record<HydrationMethod, string> = {
  *  不参与提醒/登记切换、无建议间隔） */
 export type ActionKind = "reminding" | "log_only" | "follow";
 
-/** 喂食块里单个食物的「距上次」明细（Rust care::FoodTileStatus，反馈第二轮 F3） */
+/** 喂食块里单个食物的「距上次」参考明细（Rust care::FoodTileStatus）。
+ *  ADR 0008 起降级为纯参考——悬停提示展示用，不驱动提醒（提醒按大类算）。 */
 export interface FoodTileInfo {
   food_id: number;
   name: string;
-  /** 该食物自己的建议间隔；null = 未设，只受喂食统一周期管 */
-  suggested_interval_days: number | null;
   /** 今天 − 最近一次喂「该食物」日期（含出眠重置基线）；从未喂过且无出眠史为 null */
   days_since_last: number | null;
-  /** 仅操作 kind=reminding 且已设周期且 > 周期 */
+}
+
+/** 喂食块里单个大类的提醒状态（Rust care::CategoryTileStatus，ADR 0008：
+ *  大类周期——喂大类内任一食物即刷新整类的钟）。 */
+export interface CategoryTileInfo {
+  /** 大类 key：'seed' | 'protein' | 'sugar'（展示层映射中文） */
+  category: FoodCategory;
+  /** 大类周期（天）；null = 未设（不按大类周期提醒） */
+  interval_days: number | null;
+  /** 今天 − 最近一次喂该大类任一食物（含出眠重置基线）；从未喂过且无出眠史为 null */
+  days_since_last: number | null;
+  /** 仅操作 kind=reminding 且已设周期且 > 周期；从未喂过恒 false（不催） */
   overdue: boolean;
 }
 
@@ -53,10 +63,13 @@ export interface ColonyAction {
   /** 今天 − 最近一次发生日期（自然日）；从未记录为 null */
   days_since_last: number | null;
   /** 操作层超期（Rust is_overdue_effective）：设了每窝周期 = 严格大于有效周期（设了即提醒，
-   *  登记类也一样，follow 永不）；未设 = 提醒类且 > 建议间隔；喂食类任一设周期食物超期也算（F3，Q2） */
+   *  登记类也一样，follow 永不）；未设 = 提醒类且 > 建议间隔；喂食类任一大类超期也算（ADR 0008） */
   overdue: boolean;
-  /** 逐食物「距上次」明细（F3）；仅喂食类非空，其余操作恒空数组 */
+  /** 逐食物「距上次」参考明细（ADR 0008：纯展示、不驱动提醒）；仅喂食类非空 */
   foods: FoodTileInfo[];
+  /** 逐大类提醒状态（ADR 0008：大类周期）；仅喂食类非空，其余操作恒空数组。
+   *  可选为旧测试载荷兜底——真实 IPC 恒有值。 */
+  categories?: CategoryTileInfo[];
 }
 
 /** 最近记录摘要的一行（前端拼展示文案） */
@@ -142,17 +155,23 @@ export interface LocationInput {
 }
 
 /** 食物大类 key（ADR 0007）：固定三种——'seed'=种子 | 'protein'=蛋白质 | 'sugar'=糖水。
- *  大类不可增删改名，只作分组容器、不参与提醒；可扩展的是大类之下的食物项。 */
+ *  大类不可增删改名；既是选择界面的分组容器，也是喂食提醒的单位（大类周期，
+ *  ADR 0008：喂大类内任一食物即刷新整类）；可扩展的是大类之下的食物项。 */
 export type FoodCategory = "seed" | "protein" | "sugar";
 
-/** 食物（含停用的：新建入口前端过滤 enabled；referenced=被历史记录或提醒台账引用，只能停用不能删） */
+/** 大类周期行（ADR 0008，Rust dict::FoodCategoryInterval）：恒三行固定序。 */
+export interface FoodCategoryInterval {
+  category: FoodCategory;
+  /** null = 未设（该大类不按周期提醒，只受统一周期/每窝周期管） */
+  interval_days: number | null;
+}
+
+/** 食物（含停用的：新建入口前端过滤 enabled；referenced=被历史记录引用，只能停用不能删） */
 export interface FoodItem {
   id: number;
   name: string;
   enabled: boolean;
   sort: number;
-  /** 食物建议间隔（天，F3）：距上次喂该食物超过它就单独提醒；null = 未设 */
-  suggested_interval_days: number | null;
   /** 预置项禁删可停用（反馈第二轮 F2） */
   is_preset: boolean;
   referenced: boolean;
@@ -197,13 +216,12 @@ export interface ActionPolicyInput {
   is_feeding: boolean | null;
 }
 
-/** 新增(id=null)/修改(id=有值) 食物入参；停用/删除走单独命令 */
+/** 新增(id=null)/修改(id=有值) 食物入参；停用/删除走单独命令。
+ *  ADR 0008 起食物不再有各自的建议间隔——提醒粒度在大类（大类周期，设置页配）。 */
 export interface FoodInput {
   id: number | null;
   name: string;
   sort: number;
-  /** 食物建议间隔（天，F3）；null = 不设 */
-  suggested_interval_days: number | null;
   /** 易腐（票 01）：开易腐必须配 1–168 整数小时的撤食间隔（后端同款守护拒收） */
   perishable: boolean;
   /** 撤食间隔（小时）；关易腐时传 null（后端兜底落 NULL） */

@@ -52,7 +52,15 @@ use rusqlite::{params, Connection};
 ///     建议间隔改值（种子 3→7、蛋白质类 7→3、糖水类 3）；sort 按分组重排（自建行
 ///     整体挪到预置之后，相对序保留）。大类不参与提醒（距上次/食物周期/待撤食仍
 ///     按子项算）；历史记录按 id 引用，改名不断链。
-pub const SCHEMA_VERSION: i64 = 13;
+/// v14：大类周期（ADR 0008，推翻 v13 的「大类不参与提醒」）——喂食提醒粒度从
+///     食物上移到大类：food.suggested_interval_days 废弃（DROP 列），间隔收拢进
+///     新表 food_category_interval（大类 → 周期天数，NULL = 不按周期提醒），迁移
+///     初值 = 该大类内食物间隔的最大值（宽松优先：升级后绝不新增提醒，只可能变松）；
+///     reminder_ledger 整表重建——food_id 列换 category key 列，存量 food_overdue
+///     行改 kind='category_overdue'、category 由 food_id 关联回填，同（窝,操作,
+///     基准日）多行归并留最早一条（防升级日重发）；顺带清 settings 的 avatar_shape
+///     键（头像横幅改版：形状偏好失去作用对象，见 avatar-banner spec）。
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// 库文件名，位于系统应用数据目录（Windows: `%APPDATA%\<identifier>\`）。
 pub const DB_FILE_NAME: &str = "ant-feeding-log.db";
@@ -149,6 +157,7 @@ pub fn migrate(conn: &Connection) -> DbResult<()> {
             10 => migrate_v10_to_v11(conn)?,
             11 => migrate_v11_to_v12(conn)?,
             12 => migrate_v12_to_v13(conn)?,
+            13 => migrate_v13_to_v14(conn)?,
             other => {
                 return Err(rusqlite::Error::InvalidParameterName(format!(
                     "未知 schema 版本 v{other}"
@@ -639,6 +648,70 @@ fn migrate_v12_to_v13(conn: &Connection) -> Result<(), rusqlite::Error> {
     tx.commit()
 }
 
+/// v14（大类周期，ADR 0008）：见 [`SCHEMA_VERSION`] 文档注释链 v14 条目。
+/// 台账归并键不含 category——同（窝,操作,基准日）的多食物旧行在「大类一只钟」
+/// 语义下同义，留最早一条（推送快照随行保留，pushover_done 原样）；食物行被
+/// 字典删除守卫拦着不会消失，category 回填子查询恒有解。单事务原子完成。
+fn migrate_v13_to_v14(conn: &Connection) -> Result<(), rusqlite::Error> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE food_category_interval (
+            category      TEXT    NOT NULL PRIMARY KEY
+                                 CHECK (category IN ('seed', 'protein', 'sugar')),
+            interval_days INTEGER CHECK (interval_days IS NULL OR interval_days >= 1)
+        );
+        INSERT INTO food_category_interval (category, interval_days)
+        SELECT category, MAX(suggested_interval_days) FROM food
+        GROUP BY category
+        HAVING MAX(suggested_interval_days) IS NOT NULL;
+
+        CREATE TABLE reminder_ledger_v14 (
+            id             INTEGER PRIMARY KEY,
+            colony_id      INTEGER NOT NULL REFERENCES colony(id),
+            kind           TEXT    NOT NULL,
+            action_id      INTEGER REFERENCES care_action(id),
+            category       TEXT    CHECK (category IS NULL OR category IN ('seed', 'protein', 'sugar')),
+            base_date      TEXT    NOT NULL,
+            sent_at        TEXT    NOT NULL,
+            push_title     TEXT,
+            push_body      TEXT,
+            pushover_done  INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO reminder_ledger_v14
+            (id, colony_id, kind, action_id, category, base_date, sent_at, push_title, push_body, pushover_done)
+        SELECT id, colony_id, 'category_overdue', action_id,
+               (SELECT f.category FROM food f WHERE f.id = reminder_ledger.food_id),
+               base_date, sent_at, push_title, push_body, pushover_done
+        FROM reminder_ledger
+        WHERE kind = 'food_overdue'
+          AND id IN (SELECT MIN(id) FROM reminder_ledger WHERE kind = 'food_overdue'
+                     GROUP BY colony_id, action_id, base_date);
+        INSERT INTO reminder_ledger_v14
+            (id, colony_id, kind, action_id, category, base_date, sent_at, push_title, push_body, pushover_done)
+        SELECT id, colony_id, kind, action_id, NULL, base_date, sent_at, push_title, push_body, pushover_done
+        FROM reminder_ledger WHERE kind != 'food_overdue';
+        DROP TABLE reminder_ledger;
+        ALTER TABLE reminder_ledger_v14 RENAME TO reminder_ledger;
+
+        CREATE UNIQUE INDEX uq_ledger_overdue
+            ON reminder_ledger(colony_id, action_id, base_date) WHERE kind = 'overdue';
+        CREATE UNIQUE INDEX uq_ledger_category
+            ON reminder_ledger(colony_id, action_id, base_date) WHERE kind = 'category_overdue';
+        CREATE UNIQUE INDEX uq_ledger_wake
+            ON reminder_ledger(colony_id, kind, base_date)
+            WHERE kind IN ('approaching_wake', 'wake_day');
+        CREATE UNIQUE INDEX uq_ledger_retrieval
+                ON reminder_ledger(colony_id, base_date) WHERE kind = 'retrieval_due';
+
+        ALTER TABLE food DROP COLUMN suggested_interval_days;
+        DELETE FROM settings WHERE key = 'avatar_shape';
+        "#,
+    )?;
+    tx.pragma_update(None, "user_version", 14)?;
+    tx.commit()
+}
+
 /// v1 预置数据：四操作（喂食/活动区换水/巢穴保湿/垃圾清理）、三食物、两地点、五项设置默认值。
 /// pub(crate)：restore.rs 的旧 schema 备份测试要搭真实 v1 库（票 04 验收 3）。
 pub(crate) fn seed_v1_presets(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -769,8 +842,7 @@ CREATE TABLE settings (
 "#;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests {    use super::*;
 
     use rusqlite::{params, Connection};
     use tempfile::TempDir;
@@ -820,6 +892,7 @@ mod tests {
                 "colony_action_interval",
                 "data_meta",
                 "food",
+                "food_category_interval",
                 "hibernation",
                 "location",
                 "log_food",
@@ -835,7 +908,7 @@ mod tests {
     fn user_version_is_schema_version() {
         let (conn, _dir) = fresh_conn();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
-        assert_eq!(SCHEMA_VERSION, 13);
+        assert_eq!(SCHEMA_VERSION, 14);
     }
 
     /// 按真实迁移函数链手工搭到 v7 的库（票 01 v8 迁移测试地基；含 webui-checkin
@@ -1341,7 +1414,11 @@ mod tests {
         // v9→v10：implies_retrieval 只落预置「垃圾清理」。改名后按
         // 预置+reminding+非喂食 兜底锚中；其他预置/自建项不误标。
         // （预置五操作里 reminding+非喂食只有垃圾清理一个，不歧义）
-        let (conn, _tmp) = fresh_conn();
+        // 用真实迁移链搭 v9 库（v14 删了 food 的间隔列，不能用"新库回拨版本"
+        // 的老把戏——v13 的语句在 v14 形态上会撞已删列）
+        let conn = v7_conn();
+        migrate_v7_to_v8(&conn, false).unwrap();
+        migrate_v8_to_v9(&conn).unwrap();
         conn.execute(
             "UPDATE care_action SET name = '清垃圾' WHERE name = '垃圾清理'",
             [],
@@ -1353,7 +1430,6 @@ mod tests {
             [],
         )
         .unwrap();
-        conn.pragma_update(None, "user_version", 9).unwrap();
 
         migrate(&conn).unwrap();
         assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
@@ -1886,6 +1962,8 @@ mod tests {
     fn v12_db_upgrades_to_v13_food_categories() {
         // ADR 0007：归组 + 预置改名 + 四新预置 + 间隔改值 + sort 分组重排一次到位；
         // 历史记录按 id 引用，改名后联查显示新名（id 未变，引用不断链）。
+        // 注：只升到 v13（直接调迁移函数）——v14（ADR 0008）会删掉
+        // suggested_interval_days 列，本测试的间隔断言钉在 v13 口径。
         let conn = v12_conn();
         conn.execute(
             "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
@@ -1915,8 +1993,8 @@ mod tests {
         )
         .unwrap();
 
-        migrate(&conn).unwrap();
-        assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), SCHEMA_VERSION);
+        migrate_v12_to_v13(&conn).unwrap();
+        assert_eq!(scalar_i64(&conn, "PRAGMA user_version"), 13);
 
         // 七预置 + 自建行：name / category / 间隔 / sort 全对表
         // （自建蚕蛹：归 seed 兜底、间隔不动、sort +100 挪到预置之后）
@@ -1970,6 +2048,8 @@ mod tests {
     fn v13_same_name_custom_food_upgrades_in_place() {
         // 自建「蜂蜜」与 v13 新预置撞名 → 原位升格（v8 撤食先例）：
         // 吃预置属性（大类/间隔/易腐）、is_preset 落位、不重复插行、停用态保留。
+        // 间隔断言钉在 v13（直接调迁移函数）：v14（ADR 0008）删掉该列、
+        // 间隔收拢进 food_category_interval。
         let conn = v12_conn();
         conn.execute(
             "INSERT INTO food (name, enabled, sort, is_preset, suggested_interval_days, perishable, retrieval_hours)
@@ -1978,7 +2058,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate(&conn).unwrap();
+        migrate_v12_to_v13(&conn).unwrap();
 
         assert_eq!(
             scalar_i64(&conn, "SELECT COUNT(*) FROM food WHERE name = '蜂蜜'"),
@@ -2020,6 +2100,135 @@ mod tests {
             scalar_i64(&conn, "SELECT is_preset FROM food WHERE name = '虾干'"),
             0
         );
+    }
+
+    /// 按真实迁移函数链手工搭到 v13 的库（v14 迁移测试地基）。
+    fn v13_conn() -> Connection {
+        let conn = v12_conn();
+        migrate_v12_to_v13(&conn).expect("升 v13 失败");
+        conn
+    }
+
+    #[test]
+    fn v13_db_upgrades_to_v14_category_intervals_and_ledger() {
+        // ADR 0008 三件事：① 大类周期初值 = 大类内食物间隔最大值（宽松优先）；
+        // ② 台账 food 维度换 category 维度，存量 food_overdue 归并（同窝同操作
+        // 同基准日留最早一条）；③ food 的间隔列废弃。顺带清 avatar_shape 键。
+        let conn = v13_conn();
+        conn.execute(
+            "INSERT INTO colony (name, start_date) VALUES ('大头一号', '2026-01-20')",
+            [],
+        )
+        .unwrap();
+        // 自建蛋白质「蟋蟀」设 5 天 → protein 初值取 max(3, 5) = 5
+        conn.execute(
+            "INSERT INTO food (name, enabled, sort, is_preset, suggested_interval_days, perishable, retrieval_hours, category)
+             VALUES ('蟋蟀', 1, 20, 0, 5, 0, NULL, 'protein')",
+            [],
+        )
+        .unwrap();
+        let feed: i64 = conn
+            .query_row("SELECT id FROM care_action WHERE name = '喂食'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let worm: i64 = conn
+            .query_row("SELECT id FROM food WHERE name = '面包虫干'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let shrimp: i64 = conn
+            .query_row("SELECT id FROM food WHERE name = '虾干'", [], |r| r.get(0))
+            .unwrap();
+        // 同（窝,操作,基准日）两条 food_overdue（面包虫干 + 虾干同日各一条）、
+        // 一条不同基准日、一条 overdue（对照组：不该被动）
+        conn.execute_batch(&format!(
+            "INSERT INTO reminder_ledger
+                (colony_id, kind, action_id, food_id, base_date, sent_at, push_title, push_body, pushover_done)
+             VALUES
+                (1, 'food_overdue', {feed}, {worm},   '2026-09-15', '2026-09-18 08:00:00', 't1', 'b1', 1),
+                (1, 'food_overdue', {feed}, {shrimp}, '2026-09-15', '2026-09-18 08:05:00', 't2', 'b2', 0),
+                (1, 'food_overdue', {feed}, {worm},   '2026-09-10', '2026-09-13 08:00:00', 't3', 'b3', 1),
+                (1, 'overdue',      {feed}, NULL,     '2026-09-15', '2026-09-18 08:00:00', 't4', 'b4', 1);"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('avatar_shape', 'square')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+        assert_eq!(schema_version_of(&conn).unwrap(), SCHEMA_VERSION);
+
+        // ① 大类周期初值：protein=5（蟋蟀的 5 宽松优先）、seed=7、sugar=3
+        let cats: Vec<(String, Option<i64>)> = {
+            let mut stmt = conn
+                .prepare("SELECT category, interval_days FROM food_category_interval ORDER BY category")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            cats,
+            vec![
+                ("protein".into(), Some(5)),
+                ("seed".into(), Some(7)),
+                ("sugar".into(), Some(3)),
+            ]
+        );
+
+        // ② 台账：food_overdue 全改 category_overdue + category 回填；同身份归并
+        // 留最早（id 2 消失，t1 快照保留）；overdue 原样
+        let rows: Vec<(String, Option<String>, String, String, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT kind, category, base_date, push_title, pushover_done
+                     FROM reminder_ledger ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("category_overdue".into(), Some("protein".into()), "2026-09-15".into(), "t1".into(), 1),
+                ("category_overdue".into(), Some("protein".into()), "2026-09-10".into(), "t3".into(), 1),
+                ("overdue".into(), None, "2026-09-15".into(), "t4".into(), 1),
+            ]
+        );
+
+        // ③ food 的间隔列已废；蟋蟀行保留（只删列不删行）
+        assert_eq!(
+            scalar_i64(
+                &conn,
+                "SELECT COUNT(*) FROM pragma_table_info('food') WHERE name = 'suggested_interval_days'"
+            ),
+            0
+        );
+        assert_eq!(scalar_i64(&conn, "SELECT COUNT(*) FROM food WHERE name = '蟋蟀'"), 1);
+
+        // ④ 形状偏好键已清（头像横幅改版）
+        assert_eq!(
+            scalar_i64(&conn, "SELECT COUNT(*) FROM settings WHERE key = 'avatar_shape'"),
+            0
+        );
+
+        // ⑤ 新唯一索引：同（窝,操作,基准日）的 category_overdue 再插被拒
+        assert!(conn
+            .execute(
+                "INSERT INTO reminder_ledger (colony_id, kind, action_id, category, base_date, sent_at)
+                 VALUES (1, 'category_overdue', ?1, 'protein', '2026-09-15', '2026-09-19 08:00:00')",
+                params![feed],
+            )
+            .is_err());
     }
 
     #[test]
@@ -2201,6 +2410,19 @@ mod tests {
                 .unwrap()
         };
         for (name, sql) in &before {
+            // v14（ADR 0008）合法消亡：uq_ledger_food 的 food 维度被 category 维度
+            // 取代（新索引 uq_ledger_category），旧索引随台账整表重建消失
+            if name == "uq_ledger_food" {
+                assert!(
+                    !after.iter().any(|(n, _)| n == "uq_ledger_food"),
+                    "uq_ledger_food 应已被 uq_ledger_category 取代"
+                );
+                assert!(
+                    after.iter().any(|(n, _)| n == "uq_ledger_category"),
+                    "v14 应建 uq_ledger_category"
+                );
+                continue;
+            }
             let found = after
                 .iter()
                 .find(|(n, _)| n == name)
@@ -2251,16 +2473,28 @@ mod tests {
                 continue;
             }
             if name == "food" {
-                // v13（ADR 0007）合法改动：ALTER 追加 category 归属列，断言口径同上
-                let old_sql = sql.as_deref().unwrap_or("");
+                // v13（ADR 0007）合法改动：ALTER 追加 category 归属列；
+                // v14（ADR 0008）又 DROP 了 suggested_interval_days（间隔收拢进
+                // food_category_interval）——旧列序断言不再成立，改为断言
+                // 「category 在、间隔列已废」
                 let new_sql = found.1.as_deref().unwrap_or("");
-                assert!(
-                    new_sql.starts_with(old_sql.trim_end_matches(')')),
-                    "food 旧列序被改动：{new_sql}"
-                );
                 assert!(
                     new_sql.contains("category"),
                     "food 未追加 category：{new_sql}"
+                );
+                assert!(
+                    !new_sql.contains("suggested_interval_days"),
+                    "food 的建议间隔列应已废弃（v14）：{new_sql}"
+                );
+                continue;
+            }
+            if name == "reminder_ledger" {
+                // v14（ADR 0008）合法改动：整表重建——food_id 列换 category 列，
+                // 其余列与推送语义原样
+                let new_sql = found.1.as_deref().unwrap_or("");
+                assert!(
+                    new_sql.contains("category") && !new_sql.contains("food_id"),
+                    "reminder_ledger 应已换 category 维度（v14）：{new_sql}"
                 );
                 continue;
             }
@@ -2273,8 +2507,8 @@ mod tests {
             .collect();
         assert_eq!(
             new_names,
-            vec!["colony_action_interval"],
-            "v9 恰好新增一张表"
+            vec!["colony_action_interval", "food_category_interval", "uq_ledger_category"],
+            "v9 新增每窝周期表；v14（ADR 0008）新增大类周期表并换大类去重索引"
         );
 
         // 表为空、旧数据原样（不预置任何行，spec D1）

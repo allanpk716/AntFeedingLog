@@ -3,7 +3,6 @@ import { flushPromises, mount, type VueWrapper } from "@vue/test-utils";
 import SettingsDialog from "./SettingsDialog.vue";
 import type { BackupConfigInfo, CareActionItem, FoodItem, RestoreSummary, WebUiConfigInfo } from "../types";
 // 窝头像票 03：形状镜像直接操作（复位/断言），ipc 经统一 mock 工厂拦截
-import { avatarShape, resetAvatarShapeForTests } from "../lib/ipc";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（命令包装按 cmdName 透传给唯一的
 // invokeMock；事件订阅走 mock 工厂内置的立即退订空桩）
@@ -31,6 +30,12 @@ function baseMock(updateState: object = { status: "idle" }) {
       case "list_foods":
       case "list_locations":
         return [];
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "get_settings":
         return settingsFixture();
       case "pushover_status":
@@ -76,6 +81,12 @@ function notifyTabMock(
       case "list_foods":
       case "list_locations":
         return [];
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "get_settings":
         return settingsFixture({ pushover_user: opts.pushover_user ?? "", pushover_token: opts.pushover_token ?? "" });
       case "pushover_status":
@@ -110,43 +121,7 @@ async function openUpdateTab(updateState?: object) {
   return wrapper;
 }
 
-// ── 外观 tab 头像形状（窝头像票 03）──
-
-function appearanceMock(opts: { shape?: string; setErr?: string } = {}) {
-  invokeMock.mockImplementation(async (cmd: string, args?: unknown) => {
-    switch (cmd) {
-      case "list_actions":
-      case "list_foods":
-      case "list_locations":
-        return [];
-      case "get_settings":
-        return settingsFixture();
-      case "pushover_status":
-        return { source: "none", configured: false };
-      case "get_avatar_shape":
-        return opts.shape ?? "circle";
-      case "set_avatar_shape":
-        if (opts.setErr) return Promise.reject(opts.setErr);
-        return (args as { shape: string }).shape;
-      case "get_app_version":
-        return "0.1.0";
-      case "get_update_state":
-        return { status: "idle" };
-      default:
-        return null;
-    }
-  });
-}
-
-async function openAppearanceTab(opts?: Parameters<typeof appearanceMock>[0]) {
-  appearanceMock(opts);
-  resetAvatarShapeForTests(); // 镜像/读取标志复位，回显不受其他用例污染
-  const wrapper = mount(SettingsDialog);
-  await flushPromises();
-  await wrapper.find(".tab-appearance").trigger("click");
-  await flushPromises();
-  return wrapper;
-}
+// 外观 tab 的 mock/打开助手已随功能移除（avatar-banner 乙-2）。
 
 beforeEach(() => {
   invokeMock.mockReset();
@@ -240,52 +215,8 @@ describe("设置弹窗通知 tab Pushover 应用内配置（webui-checkin 票 11
   });
 });
 
-// ── 外观 tab 头像形状（窝头像票 03）──
-
-describe("设置弹窗外观 tab 头像形状（窝头像票 03）", () => {
-  it("新增「外观」tab：圆形/方形单选，回显库内当前值（缺省圆形）", async () => {
-    const wrapper = await openAppearanceTab();
-    const radios = wrapper.findAll('input[type="radio"]');
-    expect(radios.length).toBe(2);
-    expect((radios[0]!.element as HTMLInputElement).value).toBe("circle");
-    expect((radios[1]!.element as HTMLInputElement).value).toBe("square");
-    // 缺省圆形选中
-    expect((radios[0]!.element as HTMLInputElement).checked).toBe(true);
-    wrapper.unmount();
-
-    const sq = await openAppearanceTab({ shape: "square" });
-    const sqRadios = sq.findAll('input[type="radio"]');
-    // 库内方形 → 方形选中（重启/刷新后保持的回显面）
-    expect((sqRadios[1]!.element as HTMLInputElement).checked).toBe(true);
-  });
-
-  it("选择方形即存即效：调 set_avatar_shape、全局镜像更新、成功轻提示", async () => {
-    const wrapper = await openAppearanceTab();
-    invokeMock.mockClear();
-    await wrapper.findAll('input[type="radio"]')[1]!.setValue();
-    await flushPromises();
-
-    expect(invokeMock).toHaveBeenCalledWith("set_avatar_shape", { shape: "square" });
-    // 保存成功 → 全局镜像更新（首页卡片即时切换的数据源）
-    expect(avatarShape.value).toBe("square");
-    expect(showSuccessMock).toHaveBeenCalledTimes(1);
-    expect(showErrorMock).not.toHaveBeenCalled();
-  });
-
-  it("保存失败：红色轻提示带原因，单选回弹到已生效值，镜像不被污染", async () => {
-    const wrapper = await openAppearanceTab({ setErr: "数据库操作失败: x" });
-    await wrapper.findAll('input[type="radio"]')[1]!.setValue();
-    await flushPromises();
-
-    expect(showErrorMock).toHaveBeenCalledWith("头像形状保存失败", "数据库操作失败: x");
-    expect(showSuccessMock).not.toHaveBeenCalled();
-    // 镜像保持已生效值
-    expect(avatarShape.value).toBe("circle");
-    // 单选回弹圆形
-    const radios = wrapper.findAll('input[type="radio"]');
-    expect((radios[0]!.element as HTMLInputElement).checked).toBe(true);
-  });
-});
+// 外观 tab（头像形状偏好）已随头像横幅改版移除（avatar-banner 乙-2）：
+// 横幅是矩形，圆/方遮罩无作用对象。回显/保存/镜像用例一并下线。
 
 describe("设置弹窗「更新」节（票 06）", () => {  it("新增「更新」tab：点开显示当前版本与检查入口（验收 1 的挂载面）", async () => {
     const wrapper = await openUpdateTab();
@@ -368,6 +299,12 @@ async function openDataTab(logs?: { errors?: string[]; abnormal?: object | null 
       case "list_foods":
       case "list_locations":
         return [];
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "get_settings":
         return {
           notify_master_enabled: true,
@@ -477,6 +414,12 @@ async function openDataTabWithBackup(
       case "list_foods":
       case "list_locations":
         return [];
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "get_settings":
         return {
           notify_master_enabled: true,
@@ -680,6 +623,12 @@ async function openDataTabForRestore(
       case "list_foods":
       case "list_locations":
         return [];
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "get_settings":
         return {
           notify_master_enabled: true,
@@ -828,9 +777,8 @@ describe("设置弹窗「数据」页签恢复区（数据安全二期票 04）"
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("list_actions");
-    // 终局修复：整库替换后推送状态与头像形状也重拉自新库（不残留恢复前旧值）
+    // 终局修复：整库替换后推送状态也重拉自新库（不残留恢复前旧值）
     expect(invokeMock).toHaveBeenCalledWith("pushover_status");
-    expect(invokeMock).toHaveBeenCalledWith("get_avatar_shape");
     expect(wrapper.emitted("changed")).toBeTruthy();
   });
 
@@ -886,7 +834,6 @@ function foodFixture(overrides: Partial<FoodItem> & { id: number }): FoodItem {
     name: `食物${overrides.id}`,
     enabled: true,
     sort: overrides.id,
-    suggested_interval_days: 7,
     is_preset: true,
     referenced: false,
     category: "seed",
@@ -896,7 +843,7 @@ function foodFixture(overrides: Partial<FoodItem> & { id: number }): FoodItem {
 
 function foodsFixture(): FoodItem[] {
   return [
-    foodFixture({ id: 1, name: "种子", sort: 1, suggested_interval_days: 3, perishable: false, retrieval_hours: null, category: "seed" }),
+    foodFixture({ id: 1, name: "种子", sort: 1, perishable: false, retrieval_hours: null, category: "seed" }),
     foodFixture({ id: 2, name: "干虾仁", sort: 2, perishable: true, retrieval_hours: 24, category: "protein" }),
     foodFixture({ id: 3, name: "面包虫", sort: 3, perishable: false, retrieval_hours: null, category: "protein" }),
   ];
@@ -918,6 +865,12 @@ function dictMock(cmd: string, foods: FoodItem[], actions: CareActionItem[]) {
       return actions;
     case "list_locations":
       return [];
+    case "list_food_categories":
+      return [
+        { category: "seed", interval_days: 7 },
+        { category: "protein", interval_days: 3 },
+        { category: "sugar", interval_days: 3 },
+      ];
     case "get_settings":
       return {
         notify_master_enabled: true,
@@ -974,7 +927,7 @@ describe("设置弹窗·食物易腐配置（票 01）", () => {
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("save_food", {
-      input: { id: 3, name: "面包虫", sort: 2, suggested_interval_days: 7, perishable: true, retrieval_hours: 24, category: "protein" },
+      input: { id: 3, name: "面包虫", sort: 2, perishable: true, retrieval_hours: 24, category: "protein" },
     });
   });
 
@@ -1010,7 +963,7 @@ describe("设置弹窗·食物易腐配置（票 01）", () => {
     await flushPromises();
 
     expect(invokeMock).toHaveBeenCalledWith("save_food", {
-      input: { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7, perishable: false, retrieval_hours: null, category: "protein" },
+      input: { id: 2, name: "干虾仁", sort: 1, perishable: false, retrieval_hours: null, category: "protein" },
     });
   });
 });
@@ -1104,6 +1057,12 @@ async function openNotifyTabWithSettings(settings: object, saved?: object) {
       case "list_foods":
       case "list_locations":
         return [];
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "get_settings":
         return settings;
       case "set_settings":
@@ -1136,6 +1095,12 @@ async function openDataTabWithOrphans(
       case "list_foods":
       case "list_locations":
         return [];
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "get_settings":
         return {
           notify_master_enabled: true,
@@ -1303,6 +1268,12 @@ async function openDataTabForToast(
       case "list_foods":
       case "list_locations":
         return [];
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "get_settings":
         return settingsFixture();
       case "get_recent_errors":
@@ -1621,6 +1592,12 @@ function slowMock(
         return opts.actions ?? [];
       case "list_foods":
         return opts.foods ?? [];
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "list_locations":
         return [];
       case "get_settings":
@@ -1786,6 +1763,12 @@ describe("设置弹窗首开体验（界面切换卡顿票 02）", () => {
         case "list_actions":
         case "list_foods":
           return [];
+        case "list_food_categories":
+          return [
+            { category: "seed", interval_days: 7 },
+            { category: "protein", interval_days: 3 },
+            { category: "sugar", interval_days: 3 },
+          ];
         case "list_locations":
           return [
             { id: 1, name: "家", enabled: true, sort: 1 },
@@ -1817,7 +1800,6 @@ describe("设置弹窗首开体验（界面切换卡顿票 02）", () => {
 
     const called = (want: string) => invokeMock.mock.calls.some(([cmd]) => cmd === want);
     expect(called("pushover_status")).toBe(true);
-    expect(called("get_avatar_shape")).toBe(true);
     expect(called("get_recent_errors")).toBe(true);
     expect(called("get_backup_config")).toBe(true);
     expect(called("list_orphan_photos")).toBe(true);
@@ -1831,12 +1813,17 @@ describe("设置弹窗首开体验（界面切换卡顿票 02）", () => {
           return actionsFixture();
         case "list_foods":
           return foodsFixture();
+        case "list_food_categories":
+          return [
+            { category: "seed", interval_days: 7 },
+            { category: "protein", interval_days: 3 },
+            { category: "sugar", interval_days: 3 },
+          ];
         case "list_locations":
           return [];
         case "get_settings":
           return settingsFixture();
         case "pushover_status":
-        case "get_avatar_shape":
         case "get_recent_errors":
         case "get_last_abnormal_exit":
         case "get_backup_config":

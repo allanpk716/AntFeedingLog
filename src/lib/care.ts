@@ -6,7 +6,8 @@
  * ActionTile.effective_interval_days / interval_from_colony）。
  */
 
-import type { ColonyAction, FoodTileInfo, RecentLog } from "../types";
+import type { CategoryTileInfo, ColonyAction, FoodTileInfo, RecentLog } from "../types";
+import { foodCategoryLabel } from "./foodCategories";
 
 /** 操作块展示态：ok=绿 / bad=红（超期）/ reg=中性灰（登记类）/ none=尚未记录 / mute=冬眠静音 */
 export type TileTone = "ok" | "bad" | "reg" | "none" | "mute";
@@ -34,14 +35,18 @@ export function actionTile(a: ColonyAction, hibernating: boolean): TileView {
     fromColony ? a.effective_interval_days ?? null : a.suggested_interval_days ?? null;
   if (a.overdue && days !== null) {
     if (effectiveInterval !== null && days > effectiveInterval) {
-      // 操作层自己超期（含每窝周期取代）：维持「超期 N 天」原句式（措辞优先于食物层）
+      // 操作层自己超期（含每窝周期取代）：维持「超期 N 天」原句式（措辞优先于大类层）
       return { tone: "bad", text: `⚠ 超期 ${days - effectiveInterval} 天` };
     }
-    // 红是食物层顶的（统一层还新鲜，拿它算超期天数会出负数）：报该喂哪些食物
-    const names = a.foods
-      .filter((f) => f.overdue)
-      .map((f) => f.name)
+    // 红是大类层顶的（统一层还新鲜，拿它算超期天数会出负数）：报该喂哪些大类
+    //（ADR 0008：喂大类内任一食物即刷新整类；key → 中文标签）
+    const names = (a.categories ?? [])
+      .filter((c) => c.overdue)
+      .map((c) => foodCategoryLabel(c.category))
       .join("、");
+    if (names === "") {
+      return { tone: "bad", text: "⚠ 超期" }; // 防御兜底：overdue 但两层都算不出（不该出现）
+    }
     return { tone: "bad", text: `⚠ 该喂${names}了` };
   }
   // 形态①：设了每窝周期且未超——距上次（或今天·已记录）+「/ 周期 M 天」；
@@ -98,15 +103,23 @@ export function retrievalTile(
   }
 }
 
-/** 喂食 tile 悬停提示：逐食物"距上次"，超期的标出来。 */
-export function feedingTooltip(foods: FoodTileInfo[]): string {
-  return foods
-    .map((f) => {
-      const days = f.days_since_last === null ? "尚未记录" : `距上次 ${f.days_since_last} 天`;
-      const mark = f.overdue ? " · 超期" : "";
-      return `${f.name}：${days}${mark}`;
-    })
-    .join("\n");
+/** 喂食 tile 悬停提示：大类口径在前（催办只认大类，带周期与超期态），
+ *  逐食物「距上次」随后（ADR 0008 起纯参考、不催办）。 */
+export function feedingTooltip(
+  foods: readonly FoodTileInfo[],
+  categories?: readonly CategoryTileInfo[],
+): string {
+  const catLines = (categories ?? []).map((c) => {
+    const days = c.days_since_last === null ? "尚未记录" : `距上次 ${c.days_since_last} 天`;
+    const period = c.interval_days === null ? "" : ` / 周期 ${c.interval_days} 天`;
+    const mark = c.overdue ? " · 超期" : "";
+    return `${foodCategoryLabel(c.category)}：${days}${period}${mark}`;
+  });
+  const foodLines = foods.map((f) => {
+    const days = f.days_since_last === null ? "尚未记录" : `距上次 ${f.days_since_last} 天`;
+    return `${f.name}：${days}`;
+  });
+  return [...catLines, ...foodLines, "（提醒按大类计，逐食物仅供参考）"].join("\n");
 }
 
 /**

@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>蚂蚁饲养日志 · 头像放大布局稿（讨论用）</title>
+<style>
+:root{
+  --bg:#f6f4f1; --card:#ffffff; --tile:#faf8f5; --text:#2c2822; --muted:#8f887d;
+  --border:#e8e2d8; --border-strong:#d8d1c4;
+  --accent:#d97706; --accent-deep:#b45309; --accent-soft:#fdf1de;
+  --ok:#188a4b; --ok-soft:#e7f5ec; --bad:#d13d3d; --bad-soft:#fcebeb;
+  --hib:#5b6472; --hib-soft:#eef0f3;
+  --shadow:0 1px 2px rgba(60,50,30,.05),0 4px 14px rgba(60,50,30,.06);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5;padding:20px 20px 60px}
+
+/* ── 说明区 ── */
+.intro{max-width:1080px;margin:0 auto 6px}
+.intro h1{font-size:17px}
+.intro p{font-size:12px;color:var(--muted);margin-top:2px}
+
+/* ── 变体分组标题 ── */
+.block{max-width:1080px;margin:26px auto 0}
+.block>h2{font-size:15px;display:flex;align-items:center;gap:10px}
+.block>h2 .tag{font-size:11px;font-weight:400;color:var(--accent-deep);background:var(--accent-soft);padding:1px 10px;border-radius:999px;white-space:nowrap}
+.block>.note{font-size:12px;color:var(--muted);margin:4px 0 10px}
+.block>.note b{color:var(--text)}
+
+/* ── 卡片网格（与正式版同口径 300px）── */
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px}
+.card{position:relative;background:var(--card);border:1px solid var(--border);border-radius:12px;padding:10px 12px;box-shadow:var(--shadow);overflow:hidden}
+.card.hib{background:linear-gradient(180deg,var(--hib-soft),var(--card) 60%)}
+
+/* ── 假照片：渐变模拟蚁巢照片（布局讨论用）── */
+.ph-soil{background:
+  radial-gradient(circle at 25% 30%, rgba(0,0,0,.18) 0 6px, transparent 7px),
+  radial-gradient(circle at 62% 68%, rgba(0,0,0,.14) 0 5px, transparent 6px),
+  radial-gradient(ellipse at 40% 55%, #cfa878 0%, #ab8158 45%, #7d5a3a 100%)}
+.ph-sand{background:
+  radial-gradient(circle at 70% 25%, rgba(0,0,0,.16) 0 7px, transparent 8px),
+  radial-gradient(circle at 30% 70%, rgba(0,0,0,.12) 0 4px, transparent 5px),
+  radial-gradient(ellipse at 65% 45%, #e3cba0 0%, #c4a274 50%, #96805a 100%)}
+.ph-tube{background:
+  radial-gradient(circle at 45% 40%, rgba(255,255,255,.25) 0 8px, transparent 9px),
+  radial-gradient(ellipse at 50% 60%, #b69070 0%, #8a6248 55%, #5f4030 100%)}
+
+/* ══════════ 现状基线（40px 头像行）══════════ */
+.chead{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.avatar40{flex:none;width:40px;height:40px;border:1px solid var(--border);background:var(--tile);overflow:hidden;cursor:pointer;display:grid;place-items:center;border-radius:50%;position:relative}
+.avatar40.square{border-radius:8px}
+.avatar-ph{font-size:22px;line-height:1}
+.cname{font-size:15px;font-weight:700;white-space:nowrap}
+.chip{font-size:11px;padding:0 8px;border-radius:999px;border:1px solid transparent;white-space:nowrap}
+.chip.sp{background:var(--accent-soft);color:var(--accent-deep)}
+.chip.st{background:var(--ok-soft);color:var(--ok)}
+.chip.st.hib{background:var(--hib-soft);color:var(--hib)}
+.daysbox{margin-left:auto;white-space:nowrap}
+.daysbox .n{font-size:16px;font-weight:800}
+.daysbox .l{font-size:10px;color:var(--muted)}
+
+/* ══════════ 变体甲：左列大头像（88px）══════════ */
+.chead-a{display:flex;align-items:stretch;gap:12px}
+.avatar88{flex:none;width:88px;height:88px;border:2px solid #fff;box-shadow:0 0 0 1px var(--border),0 2px 8px rgba(60,50,30,.12);overflow:hidden;cursor:pointer;border-radius:50%;position:relative;background:var(--tile)}
+.avatar88.square{border-radius:14px}
+.chead-a .info{flex:1;min-width:0;display:flex;flex-direction:column;justify-content:space-between;padding:2px 0}
+.chead-a .r1{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.chead-a .r2{display:flex;align-items:baseline;gap:6px}
+.chead-a .r2 .n{font-size:24px;font-weight:800;line-height:1.1}
+.chead-a .r2 .l{font-size:11px;color:var(--muted)}
+.chead-a .r2 .since{font-size:11px;color:var(--muted);margin-left:auto;white-space:nowrap}
+.chead-a .r3{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ══════════ 变体乙：顶部横幅大图 ══════════ */
+.banner-img{position:relative;height:118px;margin:-10px -12px 8px;cursor:pointer;overflow:hidden}
+.banner-img .img{position:absolute;inset:0}
+.banner-img.img-cover .img{background-size:cover}
+.banner-img.img-zoom .img{background-size:230% 320%;background-position:36% 40%} /* 模拟：方形裁剪区放大铺满宽幅 */
+.banner-img .scrim{position:absolute;inset:auto 0 0 0;height:64px;background:linear-gradient(180deg,transparent,rgba(20,16,10,.72));display:flex;align-items:flex-end;gap:8px;padding:8px 12px;flex-wrap:wrap}
+.banner-img .bname{color:#fff;font-size:16px;font-weight:700;text-shadow:0 1px 4px rgba(0,0,0,.5)}
+.banner-img .bchip{font-size:11px;padding:0 8px;border-radius:999px;background:rgba(255,255,255,.18);color:#fff;backdrop-filter:blur(2px)}
+.banner-img .bdays{margin-left:auto;color:#fff;text-align:right;line-height:1.15;text-shadow:0 1px 4px rgba(0,0,0,.5)}
+.banner-img .bdays .n{font-size:18px;font-weight:800}
+.banner-img .bdays .l{font-size:10px;opacity:.85}
+.banner-img .bact{position:absolute;top:8px;right:8px;display:flex;gap:6px}
+.banner-img .bact button{border:1px solid rgba(255,255,255,.55);background:rgba(255,255,255,.16);color:#fff;font:inherit;font-size:11px;padding:2px 10px;border-radius:8px;cursor:pointer;backdrop-filter:blur(2px)}
+.card.hib .banner-img{filter:grayscale(.55) brightness(1.04)}
+
+/* ══════════ 变体丙：行内加高（56px）══════════ */
+.avatar56{flex:none;width:56px;height:56px;border:1px solid var(--border);background:var(--tile);overflow:hidden;cursor:pointer;display:grid;place-items:center;border-radius:50%;position:relative}
+.avatar56.square{border-radius:10px}
+.chead-c{display:flex;align-items:center;gap:10px}
+.chead-c .info{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.chead-c .r1{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.chead-c .r3{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* ── 通用下部件（冬眠横幅 / 操作块 / 底部行）── */
+.banner{margin-top:8px;padding:4px 10px;border-radius:8px;background:var(--hib-soft);color:var(--hib);font-size:12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.banner:first-child{margin-top:0}
+.chip.wake{background:var(--accent-soft);color:var(--accent-deep);font-weight:600}
+.banner .resched{margin-left:auto;border:1px solid var(--border);background:var(--card);color:var(--hib);font-size:11px;padding:0 8px;border-radius:999px;cursor:pointer;white-space:nowrap}
+
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-top:8px}
+.tile{border:1px solid var(--border);background:var(--tile);border-radius:9px;padding:5px 9px;cursor:pointer;font:inherit;color:var(--text);display:flex;flex-direction:column;gap:3px;font-size:13px;min-width:0}
+.tile:hover{border-color:var(--accent)}
+.t-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-width:0}
+.t-ico{font-size:14px}
+.t-name{font-weight:600;white-space:nowrap}
+.t-tag{font-size:10px;font-weight:400;color:var(--muted);border:1px solid var(--border);padding:0 5px;border-radius:999px;white-space:nowrap}
+.pill{align-self:flex-start;max-width:100%;font-size:11px;padding:0 8px;border-radius:999px;white-space:normal}
+.tile.reg .pill,.tile.none .pill{background:var(--tile);color:var(--muted)}
+.tile.ok .pill{background:var(--ok-soft);color:var(--ok)}
+.tile.bad{border-color:var(--bad);background:var(--bad-soft)}
+.tile.bad .pill{background:#fff;color:var(--bad);font-weight:600}
+.tile.mute{opacity:.55}
+.tile.mute .pill{background:var(--hib-soft);color:var(--hib)}
+
+.foot{margin-top:8px;display:flex;align-items:center;gap:8px}
+.recent{flex:1;font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dots{flex:none;border:none;background:transparent;color:var(--muted);font-size:16px;cursor:pointer;padding:0 4px;border-radius:6px;line-height:1}
+.checkin-line{margin-top:6px;font-size:12px;color:var(--muted)}
+.card-actions{margin-top:10px;display:flex;justify-content:flex-end}
+.checkin-btn{border:1px solid var(--border-strong);background:var(--card);color:var(--muted);font:inherit;font-size:12px;padding:2px 12px;border-radius:8px;cursor:pointer}
+
+/* ── 手机形态演示条 ── */
+.phones{display:flex;gap:14px;flex-wrap:wrap}
+.phone{width:340px;border:1px solid var(--border-strong);border-radius:18px;background:var(--bg);padding:12px 12px 16px;box-shadow:var(--shadow)}
+.phone .cap{font-size:12px;font-weight:600;color:var(--accent-deep);margin-bottom:8px;text-align:center}
+.phone .cards{grid-template-columns:1fr}
+
+/* zoom 效果的 img 层共用 */
+.banner-img .img.ph-soil,.banner-img .img.ph-sand,.banner-img .img.ph-tube{background-repeat:no-repeat}
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>🐜 头像放大 · 布局讨论稿（三个变体 + 手机形态）</h1>
+  <p>同一张假想窝「大头一号 · 大头收获蚁 · 活跃 · 245 天」分别用三种布局呈现。照片用渐变示意（正式版是真照片）。桌面网格仍是 300px 起步自适应列，卡片只是变高。</p>
+</div>
+
+<!-- ════════════ 现状基线 ════════════ -->
+<div class="block">
+  <h2>⓪ 现状（对照用：40px 圆头像挤在头部行）</h2>
+  <div class="note">头像小到看不清蚂蚁；点它开巢况时间线。</div>
+  <div class="cards">
+    <article class="card">
+      <div class="chead">
+        <button class="avatar40"><span class="avatar-ph">🐜</span></button>
+        <span class="cname">大头一号</span>
+        <span class="chip sp">大头收获蚁</span>
+        <span class="chip st">活跃</span>
+        <span class="daysbox"><span class="n">245</span> <span class="l">天</span></span>
+      </div>
+      <div class="tiles">
+        <button class="tile bad"><span class="t-top"><span class="t-ico">🍯</span><span class="t-name">喂食</span></span><span class="pill">⚠ 该喂面包虫干、虾干了</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🗑</span><span class="t-name">垃圾清理</span></span><span class="pill">距上次 1 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">💧</span><span class="t-name">活动区换水</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 2 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">🌿</span><span class="t-name">巢穴保湿</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 5 天 / 周期 7 天</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🥄</span><span class="t-name">撤食</span></span><span class="pill">待撤食</span></button>
+      </div>
+      <div class="foot"><span class="recent">最近：09-27 喂食（面包虫干）· 09-25 巢穴保湿</span><button class="dots">⋯</button></div>
+      <div class="checkin-line">巢况：09-20 · 蚁后 1 · 工蚁约 300 · 📷3</div>
+      <div class="card-actions"><button class="checkin-btn">巢况</button></div>
+    </article>
+  </div>
+</div>
+
+<!-- ════════════ 变体甲 ════════════ -->
+<div class="block">
+  <h2>变体甲 · 左列大头像 <span class="tag">头像 88px · 保守渐进</span></h2>
+  <div class="note">头像放大到 2.2 倍，仍走「圆形/圆角方」遮罩，<b>现有方形裁剪数据完全复用</b>。右列顺势改成两行：上行名字+徽章，下行大号饲养天数。卡片高约 +50px，其余不动。</div>
+  <div class="cards">
+    <article class="card">
+      <div class="chead-a">
+        <button class="avatar88 ph-soil"></button>
+        <div class="info">
+          <div class="r1"><span class="cname">大头一号</span><span class="chip sp">大头收获蚁</span><span class="chip st">活跃</span></div>
+          <div class="r2"><span class="n">245</span><span class="l">天</span><span class="since">始于 2026-01-20</span></div>
+          <div class="r3">巢况：09-20 · 蚁后 1 · 工蚁约 300 · 📷3</div>
+        </div>
+      </div>
+      <div class="tiles">
+        <button class="tile bad"><span class="t-top"><span class="t-ico">🍯</span><span class="t-name">喂食</span></span><span class="pill">⚠ 该喂面包虫干、虾干了</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🗑</span><span class="t-name">垃圾清理</span></span><span class="pill">距上次 1 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">💧</span><span class="t-name">活动区换水</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 2 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">🌿</span><span class="t-name">巢穴保湿</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 5 天 / 周期 7 天</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🥄</span><span class="t-name">撤食</span></span><span class="pill">待撤食</span></button>
+      </div>
+      <div class="foot"><span class="recent">最近：09-27 喂食（面包虫干）· 09-25 巢穴保湿</span><button class="dots">⋯</button></div>
+      <div class="card-actions"><button class="checkin-btn">巢况</button></div>
+    </article>
+
+    <article class="card hib">
+      <div class="chead-a">
+        <button class="avatar88 square ph-tube"></button>
+        <div class="info">
+          <div class="r1"><span class="cname">针毛一号</span><span class="chip sp">针毛收获蚁</span><span class="chip st hib">冬眠</span></div>
+          <div class="r2"><span class="n">512</span><span class="l">天</span><span class="since">始于 2025-04-24</span></div>
+          <div class="r3">巢况：09-10 · 蚁后 1 · 工蚁约 2000 · 📷2</div>
+        </div>
+      </div>
+      <div class="banner">❄ 冬眠中 · 预计 2027-03-01 出眠（154 天）<button class="resched">改期</button></div>
+      <div class="tiles">
+        <button class="tile mute"><span class="t-top"><span class="t-ico">🍯</span><span class="t-name">喂食</span></span><span class="pill">距上次 12 天（静音）</span></button>
+        <button class="tile mute"><span class="t-top"><span class="t-ico">🗑</span><span class="t-name">垃圾清理</span></span><span class="pill">距上次 12 天（静音）</span></button>
+      </div>
+      <div class="foot"><span class="recent">最近：09-17 巢穴保湿 · 09-10 喂食（种子）</span><button class="dots">⋯</button></div>
+      <div class="card-actions"><button class="checkin-btn">巢况</button></div>
+    </article>
+  </div>
+</div>
+
+<!-- ════════════ 变体乙 ════════════ -->
+<div class="block">
+  <h2>变体乙 · 顶部横幅大图 <span class="tag">全宽 × 118px · 视觉最大化</span></h2>
+  <div class="note">照片占满卡片顶部整条，名字/徽章/天数叠在照片下沿的暗色渐变上，「巢况」按钮挪到照片右上角。卡片高约 +80px。<b>关键抉择在裁剪口径</b>：乙-1 用整张照片 cover（方形裁剪设置不再影响卡片）；乙-2 把方形裁剪区放大铺满宽幅（裁剪编辑器仍是唯一真相，取景会偏近）。</div>
+  <div class="cards">
+    <article class="card">
+      <div class="banner-img img-cover">
+        <div class="img ph-soil"></div>
+        <div class="scrim">
+          <span class="bname">大头一号</span>
+          <span class="bchip">大头收获蚁</span>
+          <span class="bchip">活跃</span>
+          <span class="bdays"><span class="n">245</span> <span class="l">天</span></span>
+        </div>
+        <div class="bact"><button>巢况</button><button>📷</button></div>
+      </div>
+      <div class="tiles">
+        <button class="tile bad"><span class="t-top"><span class="t-ico">🍯</span><span class="t-name">喂食</span></span><span class="pill">⚠ 该喂面包虫干、虾干了</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🗑</span><span class="t-name">垃圾清理</span></span><span class="pill">距上次 1 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">💧</span><span class="t-name">活动区换水</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 2 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">🌿</span><span class="t-name">巢穴保湿</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 5 天 / 周期 7 天</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🥄</span><span class="t-name">撤食</span></span><span class="pill">待撤食</span></button>
+      </div>
+      <div class="foot"><span class="recent">最近：09-27 喂食（面包虫干）· 09-25 巢穴保湿</span><button class="dots">⋯</button></div>
+      <div class="checkin-line">巢况：09-20 · 蚁后 1 · 工蚁约 300 · 📷3</div>
+    </article>
+
+    <article class="card">
+      <div class="banner-img img-zoom">
+        <div class="img ph-sand"></div>
+        <div class="scrim">
+          <span class="bname">大头一号</span>
+          <span class="bchip">大头收获蚁</span>
+          <span class="bchip">活跃</span>
+          <span class="bdays"><span class="n">245</span> <span class="l">天</span></span>
+        </div>
+        <div class="bact"><button>巢况</button><button>📷</button></div>
+      </div>
+      <p style="font-size:11px;color:var(--muted);margin:-4px 0 8px">↑ 乙-2：同一张照片按「方形裁剪区」放大铺满——取景更近（蚂蚁更大），裁剪编辑器照旧生效。</p>
+      <div class="tiles">
+        <button class="tile bad"><span class="t-top"><span class="t-ico">🍯</span><span class="t-name">喂食</span></span><span class="pill">⚠ 该喂面包虫干、虾干了</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🗑</span><span class="t-name">垃圾清理</span></span><span class="pill">距上次 1 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">💧</span><span class="t-name">活动区换水</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 2 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">🌿</span><span class="t-name">巢穴保湿</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 5 天 / 周期 7 天</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🥄</span><span class="t-name">撤食</span></span><span class="pill">待撤食</span></button>
+      </div>
+      <div class="foot"><span class="recent">最近：09-27 喂食（面包虫干）· 09-25 巢穴保湿</span><button class="dots">⋯</button></div>
+      <div class="checkin-line">巢况：09-20 · 蚁后 1 · 工蚁约 300 · 📷3</div>
+    </article>
+  </div>
+</div>
+
+<!-- ════════════ 变体丙 ════════════ -->
+<div class="block">
+  <h2>变体丙 · 行内加高 <span class="tag">头像 56px · 最小改动</span></h2>
+  <div class="note">头像 40 → 56px，头部结构不变，只把巢况摘要挪进头部右下。改动最小、卡片几乎不变高；但「大」得有限。</div>
+  <div class="cards">
+    <article class="card">
+      <div class="chead-c">
+        <button class="avatar56 ph-tube"></button>
+        <div class="info">
+          <div class="r1"><span class="cname">大头一号</span><span class="chip sp">大头收获蚁</span><span class="chip st">活跃</span><span class="daysbox"><span class="n">245</span> <span class="l">天</span></span></div>
+          <div class="r3">巢况：09-20 · 蚁后 1 · 工蚁约 300 · 📷3</div>
+        </div>
+      </div>
+      <div class="tiles">
+        <button class="tile bad"><span class="t-top"><span class="t-ico">🍯</span><span class="t-name">喂食</span></span><span class="pill">⚠ 该喂面包虫干、虾干了</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🗑</span><span class="t-name">垃圾清理</span></span><span class="pill">距上次 1 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">💧</span><span class="t-name">活动区换水</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 2 天</span></button>
+        <button class="tile reg"><span class="t-top"><span class="t-ico">🌿</span><span class="t-name">巢穴保湿</span><span class="t-tag">仅登记</span></span><span class="pill">距上次 5 天 / 周期 7 天</span></button>
+        <button class="tile ok"><span class="t-top"><span class="t-ico">🥄</span><span class="t-name">撤食</span></span><span class="pill">待撤食</span></button>
+      </div>
+      <div class="foot"><span class="recent">最近：09-27 喂食（面包虫干）· 09-25 巢穴保湿</span><button class="dots">⋯</button></div>
+      <div class="card-actions"><button class="checkin-btn">巢况</button></div>
+    </article>
+  </div>
+</div>
+
+<!-- ════════════ 手机形态 ════════════ -->
+<div class="block">
+  <h2>手机（网页端 ≤480px 单列）三变体同框 <span class="tag">340px 宽模拟</span></h2>
+  <div class="note">日常打卡多在手机上——头像放大是否两端同享，见问题 Q8。</div>
+  <div class="phones">
+    <div class="phone">
+      <div class="cap">甲 · 左列大头像</div>
+      <div class="cards">
+        <article class="card">
+          <div class="chead-a">
+            <button class="avatar88 ph-soil"></button>
+            <div class="info">
+              <div class="r1"><span class="cname">大头一号</span><span class="chip st">活跃</span></div>
+              <div class="r2"><span class="n">245</span><span class="l">天</span></div>
+              <div class="r3">大头收获蚁 · 巢况 09-20</div>
+            </div>
+          </div>
+          <div class="tiles">
+            <button class="tile bad"><span class="t-top"><span class="t-ico">🍯</span><span class="t-name">喂食</span></span><span class="pill">⚠ 该喂面包虫干、虾干了</span></button>
+            <button class="tile ok"><span class="t-top"><span class="t-ico">🗑</span><span class="t-name">垃圾清理</span></span><span class="pill">距上次 1 天</span></button>
+          </div>
+          <div class="foot"><span class="recent">最近：09-27 喂食（面包虫干）</span><button class="dots">⋯</button></div>
+        </article>
+      </div>
+    </div>
+    <div class="phone">
+      <div class="cap">乙 · 顶部横幅</div>
+      <div class="cards">
+        <article class="card">
+          <div class="banner-img img-cover" style="height:150px">
+            <div class="img ph-sand"></div>
+            <div class="scrim">
+              <span class="bname">大头一号</span>
+              <span class="bchip">活跃</span>
+              <span class="bdays"><span class="n">245</span> <span class="l">天</span></span>
+            </div>
+            <div class="bact"><button>巢况</button><button>📷</button></div>
+          </div>
+          <div class="tiles">
+            <button class="tile bad"><span class="t-top"><span class="t-ico">🍯</span><span class="t-name">喂食</span></span><span class="pill">⚠ 该喂面包虫干、虾干了</span></button>
+            <button class="tile ok"><span class="t-top"><span class="t-ico">🗑</span><span class="t-name">垃圾清理</span></span><span class="pill">距上次 1 天</span></button>
+          </div>
+          <div class="foot"><span class="recent">最近：09-27 喂食（面包虫干）</span><button class="dots">⋯</button></div>
+        </article>
+      </div>
+    </div>
+    <div class="phone">
+      <div class="cap">丙 · 行内加高</div>
+      <div class="cards">
+        <article class="card">
+          <div class="chead-c">
+            <button class="avatar56 ph-tube"></button>
+            <div class="info">
+              <div class="r1"><span class="cname">大头一号</span><span class="chip st">活跃</span><span class="daysbox"><span class="n">245</span> <span class="l">天</span></span></div>
+              <div class="r3">巢况 09-20 · 蚁后 1</div>
+            </div>
+          </div>
+          <div class="tiles">
+            <button class="tile bad"><span class="t-top"><span class="t-ico">🍯</span><span class="t-name">喂食</span></span><span class="pill">⚠ 该喂面包虫干、虾干了</span></button>
+            <button class="tile ok"><span class="t-top"><span class="t-ico">🗑</span><span class="t-name">垃圾清理</span></span><span class="pill">距上次 1 天</span></button>
+          </div>
+          <div class="foot"><span class="recent">最近：09-27 喂食（面包虫干）</span><button class="dots">⋯</button></div>
+        </article>
+      </div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

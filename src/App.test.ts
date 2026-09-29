@@ -41,10 +41,10 @@ const locations: LocationItem[] = [
 ];
 
 const foods: FoodItem[] = [
-  { id: 1, name: "种子", enabled: true, sort: 1, suggested_interval_days: 3, referenced: false, is_preset: true, category: "seed" },
-  { id: 2, name: "干虾仁", enabled: true, sort: 2, suggested_interval_days: 7, referenced: false, is_preset: true, category: "protein" },
-  { id: 3, name: "面包虫", enabled: true, sort: 3, suggested_interval_days: 7, referenced: false, is_preset: true, category: "protein" },
-  { id: 4, name: "蚕蛹", enabled: false, sort: 4, suggested_interval_days: null, referenced: false, is_preset: false, category: "protein" },
+  { id: 1, name: "种子", enabled: true, sort: 1, referenced: false, is_preset: true, category: "seed" },
+  { id: 2, name: "干虾仁", enabled: true, sort: 2, referenced: false, is_preset: true, category: "protein" },
+  { id: 3, name: "面包虫", enabled: true, sort: 3, referenced: false, is_preset: true, category: "protein" },
+  { id: 4, name: "蚕蛹", enabled: false, sort: 4, referenced: false, is_preset: false, category: "protein" },
 ];
 
 const actions: CareActionItem[] = [
@@ -123,6 +123,12 @@ function baseMock() {
         return locations;
       case "list_foods":
         return foods;
+      case "list_food_categories":
+        return [
+          { category: "seed", interval_days: 7 },
+          { category: "protein", interval_days: 3 },
+          { category: "sugar", interval_days: 3 },
+        ];
       case "list_actions":
         return actions;
       case "list_logs":
@@ -178,22 +184,22 @@ describe("首页卡片墙", () => {
     expect(titles).toEqual(["家", "公司"]);
 
     const home = wrapper.find('.card[data-colony-id="1"]');
-    expect(home.find(".cname").text()).toBe("大头一号");
-    expect(home.find(".chip.sp").text()).toBe("大头收获蚁");
-    expect(home.find(".chip.st").text()).toContain("活跃");
-    expect(home.find(".daysbox .n").text()).toBe("241");
-    // 交互第三轮 #7 紧凑形态：天数内联为「241 天」，无「已饲养 / 天」文案、无开始日期行
-    expect(home.find(".daysbox").text()).toContain("241");
+    expect(home.find(".bname").text()).toBe("大头一号");
+    expect(home.find(".bchip").text()).toBe("大头收获蚁");
+    expect(home.find(".bchip.st").text()).toContain("活跃");
+    expect(home.find(".bdays .n").text()).toBe("241");
+    // avatar-banner 乙-2：天数叠照片下沿「241 天」，无「已饲养 / 天」文案、无开始日期行
+    expect(home.find(".bdays").text()).toContain("241");
     expect(home.text()).not.toContain("已饲养 / 天");
     expect(home.text()).not.toContain("开始饲养 2026-01-20");
 
     const corpCards = wrapper.findAll(".group")[1].findAll(".card");
-    expect(corpCards.map((c) => c.find(".cname").text())).toEqual(["针毛一号", "大头二号"]);
+    expect(corpCards.map((c) => c.find(".bname").text())).toEqual(["针毛一号", "大头二号"]);
   });
 
   it("冬眠中的窝显示冬眠状态徽章", async () => {
     const wrapper = await mountApp();
-    expect(wrapper.find('.card[data-colony-id="3"] .chip.st').text()).toContain("冬眠");
+    expect(wrapper.find('.card[data-colony-id="3"] .bchip.st').text()).toContain("冬眠");
   });
 
   it("卡片显示最新巢况数与距上次登记天数（webui-checkin 票 02）；「巢况」按钮打开时间线", async () => {
@@ -236,7 +242,7 @@ describe("首页卡片墙", () => {
           return null;
       }
     });
-    await card.find(".checkin-btn").trigger("click");
+    await card.find(".bact-btn").trigger("click"); // 横幅右上角「巢况」按钮
     await flushPromises();
     expect(wrapper.find(".checkin-dialog").exists()).toBe(true);
     expect(invokeMock).toHaveBeenCalledWith("list_checkins", { colonyId: 1 });
@@ -260,8 +266,8 @@ describe("首页卡片墙", () => {
     expect((opened.element as HTMLElement).style.display).not.toBe("none");
     const endedCard = opened.find('.card[data-colony-id="4"]');
     expect(endedCard.exists()).toBe(true);
-    expect(endedCard.find(".chip.sp").exists()).toBe(false); // 无物种不渲染徽章
-    expect(endedCard.find(".chip.st").text()).toContain("已结束");
+    expect(endedCard.findAll(".bchip").length).toBe(1); // 无物种只留状态徽章
+    expect(endedCard.find(".bchip.st").text()).toContain("已结束");
   });
 
   it("没有任何窝时显示「暂无窝」并保留新建入口", async () => {
@@ -656,7 +662,7 @@ describe("设置 · 字典管理（票 04）", () => {
 
   // ── 食物 tab ──
 
-  it("食物 tab：改名保存走 save_food；停用即时生效（验收 1 的入口）；停用行置灰", async () => {
+  it("食物 tab：改名保存走 save_food；大类周期回显并随保存落库（ADR 0008）；停用即时生效；停用行置灰", async () => {
     const wrapper = await mountApp();
     const dlg = await openSettings(wrapper);
     await dlg.find(".tab-foods").trigger("click");
@@ -673,16 +679,32 @@ describe("设置 · 字典管理（票 04）", () => {
     expect(rows[3].find(".erase-btn").attributes("disabled")).toBeUndefined();
 
     await rows[0].find(".name-input").setValue("瓜子");
-    // F3：食物行带建议间隔输入框，回显预置值；保存一并落库
-    expect((rows[0].find(".interval-input").element as HTMLInputElement).value).toBe("3");
-    expect((rows[3].find(".interval-input").element as HTMLInputElement).value).toBe("");
-    expect(dlg.text()).toContain("任一超期喂食块就变红并单独提醒");
-    await rows[0].find(".interval-input").setValue("5");
+    // ADR 0008：食物行只剩撤食间隔输入框（种子不易腐，置灰）；大类周期区回显三行（种子 7 / 蛋白质 3 / 糖水 3）
+    const rowInputs = rows[0].findAll("input[type=number]");
+    expect(rowInputs.length).toBe(1);
+    expect((rowInputs[0].element as HTMLInputElement).disabled).toBe(true);
+    const catInputs = dlg.findAll(".cat-interval-row .interval-input");
+    expect(catInputs.map((i) => (i.element as HTMLInputElement).value)).toEqual(["7", "3", "3"]);
+    expect(dlg.text()).toContain("提醒按大类计");
+    await catInputs[1].setValue("5");
     invokeMock.mockClear();
     await dlg.find(".tab-body .btn.primary").trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("save_food", {
-      input: { id: 1, name: "瓜子", sort: 0, suggested_interval_days: 5, perishable: false, retrieval_hours: null, category: "seed" },
+      input: { id: 1, name: "瓜子", sort: 0, perishable: false, retrieval_hours: null, category: "seed" },
+    });
+    // 大类周期三条逐一落库（改过的蛋白质=5，其余原值照传）
+    expect(invokeMock).toHaveBeenCalledWith("save_food_category_interval", {
+      category: "protein",
+      intervalDays: 5,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("save_food_category_interval", {
+      category: "seed",
+      intervalDays: 7,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("save_food_category_interval", {
+      category: "sugar",
+      intervalDays: 3,
     });
 
     invokeMock.mockClear();
@@ -1178,14 +1200,19 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(card.find(".recent").text()).toBe("最近：09-17 喂食（种子）");
   });
 
-  it("喂食块带食物明细：食物层超期整块红，悬停 title 逐食物列「距上次」并标注超期（反馈第二轮 F3）", async () => {
+  it("喂食块带大类与食物明细：大类层超期整块红，悬停 title 大类口径在前、逐食物参考在后（ADR 0008）", async () => {
     const feedWithFoods: ColonyAction = {
       ...feedOverdue,
       days_since_last: 8,
       foods: [
-        { food_id: 1, name: "种子", suggested_interval_days: 3, days_since_last: 8, overdue: true },
-        { food_id: 2, name: "干虾仁", suggested_interval_days: 7, days_since_last: 1, overdue: false },
-        { food_id: 3, name: "面包虫", suggested_interval_days: 7, days_since_last: null, overdue: false },
+        { food_id: 1, name: "种子", days_since_last: 8 },
+        { food_id: 2, name: "虾干", days_since_last: 1 },
+        { food_id: 3, name: "面包虫干", days_since_last: null },
+      ],
+      categories: [
+        { category: "seed", interval_days: 7, days_since_last: 8, overdue: true },
+        { category: "protein", interval_days: 3, days_since_last: 1, overdue: false },
+        { category: "sugar", interval_days: 3, days_since_last: null, overdue: false },
       ],
     };
     colony1With([feedWithFoods, waterReg]);
@@ -1195,12 +1222,41 @@ describe("卡片操作块与一键记账（票 03）", () => {
     expect(feed.classes()).toContain("bad");
     expect(feed.find(".pill").text()).toBe("⚠ 超期 5 天");
     expect(feed.attributes("title")).toBe(
-      "种子：距上次 8 天 · 超期\n干虾仁：距上次 1 天\n面包虫：尚未记录",
+      "种子：距上次 8 天 / 周期 7 天 · 超期\n" +
+        "蛋白质：距上次 1 天 / 周期 3 天\n" +
+        "糖水：尚未记录 / 周期 3 天\n" +
+        "种子：距上次 8 天\n" +
+        "虾干：距上次 1 天\n" +
+        "面包虫干：尚未记录\n" +
+        "（提醒按大类计，逐食物仅供参考）",
     );
 
     // 非喂食块无食物明细 → 不带 title
     const water = wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="2"]');
     expect(water.attributes("title")).toBeUndefined();
+  });
+
+  it("喂食块大类层顶红（统一层新鲜）：pill 报「该喂大类了」（ADR 0008）", async () => {
+    const feedWithFoods: ColonyAction = {
+      ...feedOverdue,
+      days_since_last: 2,
+      overdue: true,
+      effective_interval_days: 3,
+      foods: [
+        { food_id: 1, name: "种子", days_since_last: 2 },
+        { food_id: 3, name: "面包虫干", days_since_last: 8 },
+      ],
+      categories: [
+        { category: "seed", interval_days: 7, days_since_last: 2, overdue: false },
+        { category: "protein", interval_days: 3, days_since_last: 8, overdue: true },
+      ],
+    };
+    colony1With([feedWithFoods, waterReg]);
+    const wrapper = await mountApp();
+
+    const feed = wrapper.find('.card[data-colony-id="1"] .tile[data-action-id="1"]');
+    expect(feed.classes()).toContain("bad");
+    expect(feed.find(".pill").text()).toBe("⚠ 该喂蛋白质了");
   });
 
   it("非喂食弹打卡面板：默认今天可补录，点「记录」才落库并刷新", async () => {
@@ -1580,7 +1636,7 @@ describe("浏览器模式入口可见性（终局评审 Important → 网页端�
     expect(wrapper.find(".new-top-btn").exists()).toBe(true);
     // 卡片「✏️ 编辑窝信息」（ColonyCard）同步放开双端；「巢况」是网页端功能不隐藏
     expect(wrapper.find(".card .edit-btn").exists()).toBe(true);
-    expect(wrapper.find(".card .checkin-btn").exists()).toBe(true);
+    expect(wrapper.find(".card .bact-btn").exists()).toBe(true);
 
     // 网页端「照片」页照常进入并拉载荷
     invokeMock.mockClear();

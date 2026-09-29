@@ -574,6 +574,32 @@ fn erase_food(state: tauri::State<'_, DbState>, app: tauri::AppHandle, id: i64) 
     result
 }
 
+/// 大类周期（ADR 0008）：恒三行固定序，缺行 = 未设。桌面设置页专用，
+/// 不进网页端白名单（系统管理桌面独占）。
+#[tauri::command]
+fn list_food_categories(
+    state: tauri::State<'_, DbState>,
+) -> Result<Vec<dict::FoodCategoryInterval>, String> {
+    with_conn(state, dict::list_food_categories)
+}
+
+/// 保存一条大类周期（None = 清空＝不按周期提醒）。
+#[tauri::command]
+fn save_food_category_interval(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+    category: String,
+    interval_days: Option<i64>,
+) -> Result<dict::FoodCategoryInterval, String> {
+    let result = with_conn(state, |conn| {
+        dict::save_food_category_interval(conn, &category, interval_days)
+    });
+    if result.is_ok() {
+        trigger_after_write(&app);
+    }
+    result
+}
+
 #[tauri::command]
 fn set_location_enabled(
     state: tauri::State<'_, DbState>,
@@ -853,22 +879,8 @@ fn set_settings(
     outcome
 }
 
-// ── 头像形状偏好（窝头像票 03）：双端读、桌面设置页写 ──
-// 独立键不进 AppSettings（同向导键先例）：整体覆盖式 set_settings 不碰它，
-// 网页端白名单只登记 get_avatar_shape 这条只读。
-
-/// 读头像形状：缺行/脏值回退 circle（旧库兼容，不写回）。
-#[tauri::command]
-fn get_avatar_shape(state: tauri::State<'_, DbState>) -> Result<String, String> {
-    with_conn(state, settings::get_avatar_shape)
-}
-
-/// 保存头像形状（桌面设置页专用；不入网页端白名单）：只接受 circle / square，
-/// 返回落库的规范值。纯外观偏好：不触发写后钩子（托盘/自动备份与本键无关）。
-#[tauri::command]
-fn set_avatar_shape(state: tauri::State<'_, DbState>, shape: String) -> Result<String, String> {
-    with_conn(state, |conn| settings::set_avatar_shape(conn, &shape))
-}
+// 头像形状偏好（get/set_avatar_shape）已随头像横幅改版移除（avatar-banner
+// 乙-2）：横幅是矩形，圆/方遮罩无作用对象；settings 键由 v14 迁移清理。
 
 /// 设置保存的 command 层裁决：落库结果 + 自启同步结果 → 前端口径。
 /// 落库失败恒报错；自启同步失败只记日志、不吞掉已保存的设置（设置是权威，
@@ -1872,6 +1884,8 @@ pub fn run() {
             save_food,
             set_food_enabled,
             erase_food,
+            list_food_categories,
+            save_food_category_interval,
             set_location_enabled,
             list_colonies,
             create_colony,
@@ -1889,8 +1903,6 @@ pub fn run() {
             update_expected_end,
             get_settings,
             set_settings,
-            get_avatar_shape,
-            set_avatar_shape,
             send_test_notification,
             check_update_now,
             confirm_and_install,

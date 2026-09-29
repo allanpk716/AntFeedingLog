@@ -74,8 +74,8 @@ pub struct CheckOutcome {
 pub enum ReminderKind {
     /// 提醒类操作超期（仅活跃窝）
     Overdue,
-    /// 食物超期：距上次喂「该食物」超过它的建议间隔（仅活跃窝，F3）
-    FoodOverdue,
+    /// 大类超期：距上次喂「该大类」任一食物超过大类周期（仅活跃窝，ADR 0008）
+    CategoryOverdue,
     /// 临近出眠（预计出眠日前 N 天起，一次）
     ApproachingWake,
     /// 出眠日当天（一次）
@@ -88,7 +88,7 @@ impl ReminderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             ReminderKind::Overdue => "overdue",
-            ReminderKind::FoodOverdue => "food_overdue",
+            ReminderKind::CategoryOverdue => "category_overdue",
             ReminderKind::ApproachingWake => "approaching_wake",
             ReminderKind::WakeDay => "wake_day",
             ReminderKind::RetrievalDue => "retrieval_due",
@@ -96,19 +96,18 @@ impl ReminderKind {
     }
 }
 
-/// 一条「该发的提醒」。台账身份 = (colony_id, kind, action_id, food_id, base_date)。
+/// 一条「该发的提醒」。台账身份 = (colony_id, kind, action_id, category, base_date)。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Reminder {
     pub colony_id: i64,
     pub colony_name: String,
     pub kind: ReminderKind,
-    /// 仅超期类（操作层/食物层）非空。
+    /// 仅超期类（操作层/大类层）非空。
     pub action_id: Option<i64>,
     pub action_name: Option<String>,
-    /// 仅食物层（FoodOverdue）非空（F3）。
-    pub food_id: Option<i64>,
-    pub food_name: Option<String>,
-    /// 去重基准日：超期 = 今天 − 建议间隔；临近/出眠日 = 预计出眠日；
+    /// 仅大类层（CategoryOverdue）非空（ADR 0008）：大类英文 key，展示层映射中文。
+    pub category: Option<String>,
+    /// 去重基准日：超期 = 今天 − 有效周期；临近/出眠日 = 预计出眠日；
     /// 撤食 = 当前自然日（每窝每天至多一条，票 05）。
     pub base_date: String,
     /// 超期类：距上次天数（通知文案用）。
@@ -139,18 +138,20 @@ impl Reminder {
                 }
                 (format!("{action}超期"), body)
             }
-            ReminderKind::FoodOverdue => {
-                let food = self.food_name.as_deref().unwrap_or("食物");
+            ReminderKind::CategoryOverdue => {
+                let label = crate::dict::food_category_label(
+                    self.category.as_deref().unwrap_or("protein"),
+                );
                 let mut body = format!("「{}」已 ", self.colony_name);
                 match self.days_since_last {
                     Some(d) => body.push_str(&format!("{d} 天")),
                     None => body.push_str("有一阵子"),
                 }
-                body.push_str(&format!("没喂{food}"));
+                body.push_str(&format!("没喂{label}"));
                 if let Some(n) = self.suggested_interval_days {
                     body.push_str(&format!("（建议 {n} 天一次）"));
                 }
-                (format!("该喂{food}了"), body)
+                (format!("该喂{label}了"), body)
             }
             ReminderKind::ApproachingWake => (
                 "临近出眠".into(),
@@ -253,13 +254,13 @@ pub fn compute_due_reminders(
     for (colony_id, colony_name, status) in colonies {
         match status.as_str() {
             "active" => {
-                // F3：喂食 tile 即使统一层不红也要扫食物层（食物层可独立超期）
+                // 大类层（ADR 0008）即使统一层不红也要扫（大类可独立超期）
                 for tile in crate::care::tiles_for_colony(conn, colony_id, &today.to_string())?
                     .into_iter()
                     .filter(|t| t.overdue || t.is_feeding)
                 {
-                    // 统一层只看操作层自身的超期（tile.overdue 已含食物层，不能用它判定，
-                    // 否则食物层顶红时会把"距上次 2 天 ≤ 3"也当超期发出去）；
+                    // 统一层只看操作层自身的超期（tile.overdue 已含大类层，不能用它判定，
+                    // 否则大类层顶红时会把"距上次 2 天 ≤ 3"也当超期发出去）；
                     // 票 02：操作层判定与文案周期值换用有效周期（每窝周期(若有)否则
                     // 操作层建议间隔，设了即提醒、follow 除外）
                     if tile.operation_overdue() {
@@ -273,8 +274,7 @@ pub fn compute_due_reminders(
                             kind: ReminderKind::Overdue,
                             action_id: Some(tile.action_id),
                             action_name: Some(tile.name.clone()),
-                            food_id: None,
-                            food_name: None,
+                            category: None,
                             base_date: base,
                             days_since_last: tile.days_since_last,
                             // 文案周期值 = 该窝有效周期（spec D7；未设窝即建议间隔，值不变）
@@ -284,9 +284,9 @@ pub fn compute_due_reminders(
                             hours_overdue: None,
                         });
                     }
-                    // 食物层（F3）：与统一层各记各的，台账按 food 维度去重
-                    for f in tile.foods.iter().filter(|f| f.overdue) {
-                        let Some(interval) = f.suggested_interval_days else {
+                    // 大类层（ADR 0008）：与统一层各记各的，台账按大类维度去重
+                    for c in tile.categories.iter().filter(|c| c.overdue) {
+                        let Some(interval) = c.interval_days else {
                             continue;
                         };
                         let base = (today - Duration::days(interval.max(0)))
@@ -295,14 +295,13 @@ pub fn compute_due_reminders(
                         due.push(Reminder {
                             colony_id,
                             colony_name: colony_name.clone(),
-                            kind: ReminderKind::FoodOverdue,
+                            kind: ReminderKind::CategoryOverdue,
                             action_id: Some(tile.action_id),
                             action_name: Some(tile.name.clone()),
-                            food_id: Some(f.food_id),
-                            food_name: Some(f.name.clone()),
+                            category: Some(c.category.clone()),
                             base_date: base,
-                            days_since_last: f.days_since_last,
-                            suggested_interval_days: f.suggested_interval_days,
+                            days_since_last: c.days_since_last,
+                            suggested_interval_days: c.interval_days,
                             fed_at: None,
                             retrieval_food_names: None,
                             hours_overdue: None,
@@ -328,8 +327,7 @@ pub fn compute_due_reminders(
                         kind: ReminderKind::ApproachingWake,
                         action_id: None,
                         action_name: None,
-                        food_id: None,
-                        food_name: None,
+                        category: None,
                         base_date: base.clone(),
                         days_since_last: None,
                         suggested_interval_days: None,
@@ -346,8 +344,7 @@ pub fn compute_due_reminders(
                         kind: ReminderKind::WakeDay,
                         action_id: None,
                         action_name: None,
-                        food_id: None,
-                        food_name: None,
+                        category: None,
                         base_date: base,
                         days_since_last: None,
                         suggested_interval_days: None,
@@ -417,8 +414,7 @@ fn retrieval_reminder_if_due(
         kind: ReminderKind::RetrievalDue,
         action_id: None,
         action_name: None,
-        food_id: None,
-        food_name: None,
+        category: None,
         // 台账基准日 = 当前自然日 → uq_ledger_retrieval (窝, 当日) 每天至多一条，
         // 随今天推进实现每日催促（Q6）
         base_date: now.date().format("%Y-%m-%d").to_string(),
@@ -502,9 +498,9 @@ pub fn run_check(conn: &Connection, today: &str, now: &str) -> Result<CheckOutco
             // 通知文案随行落库（快照），补发时不重算
             let inserted = tx
                 .execute(
-                    "INSERT OR IGNORE INTO reminder_ledger (colony_id, kind, action_id, food_id, base_date, sent_at, push_title, push_body)
+                    "INSERT OR IGNORE INTO reminder_ledger (colony_id, kind, action_id, category, base_date, sent_at, push_title, push_body)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![r.colony_id, r.kind.as_str(), r.action_id, r.food_id, r.base_date, now, &title, &body],
+                    params![r.colony_id, r.kind.as_str(), r.action_id, r.category, r.base_date, now, &title, &body],
                 )
                 .map_err(db_err)?;
             if inserted == 1 {
@@ -611,10 +607,14 @@ pub fn tray_summary(colonies: &[crate::colony::Colony]) -> String {
                 t.days_since_last.unwrap_or(0)
             ));
         }
-        // 食物层超期（F3）：统一层超期维持原句式，两者可并存
+        // 大类层超期（ADR 0008）：统一层超期维持原句式，两者可并存
         for t in c.actions.iter() {
-            for f in t.foods.iter().filter(|f| f.overdue) {
-                parts.push(format!("{}该喂{}了", c.name, f.name));
+            for cat in t.categories.iter().filter(|cat| cat.overdue) {
+                parts.push(format!(
+                    "{}该喂{}了",
+                    c.name,
+                    crate::dict::food_category_label(&cat.category)
+                ));
             }
         }
     }
@@ -962,9 +962,9 @@ mod tests {
         .unwrap();
     }
 
-    fn ledger_rows(conn: &Connection) -> Vec<(String, Option<i64>, String, Option<i64>)> {
+    fn ledger_rows(conn: &Connection) -> Vec<(String, Option<i64>, String, Option<String>)> {
         let mut stmt = conn
-            .prepare("SELECT kind, action_id, base_date, food_id FROM reminder_ledger ORDER BY id")
+            .prepare("SELECT kind, action_id, base_date, category FROM reminder_ledger ORDER BY id")
             .unwrap();
         stmt.query_map([], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -1151,22 +1151,24 @@ mod tests {
 
         // 推进到预计出眠日当天：临近/出眠日不再触发（规则 4）。
         // 出眠后「距上次」从出眠日重新起算（5 天没喂 → 统一层超期；
-        // ADR 0007 后种子周期 7（5 < 7 静默），蛋白质/糖水预置周期 3
-        //（5 > 3 各自再发一条）→ 统一 1 + 食物层 6。
+        // ADR 0008 后大类周期：seed 7（5 < 7 静默），protein/sugar 3
+        //（5 > 3 各发一条）→ 统一 1 + 大类层 2。
         let due = compute_due_reminders(&conn, &fmt(end), NOW, 7).unwrap();
         assert_eq!(
             due.len(),
-            7,
-            "统一超期 + 六个 3 天周期预置食物层，实际：{due:?}"
+            3,
+            "统一超期 + protein/sugar 两个 3 天大类层，实际：{due:?}"
         );
         assert_eq!(due[0].kind, ReminderKind::Overdue);
         assert_eq!(due[0].base_date, fmt(end - Duration::days(3)));
-        assert!(due[1..].iter().all(|r| r.kind == ReminderKind::FoodOverdue));
+        assert!(due[1..]
+            .iter()
+            .all(|r| r.kind == ReminderKind::CategoryOverdue));
         assert!(
             due[1..]
                 .iter()
-                .all(|r| r.food_name.as_deref() != Some("种子")),
-            "种子周期 7，5 天未超期不提醒"
+                .all(|r| r.category.as_deref() != Some("seed")),
+            "seed 周期 7，5 天未超期不提醒"
         );
     }
 
@@ -1313,29 +1315,29 @@ mod tests {
         assert_eq!(done, 1, "超窗自动了结");
     }
 
-    // ── 食物层超期（反馈第二轮 F3）──
+    // ── 大类层超期（ADR 0008）──
 
     #[test]
-    fn food_overdue_fires_independently_of_operation_layer() {
+    fn category_overdue_fires_independently_of_operation_layer() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
-        // 只喂种子（2 天前）：统一层不超期；面包虫干 8 天前喂过 → 食物层超期
+        // 只喂种子（2 天前）：统一层不超期；面包虫干 8 天前喂过 → protein 大类超期
         feed_foods(&conn, c, "2026-09-16 20:00:00", &["种子"]);
         feed_foods(&conn, c, "2026-09-10 20:00:00", &["面包虫干"]);
 
         let out = run_check(&conn, TODAY, NOW).unwrap();
-        assert_eq!(out.toasts.len(), 1, "只有面包虫干食物层一条");
+        assert_eq!(out.toasts.len(), 1, "只有 protein 大类层一条");
         let r = &out.toasts[0];
-        assert_eq!(r.kind, ReminderKind::FoodOverdue);
+        assert_eq!(r.kind, ReminderKind::CategoryOverdue);
         assert_eq!(r.action_name.as_deref(), Some("喂食"));
-        assert_eq!(r.food_name.as_deref(), Some("面包虫干"));
+        assert_eq!(r.category.as_deref(), Some("protein"));
         assert_eq!(r.days_since_last, Some(8));
         assert_eq!(r.base_date, fmt(day(TODAY) - Duration::days(3)));
         let (title, body) = r.notification_text();
-        assert_eq!(title, "该喂面包虫干了");
-        assert_eq!(body, "「大头一号」已 8 天没喂面包虫干（建议 3 天一次）");
+        assert_eq!(title, "该喂蛋白质了");
+        assert_eq!(body, "「大头一号」已 8 天没喂蛋白质（建议 3 天一次）");
 
-        // 同日重查不重发；台账 food 维度去重
+        // 同日重查不重发；台账按大类维度去重
         assert!(run_check(&conn, TODAY, "2026-09-18 12:00:00")
             .unwrap()
             .toasts
@@ -1345,7 +1347,23 @@ mod tests {
     }
 
     #[test]
-    fn operation_and_food_layers_same_day_both_fire() {
+    fn category_rotation_feeding_refreshes_whole_category_clock() {
+        // 用户的原始场景：周二喂面包虫干、周四喂虾干 → protein 一只钟，
+        // 喂任一蛋白质即刷新整类，不再「该喂两个东西」
+        let conn = mem_conn();
+        let c = colony(&conn, "大头一号", "active");
+        feed_foods(&conn, c, "2026-09-10 20:00:00", &["面包虫干"]); // 8 天前
+        feed_foods(&conn, c, "2026-09-16 20:00:00", &["虾干"]); // 2 天前
+        let out = run_check(&conn, TODAY, NOW).unwrap();
+        assert!(
+            out.toasts.is_empty(),
+            "蛋白质整类 2 天前刚刷新（2 ≤ 3），交叉喂不再重复催：{:?}",
+            out.toasts
+        );
+    }
+
+    #[test]
+    fn operation_and_category_layers_same_day_both_fire() {
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
         feed_foods(&conn, c, "2026-09-10 20:00:00", &["种子", "面包虫干"]); // 8 天 → 两层全超
@@ -1353,12 +1371,12 @@ mod tests {
         assert_eq!(
             out.toasts.len(),
             3,
-            "统一层 1 + 种子 1 + 面包虫干 1，各记各的"
+            "统一层 1 + seed 1 + protein 1，各记各的"
         );
     }
 
     #[test]
-    fn hibernating_colony_food_layer_silent_too() {
+    fn hibernating_colony_category_layer_silent_too() {
         let conn = mem_conn();
         let h = colony(&conn, "冬眠一号", "hibernating");
         open_seg(&conn, h, "2027-03-01");
@@ -1502,9 +1520,9 @@ mod tests {
     }
 
     #[test]
-    fn food_layer_still_stacks_when_feeding_has_per_colony_interval() {
-        // 喂食设了每窝 10：操作层 2 ≤ 10 不发；面包虫干 8 > 3 食物层照旧各发各的，
-        // 台账按 food 维度去重，食物行文案仍是食物自己的周期
+    fn category_layer_still_stacks_when_feeding_has_per_colony_interval() {
+        // 喂食设了每窝 10：操作层 2 ≤ 10 不发；protein 大类 8 > 3 照旧各发各的，
+        // 台账按大类维度去重，文案取大类周期（不被每窝周期取代，ADR 0008）
         let conn = mem_conn();
         let c = colony(&conn, "大头一号", "active");
         set_interval(&conn, c, "喂食", 10);
@@ -1512,13 +1530,13 @@ mod tests {
         feed_foods(&conn, c, "2026-09-10 20:00:00", &["面包虫干"]);
 
         let due = compute_due_reminders(&conn, TODAY, NOW, 7).unwrap();
-        assert_eq!(due.len(), 1, "只有面包虫干食物层一条：{due:?}");
-        assert_eq!(due[0].kind, ReminderKind::FoodOverdue);
-        assert_eq!(due[0].food_name.as_deref(), Some("面包虫干"));
+        assert_eq!(due.len(), 1, "只有 protein 大类层一条：{due:?}");
+        assert_eq!(due[0].kind, ReminderKind::CategoryOverdue);
+        assert_eq!(due[0].category.as_deref(), Some("protein"));
         assert_eq!(
             due[0].suggested_interval_days,
             Some(3),
-            "食物层文案仍取食物自己的周期"
+            "大类层文案仍取大类自己的周期"
         );
         assert_eq!(due[0].base_date, fmt(day(TODAY) - Duration::days(3)));
     }
@@ -1818,8 +1836,7 @@ mod tests {
             kind: ReminderKind::Overdue,
             action_id: Some(1),
             action_name: Some("喂食".into()),
-            food_id: None,
-            food_name: None,
+            category: None,
             base_date: "2026-09-15".into(),
             days_since_last: Some(4),
             suggested_interval_days: Some(3),
@@ -1864,8 +1881,7 @@ mod tests {
             kind: ReminderKind::RetrievalDue,
             action_id: None,
             action_name: None,
-            food_id: None,
-            food_name: None,
+            category: None,
             base_date: "2026-09-18".into(),
             days_since_last: None,
             suggested_interval_days: None,
@@ -1911,6 +1927,7 @@ mod tests {
             days_since_last: days,
             overdue,
             foods: vec![],
+            categories: vec![],
             retrieval_state: "none".into(), // 票 02 新字段；托盘概要测试用不到三态
             implies_retrieval: false,       // ADR 0006 新字段；提醒引擎不消费
         }
@@ -1998,21 +2015,19 @@ mod tests {
     }
 
     #[test]
-    fn tray_summary_reports_food_overdue_alongside_operation_layer() {
-        // F3：食物层超期补「某窝该喂某食物了」，与统一层句式并存
+    fn tray_summary_reports_category_overdue_alongside_operation_layer() {
+        // ADR 0008：大类层超期补「某窝该喂某大类了」，与统一层句式并存
         let mut feed = tile("喂食", "reminding", true, Some(4));
-        feed.foods = vec![
-            crate::care::FoodTileStatus {
-                food_id: 1,
-                name: "面包虫干".into(),
-                suggested_interval_days: Some(7),
+        feed.categories = vec![
+            crate::care::CategoryTileStatus {
+                category: "protein".into(),
+                interval_days: Some(3),
                 days_since_last: Some(8),
                 overdue: true,
             },
-            crate::care::FoodTileStatus {
-                food_id: 2,
-                name: "种子".into(),
-                suggested_interval_days: Some(3),
+            crate::care::CategoryTileStatus {
+                category: "seed".into(),
+                interval_days: Some(7),
                 days_since_last: Some(1),
                 overdue: false,
             },
@@ -2020,18 +2035,24 @@ mod tests {
         let c = col("大头一号", "active", vec![feed]);
         assert_eq!(
             tray_summary(&[c]),
-            "1 窝活跃 · 大头一号喂食超期 4 天 · 大头一号该喂面包虫干了",
-            "统一层句式不变 + 食物层各补一条；不超期的食物不报"
+            "1 窝活跃 · 大头一号喂食超期 4 天 · 大头一号该喂蛋白质了",
+            "统一层句式不变 + 大类层各补一条；不超期的大类不报"
         );
 
-        // 统一层新鲜、仅食物层超期：只报食物行
-        let fresh = col(
-            "针毛一号",
-            "active",
-            vec![tile("喂食", "reminding", false, Some(1))],
+        // 统一层新鲜、仅大类层超期：只报大类行
+        let mut fresh = tile("喂食", "reminding", false, Some(1));
+        fresh.categories = vec![crate::care::CategoryTileStatus {
+            category: "sugar".into(),
+            interval_days: Some(3),
+            days_since_last: Some(5),
+            overdue: true,
+        }];
+        let c = col("针毛一号", "active", vec![fresh]);
+        assert_eq!(
+            tray_summary(&[c]),
+            "1 窝活跃 · 针毛一号该喂糖水了",
+            "统一层不超期、大类层超 → 只加大类行（中文映射）"
         );
-        let text = tray_summary(&[fresh]);
-        assert_eq!(text, "1 窝活跃", "无食物明细且统一层不超期 → 不加食物行");
     }
 
     /// follow（撤食）块专用：只有三态通道，无超期/间隔/食物明细。
@@ -2048,6 +2069,7 @@ mod tests {
             days_since_last: None,
             overdue: false,
             foods: vec![],
+            categories: vec![],
             retrieval_state: retrieval_state.into(),
             implies_retrieval: false,
         }

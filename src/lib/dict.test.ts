@@ -2,11 +2,14 @@ import { describe, expect, it } from "vitest";
 import type { CareActionItem, FoodItem } from "../types";
 import {
   buildActionRows,
+  buildCategoryIntervalRows,
   buildFoodRows,
   parseInterval,
   toActionInputs,
+  toCategoryIntervalInputs,
   toFoodInputs,
   validateActionRows,
+  validateCategoryIntervalRows,
   validateFoodRows,
   moveRow,
 } from "./dict";
@@ -31,7 +34,6 @@ function foodItem(partial: Partial<FoodItem> & { id: number }): FoodItem {
     name: `食物${partial.id}`,
     enabled: true,
     sort: partial.id,
-    suggested_interval_days: null,
     referenced: false,
     is_preset: false,
     category: "seed",
@@ -137,28 +139,23 @@ describe("操作行排序", () => {
 });
 
 describe("食物行", () => {
-  it("buildFoodRows 排序并携带停用/被引用/间隔；toFoodInputs 按行下标落 sort、名字 trim、间隔转数字或 null", () => {
+  it("buildFoodRows 排序并携带停用/被引用；toFoodInputs 按行下标落 sort、名字 trim（ADR 0008：食物行不再带间隔）", () => {
     const rows = buildFoodRows([
-      foodItem({ id: 2, name: "干虾仁", sort: 2, suggested_interval_days: 7 }),
-      foodItem({ id: 1, name: "种子", sort: 1, referenced: true, suggested_interval_days: 3 }),
+      foodItem({ id: 2, name: "干虾仁", sort: 2 }),
+      foodItem({ id: 1, name: "种子", sort: 1, referenced: true }),
       foodItem({ id: 5, name: "面包虫", enabled: false }),
     ]);
     expect(rows.map((r) => r.name)).toEqual(["种子", "干虾仁", "面包虫"]);
     expect(rows[0]!.referenced).toBe(true);
-    expect(rows[0]!.intervalText).toBe("3");
-    expect(rows[1]!.intervalText).toBe("7");
     expect(rows[2]!.enabled).toBe(false);
-    expect(rows[2]!.intervalText).toBe("");
 
-    rows.push({ id: null, name: " 糖水 ", enabled: true, intervalText: "", referenced: false, isPreset: false, perishable: false, retrievalHoursText: "", category: "sugar" });
+    rows.push({ id: null, name: " 糖水 ", enabled: true, referenced: false, isPreset: false, perishable: false, retrievalHoursText: "", category: "sugar" });
     expect(toFoodInputs(rows)).toEqual([
-      { id: 1, name: "种子", sort: 0, suggested_interval_days: 3, perishable: false, retrieval_hours: null, category: "seed" },
-      { id: 2, name: "干虾仁", sort: 1, suggested_interval_days: 7, perishable: false, retrieval_hours: null, category: "seed" },
-      { id: 5, name: "面包虫", sort: 2, suggested_interval_days: null, perishable: false, retrieval_hours: null, category: "seed" },
-      { id: null, name: "糖水", sort: 3, suggested_interval_days: null, perishable: false, retrieval_hours: null, category: "sugar" },
+      { id: 1, name: "种子", sort: 0, perishable: false, retrieval_hours: null, category: "seed" },
+      { id: 2, name: "干虾仁", sort: 1, perishable: false, retrieval_hours: null, category: "seed" },
+      { id: 5, name: "面包虫", sort: 2, perishable: false, retrieval_hours: null, category: "seed" },
+      { id: null, name: "糖水", sort: 3, perishable: false, retrieval_hours: null, category: "sugar" },
     ]);
-    rows[3]!.intervalText = " 5 ";
-    expect(toFoodInputs(rows)[3]!.suggested_interval_days).toBe(5);
   });
 
   it("buildFoodRows 映射 isPreset：预置跟随 is_preset", () => {
@@ -199,24 +196,38 @@ describe("食物行", () => {
     expect(
       validateFoodRows([
         ...rows,
-        { id: null, name: " 种子 ", enabled: true, intervalText: "", referenced: false, isPreset: false, perishable: false, retrievalHoursText: "", category: "seed" },
+        { id: null, name: " 种子 ", enabled: true, referenced: false, isPreset: false, perishable: false, retrievalHoursText: "", category: "seed" },
       ]),
     ).toContain("已存在");
     expect(validateFoodRows(rows)).toBe("");
   });
 
-  it("validateFoodRows 拦非法间隔（F3：与操作同款校验），通过返回空串", () => {
-    const rows = buildFoodRows([foodItem({ id: 1, name: "种子", suggested_interval_days: 3 })]);
+  it("validateCategoryIntervalRows（ADR 0008）：大类周期拦非法值，通过返回空串", () => {
+    const rows = buildCategoryIntervalRows([
+      { category: "seed", interval_days: 7 },
+      { category: "protein", interval_days: 3 },
+      { category: "sugar", interval_days: null },
+    ]);
+    // 载荷乱序也按固定序归位；空串 = 未设
+    expect(rows.map((r) => r.category)).toEqual(["seed", "protein", "sugar"]);
+    expect(rows.map((r) => r.intervalText)).toEqual(["7", "3", ""]);
+
+    expect(toCategoryIntervalInputs(rows)).toEqual([
+      { category: "seed", intervalDays: 7 },
+      { category: "protein", intervalDays: 3 },
+      { category: "sugar", intervalDays: null },
+    ]);
+
     rows[0]!.intervalText = "0";
-    expect(validateFoodRows(rows)).toBe("食物「种子」的建议间隔应是不小于 1 的整数天数");
-    rows[0]!.intervalText = "-2";
-    expect(validateFoodRows(rows)).toContain("建议间隔");
+    expect(validateCategoryIntervalRows(rows)).toBe(
+      "「种子」大类的周期应是不小于 1 的整数天数",
+    );
     rows[0]!.intervalText = "abc";
-    expect(validateFoodRows(rows)).toContain("建议间隔");
-    rows[0]!.intervalText = 7; // type=number 输入框给回数字同样放行
-    expect(validateFoodRows(rows)).toBe("");
-    rows[0]!.intervalText = ""; // 空串 = 未设，合法
-    expect(validateFoodRows(rows)).toBe("");
+    expect(validateCategoryIntervalRows(rows)).toContain("周期");
+    rows[0]!.intervalText = 5; // type=number 输入框给回数字同样放行
+    expect(validateCategoryIntervalRows(rows)).toBe("");
+    rows[0]!.intervalText = ""; // 空串 = 清空（不按周期提醒），合法
+    expect(validateCategoryIntervalRows(rows)).toBe("");
   });
 
   it("validateFoodRows 易腐撤食间隔矩阵（票 01）：开易腐必填 1–168 整数，关易腐不校验", () => {
