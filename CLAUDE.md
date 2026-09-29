@@ -16,3 +16,13 @@
 - **判定原则：界面切换或打开时，内容需异步读取的，读取完成前必须给「加载中…」占位——不许空白，也不许先显示默认值再跳成真实值；数据已在内存（缓存/父组件状态）时即时渲染，不显示加载态。**
 - 实现：全局唯一加载占位组件（`src/components/LoadingHint.vue`）；各处只调用，不得自造提示样式。
 - 加载态管「读之前」，轻提示管「做完之后」，两套永不通勤。
+
+## Agent skills
+
+### Issue tracker
+
+Issues 以本地 markdown 形式放在 `.scratch/<feature-slug>/issues/`（一票一文件）。见 `docs/agents/issue-tracker.md`。
+
+### Domain docs
+
+单上下文：根目录一个 `CONTEXT.md` + `docs/adr/`。见 `docs/agents/domain.md`。
