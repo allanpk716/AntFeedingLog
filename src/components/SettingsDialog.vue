@@ -1,7 +1,8 @@
 <script setup lang="ts">
 /**
- * 设置弹窗（票 04 字典管理 + 票 06 通知 + 票 09 数据收口 + release-update 票 06 更新）：
- * 操作 / 食物 / 地点 / 通知 / 数据 / 更新 六个 tab。
+ * 设置弹窗（票 04 字典管理 + 票 06 通知 + 票 09 数据收口 + release-update 票 06 更新
+ * + species-profile 票 05 物种）：
+ * 操作 / 食物 / 地点 / 物种 / 通知 / 网页端 / 数据 / 更新 八个 tab。
  * - 食物行：名字、建议间隔（F3：留空=只按喂食统一周期）、易腐开关 + 撤食间隔小时
  *   （票 01：开易腐必填 1–168 整数，关易腐自动清空并置灰，保存时落 null）、
  *   停用/启用、删除（预置或被引用禁用）。
@@ -11,6 +12,8 @@
  *   follow（跟随喂食）行（票 01：撤食预置）固定标注「跟随喂食」，无性质切换与
  *   间隔编辑，停用按钮照常（停用 = 撤食提醒整体关闭）。
  * - 地点 tab 复用 LocationManagerPanel。
+ * - 物种 tab（species-profile 票 05）：自建物种清单管理（改名/删除，被引用禁删）
+ *   复用 SpeciesManagerPanel；面板自读清单、保活挂载；内置 12 种不在此管理。
  * - 通知 tab（票 06 + 反馈第二轮 F4 + 票 05 + webui-checkin 票 11）：推送通知总开关
  *   （桌面 + 手机，分类子开关作废）+「撤食提醒」独立开关（票 05：只闸撤食这一类，
  *   默认开）+ 临近出眠提前天数 + Pushover 应用内凭据
@@ -140,11 +143,12 @@ import {
 } from "../lib/pushoverUi";
 import LoadingHint from "./LoadingHint.vue";
 import LocationManagerPanel from "./LocationManagerPanel.vue";
+import SpeciesManagerPanel from "./SpeciesManagerPanel.vue";
 import UpdatePanel from "./UpdatePanel.vue";
 import WebUiPanel from "./WebUiPanel.vue";
 import { showError, showSuccess } from "../lib/toast";
 
-type Tab = "actions" | "foods" | "locations" | "notify" | "webui" | "data" | "update";
+type Tab = "actions" | "foods" | "locations" | "species" | "notify" | "webui" | "data" | "update";
 
 const emit = defineEmits<{ close: []; changed: [] }>();
 
@@ -730,6 +734,9 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
         <button class="tab tab-locations" :class="{ active: activeTab === 'locations' }" type="button" @click="activeTab = 'locations'">
           地点
         </button>
+        <button class="tab tab-species" :class="{ active: activeTab === 'species' }" type="button" @click="activeTab = 'species'">
+          物种
+        </button>
         <button class="tab tab-notify" :class="{ active: activeTab === 'notify' }" type="button" @click="activeTab = 'notify'">
           通知
         </button>
@@ -1151,6 +1158,13 @@ function eraseTitle(row: { referenced: boolean; isPreset: boolean }): string {
              完成），挂载即带全量数据（面板行是入参快照，不能先空挂再等数据） -->
         <LocationManagerPanel v-if="firstLoadDone" :locations="locations" @saved="onPanelSaved" @changed="onPanelChanged" />
         <LoadingHint v-else />
+      </div>
+
+      <!-- 物种（species-profile 票 05，D19）：自建物种改名/删除（被引用禁删）。
+           面板自读清单（与网页端/更新面板同批挂载即读），保活挂载——行内未保存
+           的改名草稿在页签往返间保留；内置 12 种不在此管理（不可删改）。 -->
+      <div v-show="activeTab === 'species'" class="tab-body">
+        <SpeciesManagerPanel @changed="onPanelChanged" />
       </div>
 
       <!-- 网页端（webui-checkin 票 03）：网段 / 端口 / 凭证 / 访问地址 / 防火墙联动 -->
