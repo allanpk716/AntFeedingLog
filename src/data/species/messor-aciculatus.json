@@ -2,7 +2,7 @@
   "key": "messor-aciculatus",
   "cnName": "针毛收获蚁",
   "latinName": "Messor aciculatus",
-  "aliases": ["针毛"],
+  "aliases": ["针毛", "针毛收获"],
   "type": "收获蚁",
   "hibernation": "浅冬眠",
   "hibernationNote": "冬季活跃型：日本种群土温 4~5°C 以上仍外出活动、不进完全滞育（文献+多源）；欧系商家建议 11~2 月 10~15°C 轻度冬休（商家单源）；人工饲养可不强制冬眠",
@@ -19,7 +19,7 @@
   "price": "几块~30 元（新后小群，原调研）",
   "distribution": "中国华北、西北；日本",
   "appearance": "",
-  "purchaseWarning": "",
+  "purchaseWarning": "别把切叶蚁（Atta/Acromyrmex）当收获蚁买——切叶种真菌要恒温恒湿，极难养，发烧友领域（原调研）",
   "growth": {
     "eggLaying": "野外一年约 3 批（4 月上旬、7 月中旬、10 月下旬，单源经验）；人工温食充足时可连续产卵（经验）；每月产卵数查无实据",
     "eggToWorkerDays": "全程约 3~5 周、强温度依赖（商家单源）；属级参考 6~10 周（属级估计，非本种实测）；幼虫三个龄期（多源）",
