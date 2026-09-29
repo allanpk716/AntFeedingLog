@@ -782,11 +782,11 @@ describe("顶栏导航（票 07/08）", () => {
     expect(wrapper.find(".topbar .today").text()).toBe(todayLabel());
   });
 
-  it("四页 nav：首页/统计/照片/记录可切换，照片页拉照片墙、记录页拉记录列表", async () => {
+  it("五页 nav：首页/统计/照片/记录/图鉴可切换，照片页拉照片墙、记录页拉记录列表、图鉴页纯前端渲染（物种档案票 04）", async () => {
     const wrapper = await mountApp();
 
     const tabs = wrapper.findAll(".topbar .tab");
-    expect(tabs.map((t) => t.text())).toEqual(["首页", "统计", "照片", "记录"]);
+    expect(tabs.map((t) => t.text())).toEqual(["首页", "统计", "照片", "记录", "图鉴"]);
     expect(tabs[0].classes()).toContain("active");
 
     // 切到统计：统计页渲染并拉数据
@@ -810,12 +810,20 @@ describe("顶栏导航（票 07/08）", () => {
     expect(wrapper.find(".log-list").exists()).toBe(true);
     expect(invokeMock.mock.calls.some(([cmd]) => cmd === "list_logs")).toBe(true);
 
+    // 切到图鉴（物种档案票 04）：纯前端内容页，无页面级 IPC
+    invokeMock.mockClear();
+    await wrapper.findAll(".topbar .tab")[4].trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".species-guide").exists()).toBe(true);
+    expect(wrapper.findAll(".sp-head")).toHaveLength(12);
+
     // 切回首页：卡片墙回来
     await wrapper.findAll(".topbar .tab")[0].trigger("click");
     expect(wrapper.find(".group-title").exists()).toBe(true);
     expect(wrapper.find(".stats-page").exists()).toBe(false);
     expect(wrapper.find(".photo-wall").exists()).toBe(false);
     expect(wrapper.find(".log-list").exists()).toBe(false);
+    expect(wrapper.find(".species-guide").exists()).toBe(false);
   });
 
   it("外壳：顶栏之外有独立滚动容器 .page-body（交互第三轮 #6）", async () => {
@@ -1624,13 +1632,13 @@ describe("冬眠管理（票 05）", () => {
 });
 
 describe("浏览器模式入口可见性（终局评审 Important → 网页端窝编辑票 02）", () => {
-  it("浏览器模式：顶栏无「统计」/设置；新建窝与卡片「编辑」双端可见；首页/照片/记录与巢况入口照常", async () => {
+  it("浏览器模式：顶栏无「统计」/设置；新建窝与卡片「编辑」双端可见；首页/照片/记录/图鉴与巢况入口照常", async () => {
     delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     const wrapper = await mountApp();
 
-    // 顶栏三 tab：首页/照片/记录（统计是桌面专属页；照片墙双端都有，窝头像票 05）
+    // 顶栏四 tab：首页/照片/记录/图鉴（统计是桌面专属页；图鉴物种档案票 04 双端可见排最后）
     const tabs = wrapper.findAll(".topbar .tab");
-    expect(tabs.map((t) => t.text())).toEqual(["首页", "照片", "记录"]);
+    expect(tabs.map((t) => t.text())).toEqual(["首页", "照片", "记录", "图鉴"]);
     expect(wrapper.find(".settings-btn").exists()).toBe(false);
     // 网页端窝编辑票 02：「＋ 新建窝」放开双端
     expect(wrapper.find(".new-top-btn").exists()).toBe(true);
@@ -1656,6 +1664,7 @@ describe("浏览器模式入口可见性（终局评审 Important → 网页端�
       "统计",
       "照片",
       "记录",
+      "图鉴",
     ]);
     expect(wrapper.find(".settings-btn").exists()).toBe(true);
     expect(wrapper.find(".new-top-btn").exists()).toBe(true);
