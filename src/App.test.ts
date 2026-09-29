@@ -303,7 +303,14 @@ describe("新建窝", () => {
     expect((dialog.find(".name-input").element as HTMLInputElement).value).toBe("");
 
     await dialog.find(".name-input").setValue("  新窝一号  ");
-    await dialog.find(".species-input").setValue("针毛收获蚁");
+    // species-profile 票 03：物种自由文本改为 SpeciesSelect 选择器交互
+    await dialog.find(".species-trigger").trigger("click");
+    await flushPromises();
+    const speciesOption = dialog
+      .findAll(".option")
+      .find((o) => o.text().includes("针毛收获蚁"));
+    expect(speciesOption, "选择器应有「针毛收获蚁」选项").toBeDefined();
+    await speciesOption!.trigger("click");
     await dialog.find(".location-select").setValue("1");
     await dialog.findComponent(DatePickerPop).vm.$emit("update:modelValue", "2026-09-18");
 
@@ -314,7 +321,8 @@ describe("新建窝", () => {
     expect(invokeMock).toHaveBeenCalledWith("create_colony", {
       input: {
         name: "新窝一号",
-        species: "针毛收获蚁",
+        species: null,
+        species_key: "messor-aciculatus",
         location_id: 1,
         start_date: "2026-09-18",
         status: "active",
@@ -344,12 +352,18 @@ describe("新建窝", () => {
 
 describe("编辑窝", () => {
   it("预填当前值，修改后调用 update_colony（带 id）", async () => {
+    // species-profile 票 03：本用例单独给窝 1 挂 species_key（共享 fixture 不动，
+    // 首页徽章用例仍按「key 缺失→快照兜底」断言旧文本）
+    currentColonies = colonies.map((c) =>
+      c.id === 1 ? { ...c, species_key: "messor-cephalotes" } : c,
+    );
     const wrapper = await mountApp();
     await wrapper.find('.card[data-colony-id="1"] .edit-btn').trigger("click");
 
     const dialog = wrapper.find(".dialog");
     expect((dialog.find(".name-input").element as HTMLInputElement).value).toBe("大头一号");
-    expect((dialog.find(".species-input").element as HTMLInputElement).value).toBe("大头收获蚁");
+    // 物种为 SpeciesSelect：内置 key 实时解析当前中文名（旧快照文本不参与显示）
+    expect(dialog.find(".species-trigger").text()).toContain("肯尼亚收获蚁");
     expect((dialog.find(".location-select").element as HTMLSelectElement).value).toBe("1");
     expect(dialog.findComponent(DatePickerPop).props("modelValue")).toBe("2026-01-20");
 
@@ -364,7 +378,8 @@ describe("编辑窝", () => {
       id: 1,
       input: {
         name: "大头一号B",
-        species: "大头收获蚁",
+        species: null,
+        species_key: "messor-cephalotes",
         location_id: 1,
         start_date: "2026-01-20",
         status: "ended",

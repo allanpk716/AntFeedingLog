@@ -35,6 +35,7 @@ import type {
   CheckinUpdateInput,
   Colony,
   ColonyInput,
+  CustomSpecies,
   FoodCategory,
   FoodCategoryInterval,
   FoodInput,
@@ -328,6 +329,26 @@ export const createColony = cmdFn<{ input: ColonyInput }, void>("create_colony")
 export const updateColony = cmdFn<{ id: number; input: ColonyInput }, void>("update_colony");
 export const archiveColony = cmdFn<{ id: number }, void>("archive_colony");
 export const deleteColony = cmdFn<{ id: number }, void>("delete_colony");
+
+// ── 自建物种（species-profile 票 02/03，物种选择器的数据与写通道）──
+// list 双端可达（网页端白名单只读放行）；建/改名/删桌面端专属（网页端选择器
+// 隐藏内联新建入口）。create/update_colony 的 species_key 随 ColonyInput 整窗
+// 透传（入参对象原样），本层无额外包装。
+
+/** 全部自建物种（按创建序），referenced=被窝引用（禁删）。 */
+export const listCustomSpecies = cmdFn<void, CustomSpecies[]>("list_custom_species");
+/** 新建自建物种：名字 trim 后必填，同名**返回既有行不报错**（选择器「同名即
+ *  选用」）；speciesType 缺省/空白 = 后端落默认「自定义」。 */
+export const createCustomSpecies = cmdFn<
+  { name: string; speciesType?: string | null },
+  CustomSpecies
+>("create_custom_species");
+/** 改名：只改 name 并级联刷新引用窝的显示名快照；key 永不改变。 */
+export const renameCustomSpecies = cmdFn<{ key: string; newName: string }, CustomSpecies>(
+  "rename_custom_species",
+);
+/** 删除：被窝引用时后端人话拒绝。 */
+export const deleteCustomSpecies = cmdFn<{ key: string }, void>("delete_custom_species");
 
 // ── 每窝周期（ColonyFormDialog「周期提醒」小节）──
 // web-colony-edit 终局修复：已入网页端 HTTP 白名单——编辑表单保存是两段式，

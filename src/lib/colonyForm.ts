@@ -14,7 +14,10 @@ import { isValidIsoDate } from "./dates";
 
 export interface ColonyForm {
   name: string;
-  species: string;
+  /** 物种 key（species-profile 票 03）：内置档案 slug 或自建 `custom-N`；"" = 未
+   *  指定（物种可不填的可空语义）。自由文本已被 SpeciesSelect 取代——显示名快照
+   *  由后端按 key 推导，前端不再提交 species 文本。 */
+  speciesKey: string;
   locationId: number | null;
   startDate: string;
   status: ColonyStatus;
@@ -23,7 +26,7 @@ export interface ColonyForm {
 export function emptyForm(today: string, defaultLocationId: number | null): ColonyForm {
   return {
     name: "",
-    species: "",
+    speciesKey: "",
     locationId: defaultLocationId,
     startDate: today,
     status: "active",
@@ -33,7 +36,7 @@ export function emptyForm(today: string, defaultLocationId: number | null): Colo
 export function formFromColony(colony: Colony): ColonyForm {
   return {
     name: colony.name,
-    species: colony.species ?? "",
+    speciesKey: colony.species_key ?? "",
     locationId: colony.location_id,
     startDate: colony.start_date,
     status: colony.status,
@@ -60,12 +63,17 @@ export function validateColonyForm(
   return null;
 }
 
-/** trim 名字与物种、空物种转 null，键名转 Rust 入参的 snake_case。 */
+/**
+ * trim 名字与 speciesKey，键名转 Rust 入参的 snake_case。物种映射（快照生命周期
+ * §5.7）：未指定 = species_key 与 species 文本都不给（两列皆空）；选了 key 时
+ * species 恒 null——快照由后端按 key 推导（内置=cnName/自建=当前名）。
+ */
 export function formToInput(form: ColonyForm): ColonyInput {
-  const species = form.species.trim();
+  const speciesKey = form.speciesKey.trim();
   return {
     name: form.name.trim(),
-    species: species === "" ? null : species,
+    species: null,
+    species_key: speciesKey === "" ? null : speciesKey,
     location_id: form.locationId,
     start_date: form.startDate.trim(),
     status: form.status,

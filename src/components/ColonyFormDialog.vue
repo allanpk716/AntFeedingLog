@@ -1,6 +1,7 @@
 <script setup lang="ts">
 /**
- * 新建/编辑窝弹窗：名字、物种、地点下拉、开始日期、状态。
+ * 新建/编辑窝弹窗：名字、物种（SpeciesSelect 选择器，species-profile 票 03；
+ * 可不填，保存为 species_key + 后端快照推导）、地点下拉、开始日期、状态。
  * 状态下拉只开放 活跃/已结束——冬眠只能走卡片「开始冬眠/确认出眠」流程（定点修 5）；
  * 编辑冬眠中的窝时该状态以禁用项显示、保存不改变它。
  * 编辑模式额外提供「置为已结束」（桌面专属，网页端窝编辑票 02：网页端已结束经状态下拉可达）与「删除」
@@ -11,8 +12,9 @@
  * （选/切方式预填跟随、清回未设清空置灰、净零 B 仍 B），落库改走 update_colony
  * 整窗新通道（hydration_method + interval_changes，与基础字段同事务）。
  * 新建模式带「保湿方式」选择（D3 随建随落），保存走 create_colony 同一整窗通道。
- * 本组件自己发 IPC（create/update/archive/delete_colony、新建时 list_actions），
- * 成功后抛 saved 让外层刷新。
+ * 本组件自己发 IPC（create/update/archive/delete_colony、新建时 list_actions；
+ * 内嵌 SpeciesSelect 另拉只读 list_custom_species，写自建物种走选择器内桌面通
+ * 道），成功后抛 saved 让外层刷新。
  */
 import { computed, ref, watch } from "vue";
 import {
@@ -49,6 +51,7 @@ import {
 } from "../lib/colonyForm";
 import { todayIso } from "../lib/dates";
 import DatePickerPop from "./DatePickerPop.vue";
+import SpeciesSelect from "./SpeciesSelect.vue";
 
 const props = defineProps<{
   editing: Colony | null;
@@ -307,12 +310,7 @@ async function remove() {
       />
 
       <div class="field-label">物种</div>
-      <input
-        v-model="form.species"
-        class="species-input"
-        type="text"
-        placeholder="如：大头收获蚁"
-      />
+      <SpeciesSelect v-model="form.speciesKey" />
 
       <div class="field-label">地点</div>
       <select v-model="form.locationId" class="location-select">
