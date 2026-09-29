@@ -1025,6 +1025,19 @@ fn get_update_state() -> Result<updater::UpdateState, String> {
     Ok(updater::current_update_state())
 }
 
+/// 红点判活（update-entry 票 02）：落库的已发现版本是否数值上比当前新
+///（主页面「检查更新」按钮角标的数据源；重启读一次，之后随事件刷新）。
+#[tauri::command]
+fn get_update_badge(
+    state: tauri::State<'_, DbState>,
+    app: tauri::AppHandle,
+) -> Result<updater::BadgeState, String> {
+    let available = with_conn(state, |conn| {
+        updater::badge_available(conn, &app.package_info().version.to_string())
+    })?;
+    Ok(updater::BadgeState { available })
+}
+
 // ── 更新 UI 的轻量出口（release-update 票 06 设置页「更新」节）──
 
 /// 当前应用版本（设置页展示）。与更新流同源（package_info，即 tauri.conf.json
@@ -1907,6 +1920,7 @@ pub fn run() {
             check_update_now,
             confirm_and_install,
             get_update_state,
+            get_update_badge,
             get_app_version,
             open_releases_page,
             pushover_status,

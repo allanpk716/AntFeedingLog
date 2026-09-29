@@ -61,7 +61,7 @@ import type {
   WebUiSaveInput,
   WebUiSaveOutcome,
 } from "../types";
-import type { CheckOutcome, InstallOutcome, UpdateState } from "./updaterUi";
+import type { CheckOutcome, InstallOutcome, UpdateBadgePayload, UpdateState } from "./updaterUi";
 
 /** 网页端访问凭证的 localStorage 键（票 04 起由页面写入；为空时不带 Authorization 头）。 */
 export const WEBUI_TOKEN_KEY = "antfeedinglog.webui.token";
@@ -512,6 +512,9 @@ export const exportData = cmdFn<{ format: "csv" | "json" }, string | null>("expo
 
 export const getAppVersion = cmdFn<void, string>("get_app_version");
 export const getUpdateState = cmdFn<void, UpdateState>("get_update_state");
+/** 红点判活（update-entry 票 02）：落库的已发现版本是否比当前新；变化经
+ *  update-badge-changed 事件广播（payload 同 UpdateBadgePayload 形态）。 */
+export const getUpdateBadge = cmdFn<void, UpdateBadgePayload>("get_update_badge");
 export const checkUpdateNow = cmdFn<void, CheckOutcome>("check_update_now");
 export const confirmAndInstall = cmdFn<void, InstallOutcome>("confirm_and_install");
 export const openReleasesPage = cmdFn<void, void>("open_releases_page");

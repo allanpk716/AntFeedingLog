@@ -57,6 +57,11 @@ use serde::Serialize;
 /// settings 表键名：每日更新检查最近一次执行的日期（ISO 日期串）。
 pub const K_LAST_CHECK_DAY: &str = "update_last_check_day";
 
+/// settings 表键名：红点事实源——已发现的可升级版本号（update-entry 票 02；
+/// 空/缺 = 无）。任一检查路径发现新版即写、已是最新即清、检查失败不动
+/// （失败≠无更新）；判活在读取时数值比较，装完重启版本追上自然灭。
+pub const K_AVAILABLE_VERSION: &str = "update_available_version";
+
 /// 发布页地址（票 06 手动下载出口：升级未完成引导 / 安装失败的兜底）。
 /// 与 tauri.conf.json endpoints 同仓库；`releases/latest` 恒指最新发布，
 /// 不随版本号变，无需在发版时改这里。
@@ -100,6 +105,13 @@ pub enum DailyOutcome {
         version: String,
         notes: Option<String>,
     },
+}
+
+/// get_update_badge 命令返回与 update-badge-changed 事件负载（serde 同形，
+/// 前端契约见 src/lib/updaterUi.ts）：available = 落库版本数值上比当前新。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BadgeState {
+    pub available: bool,
 }
 
 // ── 核心：每日节奏 ────────────────────────────────────────────────────────
@@ -475,6 +487,83 @@ fn set_last_check_day(conn: &Connection, day: &str) -> Result<(), String> {
     Ok(())
 }
 
+// ── 红点事实源（update-entry 票 02）───────────────────────────────────────
+
+/// 读红点事实源：已发现的可升级版本号；从没发现过 = None。
+pub fn available_version(conn: &Connection) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![K_AVAILABLE_VERSION],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
+/// 写/清红点事实源：Some 写版本，None 删键。
+fn set_available_version(conn: &Connection, version: Option<&str>) -> Result<(), String> {
+    match version {
+        Some(v) => {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![K_AVAILABLE_VERSION, v],
+            )
+            .map_err(db_err)?;
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![K_AVAILABLE_VERSION],
+            )
+            .map_err(db_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// 数值语义版本比较（candidate 严格大于 current？）：按「.」分段逐段比数值，
+/// 避免 "0.10.0" < "0.9.0" 的字符串序坑。段解析失败按 0（脏值宁可漏报不误报
+/// ——红点灭了不丢任何数据）；段数不等时缺段按 0 补齐。
+pub fn version_is_newer(candidate: &str, current: &str) -> bool {
+    let parse = |s: &str| -> Vec<u64> {
+        s.split('.').map(|seg| seg.parse().unwrap_or(0)).collect()
+    };
+    let (c, k) = (parse(candidate), parse(current));
+    for i in 0..c.len().max(k.len()) {
+        let (a, b) = (c.get(i).copied().unwrap_or(0), k.get(i).copied().unwrap_or(0));
+        if a != b {
+            return a > b;
+        }
+    }
+    false
+}
+
+/// 红点判活：落库版本数值上比当前新才亮（无落库 = 不亮；装完重启版本追上
+/// 自然灭——键还在但比较为假）。
+pub fn badge_available(conn: &Connection, current_version: &str) -> Result<bool, String> {
+    Ok(version_is_newer(
+        available_version(conn)?.as_deref().unwrap_or(""),
+        current_version,
+    ))
+}
+
+/// 一轮检查后的红点记账：Ok(Some) 写版本、Ok(None) 清键、Err 不动（检查失败
+/// ≠无更新，红点保持原状）。返回记账后的判活结果（落库版本 vs 当前版本），
+/// 调用方据此广播。仍不碰每日记账（update_last_check_day），两条路径互不干扰。
+pub fn record_badge_from_result(
+    conn: &Connection,
+    result: &Result<Option<UpdateInfo>, String>,
+    current_version: &str,
+) -> Result<bool, String> {
+    match result {
+        Ok(Some(info)) => set_available_version(conn, Some(&info.version))?,
+        Ok(None) => set_available_version(conn, None)?,
+        Err(_) => {}
+    }
+    badge_available(conn, current_version)
+}
+
 /// 每日检查 · 段 1（持锁段）：读"上次检查日"判断今天该不该查。调用方拿锁调它、
 /// 拿到结果立即放锁，网络检查在锁外做（评审 R1-1）。
 pub fn should_run_daily_check(conn: &Connection, today: &str) -> Result<bool, String> {
@@ -711,18 +800,50 @@ struct DownloadProgress {
     total: Option<u64>,
 }
 
-/// 手动检查入口（设置页 `check_update_now`）。async：同步 command 跑在主线程/
+/// 手动检查入口（设置页 `check_update_now`；update-entry 票 01 主页面按钮与
+/// 票 03 托盘同走本路径）。async：同步 command 跑在主线程/
 /// 事件循环上，阻塞网络会把整个 UI 冻住（评审 R1-2），改 async 由 Tauri 丢进
 /// 异步运行时、内部直接 `.await`（此处不得再 block_on）。
 /// 失败折为 Err 一次性展示。刻意不写每日记账（last_check_day）：两条路径互不
-/// 干扰，当天每日检查照常执行。
+/// 干扰，当天每日检查照常执行。红点记账（update-entry 票 02）：发现写版本、
+/// 无更新清键、失败不动，记账后广播。
 pub async fn manual_check(app: tauri::AppHandle) -> Result<CheckOutcome, String> {
     let updater = build_updater(&app)?;
     let update = updater
         .check()
         .await
         .map_err(|e| format!("检查更新失败: {e}"))?;
-    manual_result(to_outcome(Ok(update.map(update_to_info))))
+    let raw = update.map(update_to_info);
+    record_badge_and_emit(&app, &Ok(raw.clone()));
+    manual_result(to_outcome(Ok(raw)))
+}
+
+/// 红点记账 + 广播（update-entry 票 02，薄封装不进单测；核心
+/// record_badge_from_result 全测）：每日/手动两条路径共用。禁写窗口整段跳过
+/// （快照中不落任何写）；记账失败只记日志——红点是副产物，绝不影响检查结果。
+/// 事件无条件发（幂等，前端直接采信 payload 判亮灭）。
+fn record_badge_and_emit(app: &tauri::AppHandle, result: &Result<Option<UpdateInfo>, String>) {
+    use tauri::Emitter;
+    if is_write_blocked() {
+        return;
+    }
+    let Some(state) = app.try_state::<crate::DbState>() else {
+        return;
+    };
+    let Ok(conn) = state.0.lock() else {
+        return;
+    };
+    // 锁内复查禁写标志（与 daily_tick 段 3 / check_and_notify 同款 TOCTOU 纪律）
+    if is_write_blocked() {
+        return;
+    }
+    let current = app.package_info().version.to_string();
+    match record_badge_from_result(&conn, result, &current) {
+        Ok(available) => {
+            let _ = app.emit("update-badge-changed", BadgeState { available });
+        }
+        Err(e) => crate::applog::log_error(&format!("更新红点记账失败（忽略）: {e}")),
+    }
 }
 
 /// 「发现新版」通知正文（update-entry 票 01：指路主页面「检查更新」按钮，
@@ -797,8 +918,11 @@ fn daily_tick(handle: &tauri::AppHandle) {
         if is_write_blocked() {
             return;
         }
-        finish_daily_check(&conn, result, &today)
+        finish_daily_check(&conn, result.clone(), &today)
     };
+    // 红点记账 + 广播（update-entry 票 02）：吃段 2 的原始结果——失败不清红点
+    //（fold_daily 只作用于对外通知口径，红点语义是「远端确有更新」这个事实）
+    record_badge_and_emit(handle, &result);
     match outcome {
         Ok(DailyOutcome::UpdateAvailable { version, notes }) => {
             // 终局评审 D7：每日检查结果一天一行（真查才走到这里，Skipped 已提前返回）
@@ -1155,6 +1279,79 @@ mod tests {
         // 每日照常可查
         let out = run_daily_flow(&conn, &checker, D1).unwrap();
         assert_eq!(out, DailyOutcome::NoUpdate);
+    }
+
+    // ── 红点事实源（update-entry 票 02）──
+
+    #[test]
+    fn version_compare_is_numeric_per_segment() {
+        // 字符串序坑的反例：0.10.0 必须大于 0.9.0
+        assert!(version_is_newer("0.10.0", "0.9.0"));
+        assert!(version_is_newer("0.3.0", "0.2.9"));
+        assert!(!version_is_newer("0.3.0", "0.3.0"), "等版本不亮");
+        assert!(!version_is_newer("0.2.0", "0.3.0"));
+        assert!(version_is_newer("0.3", "0.2.1"), "段数不等：缺段按 0 补齐");
+        assert!(!version_is_newer("0.3.0.1", "0.3.1"));
+        assert!(!version_is_newer("", "0.2.0"), "无落库不亮");
+        assert!(!version_is_newer("abc", "0.2.0"), "脏值按 0 段：漏报不误报");
+    }
+
+    #[test]
+    fn badge_records_available_and_clears_on_up_to_date() {
+        let conn = mem_conn();
+        // 发现新版 → 写键 + 判活真
+        let on = record_badge_from_result(
+            &conn,
+            &Ok(Some(UpdateInfo {
+                version: "0.3.0".into(),
+                notes: None,
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+        assert!(on);
+        assert_eq!(available_version(&conn).unwrap().as_deref(), Some("0.3.0"));
+
+        // 已是最新 → 清键 + 判活假
+        let off = record_badge_from_result(&conn, &Ok(None), "0.2.0").unwrap();
+        assert!(!off);
+        assert_eq!(available_version(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn badge_untouched_on_check_failure() {
+        let conn = mem_conn();
+        record_badge_from_result(
+            &conn,
+            &Ok(Some(UpdateInfo {
+                version: "0.3.0".into(),
+                notes: None,
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+
+        // 检查失败：键不动、判活维持（失败≠无更新）
+        let on = record_badge_from_result(&conn, &Err("HTTP 404：latest.json 不存在".into()), "0.2.0").unwrap();
+        assert!(on);
+        assert_eq!(available_version(&conn).unwrap().as_deref(), Some("0.3.0"));
+    }
+
+    #[test]
+    fn badge_goes_dim_when_current_catches_up() {
+        // 装完重启版本追上：键还在、数值不比当前新 → 判活灭（无需显式清键）
+        let conn = mem_conn();
+        record_badge_from_result(
+            &conn,
+            &Ok(Some(UpdateInfo {
+                version: "0.3.0".into(),
+                notes: None,
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+        assert!(!badge_available(&conn, "0.3.0").unwrap());
+        assert!(badge_available(&conn, "0.2.9").unwrap());
     }
 
     // ── 「发现新版」通知文案（update-entry 票 01：指路主页面新入口）──

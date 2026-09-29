@@ -10,11 +10,27 @@ import DatePickerPop from "./components/DatePickerPop.vue";
 
 // 不依赖 Tauri 运行时：统一 mock 调用层（命令包装按 cmdName 透传给唯一的
 // invokeMock，调用形状 (命令名, 入参) 与旧式 vi.mock("@tauri-apps/api/core") 一致）；
-// 事件订阅（db-restored 等）走 mock 工厂内置的立即退订空桩
-const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+// 事件订阅经捕获桩（update-entry 票 02）：按事件名记最后注册的处理器，
+// emitAppEvent 派发——不发事件的既有测试不受影响（默认空桩行为不变）
+const { invokeMock, subscribeMock, emitAppEvent } = vi.hoisted(() => {
+  const invokeMock = vi.fn();
+  const handlers = new Map<string, (payload: unknown) => void>();
+  const subscribeMock = vi.fn(
+    async (_event: string, handler: (payload: unknown) => void) => {
+      handlers.set(_event, handler);
+      return () => handlers.delete(_event);
+    },
+  );
+  return {
+    invokeMock,
+    subscribeMock,
+    emitAppEvent: (event: string, payload: unknown) =>
+      handlers.get(event)?.(payload),
+  };
+});
 vi.mock("./lib/ipc", async (importOriginal) => {
   const { ipcModuleMock } = await import("./testing/ipcMock");
-  return ipcModuleMock(invokeMock)(importOriginal);
+  return ipcModuleMock(invokeMock, { subscribe: subscribeMock })(importOriginal);
 });
 
 // 票 07：统计页图表在 happy-dom 无 canvas，mock 掉 echarts（导航测试只验接线）
@@ -114,6 +130,9 @@ const colonies: Colony[] = [
 /** list_colonies 返回的数据源，测试里可整体替换（模拟后端重算后的新数据）。 */
 let currentColonies: Colony[] = colonies;
 
+/** get_update_badge 回放（update-entry 票 02）：默认不亮。 */
+let currentBadge = { available: false };
+
 function baseMock() {
   invokeMock.mockImplementation(async (cmd: string) => {
     switch (cmd) {
@@ -137,6 +156,8 @@ function baseMock() {
         return []; // 照片墙页挂载即拉载荷；默认空库（页面自渲染空态）
       case "get_settings":
         return currentSettings;
+      case "get_update_badge":
+        return currentBadge;
       case "colony_month_records":
         return []; // 打卡/喂食弹窗挂载即拉当月标记；默认空月（黄条/标记用例各自覆写）
       default:
@@ -153,8 +174,10 @@ async function mountApp() {
 
 beforeEach(() => {
   invokeMock.mockReset();
+  subscribeMock.mockClear();
   currentColonies = colonies;
   currentSettings = defaultSettings;
+  currentBadge = { available: false };
   // 桌面 WebView 形态为默认（桌面专属入口按 isTauri 渲染）；
   // 浏览器形态在「浏览器模式入口可见性」describe 里单独删掉注入
   (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
@@ -1701,6 +1724,42 @@ describe("主页面「检查更新」按钮（update-entry 票 01）", () => {
     delete (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
     const wrapper = await mountApp();
     expect(wrapper.find(".topbar .update-top-btn").exists()).toBe(false);
+  });
+});
+
+// ── 主页面红点角标（update-entry 票 02）：落库事实源判活 + 事件即时刷新 ──
+
+describe("主页面红点角标（update-entry 票 02）", () => {
+  it("挂载读取红点事实源：有新版 → 按钮亮红点；无新版 → 不亮", async () => {
+    currentBadge = { available: true };
+    const wrapper = await mountApp();
+    expect(wrapper.find(".update-top-btn .update-dot").exists()).toBe(true);
+
+    currentBadge = { available: false };
+    const wrapper2 = await mountApp();
+    expect(wrapper2.find(".update-top-btn .update-dot").exists()).toBe(false);
+  });
+
+  it("红点随 update-badge-changed 事件即时亮灭（任一检查路径落库后广播）", async () => {
+    const wrapper = await mountApp();
+    expect(wrapper.find(".update-top-btn .update-dot").exists()).toBe(false);
+
+    emitAppEvent("update-badge-changed", { available: true });
+    await flushPromises();
+    expect(wrapper.find(".update-top-btn .update-dot").exists()).toBe(true);
+
+    emitAppEvent("update-badge-changed", { available: false });
+    await flushPromises();
+    expect(wrapper.find(".update-top-btn .update-dot").exists()).toBe(false);
+  });
+
+  it("判活读取失败/事件形态不对 → 不亮不崩（漏报不误报）", async () => {
+    const wrapper = await mountApp();
+    expect(wrapper.find(".update-top-btn .update-dot").exists()).toBe(false);
+
+    emitAppEvent("update-badge-changed", null);
+    await flushPromises();
+    expect(wrapper.find(".update-top-btn .update-dot").exists()).toBe(false);
   });
 });
 

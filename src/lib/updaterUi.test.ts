@@ -8,6 +8,7 @@ import {
   progressText,
   shouldRefreshProgress,
   stateBannerFor,
+  toBadgeOn,
   toProgressView,
   upToDateText,
   updateAvailableTitle,
@@ -191,5 +192,18 @@ describe("下载进度", () => {
     // 自定义间隔生效
     expect(shouldRefreshProgress(shown, p(20), 1400, 500)).toBe(false);
     expect(shouldRefreshProgress(shown, p(20), 1500, 500)).toBe(true);
+  });
+});
+
+// ── 红点负载容错解析（update-entry 票 02）──
+
+describe("红点负载解析 toBadgeOn（update-entry 票 02）", () => {
+  it("available=true 亮；false/缺字段/非对象一律不亮（漏报不误报）", () => {
+    expect(toBadgeOn({ available: true })).toBe(true);
+    expect(toBadgeOn({ available: false })).toBe(false);
+    expect(toBadgeOn({})).toBe(false);
+    expect(toBadgeOn(null)).toBe(false);
+    expect(toBadgeOn("available")).toBe(false);
+    expect(toBadgeOn(undefined)).toBe(false);
   });
 });

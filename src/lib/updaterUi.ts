@@ -33,6 +33,23 @@ export type UpdateState =
   | { status: "last_install_succeeded"; version: string }
   | { status: "last_install_incomplete"; version: string };
 
+// ── 红点（update-entry 票 02）：get_update_badge 命令与 update-badge-changed
+//    事件共用负载（Rust updater::BadgeState）─────────────────────────────────
+
+/** 红点负载形态：available = 落库的已发现版本数值上比当前新 */
+export interface UpdateBadgePayload {
+  available: boolean;
+}
+
+/** 红点负载容错解析：形态不对一律不亮（红点是提示副产物，宁可漏报不误报） */
+export function toBadgeOn(payload: unknown): boolean {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    (payload as UpdateBadgePayload).available === true
+  );
+}
+
 // ── 文案选择（中文文案集中在此，组件只渲染）────────────────────────────────
 
 /** 无更新：平静一句话，不催促 */

@@ -8,8 +8,9 @@
  * 驱动 refresh 重拉——卡片距上次/红标/饲养天数跟着换天，零操作自动追上。
  */
 import { computed, KeepAlive, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { getWebUiWizardDone, isTauri, listColonies, listLocations, subscribe } from "./lib/ipc";
+import { getUpdateBadge, getWebUiWizardDone, isTauri, listColonies, listLocations, subscribe } from "./lib/ipc";
 import { watchDataVersion } from "./lib/versionSync";
+import { toBadgeOn } from "./lib/updaterUi";
 import type { Colony, LocationItem } from "./types";
 import { groupColonies, splitColonies } from "./lib/home";
 import { todayLabel } from "./lib/dates";
@@ -51,6 +52,20 @@ const showWebUiWizard = ref(false);
 const activeColonies = computed(() => splitColonies(colonies.value).active);
 const endedColonies = computed(() => splitColonies(colonies.value).ended);
 const groups = computed(() => groupColonies(activeColonies.value, locations.value));
+
+/** 红点（update-entry 票 02）：「远端有比当前新的版本」的事实——挂载读落库
+ * 判活（重启不丢、离线照读），此后随 update-badge-changed 事件即时刷新
+ * （每日/手动/托盘任一检查路径记账后广播）。只随事实变，「暂不更新」不灭。 */
+const updateBadgeOn = ref(false);
+
+async function refreshUpdateBadge() {
+  try {
+    const state = await getUpdateBadge();
+    updateBadgeOn.value = state?.available === true;
+  } catch {
+    // 读失败不亮（漏报不误报）：下次事件或重启再对齐
+  }
+}
 
 /** 顶栏日期从全局今天源派生（`T00:00` 本地零点解析：任何时区下星期都正确）。 */
 const today = todayIsoRef();
@@ -111,6 +126,12 @@ onMounted(() => {
   // 今天时钟源在根启动（分钟 tick + focus/visibilitychange 兜底）；根卸载才停表
   startTodayClock();
   void refresh();
+  // 红点（update-entry 票 02）：挂载读一次落库判活；根组件常驻不卸载，
+  // 与 db-restored 同款不退订，之后靠事件即时刷新
+  void refreshUpdateBadge();
+  void subscribe("update-badge-changed", (payload) => {
+    updateBadgeOn.value = toBadgeOn(payload);
+  });
   // 恢复完成广播（数据安全二期票 04，语义=无条件刷新，票 06 不改）：整库被
   // 替换，各页数据全部重拉——首页在此刷新；统计/照片/记录页保活常驻，经各自
   // 的数据版本订阅跟进（恢复完成后端同帧广播版本，见 lib.rs restore 钩子）
@@ -187,7 +208,7 @@ onBeforeUnmount(() => stopTodayClock());
           title="检查更新：直达设置「更新」页签并自动检查"
           @click="openUpdateCheck"
         >
-          ↑
+          ↑<span v-if="updateBadgeOn" class="update-dot" aria-hidden="true"></span>
         </button>
         <button v-if="isTauri()" class="ghost-btn settings-btn" type="button" title="字典管理（操作 / 食物 / 地点）" @click="showSettings = true">
           ⚙ 设置
@@ -399,6 +420,23 @@ onBeforeUnmount(() => stopTodayClock());
 .ghost-btn:hover {
   border-color: var(--accent);
   color: var(--accent-deep);
+}
+
+/* 红点角标（update-entry 票 02）：按钮右上小圆点，只随事实亮灭 */
+.update-top-btn {
+  position: relative;
+}
+
+.update-dot {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--bad);
+  border: 1px solid var(--card);
+  pointer-events: none;
 }
 
 .container {
