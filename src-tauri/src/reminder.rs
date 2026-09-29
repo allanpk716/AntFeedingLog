@@ -828,9 +828,10 @@ pub fn spawn_scheduler(handle: tauri::AppHandle) {
     });
 }
 
-/// 建托盘：悬停看概要 tooltip；右键菜单 版本 / 显示主窗口 / 退出（spec 用户故事 19；
-/// 版本项为后续补充——禁用灰显只作展示，取 Cargo.toml 编译期版本，与
-/// tauri.conf.json/package.json 由发版流程同步）。
+/// 建托盘：悬停看概要 tooltip；右键菜单 检查更新… / 版本 / 显示主窗口 / 退出
+///（spec 用户故事 19；版本项为后续补充——禁用灰显只作展示，取 Cargo.toml 编译期
+/// 版本，与 tauri.conf.json/package.json 由发版流程同步。「检查更新…」为
+/// update-entry 票 03：后台静默查 + 智能分流，编排全在 updater::run_tray_check）。
 pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItem};
     use tauri::tray::TrayIconBuilder;
@@ -842,15 +843,17 @@ pub fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
         false, // 禁用项：只展示不可点，on_menu_event 不需要分支
         None::<&str>,
     )?;
+    let check_update = MenuItem::with_id(app, "check_update", "检查更新…", true, None::<&str>)?;
     let show = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&version, &show, &quit])?;
+    let menu = Menu::with_items(app, &[&version, &check_update, &show, &quit])?;
 
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "quit" => app.exit(0),
+            "check_update" => crate::updater::run_tray_check(app.clone()),
             "show" => {
                 if let Some(window) = app.get_webview_window("main") {
                     let _ = window.show();

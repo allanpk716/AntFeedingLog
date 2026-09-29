@@ -45,6 +45,9 @@ const showSettings = ref(false);
 const settingsInitialTab = ref<"actions" | "update">("actions");
 /** 与直达配套的自动检查；关弹窗即复位（⚙设置 旧路径永远是手动检查） */
 const settingsAutoCheck = ref(false);
+/** 直达事件序号（update-entry 票 03）：弹窗已开时的直达靠它驱动切页签
+ *（initialTab 同值不触发 watch），托盘分流每发一次递增 */
+const directOpenSeq = ref(0);
 const endedOpen = ref(false);
 /** 网页端首启向导（webui-checkin 票 03）：启动时查到「未做」才弹一次。 */
 const showWebUiWizard = ref(false);
@@ -110,6 +113,18 @@ function openUpdateCheck() {
   showSettings.value = true;
 }
 
+/** 托盘分流直达（update-entry 票 03）：托盘查到新版后 Rust 侧已弹主窗口，
+ * 这里开弹窗落「更新」页签。弹窗未开 → 连自动检查一起给；已开 → 仅切页签
+ * 不重触发检查（安装进行中的面板不被打扰）。 */
+function onOpenUpdateEntry() {
+  settingsInitialTab.value = "update";
+  directOpenSeq.value += 1;
+  if (!showSettings.value) {
+    settingsAutoCheck.value = true;
+    showSettings.value = true;
+  }
+}
+
 function onSettingsChanged() {
   void refresh();
 }
@@ -131,6 +146,10 @@ onMounted(() => {
   void refreshUpdateBadge();
   void subscribe("update-badge-changed", (payload) => {
     updateBadgeOn.value = toBadgeOn(payload);
+  });
+  // 托盘分流直达（update-entry 票 03）：常驻订阅同款不退订
+  void subscribe("open-update-entry", () => {
+    onOpenUpdateEntry();
   });
   // 恢复完成广播（数据安全二期票 04，语义=无条件刷新，票 06 不改）：整库被
   // 替换，各页数据全部重拉——首页在此刷新；统计/照片/记录页保活常驻，经各自
@@ -289,6 +308,7 @@ onBeforeUnmount(() => stopTodayClock());
       v-if="showSettings"
       :initial-tab="settingsInitialTab"
       :auto-update-check="settingsAutoCheck"
+      :direct-open-seq="directOpenSeq"
       @close="onSettingsClosed"
       @changed="onSettingsChanged"
     />

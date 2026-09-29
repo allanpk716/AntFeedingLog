@@ -1763,6 +1763,63 @@ describe("主页面红点角标（update-entry 票 02）", () => {
   });
 });
 
+// ── 托盘分流直达事件（update-entry 票 03）──
+
+describe("托盘分流直达（update-entry 票 03）", () => {
+  it("open-update-entry 事件（托盘查到新版）：弹窗未开 → 打开并落「更新」页签自动检查", async () => {
+    const wrapper = await mountApp();
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "check_update_now" ? { status: "up_to_date" } : base(cmd),
+    );
+
+    emitAppEvent("open-update-entry", undefined);
+    await flushPromises();
+
+    expect(wrapper.find(".settings-dialog").exists()).toBe(true);
+    expect(wrapper.find(".tab-update").classes()).toContain("active");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "check_update_now")).toBe(true);
+  });
+
+  it("弹窗已开（停在别的页签）→ 仅切到「更新」页签，不重新触发检查", async () => {
+    const wrapper = await mountApp();
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "check_update_now" ? { status: "up_to_date" } : base(cmd),
+    );
+
+    await wrapper.find(".settings-btn").trigger("click");
+    await flushPromises();
+    expect(wrapper.find(".tab-actions").classes()).toContain("active");
+
+    emitAppEvent("open-update-entry", undefined);
+    await flushPromises();
+
+    expect(wrapper.find(".tab-update").classes()).toContain("active");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "check_update_now")).toBe(false);
+  });
+
+  it("重复直达（页签已在更新）：页签保持更新，不重触发检查", async () => {
+    const wrapper = await mountApp();
+    const base = invokeMock.getMockImplementation()!;
+    invokeMock.mockImplementation(async (cmd: string) =>
+      cmd === "check_update_now" ? { status: "up_to_date" } : base(cmd),
+    );
+
+    emitAppEvent("open-update-entry", undefined);
+    await flushPromises();
+    invokeMock.mockClear();
+
+    // 手动翻去「操作」页签后再次直达：切回更新页签
+    await wrapper.find(".tab-actions").trigger("click");
+    emitAppEvent("open-update-entry", undefined);
+    await flushPromises();
+
+    expect(wrapper.find(".tab-update").classes()).toContain("active");
+    expect(invokeMock.mock.calls.some(([cmd]) => cmd === "check_update_now")).toBe(false);
+  });
+});
+
 // ── 轻提示宿主挂应用根（保湿方式+轻提示票 03）──
 
 describe("轻提示宿主挂应用根（票 03）", () => {

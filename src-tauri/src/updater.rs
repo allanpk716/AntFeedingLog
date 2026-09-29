@@ -522,21 +522,11 @@ fn set_available_version(conn: &Connection, version: Option<&str>) -> Result<(),
     Ok(())
 }
 
-/// 数值语义版本比较（candidate 严格大于 current？）：按「.」分段逐段比数值，
-/// 避免 "0.10.0" < "0.9.0" 的字符串序坑。段解析失败按 0（脏值宁可漏报不误报
-/// ——红点灭了不丢任何数据）；段数不等时缺段按 0 补齐。
+/// 红点判活的版本比较（candidate 严格大于 current？）：复用本模块既有的
+/// 语义化版本比较 version_cmp（0.10.0 > 0.9.0 反例、缺段补 0、容忍前导 v），
+/// 不另立第二套比较口径；无落库（空串）比较为假 → 不亮。
 pub fn version_is_newer(candidate: &str, current: &str) -> bool {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split('.').map(|seg| seg.parse().unwrap_or(0)).collect()
-    };
-    let (c, k) = (parse(candidate), parse(current));
-    for i in 0..c.len().max(k.len()) {
-        let (a, b) = (c.get(i).copied().unwrap_or(0), k.get(i).copied().unwrap_or(0));
-        if a != b {
-            return a > b;
-        }
-    }
-    false
+    version_cmp(candidate, current) == std::cmp::Ordering::Greater
 }
 
 /// 红点判活：落库版本数值上比当前新才亮（无落库 = 不亮；装完重启版本追上
@@ -844,6 +834,104 @@ fn record_badge_and_emit(app: &tauri::AppHandle, result: &Result<Option<UpdateIn
         }
         Err(e) => crate::applog::log_error(&format!("更新红点记账失败（忽略）: {e}")),
     }
+}
+
+/// 托盘「检查更新…」的分流决策（update-entry 票 03，纯函数）：有新版开窗直达
+/// 更新入口、无新版发「已是最新」通知（带当前版本）、失败发带原因的通知。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrayCheckAction {
+    OpenUpdateEntry,
+    NotifyUpToDate {
+        current_version: String,
+    },
+    NotifyFailed {
+        message: String,
+    },
+}
+
+pub fn tray_check_action(
+    outcome: &Result<CheckOutcome, String>,
+    current_version: &str,
+) -> TrayCheckAction {
+    match outcome {
+        Ok(CheckOutcome::UpdateAvailable { .. }) => TrayCheckAction::OpenUpdateEntry,
+        Ok(CheckOutcome::UpToDate) => TrayCheckAction::NotifyUpToDate {
+            current_version: current_version.to_string(),
+        },
+        Ok(CheckOutcome::CheckFailed { message }) | Err(message) => {
+            TrayCheckAction::NotifyFailed {
+                message: message.clone(),
+            }
+        }
+    }
+}
+
+/// 托盘「已是最新」通知正文（票 03）。
+pub fn tray_up_to_date_text(current_version: &str) -> String {
+    format!("已是最新版本 v{current_version}。")
+}
+
+/// 托盘「检查失败」通知正文（票 03）：带原因（用户主动点的，点了没反应不行）。
+pub fn tray_check_failed_text(message: &str) -> String {
+    format!("检查更新失败：{message}")
+}
+
+/// 托盘检查结果通知（票 03 薄封装）：与 notify_update 同插件同静默策略。
+fn notify_plain(handle: &tauri::AppHandle, title: &str, body: String) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = handle
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show();
+}
+
+/// 托盘检查防重入标志（票 03 评审项）：一轮检查最长 30s，运行中再点菜单
+/// 直接忽略——并发两轮只会重复发「已是最新/失败」通知（红点写入幂等无害）。
+static TRAY_CHECK_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Drop 兜底复位防重入标志（检查线程任何路径退出都复位，含 panic 后 unwinding）。
+struct TrayCheckInFlightGuard;
+impl Drop for TrayCheckInFlightGuard {
+    fn drop(&mut self) {
+        TRAY_CHECK_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 托盘「检查更新…」一轮（update-entry 票 03 薄封装，不进单测；分流决策
+/// tray_check_action 与文案纯函数全测）：独立 std 线程跑手动检查路径（复用
+/// manual_check——不写每日记账，红点记账+广播随检查自动带上；30s 总超时
+/// 沿用），检查全程无窗口动作，按分流决策收尾：有新版弹主窗口 + 广播
+/// open-update-entry 事件直达更新页签（弹窗开不开、重不重查由前端按状态定）。
+/// 防重入照 confirm_and_install 的 CONFIRM_IN_FLIGHT 原子位模式。
+pub fn run_tray_check(app: tauri::AppHandle) {
+    if TRAY_CHECK_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _guard = TrayCheckInFlightGuard;
+        let outcome = tauri::async_runtime::block_on(manual_check(app.clone()));
+        let current = app.package_info().version.to_string();
+        match tray_check_action(&outcome, &current) {
+            TrayCheckAction::OpenUpdateEntry => {
+                use tauri::{Emitter, Manager};
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+                let _ = app.emit("open-update-entry", ());
+            }
+            TrayCheckAction::NotifyUpToDate { current_version } => {
+                notify_plain(&app, "蚂蚁饲养记录", tray_up_to_date_text(&current_version));
+            }
+            TrayCheckAction::NotifyFailed { message } => {
+                notify_plain(&app, "蚂蚁饲养记录", tray_check_failed_text(&message));
+            }
+        }
+    });
 }
 
 /// 「发现新版」通知正文（update-entry 票 01：指路主页面「检查更新」按钮，
@@ -1293,7 +1381,9 @@ mod tests {
         assert!(version_is_newer("0.3", "0.2.1"), "段数不等：缺段按 0 补齐");
         assert!(!version_is_newer("0.3.0.1", "0.3.1"));
         assert!(!version_is_newer("", "0.2.0"), "无落库不亮");
-        assert!(!version_is_newer("abc", "0.2.0"), "脏值按 0 段：漏报不误报");
+        // 复用 version_cmp 的口径：容忍前导 v
+        assert!(version_is_newer("v0.3.0", "0.2.0"));
+        assert!(!version_is_newer("v0.2.0", "0.2.0"));
     }
 
     #[test]
@@ -1352,6 +1442,51 @@ mod tests {
         .unwrap();
         assert!(!badge_available(&conn, "0.3.0").unwrap());
         assert!(badge_available(&conn, "0.2.9").unwrap());
+    }
+
+    // ── 托盘检查分流（update-entry 票 03）──
+
+    #[test]
+    fn tray_check_routes_three_ways() {
+        // 有新版 → 开窗直达
+        assert_eq!(
+            tray_check_action(
+                &Ok(CheckOutcome::UpdateAvailable {
+                    version: "0.3.0".into(),
+                    notes: None
+                }),
+                "0.2.0"
+            ),
+            TrayCheckAction::OpenUpdateEntry
+        );
+        // 已是最新 → 发「已是最新 vX」通知
+        assert_eq!(
+            tray_check_action(&Ok(CheckOutcome::UpToDate), "0.2.0"),
+            TrayCheckAction::NotifyUpToDate {
+                current_version: "0.2.0".into()
+            }
+        );
+        // 失败（Err，manual_result 已折）→ 发带原因通知
+        assert_eq!(
+            tray_check_action(&Err("HTTP 404：latest.json 不存在".into()), "0.2.0"),
+            TrayCheckAction::NotifyFailed {
+                message: "HTTP 404：latest.json 不存在".into()
+            }
+        );
+        // 失败（Ok(CheckFailed)，枚举兜底分支）→ 同样发带原因通知
+        assert_eq!(
+            tray_check_action(&Ok(CheckOutcome::CheckFailed { message: "请求超时".into() }), "0.2.0"),
+            TrayCheckAction::NotifyFailed { message: "请求超时".into() }
+        );
+    }
+
+    #[test]
+    fn tray_notification_texts() {
+        assert_eq!(tray_up_to_date_text("0.2.0"), "已是最新版本 v0.2.0。");
+        assert_eq!(
+            tray_check_failed_text("HTTP 404：latest.json 不存在"),
+            "检查更新失败：HTTP 404：latest.json 不存在"
+        );
     }
 
     // ── 「发现新版」通知文案（update-entry 票 01：指路主页面新入口）──

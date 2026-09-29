@@ -57,7 +57,7 @@
  * 通知/自动备份区「保存」（自身「已保存」回显）、恢复（摘要+结果回显+重拉）、
  * 打开文件夹类（OS 层反馈）有天然反馈，不接。
  */
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 import {
   backupTo,
   cleanOrphanPhotos,
@@ -148,10 +148,20 @@ type Tab = "actions" | "foods" | "locations" | "notify" | "webui" | "data" | "up
 
 // 直达「更新」页签（update-entry 票 01）：initialTab 缺省维持「操作」不动旧路径；
 // autoUpdateCheck 仅直达时为真，随挂载传给 UpdatePanel 自动检查一次。
-const props = defineProps<{ initialTab?: Tab; autoUpdateCheck?: boolean }>();
+// directOpenSeq（票 03 托盘分流）：弹窗已开时收到的直达靠 nonce 变化驱动切
+// 页签（initialTab 同值不触发 watch）；已挂载的更新面板不重触发检查——
+// autoCheck 只在挂载时生效一次，安装进行中的视图不被打扰。
+const props = defineProps<{ initialTab?: Tab; autoUpdateCheck?: boolean; directOpenSeq?: number }>();
 const emit = defineEmits<{ close: []; changed: [] }>();
 
 const activeTab = ref<Tab>(props.initialTab ?? "actions");
+
+watch(
+  () => props.directOpenSeq,
+  () => {
+    if (props.initialTab) activeTab.value = props.initialTab;
+  },
+);
 const actionRows = ref<ActionRow[]>([]);
 const foodRows = ref<FoodRow[]>([]);
 /** 大类周期行（ADR 0008）：恒三行固定序，随食物区批量「保存」一并落库 */
