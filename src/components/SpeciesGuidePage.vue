@@ -184,7 +184,7 @@ function riskRows(p: SpeciesProfile): Row[] {
             <b>{{ a.name }}</b>——{{ a.reason }}
           </li>
           <li class="avoid-callout">
-            <b>香斑弓背蚁</b>——中文社区公认的「暴毙天王」，暴毙率高、新手翻车多（多源一致），建议有经验后再碰。
+            <b>香斑弓背蚁</b>——中文社区公认的「暴毙天王」，暴毙率高、新手翻车多，建议有经验后再碰。
           </li>
         </ul>
       </div>
