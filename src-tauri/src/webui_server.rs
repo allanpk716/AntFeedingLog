@@ -42,7 +42,9 @@
 //! 框架层预留按路径 `DefaultBodyLimit::max` 的口子）、普通并发 ≤8、SSE 连接单独计量
 //! ≤4（计数器本票落地，票 06 挂到 SSE 路由）、读超时 30 秒（hyper 连接层
 //! header 读超时 + 请求处理超时中间件；照片上传的处理超时按路径放宽到 300
-//! 秒——慢 Wi-Fi 大批量，终局评审）、header 条数/单条长度/总体积上限。
+//! 秒——慢 Wi-Fi 大批量，终局评审；webui-update 票 01 起 `POST /api/cmd` 同款
+//! 放宽到 300 秒——确认流含长下载，30 秒会切断安装结果的 HTTP 回报）、
+//! header 条数/单条长度/总体积上限。
 //!
 //! 照片端点（票 08，规格 E「桌面/网页同一套」）：**独立 HTTP 端点，不进 /api/cmd
 //! 白名单**（二进制体不进 JSON 派发层，也不新增命令名）：
@@ -84,6 +86,9 @@ pub const MAX_BODY_BYTES: usize = 1024 * 1024;
 /// 照片上传端点路径（票 08；limits_mw 的体上限按路径放宽以此判定）。
 pub const PHOTO_UPLOAD_PATH: &str = "/api/photos";
 
+/// 统一命令端点路径（webui-update 票 01 提取常量：超时按路径放宽的判定键）。
+pub const CMD_PATH: &str = "/api/cmd";
+
 /// 照片上传端点请求体上限：单张 ≤15MB × 单次 ≤9 张 + multipart 框架开销
 /// （票 04 预留的按路径 `DefaultBodyLimit` 口子；全局 1MB 对其余路径不动）。
 pub const MAX_PHOTOS_BODY_BYTES: usize =
@@ -103,11 +108,21 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// 放宽」的口子（[`PHOTO_UPLOAD_PATH`] 专用，其余路径维持 [`READ_TIMEOUT`]）。
 pub const PHOTO_UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// 请求处理超时按（方法, 路径）取值：仅 `POST /api/photos` 放宽（照片上传，
-/// 慢 Wi-Fi 大批量），其余一律 [`READ_TIMEOUT`]。纯核独立可测。
+/// `POST /api/cmd` 的请求处理超时（300 秒；webui-update 票 01）：确认安装触发
+/// 的编排 = 复查 + 下载 + 安装，下载是长网络任务，30 秒普通超时会切断
+/// install_started/install_failed 的 HTTP 生命周期回报（规格出口 1：失败响应
+/// 要在 HTTP 生命周期内到达）。与照片上传同款「按路径放宽」口径——受信网段
+/// 单用户场景，其余命令照旧秒级返回，放宽只抬高卡死请求的兜底上限。
+pub const CMD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// 请求处理超时按（方法, 路径）取值：`POST /api/photos` 与 `POST /api/cmd`
+/// 放宽（照片上传慢 Wi-Fi 大批量；确认流含长下载），其余一律 [`READ_TIMEOUT`]。
+/// 纯核独立可测。
 fn request_timeout_for(method: &axum::http::Method, path: &str) -> Duration {
     if method == axum::http::Method::POST && path == PHOTO_UPLOAD_PATH {
         PHOTO_UPLOAD_TIMEOUT
+    } else if method == axum::http::Method::POST && path == CMD_PATH {
+        CMD_TIMEOUT
     } else {
         READ_TIMEOUT
     }
@@ -471,7 +486,10 @@ pub fn header_limit_error(headers: &axum::http::HeaderMap) -> Option<&'static st
 /// 网页端命令白名单注册表：**不登记即 404**。
 ///
 /// 票 05 登记记录类命令（规格 H 功能面：首页/打卡/历史/冬眠/巢况）；设置/
-/// 管理/备份/更新**永不入表**。
+/// 管理/备份**永不入表**；更新面按 ADR-0010（webui-update 票 01）只放行
+/// 「红点详情只读 + 确认安装触发」两条——其余更新类命令（手动检查/状态查询/
+/// 桌面红点/版本号/发布页）仍桌面专属不入表，守护测试
+/// [`tests::registry_excludes_desktop_only_update_commands`] 钉死。
 ///
 /// ⚠ **永久禁入清单**（不得加入本表，测试 [`tests::registry_excludes_forbidden_commands`]
 /// 钉死，票 03 评审 Important 的落点）：
@@ -526,12 +544,31 @@ pub const WEBUI_COMMANDS: &[&str] = &[
     "update_photo_crop",
     // 照片旋转（头像旋转：烧进文件）：裁剪编辑器「↻ 旋转」的通道
     "rotate_photo",
+    // 升级入口（webui-update 票 01，ADR-0010 部分反转「更新留桌面端」）：
+    // 红点详情只读（升级横幅数据源）+ 确认安装触发（复用桌面确认流编排——
+    // 防重入/快照/禁写全部照旧，经 ConfirmInstallHook 接线）。其余更新面命令
+    // 仍桌面专属不入表（守护测试 registry_excludes_desktop_only_update_commands）
+    "get_update_badge_detail",
+    "confirm_and_install_update",
 ];
 
 /// 写命令成功后的副作用钩子（票 05）：参数 = 是否同时刷新托盘 tooltip。
 /// 生产在 lib.rs setup 接线（`refresh_tray_tooltip` + `trigger_after_write`，
 /// 与桌面写命令收尾两件套同一语义）；测试注入计数器断言。
 pub type AfterWriteHook = std::sync::Arc<dyn Fn(bool) + std::marker::Send + std::marker::Sync>;
+
+/// 网页端升级触发钩子（webui-update 票 01）：确认流同步执行体，生产 = lib.rs
+/// 接线的桌面 `confirm_and_install` 同一函数（防重入/快照/禁写/流水零复制）；
+/// 测试注入假钩子（绝不碰真网络/真安装器）。同步签名刻意与派发层对齐——
+/// `POST /api/cmd` 的执行本就跑在 blocking 线程池（[`dispatch_on_blocking`]），
+/// 确认流步骤内部 block_on 桥接插件 async API 的「非运行时线程」约束天然满足。
+/// 返回与桌面完全同一契约：Ok = install_started/install_failed 状态；
+/// Err = 检查失败类（含复查无新版固定串与防重入串）。
+pub type ConfirmInstallHook = std::sync::Arc<
+    dyn Fn() -> Result<crate::updater::InstallOutcome, String>
+        + std::marker::Send
+        + std::marker::Sync,
+>;
 
 /// 前端静态资源查找（票 05）：dist 产物相对路径 → 字节；None = 无此资源。
 /// 生产 = Tauri 嵌入资源（frontendDist 打进二进制，asset resolver 取出）；
@@ -863,6 +900,28 @@ pub fn dispatch_command(
             ))
         }
         // 头像形状只读通道已随头像横幅改版移除（avatar-banner 乙-2）。
+        // ── 升级入口（webui-update 票 01，ADR-0010）──
+        // 红点详情（只读）：available 沿用判活语义（落库版本 vs 当前版本），
+        // version/notes 来自落库（无记录 null）；与桌面 BadgeState 同源不另立口径
+        "get_update_badge_detail" => Some(read_cmd(deps, args, |conn, _: webui_args::EmptyArgs| {
+            crate::updater::badge_detail(conn, &deps.current_version)
+        })),
+        // 确认安装触发：走 ConfirmInstallHook（生产 = lib.rs 接线的桌面确认流
+        // 同一执行体——防重入/快照/禁写/流水照旧零复制）。不碰库锁：编排自带
+        // 数据目录落盘凭据，与桌面命令同。args 照走校验链（无参命令 deny_
+        // unknown_fields 先例，畸形载荷 400 不触达钩子）。映射契约：Ok =
+        // install_started/install_failed 状态（200，与桌面 invoke 同形）；Err =
+        // 检查失败类（500，桌面 invoke Err 同形，含复查无新版固定串与防重入串）。
+        // 刻意不走 write_cmd：安装不是库写，after_write 副作用不适用。
+        "confirm_and_install_update" => Some(match parse_validated::<webui_args::EmptyArgs>(args) {
+            Ok(_) => match (deps.confirm_install)() {
+                Ok(outcome) => CmdOutcome::Ok(
+                    serde_json::to_value(outcome).unwrap_or(serde_json::Value::Null),
+                ),
+                Err(e) => CmdOutcome::Failed(e),
+            },
+            Err(msg) => CmdOutcome::Rejected(msg),
+        }),
         // 不存在「注册表里有但这里没有」的分支——registry_entries_all_have_real_dispatch
         // 钉住两边同步；走到这等于调用方没先查注册表
         _ => None,
@@ -923,6 +982,13 @@ pub struct SharedDeps {
     /// 数据版本广播枢纽（票 06：初值 = 库内计数；SSE 连接订阅它收推送，
     /// lib.rs 的写后/恢复链路经 bump_and_publish 系列同步发布）。
     pub versions: VersionHub,
+    /// 当前应用版本（webui-update 票 01：红点判活「当前侧」的取值源）。
+    /// 生产 lib.rs setup 覆盖为 package_info（tauri.conf.json 的 version，与
+    /// 桌面更新流同源）；测试可用默认值或按需注入。
+    pub current_version: String,
+    /// 升级触发钩子（webui-update 票 01；默认未接线——触发即人话失败不静默
+    /// 假成功，生产 lib.rs setup 覆盖为桌面确认流同一执行体）。
+    pub confirm_install: ConfirmInstallHook,
 }
 
 impl SharedDeps {
@@ -964,6 +1030,11 @@ impl SharedDeps {
             after_write,
             frontend_assets,
             versions: VersionHub::new(epoch, initial_version),
+            // 升级入口默认未接线（webui-update 票 01）：触发即人话失败，不静默
+            // 假成功；生产 lib.rs setup 覆盖为桌面确认流同一执行体。当前版本
+            // 默认取 crate 版本（CI 脚本保证与 tauri.conf.json 一致），生产同样覆盖。
+            confirm_install: Arc::new(|| Err("升级触发未接线（内部配置错误）".into())),
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 }
@@ -1848,7 +1919,7 @@ fn build_router(deps: Shared) -> axum::Router {
     use axum::routing::{get, post};
 
     let api = axum::Router::new()
-        .route("/api/cmd", post(cmd_handler))
+        .route(CMD_PATH, post(cmd_handler))
         .route("/api/sse-ticket", post(sse_ticket_handler))
         .route("/api/data-version", get(data_version_handler))
         // 照片端点（票 08）：闸二/限额/超时照组层挂；上传路由用路由层
@@ -2295,16 +2366,19 @@ mod tests {
     // ── 超时按路径放宽（终局评审）──
 
     #[test]
-    fn photo_upload_timeout_relaxed_by_path_others_keep_read_timeout() {
-        // 仅 POST /api/photos 放宽（慢 Wi-Fi 一批传 9 张大图，服务端还要逐张
-        // 解码重编码，30 秒普通读超时太紧）；其余路径一律 READ_TIMEOUT 不动
+    fn timeouts_relaxed_by_path_photo_upload_and_confirm_cmd() {
+        // POST /api/photos 放宽（慢 Wi-Fi 一批传 9 张大图，服务端还要逐张
+        // 解码重编码，30 秒普通读超时太紧）；webui-update 票 01 起
+        // POST /api/cmd 同款放宽（确认流 = 复查+下载+安装编排，30 秒会切断
+        // install_started/install_failed 的 HTTP 生命周期回报）；其余路径一律
+        // READ_TIMEOUT 不动。
         assert_eq!(
             request_timeout_for(&axum::http::Method::POST, PHOTO_UPLOAD_PATH),
             PHOTO_UPLOAD_TIMEOUT
         );
         assert_eq!(
-            request_timeout_for(&axum::http::Method::POST, "/api/cmd"),
-            READ_TIMEOUT
+            request_timeout_for(&axum::http::Method::POST, CMD_PATH),
+            CMD_TIMEOUT
         );
         assert_eq!(
             request_timeout_for(&axum::http::Method::GET, PHOTO_UPLOAD_PATH),
@@ -2314,13 +2388,17 @@ mod tests {
             request_timeout_for(&axum::http::Method::GET, "/api/data-version"),
             READ_TIMEOUT
         );
-        // 前后缀相近路径不误放宽
+        // 前后缀相近路径不误放宽；GET /api/cmd 不放宽（升级触发是 POST 专属）
         assert_eq!(
             request_timeout_for(&axum::http::Method::POST, "/api/photosX"),
             READ_TIMEOUT
         );
         assert_eq!(
             request_timeout_for(&axum::http::Method::POST, "/api/photos/1/a.jpg"),
+            READ_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&axum::http::Method::GET, CMD_PATH),
             READ_TIMEOUT
         );
     }
@@ -4826,6 +4904,230 @@ mod tests {
         assert!(dispatch_command(&deps, "create_custom_species", &serde_json::json!({})).is_none());
         assert!(dispatch_command(&deps, "rename_custom_species", &serde_json::json!({})).is_none());
         assert!(dispatch_command(&deps, "delete_custom_species", &serde_json::json!({})).is_none());
+    }
+
+    // ── 升级入口（webui-update 票 01）：红点详情只读 + 确认安装触发 ──
+
+    #[test]
+    fn http_update_badge_detail_whitelisted_and_desktop_same_shape() {
+        // 白名单放行 + HTTP POST /api/cmd 实测：返回形状 {available, version,
+        // notes}（serde 与桌面契约同源 updater::BadgeDetailState，null 不省略）；
+        // notes 生命周期跟随 available——查无新版两键齐清。
+        assert!(WEBUI_COMMANDS.contains(&"get_update_badge_detail"));
+        let token = "a".repeat(32);
+        let (deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        let handle = block(start(deps.clone(), 0)).expect("启动失败");
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+
+        // 无记录：available=false，version/notes=null
+        let (status, body) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"get_update_badge_detail","args":{}}"#,
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({"available": false, "version": null, "notes": null}),
+            "返回形状与桌面契约同形（无记录三键）"
+        );
+
+        // 落库发现新版（9.9.9 恒比测试默认当前版本新）：判活真 + 双键齐全
+        {
+            let conn = deps.conn.lock().unwrap();
+            crate::updater::record_badge_from_result(
+                &conn,
+                &Ok(Some(crate::updater::UpdateInfo {
+                    version: "9.9.9".into(),
+                    notes: Some("修复若干问题".into()),
+                })),
+                &deps.current_version,
+            )
+            .unwrap();
+        }
+        let (status, body) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"get_update_badge_detail","args":{}}"#,
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({"available": true, "version": "9.9.9", "notes": "修复若干问题"}),
+            "发现新版：available 真 + version/notes 落库值"
+        );
+
+        // 查无新版：红点记账清两键 → 回到 false/null/null
+        {
+            let conn = deps.conn.lock().unwrap();
+            crate::updater::record_badge_from_result(&conn, &Ok(None), &deps.current_version)
+                .unwrap();
+        }
+        let (status, body) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"get_update_badge_detail","args":{}}"#,
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({"available": false, "version": null, "notes": null}),
+            "查无新版：两键皆清（notes 生命周期跟随 available）"
+        );
+
+        // args 垃圾：无参命令 deny_unknown_fields 照拒（400，校验链在白名单之后）
+        let (status, body) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"get_update_badge_detail","args":{"foo":1}}"#,
+        );
+        assert_eq!(status, 400, "实际：{body}");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("未知字段"),
+            "实际：{body}"
+        );
+    }
+
+    #[test]
+    fn http_confirm_install_update_whitelisted_and_maps_contract() {
+        // 白名单放行 + HTTP POST /api/cmd 实测：注入假钩子（绝不碰真网络/真
+        // 安装器），验证派发映射既有安装契约（install_started 200 形）与
+        // 桌面专属原命令名仍 404。防重入/编排语义在 lib.rs
+        // confirm_and_install_blocking（生产钩子接线本体，零复制）。
+        assert!(WEBUI_COMMANDS.contains(&"confirm_and_install_update"));
+        let token = "a".repeat(32);
+        let (mut deps, _dir) = test_deps(&["127.0.0.0/8"], &token);
+        Arc::get_mut(&mut deps).unwrap().confirm_install =
+            Arc::new(|| Ok(crate::updater::InstallOutcome::InstallStarted { version: "0.3.0".into() }));
+        let handle = block(start(deps.clone(), 0)).expect("启动失败");
+        let base = format!("http://127.0.0.1:{}", handle.port());
+        let a = agent();
+
+        // 触发成功：与桌面 invoke 同形 {"status":"install_started","version":..}
+        let (status, body) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"confirm_and_install_update","args":{}}"#,
+        );
+        assert_eq!(status, 200, "实际：{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({"status": "install_started", "version": "0.3.0"})
+        );
+
+        // 无 args 键 = {}（cmd_handler 缺省口径，与桌面无参 invoke 同形放行）
+        let (status, _) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"confirm_and_install_update"}"#,
+        );
+        assert_eq!(status, 200);
+
+        // 守护（票面验收）：桌面专属原命令名对 /api/cmd 仍 404——升级入口只开
+        // confirm_and_install_update 一个洞，deny-by-default 不松动
+        let (status, body) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"confirm_and_install","args":{}}"#,
+        );
+        assert_eq!(status, 404, "实际：{body}");
+        let (status, _) = http(
+            &a,
+            "POST",
+            &format!("{base}/api/cmd"),
+            Some(&token),
+            r#"{"cmd":"check_update_now","args":{}}"#,
+        );
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn dispatch_confirm_install_update_maps_err_and_install_failed() {
+        // 派发层契约映射（不占 HTTP 端口）：检查失败类 → Failed（HTTP 500，与
+        // 桌面 invoke Err 同形，含复查无新版固定串与防重入串）；install_failed
+        // 是「状态」不是 Err（200 + status 标签，桌面同形）；args 垃圾 400。
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join(crate::db::DB_FILE_NAME);
+        let conn = crate::db::open_and_migrate(&db_path).unwrap();
+        let mut deps = SharedDeps::new(Arc::new(Mutex::new(conn)), dir.path().to_path_buf());
+
+        // Err = 检查失败类（复查无新版的既有固定文案）→ Failed
+        deps.confirm_install = Arc::new(|| Err("远端已没有比当前更新的版本".into()));
+        let out = dispatch_command(&deps, "confirm_and_install_update", &serde_json::json!({}))
+            .expect("已登记，应有派发");
+        assert_eq!(out, CmdOutcome::Failed("远端已没有比当前更新的版本".into()));
+
+        // Err = 防重入串（生产钩子内 CONFIRM_IN_FLIGHT 语义的透传形状）
+        deps.confirm_install = Arc::new(|| Err("已有安装流程正在进行，请稍候".into()));
+        let out = dispatch_command(&deps, "confirm_and_install_update", &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(out, CmdOutcome::Failed("已有安装流程正在进行，请稍候".into()));
+
+        // install_failed 是「状态」不是 Err：200 + {"status":"install_failed",..}
+        deps.confirm_install = Arc::new(|| {
+            Ok(crate::updater::InstallOutcome::InstallFailed {
+                version: "0.3.0".into(),
+                message: "下载更新失败: 网络断了".into(),
+            })
+        });
+        let out = dispatch_command(&deps, "confirm_and_install_update", &serde_json::json!({}))
+            .unwrap();
+        assert_eq!(
+            out,
+            CmdOutcome::Ok(serde_json::json!({
+                "status": "install_failed",
+                "version": "0.3.0",
+                "message": "下载更新失败: 网络断了"
+            }))
+        );
+
+        // args 垃圾：无参命令 deny_unknown_fields → Rejected（HTTP 400，不触发钩子）
+        deps.confirm_install = Arc::new(|| panic!("校验层拒绝后不得触达钩子"));
+        let out = dispatch_command(&deps, "confirm_and_install_update", &serde_json::json!({"foo": 1}))
+            .unwrap();
+        assert!(matches!(out, CmdOutcome::Rejected(_)), "实际：{out:?}");
+    }
+
+    #[test]
+    fn registry_excludes_desktop_only_update_commands() {
+        // 守护测试（票面验收）：更新面只放行「红点详情 + 触发」两条（ADR-0010），
+        // 其余更新类命令（桌面专属原命令名）不入表且派发 None（HTTP 404）。
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join(crate::db::DB_FILE_NAME);
+        let conn = crate::db::open_and_migrate(&db_path).unwrap();
+        let deps = SharedDeps::new(Arc::new(Mutex::new(conn)), dir.path().to_path_buf());
+        for desktop_only in [
+            "check_update_now",
+            "confirm_and_install", // 桌面原命令名：网页端走 confirm_and_install_update
+            "get_update_state",
+            "get_update_badge",
+            "get_app_version",
+            "open_releases_page",
+        ] {
+            assert!(
+                !WEBUI_COMMANDS.contains(&desktop_only),
+                "{desktop_only} 不得入网页端白名单"
+            );
+            assert!(
+                dispatch_command(&deps, desktop_only, &serde_json::json!({})).is_none(),
+                "{desktop_only} 未登记必须派发 None（HTTP 404）"
+            );
+        }
     }
 
     #[test]

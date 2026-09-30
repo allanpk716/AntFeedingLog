@@ -5,43 +5,43 @@
   "aliases": [],
   "type": "弓背蚁",
   "hibernation": "冬眠",
-  "hibernationNote": "10~15°C、2~3 个月——模拟四川/云南原产地季节周期，可能对长期健康必要、不建议省略（单源推断）",
+  "hibernationNote": "10~15°C、2~3 个月——模拟四川/云南原产地季节周期，可能对长期健康必要、不建议省略",
   "difficulty": 2,
   "beginnerRecommended": false,
   "recommendReason": "",
   "queenSize": "",
-  "workerSize": "大工 13.5~14.6mm、中小工 8.4~11.6mm（分类文献，多源同引）",
+  "workerSize": "大工 13.5~14.6mm、中小工 8.4~11.6mm",
   "queenSystem": "",
   "activityRhythm": "",
-  "tempRange": "适宜 22~26°C（商家经验估计）",
+  "tempRange": "适宜 22~26°C（商家估计值）",
   "humidity": "",
   "diet": "",
-  "price": "一百元左右（原调研）",
+  "price": "一百元左右",
   "distribution": "中国特有（1989 年发表，模式产地四川西昌）",
-  "appearance": "体黑、后腹各节后缘黄色窄带——金毛/金背俗称的来源；前胸背板直立毛 30~40 根（分类文献）",
+  "appearance": "体黑、后腹各节后缘黄色窄带——金毛/金背俗称的来源；前胸背板直立毛 30~40 根",
   "purchaseWarning": "几乎所有饲养数据来自商家页面、按同属推断（海外资料自认该种发育数据不可获得）——预期按资料稀缺种设定",
   "growth": {
     "eggLaying": "",
     "eggToWorkerDays": "",
-    "firstWorkersDays": "估计 6~8 周（24~26°C）——来源自标估计值（属级推断）",
+    "firstWorkersDays": "估计 6~8 周（24~26°C）——商家自标的估计值",
     "broodSurvival": "",
     "firstYearSize": "",
     "secondYearSize": "",
-    "matureSize": "中等生长速度、条件好时 1~2 年达可观规模（商家经验估计，无工数）",
-    "castes": "大工 13.5~14.6mm（后腹黄色窄带）、中小工 8.4~11.6mm（分类文献）；大工偏防御搬运（经验估计）",
+    "matureSize": "中等生长速度、条件好时 1~2 年达可观规模（无具体工数）",
+    "castes": "大工 13.5~14.6mm（后腹黄色窄带）、中小工 8.4~11.6mm；大工偏防御搬运（推测）",
     "queenLifespan": "",
     "workerLifespan": ""
   },
   "risks": {
     "stressNew": 3,
     "stressColony": 3,
-    "stressNote": "专种资料查无实据、无评级依据——按弓背属通例新后期按敏感对待（属级估计）",
+    "stressNote": "本种资料没有可靠数据、无评级依据——按弓背属通例，新后期按敏感对待",
     "escapeTendency": "",
     "healthRisks": "",
-    "tempRedline": "适宜 22~26°C（商家经验估计）；停产/死亡红线查无实据；冬眠 10~15°C、2~3 个月（单源推断）"
+    "tempRedline": "适宜 22~26°C（商家估计值）；停产/死亡红线没有可靠数据；冬眠 10~15°C、2~3 个月"
   },
   "careNotes": [
     "中国特有种：1989 年发表、模式产地四川西昌",
-    "圈内曾称国产第二大弓背蚁（指体型排名，单源说法）"
+    "圈内曾称国产第二大弓背蚁（指体型排名）"
   ]
 }

@@ -1014,6 +1014,7 @@ async fn check_update_now(app: tauri::AppHandle) -> Result<updater::CheckOutcome
 static CONFIRM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Drop 兜底复位防重入标志（检查数据目录失败等早退路径也复位）。
+#[derive(Debug)] // 测试 unwrap_err 需要；纯标记类型无字段
 struct ConfirmInFlightGuard;
 impl Drop for ConfirmInFlightGuard {
     fn drop(&mut self) {
@@ -1021,47 +1022,56 @@ impl Drop for ConfirmInFlightGuard {
     }
 }
 
-/// 确认升级并安装（设置页按钮，票 06 接 UI）。编排（再次检查 → 写 pending 标记
-/// → 下载 → install）与失败路径在 updater::run_confirm_flow 纯函数层（FakeSteps
-/// 测试锚定）；本 command 只做三件事：
-/// - 防重入（CONFIRM_IN_FLIGHT）；
-/// - 解析数据目录（标记落盘点）；
-/// - 把编排丢进阻塞线程池：生产步骤内部用 block_on 桥接插件 async API，只允许
-///   在非运行时线程上做（spawn_blocking 线程不是 tokio worker，阻塞安全），
-///   下载是长网络任务也不占异步 worker。
-/// 返回：成功 `{"status":"install_started",..}`（Windows 下进程随即退出）；
-/// 下载/安装失败 `{"status":"install_failed",..}`（进程存活，禁写标志已被编排
-/// 复位——票 04 评审 M-1 契约）；检查失败/写标记失败折为 Err 一次性展示。
-#[tauri::command]
-async fn confirm_and_install(app: tauri::AppHandle) -> Result<updater::InstallOutcome, String> {
+/// 防重入闸门（webui-update 票 01 自 confirm_and_install 提取）：第二条流
+/// 返回既有人话串；成功时交出 Guard（Drop 复位——任何早退路径都不漏复位）。
+/// 桌面命令与网页端触发钩子（webui_server::ConfirmInstallHook）共用同一闸门，
+/// 防重入语义只有一份实现。
+fn try_acquire_confirm_slot() -> Result<ConfirmInFlightGuard, String> {
     if CONFIRM_IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return Err("已有安装流程正在进行，请稍候".into());
     }
-    let _guard = ConfirmInFlightGuard;
-    let data_dir = match app.path().app_data_dir() {
-        Ok(dir) => dir,
-        Err(e) => {
-            let msg = format!("解析数据目录失败: {e}");
-            applog::log_error(&format!("确认安装失败: {msg}"));
+    Ok(ConfirmInFlightGuard)
+}
+
+/// 确认流同步执行体（webui-update 票 01：桌面命令与网页端触发钩子共用——
+/// 防重入、数据目录解析、编排、panic 兜底与结果流水只此一处，两端零复制）。
+/// 必须在非运行时线程上调用（步骤内部 block_on 桥接插件 async API）：桌面
+/// 命令经 spawn_blocking 进入；网页端派发本就跑在 blocking 线程池
+///（webui_server::dispatch_on_blocking）。
+///
+/// 返回：成功 `{"status":"install_started",..}`（Windows 下进程随即退出）；
+/// 下载/安装失败 `{"status":"install_failed",..}`（进程存活，禁写标志已被编排
+/// 复位——票 04 评审 M-1 契约）；检查失败/写标记失败/防重入折为 Err 一次性展示。
+fn confirm_and_install_blocking(app: tauri::AppHandle) -> Result<updater::InstallOutcome, String> {
+    // 防重入闸门：第二条流（桌面双击 / 网页端与桌面并发）挡在门外
+    let _guard = try_acquire_confirm_slot()?;
+    // 返工 R1：AppHandle 会被下面的 catch_unwind 闭包 move 进确认流
+    //（PluginConfirmSteps::new(app)）；Err 臂的红点作废还要拿数据库连接，
+    // 提前克隆一份把手留在闭包外。
+    let badge_app = app.clone();
+    // panic 兜底（原 spawn_blocking JoinError 臂的语义内移，两端共用）：panic 点
+    // 可能已在 install 置位禁写之后——进程存活就必须复位（M-1 契约精神：失败后
+    // 应用不得卡在只读态）；标记保留，交启动判定兜底。
+    let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let data_dir = match app.path().app_data_dir() {
+            Ok(dir) => dir,
+            Err(e) => {
+                let msg = format!("解析数据目录失败: {e}");
+                applog::log_error(&format!("确认安装失败: {msg}"));
+                return Err(msg);
+            }
+        };
+        let steps = updater::PluginConfirmSteps::new(app);
+        updater::run_confirm_flow(&data_dir, &steps)
+    })) {
+        Ok(outcome) => outcome,
+        Err(panic) => {
+            updater::set_write_blocked(false);
+            let msg = format!("确认安装任务异常退出: {panic:?}");
+            applog::log_error(&msg);
             return Err(msg);
         }
     };
-    let outcome = tauri::async_runtime::spawn_blocking(move || {
-        let steps = updater::PluginConfirmSteps::new(app);
-        updater::run_confirm_flow(&data_dir, &steps)
-    })
-    .await
-    .map_or_else(
-        |e| {
-            // 编排线程 panic（理论外路径，如插件步骤 panics）：panic 点可能已在
-            // install 置位禁写之后——进程存活就必须复位（M-1 契约精神：失败后
-            // 应用不得卡在只读态）；标记保留，交启动判定兜底。
-            updater::set_write_blocked(false);
-            applog::log_error(&format!("确认安装任务异常退出: {e}"));
-            Err(format!("确认安装任务异常退出: {e}"))
-        },
-        Ok,
-    )?;
     // 终局评审 D7：安装结果落流水（下载完成行在 PluginConfirmSteps::download；
     // 失败原因随 message 带全，目标版本齐全，供日志侧对账"想升到哪、成没成"）
     match &outcome {
@@ -1072,11 +1082,73 @@ async fn confirm_and_install(app: tauri::AppHandle) -> Result<updater::InstallOu
             applog::log_error(&format!("更新安装失败（目标 v{version}）: {message}"));
         }
         Err(e) => {
-            // 确认流在下载前中止（再次检查失败 / 写 pending 标记失败）
+            // 确认流在下载前中止（再次检查失败 / 写 pending 标记失败 / 防重入拒绝
+            // 不会走到这——闸门在编排之前早退，不落流水）
             applog::log_error(&format!("确认安装流程中止: {e}"));
+            // 返工 R1：复查证实"远端已没有比当前更新的版本"→ 落库红点是陈旧
+            // 事实，两键一并作废（网页端出口3"重读红点、收横幅"后
+            // get_update_badge_detail 即灭，与 record_badge_from_result 的
+            // Ok(None) 同口径）；其他 Err（检查失败/写标记失败）≠ 无更新，红点
+            // 保持原状。清失败只落日志，不改变原 Err 返回——红点是副产物。
+            clear_stale_badge_best_effort(&badge_app, e);
         }
     }
     outcome
+}
+
+/// 返工 R1：确认流 Err 后的红点作废判定 + 动作（注入连接的纯逻辑，可测）：
+/// 仅当 Err 文案包含复查"查无新版"固定串（[`updater::ERR_NO_NEWER_REMOTE`]，
+/// 包含匹配，与网页端前端出口3 同口径）时清 available_version 与
+/// available_notes 两键并返回 true；其他 Err（检查失败/写标记失败）不动红点，
+/// 返回 false——检查失败≠无更新，红点保持原状。
+fn clear_stale_badge_if_remote_exhausted(
+    conn: &rusqlite::Connection,
+    err: &str,
+) -> Result<bool, String> {
+    if err.contains(updater::ERR_NO_NEWER_REMOTE) {
+        updater::clear_stale_badge(conn)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// 上者的 AppHandle 接线壳（薄封装不进单测，照 updater::record_badge_and_emit
+/// 容错口径）：连接取不到（状态未就绪/锁毒化）直接放弃；清理失败只落日志——
+/// 红点是副产物，绝不影响 confirm_and_install_blocking 的原 Err 返回。
+fn clear_stale_badge_best_effort(app: &tauri::AppHandle, err: &str) {
+    let Some(state) = app.try_state::<DbState>() else {
+        return;
+    };
+    let Ok(conn) = state.0.lock() else {
+        return;
+    };
+    if let Err(e) = clear_stale_badge_if_remote_exhausted(&conn, err) {
+        applog::log_error(&format!("复查无新版清红点失败（忽略）: {e}"));
+    }
+}
+
+/// 确认升级并安装（设置页按钮，票 06 接 UI）。编排（再次检查 → 写 pending 标记
+/// → 下载 → install）与失败路径在 updater::run_confirm_flow 纯函数层（FakeSteps
+/// 测试锚定）；防重入/数据目录/panic 兜底/流水全内聚在
+/// [`confirm_and_install_blocking`]（webui-update 票 01 起与网页端触发钩子共用），
+/// 本 command 只把执行体丢进阻塞线程池：生产步骤内部用 block_on 桥接插件
+/// async API，只允许在非运行时线程上做（spawn_blocking 线程不是 tokio worker，
+/// 阻塞安全），下载是长网络任务也不占异步 worker。
+#[tauri::command]
+async fn confirm_and_install(app: tauri::AppHandle) -> Result<updater::InstallOutcome, String> {
+    tauri::async_runtime::spawn_blocking(move || confirm_and_install_blocking(app))
+        .await
+        .map_or_else(
+            |e| {
+                // 编排线程异常（理论外：执行体内已 catch_unwind 兜底，此臂只剩
+                // spawn 机制本身的异常）——复位契约照旧兑现
+                updater::set_write_blocked(false);
+                applog::log_error(&format!("确认安装任务异常退出: {e}"));
+                Err(format!("确认安装任务异常退出: {e}"))
+            },
+            Ok,
+        )?
 }
 
 /// 查询更新状态（票 05）：`idle` 无残留 / `last_install_succeeded` 上次升级成功
@@ -1857,12 +1929,23 @@ pub fn run() {
                         .map(|asset| asset.bytes().to_vec())
                 })
             };
-            let webui_deps = Arc::new(webui_server::SharedDeps::with_hooks(
+            // 升级入口接线（webui-update 票 01）：触发钩子 = 桌面确认流同一执行体
+            //（防重入/快照/禁写/流水零复制）；当前版本与桌面更新流同源
+            //（package_info，即 tauri.conf.json 的 version）。
+            let current_version = app.package_info().version.to_string();
+            let webui_confirm: webui_server::ConfirmInstallHook = {
+                let handle = app.handle().clone();
+                Arc::new(move || confirm_and_install_blocking(handle.clone()))
+            };
+            let mut webui_shared = webui_server::SharedDeps::with_hooks(
                 db_state.conn_handle(),
                 data_dir.clone(),
                 webui_after_write,
                 webui_assets,
-            ));
+            );
+            webui_shared.confirm_install = webui_confirm;
+            webui_shared.current_version = current_version.clone();
+            let webui_deps = Arc::new(webui_shared);
             app.manage(webui_deps);
             app.manage(webui_server::WebUiRuntime::new());
             app.manage(db_state);
@@ -1872,7 +1955,6 @@ pub fn run() {
             // 升级残留兜底（票 05）：上次"想升没升成"的启动判定——读 pending 标记
             // 对比当前运行版本（与票 04 快照同源），三态结果暂存（get_update_state
             // 可查），标记判定后即清。失败只影响提示，绝不挡启动。
-            let current_version = app.package_info().version.to_string();
             match updater::startup_judgment(&data_dir, &current_version) {
                 updater::UpdateState::LastInstallIncomplete { version } => {
                     // 终局评审 D7：安装结果三态判定落流水（未完成是错误态）
@@ -2032,8 +2114,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::clear_stale_badge_if_remote_exhausted;
     use super::settle_settings_save;
+    use super::try_acquire_confirm_slot;
     use crate::settings::AppSettings;
+    use crate::updater::{self, UpdateInfo};
 
     #[test]
     fn autostart_sync_failure_does_not_sink_saved_settings() {
@@ -2051,5 +2136,92 @@ mod tests {
         let outcome = settle_settings_save(Err("数据库已锁定".into()), Ok(()));
         let err = outcome.unwrap_err();
         assert!(err.contains("锁定"), "实际错误：{err}");
+    }
+
+    #[test]
+    fn confirm_slot_gate_blocks_second_flow_and_resets_on_drop() {
+        // webui-update 票 01：防重入闸门自 confirm_and_install 提取为
+        // try_acquire_confirm_slot——桌面命令与网页端触发钩子共用同一闸门。
+        // 第二条流挡在门外且文案与既有桌面串一致；Guard Drop 复位后可再进
+        //（早退路径不漏复位）。测试进程独占全局原子位，无并行踩踏面。
+        let first = try_acquire_confirm_slot().expect("首次进入应放行");
+        let second = try_acquire_confirm_slot();
+        assert_eq!(second.unwrap_err(), "已有安装流程正在进行，请稍候");
+        drop(first);
+        assert!(try_acquire_confirm_slot().is_ok(), "Guard Drop 复位后可再进");
+    }
+
+    // ── 返工 R1：确认流复查"查无新版"时的红点作废接线 ──────────────────────
+    //（照 updater.rs 既有 mem_conn/注入式先例：接线处的连接动作 + 字符串分支
+    // 在此可测；AppHandle 薄壳 clear_stale_badge_best_effort 本身不进单测。）
+
+    fn mem_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("内存库打开失败");
+        crate::db::migrate(&conn).expect("迁移失败");
+        conn
+    }
+
+    /// 种一份"已发现新版"的完整红点落库（版本号 + 说明两键齐全）。
+    fn seed_badge(conn: &rusqlite::Connection) {
+        updater::record_badge_from_result(
+            conn,
+            &Ok(Some(UpdateInfo {
+                version: "9.9.9".into(),
+                notes: Some("修复若干问题".into()),
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn remote_exhausted_err_clears_both_badge_keys() {
+        // 复查查无新版的该特定 Err → 两键一并清（判活假、version/notes 皆空）；
+        // 文案带前后缀的包裹变体同样触发（包含匹配，与网页端出口3 同口径）。
+        let conn = mem_conn();
+
+        seed_badge(&conn);
+        let cleared =
+            clear_stale_badge_if_remote_exhausted(&conn, updater::ERR_NO_NEWER_REMOTE).unwrap();
+        assert!(cleared, "固定串应触发清理");
+        assert_eq!(updater::available_version(&conn).unwrap(), None);
+        assert_eq!(updater::available_notes(&conn).unwrap(), None);
+
+        seed_badge(&conn);
+        let cleared = clear_stale_badge_if_remote_exhausted(
+            &conn,
+            "确认安装流程中止: 远端已没有比当前更新的版本",
+        )
+        .unwrap();
+        assert!(cleared, "包含匹配应触发清理");
+        assert_eq!(updater::available_version(&conn).unwrap(), None);
+        assert_eq!(updater::available_notes(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn other_confirm_errs_leave_badge_keys_untouched() {
+        // 其他 Err（检查失败/防重入/写标记失败/部分串）≠ 无更新：两键原样，
+        // 红点保持原状（与 record_badge_from_result 的 Err 臂同口径）。
+        let conn = mem_conn();
+        seed_badge(&conn);
+
+        for err in [
+            "检查更新失败: 网络超时",
+            "已有安装流程正在进行，请稍候",
+            "写 pending 标记失败: 权限不足",
+            "远端已没有", // 部分串不触发：必须包含全串才判"查无新版"
+        ] {
+            let cleared =
+                clear_stale_badge_if_remote_exhausted(&conn, err).expect("判定本身不应失败");
+            assert!(!cleared, "「{err}」不应触发红点清理");
+        }
+        assert_eq!(
+            updater::available_version(&conn).unwrap().as_deref(),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            updater::available_notes(&conn).unwrap().as_deref(),
+            Some("修复若干问题")
+        );
     }
 }

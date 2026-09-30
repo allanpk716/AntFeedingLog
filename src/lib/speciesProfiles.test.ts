@@ -74,6 +74,18 @@ const RISKS_FIELDS = [
   "tempRedline",
 ] as const;
 
+/** 递归收集档案内全部字符串值（顶层/growth/risks/careNotes/aliases 一网打尽；number/null 跳过） */
+function collectStrings(value: unknown, out: string[] = []): string[] {
+  if (typeof value === "string") {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectStrings(item, out);
+  } else if (value !== null && typeof value === "object") {
+    for (const item of Object.values(value)) collectStrings(item, out);
+  }
+  return out;
+}
+
 describe("speciesProfiles 内置档案包", () => {
   it("恰好 12 份，key 与裁决清单一致且文件名=key（按 key 能原样查回同一对象）", () => {
     const all = allSpeciesProfiles();
@@ -193,5 +205,30 @@ describe("speciesProfiles 内置档案包", () => {
     const tk = getSpeciesProfile("camponotus-turkestanus")!;
     expect(speciesSummary(tk)).toContain("暂无资料"); // diet 查无实据
     expect(speciesSummary(tk).endsWith("冬眠")).toBe(true);
+  });
+
+  it("文案自然话：全档案字符串字段不得含来源档括号标记与「低置信」「查无实据」", () => {
+    const banned = [
+      "（多源）",
+      "（文献）",
+      "（文献+多源）",
+      "（商家单源）",
+      "（商家口径）",
+      "（原调研）",
+      "（属级估计）",
+      "（属级）",
+      "（经验）",
+      "（属通病）",
+      "（单源经验）",
+      "低置信",
+      "查无实据",
+    ];
+    for (const p of allSpeciesProfiles()) {
+      for (const s of collectStrings(p)) {
+        for (const b of banned) {
+          expect(s, `${p.key} 的文案「${s}」含被禁标记「${b}」`).not.toContain(b);
+        }
+      }
+    }
   });
 });

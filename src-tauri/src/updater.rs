@@ -62,10 +62,21 @@ pub const K_LAST_CHECK_DAY: &str = "update_last_check_day";
 /// （失败≠无更新）；判活在读取时数值比较，装完重启版本追上自然灭。
 pub const K_AVAILABLE_VERSION: &str = "update_available_version";
 
+/// settings 表键名：红点说明——已发现版本的 release 说明（webui-update 票 01，
+/// 网页端升级横幅数据源）。**生命周期跟随 [`K_AVAILABLE_VERSION`]**：发现新版
+/// 一并写、查无新版一并清、检查失败一并不动；绝不外显陈旧 notes。
+pub const K_AVAILABLE_NOTES: &str = "update_available_notes";
+
 /// 发布页地址（票 06 手动下载出口：升级未完成引导 / 安装失败的兜底）。
 /// 与 tauri.conf.json endpoints 同仓库；`releases/latest` 恒指最新发布，
 /// 不随版本号变，无需在发版时改这里。
 pub const RELEASES_PAGE_URL: &str = "https://github.com/allanpk716/AntFeedingLog/releases/latest";
+
+/// 确认流复查"查无新版"的固定中止文案：[`PluginConfirmSteps::fresh_update`]
+/// 远端没有比当前更新的版本时返回；网页端前端出口3 与 lib.rs 确认流 Err 臂的
+/// 红点清理判定（返工 R1）都按这一串做包含匹配——收敛为常量，生产者与匹配方
+/// 共用，防文案漂移。
+pub const ERR_NO_NEWER_REMOTE: &str = "远端已没有比当前更新的版本";
 
 /// 远端有新版时的最小信息：版本号 + release 说明。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -500,6 +511,18 @@ pub fn available_version(conn: &Connection) -> Result<Option<String>, String> {
     .map_err(db_err)
 }
 
+/// 读红点说明（webui-update 票 01）：已发现版本的 release 说明；无 = None。
+/// 生命周期跟随版本号键（见 [`K_AVAILABLE_NOTES`]）。
+pub fn available_notes(conn: &Connection) -> Result<Option<String>, String> {
+    conn.query_row(
+        "SELECT value FROM settings WHERE key = ?1",
+        params![K_AVAILABLE_NOTES],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(db_err)
+}
+
 /// 写/清红点事实源：Some 写版本，None 删键。
 fn set_available_version(conn: &Connection, version: Option<&str>) -> Result<(), String> {
     match version {
@@ -515,6 +538,30 @@ fn set_available_version(conn: &Connection, version: Option<&str>) -> Result<(),
             conn.execute(
                 "DELETE FROM settings WHERE key = ?1",
                 params![K_AVAILABLE_VERSION],
+            )
+            .map_err(db_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// 写/清红点说明（webui-update 票 01）：与 [`set_available_version`] 同款，
+/// 键为 [`K_AVAILABLE_NOTES`]。只在 [`record_badge_from_result`] 里与版本号
+/// 同点调用——两键的写/清/不动永远同步，无单一漂移窗口。
+fn set_available_notes(conn: &Connection, notes: Option<&str>) -> Result<(), String> {
+    match notes {
+        Some(n) => {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![K_AVAILABLE_NOTES, n],
+            )
+            .map_err(db_err)?;
+        }
+        None => {
+            conn.execute(
+                "DELETE FROM settings WHERE key = ?1",
+                params![K_AVAILABLE_NOTES],
             )
             .map_err(db_err)?;
         }
@@ -538,20 +585,64 @@ pub fn badge_available(conn: &Connection, current_version: &str) -> Result<bool,
     ))
 }
 
-/// 一轮检查后的红点记账：Ok(Some) 写版本、Ok(None) 清键、Err 不动（检查失败
-/// ≠无更新，红点保持原状）。返回记账后的判活结果（落库版本 vs 当前版本），
-/// 调用方据此广播。仍不碰每日记账（update_last_check_day），两条路径互不干扰。
+/// 一轮检查后的红点记账：Ok(Some) 写版本 + 说明（webui-update 票 01 起一并
+/// 落库）、Ok(None) 清版本 + 说明（notes 生命周期跟随 available，同一处同步
+/// 清，绝不外显陈旧 notes）、Err 不动（检查失败≠无更新，红点保持原状）。
+/// 返回记账后的判活结果（落库版本 vs 当前版本），调用方据此广播。仍不碰每日
+/// 记账（update_last_check_day），两条路径互不干扰。
 pub fn record_badge_from_result(
     conn: &Connection,
     result: &Result<Option<UpdateInfo>, String>,
     current_version: &str,
 ) -> Result<bool, String> {
     match result {
-        Ok(Some(info)) => set_available_version(conn, Some(&info.version))?,
-        Ok(None) => set_available_version(conn, None)?,
+        Ok(Some(info)) => {
+            set_available_version(conn, Some(&info.version))?;
+            set_available_notes(conn, info.notes.as_deref())?;
+        }
+        Ok(None) => {
+            set_available_version(conn, None)?;
+            set_available_notes(conn, None)?;
+        }
         Err(_) => {}
     }
     badge_available(conn, current_version)
+}
+
+/// 复查证实无新版后的红点作废（返工 R1）：确认升级流首步复查返回
+/// [`ERR_NO_NEWER_REMOTE`]（远端已没有比当前更新的版本）时，落库红点已成
+/// 陈旧事实——available_version 与 available_notes 两键一并清（与
+/// [`record_badge_from_result`] 的 Ok(None) 臂同款同步清，绝不外显陈旧
+/// notes）。由 lib.rs 确认流 Err 接线调用（清失败只落日志，不拦流程）；每日/
+/// 手动检查路径仍走 [`record_badge_from_result`]，两条路径互不干扰。
+pub fn clear_stale_badge(conn: &Connection) -> Result<(), String> {
+    set_available_version(conn, None)?;
+    set_available_notes(conn, None)?;
+    Ok(())
+}
+
+/// 网页端红点详情命令的数据源（webui-update 票 01 spec B，桌面
+/// [`BadgeState`] 形状不变——本结构只服务新只读命令）：available 沿用判活
+/// 语义（落库版本数值上比当前新）；version/notes 来自落库（无记录 = null）。
+/// serde 形态 null 不省略：`{"available":bool,"version":string|null,"notes":string|null}`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BadgeDetailState {
+    pub available: bool,
+    pub version: Option<String>,
+    pub notes: Option<String>,
+}
+
+/// 红点详情读取（webui-update 票 01）：版本与说明读落库，判活复用
+/// [`badge_available`] 同一口径（不另立第二套比较）。
+pub fn badge_detail(conn: &Connection, current_version: &str) -> Result<BadgeDetailState, String> {
+    let version = available_version(conn)?;
+    let notes = available_notes(conn)?;
+    let available = badge_available(conn, current_version)?;
+    Ok(BadgeDetailState {
+        available,
+        version,
+        notes,
+    })
 }
 
 /// 每日检查 · 段 1（持锁段）：读"上次检查日"判断今天该不该查。调用方拿锁调它、
@@ -717,7 +808,7 @@ impl ConfirmSteps for PluginConfirmSteps {
         let updater = build_updater(&self.app)?;
         let update = tauri::async_runtime::block_on(updater.check())
             .map_err(|e| format!("检查更新失败: {e}"))?
-            .ok_or_else(|| "远端已没有比当前更新的版本".to_string())?;
+            .ok_or_else(|| ERR_NO_NEWER_REMOTE.to_string())?;
         let info = update_to_info(update.clone());
         *self
             .update
@@ -1442,6 +1533,138 @@ mod tests {
         .unwrap();
         assert!(!badge_available(&conn, "0.3.0").unwrap());
         assert!(badge_available(&conn, "0.2.9").unwrap());
+    }
+
+    #[test]
+    fn badge_notes_follow_version_lifecycle() {
+        // webui-update 票 01：notes 与版本号一并落库，生命周期跟随 available——
+        // 发现新版两键齐写、查无新版两键齐清，绝不外显陈旧 notes。
+        let conn = mem_conn();
+
+        // 发现新版（带说明）→ version + notes 一并落库
+        record_badge_from_result(
+            &conn,
+            &Ok(Some(UpdateInfo {
+                version: "0.3.0".into(),
+                notes: Some("修复若干问题".into()),
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+        assert_eq!(available_version(&conn).unwrap().as_deref(), Some("0.3.0"));
+        assert_eq!(
+            available_notes(&conn).unwrap().as_deref(),
+            Some("修复若干问题")
+        );
+
+        // 新版说明可缺：版本推进，notes 键清空（本次 release 无说明）
+        record_badge_from_result(
+            &conn,
+            &Ok(Some(UpdateInfo {
+                version: "0.4.0".into(),
+                notes: None,
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+        assert_eq!(available_version(&conn).unwrap().as_deref(), Some("0.4.0"));
+        assert_eq!(available_notes(&conn).unwrap(), None);
+
+        // 查无新版 → 两键皆清
+        record_badge_from_result(&conn, &Ok(None), "0.2.0").unwrap();
+        assert_eq!(available_version(&conn).unwrap(), None);
+        assert_eq!(available_notes(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn badge_notes_untouched_on_check_failure() {
+        // webui-update 票 01：检查失败≠无更新，version + notes 都不动（同版本号口径）
+        let conn = mem_conn();
+        record_badge_from_result(
+            &conn,
+            &Ok(Some(UpdateInfo {
+                version: "0.3.0".into(),
+                notes: Some("n".into()),
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+        record_badge_from_result(
+            &conn,
+            &Err("HTTP 404：latest.json 不存在".into()),
+            "0.2.0",
+        )
+        .unwrap();
+        assert_eq!(available_version(&conn).unwrap().as_deref(), Some("0.3.0"));
+        assert_eq!(available_notes(&conn).unwrap().as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn clear_stale_badge_clears_both_keys() {
+        // 返工 R1：复查证实无新版后的红点作废直测——版本号与说明两键同清
+        //（与 record_badge_from_result 的 Ok(None) 臂同口径）；键已空再清仍
+        // Ok（幂等）。
+        let conn = mem_conn();
+        record_badge_from_result(
+            &conn,
+            &Ok(Some(UpdateInfo {
+                version: "0.3.0".into(),
+                notes: Some("修复若干问题".into()),
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+        assert_eq!(available_version(&conn).unwrap().as_deref(), Some("0.3.0"));
+        assert_eq!(
+            available_notes(&conn).unwrap().as_deref(),
+            Some("修复若干问题")
+        );
+
+        clear_stale_badge(&conn).unwrap();
+        assert_eq!(available_version(&conn).unwrap(), None);
+        assert_eq!(available_notes(&conn).unwrap(), None);
+
+        // 幂等：两键已空再清一次不报错
+        clear_stale_badge(&conn).unwrap();
+    }
+
+    #[test]
+    fn badge_detail_shape_and_liveness() {
+        // webui-update 票 01 网页端只读命令的数据源：available 沿用判活语义，
+        // version/notes 来自落库（无记录 = None）；serde 形态 null 不省略。
+        let conn = mem_conn();
+
+        // 无记录：false / null / null
+        let detail = badge_detail(&conn, "0.2.0").unwrap();
+        assert!(!detail.available);
+        assert_eq!(detail.version, None);
+        assert_eq!(detail.notes, None);
+        assert_eq!(
+            serde_json::to_string(&detail).unwrap(),
+            r#"{"available":false,"version":null,"notes":null}"#
+        );
+
+        // 有新版记录：判活真 + version/notes 齐全
+        record_badge_from_result(
+            &conn,
+            &Ok(Some(UpdateInfo {
+                version: "0.3.0".into(),
+                notes: Some("修复若干问题".into()),
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+        let detail = badge_detail(&conn, "0.2.0").unwrap();
+        assert!(detail.available);
+        assert_eq!(detail.version.as_deref(), Some("0.3.0"));
+        assert_eq!(detail.notes.as_deref(), Some("修复若干问题"));
+
+        // 装完重启版本追上：判活灭；键还在——version/notes 照落库事实返回，
+        // available 才是亮灭权威（与 BadgeState 判活口径一致）
+        let detail = badge_detail(&conn, "0.3.0").unwrap();
+        assert!(!detail.available);
+        assert_eq!(detail.version.as_deref(), Some("0.3.0"));
+        assert_eq!(detail.notes.as_deref(), Some("修复若干问题"));
     }
 
     // ── 托盘检查分流（update-entry 票 03）──

@@ -540,6 +540,30 @@ export const checkUpdateNow = cmdFn<void, CheckOutcome>("check_update_now");
 export const confirmAndInstall = cmdFn<void, InstallOutcome>("confirm_and_install");
 export const openReleasesPage = cmdFn<void, void>("open_releases_page");
 
+// ── 网页端升级（webui-update 票 02，ADR-0010）：横幅数据源 + 确认触发 + 探活
+//    前两条已入网页端白名单（webui_server.rs 派发臂同名单逐字）；health_check
+//    此前未包装（本文件头注释「随用随加」），升级等待期轮询首次在用故补上。──
+
+/** 红点详情（get_update_badge_detail 返回；Rust updater::BadgeDetailState，
+ *  serde 形态 null 不省略）：available = 判活（落库版本数值上比当前新），
+ *  version/notes 来自落库（无记录 = null）。 */
+export interface UpdateBadgeDetail {
+  available: boolean;
+  version: string | null;
+  notes: string | null;
+}
+/** 网页端红点详情（升级横幅数据源；无参）。 */
+export const getUpdateBadgeDetail = cmdFn<void, UpdateBadgeDetail>("get_update_badge_detail");
+/** 网页端确认安装触发：Ok 与桌面 confirm_and_install 完全同契约
+ *  （install_started / install_failed 状态，install_failed 是「状态」不是
+ *  Err）；Err(String) = 检查失败类（含「远端已没有比当前更新的版本」固定串
+ *  与防重入串「已有安装流程正在进行…」），经 /api/cmd 500 以字符串 reject
+ *  （httpInvoke 已归一，与桌面 invoke Err 同形）。 */
+export const confirmAndInstallUpdate = cmdFn<void, InstallOutcome>("confirm_and_install_update");
+/** 服务端探活（升级等待期轮询）：resolve = 服务端还在；reject（网络错误/非
+ *  2xx）= 服务端已退出重启中。 */
+export const healthCheck = cmdFn<void, { schema_version: number }>("health_check");
+
 // ── 网页端设置（webui-checkin 票 03；防火墙 UAC 路径真机冒烟，不在前端测）──
 
 export const listNetworkSegments = cmdFn<void, NetworkSegment[]>("list_network_segments");
