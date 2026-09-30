@@ -24,6 +24,7 @@ import PhotoWallPage from "./components/PhotoWallPage.vue";
 import SpeciesGuidePage from "./components/SpeciesGuidePage.vue";
 import ToastHost from "./components/ToastHost.vue";
 import WebUiWizard from "./components/WebUiWizard.vue";
+import WebUpdateBanner from "./components/WebUpdateBanner.vue";
 
 import pkg from "../package.json";
 
@@ -245,6 +246,10 @@ onBeforeUnmount(() => stopTodayClock());
         </button>
       </div>
     </header>
+
+    <!-- 网页端升级横幅（webui-update 票 02，ADR-0010）：浏览器模式专属外壳层，
+         桌面端不渲染；横幅/确认面板/升级状态机本体在 WebUpdateBanner -->
+    <WebUpdateBanner v-if="!isTauri()" />
 
     <!-- 交互第三轮 #6：顶栏固定，内容区独立滚动 -->
     <div class="page-body">

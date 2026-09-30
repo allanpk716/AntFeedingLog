@@ -2,8 +2,11 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 import * as ipc from "./ipc";
 import {
   WEBUI_TOKEN_KEY,
+  confirmAndInstallUpdate,
   createColony,
   getStats,
+  getUpdateBadgeDetail,
+  healthCheck,
   isTauri,
   listColonies,
   saveCheckinWithPhotos,
@@ -528,5 +531,76 @@ describe("命令包装的导出面（测试 mock 工厂的路由依据）", () =
     expect(setColonyActionInterval.cmdName).toBe("set_colony_action_interval");
     // 拍一张桌面通道（checkin-photo-entry 票 02）：命令名按规格钉死
     expect(saveCheckinWithPhotos.cmdName).toBe("save_checkin_with_photos");
+    // 网页端升级（webui-update 票 02）：命令名与 Rust 派发臂逐字一致
+    expect(getUpdateBadgeDetail.cmdName).toBe("get_update_badge_detail");
+    expect(confirmAndInstallUpdate.cmdName).toBe("confirm_and_install_update");
+  });
+});
+
+// ── 网页端升级命令（webui-update 票 02）：横幅数据源 + 确认触发 + 探活 ──
+
+describe("网页端升级命令（webui-update 票 02）", () => {
+  it("桌面路由：get_update_badge_detail / confirm_and_install_update 透传 invoke（无参）", async () => {
+    asTauri();
+    invokeMock.mockResolvedValue({ available: true, version: "0.3.0", notes: null });
+    await expect(getUpdateBadgeDetail()).resolves.toEqual({
+      available: true,
+      version: "0.3.0",
+      notes: null,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("get_update_badge_detail");
+
+    invokeMock.mockResolvedValue({ status: "install_started", version: "0.3.0" });
+    await expect(confirmAndInstallUpdate()).resolves.toEqual({
+      status: "install_started",
+      version: "0.3.0",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("confirm_and_install_update");
+  });
+
+  it("浏览器路由：详情查询 POST /api/cmd（args 空对象），返回体 = BadgeDetailState 形状原样", async () => {
+    asBrowser();
+    const fetchMock = stubFetch(200, JSON.stringify({ available: true, version: "0.3.0", notes: null }));
+
+    await expect(getUpdateBadgeDetail()).resolves.toEqual({
+      available: true,
+      version: "0.3.0",
+      notes: null,
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ cmd: "get_update_badge_detail", args: {} });
+  });
+
+  it("浏览器路由：install_failed 是 200 返回值（「状态」不是 Err），形状原样透传", async () => {
+    asBrowser();
+    stubFetch(200, JSON.stringify({ status: "install_failed", version: "0.3.0", message: "下载更新失败: 请求超时" }));
+
+    await expect(confirmAndInstallUpdate()).resolves.toEqual({
+      status: "install_failed",
+      version: "0.3.0",
+      message: "下载更新失败: 请求超时",
+    });
+  });
+
+  it("浏览器路由：确认流 Err（复查无新版/防重入固定串）以 500 {error} 字符串 reject（桌面 invoke Err 同形）", async () => {
+    asBrowser();
+    stubFetch(500, JSON.stringify({ error: "远端已没有比当前更新的版本" }));
+    await expect(confirmAndInstallUpdate()).rejects.toBe("远端已没有比当前更新的版本");
+
+    stubFetch(500, JSON.stringify({ error: "已有安装流程正在进行，请稍候" }));
+    await expect(confirmAndInstallUpdate()).rejects.toBe("已有安装流程正在进行，请稍候");
+  });
+
+  it("浏览器路由：health_check 探活（升级等待期轮询）返回体原样", async () => {
+    asBrowser();
+    stubFetch(200, JSON.stringify({ schema_version: 14 }));
+
+    await expect(healthCheck()).resolves.toEqual({ schema_version: 14 });
+
+    const second = stubFetch(200, "null");
+    await healthCheck();
+    const [, init] = second.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({ cmd: "health_check", args: {} });
   });
 });
