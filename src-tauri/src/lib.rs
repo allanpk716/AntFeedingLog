@@ -1045,6 +1045,10 @@ fn try_acquire_confirm_slot() -> Result<ConfirmInFlightGuard, String> {
 fn confirm_and_install_blocking(app: tauri::AppHandle) -> Result<updater::InstallOutcome, String> {
     // 防重入闸门：第二条流（桌面双击 / 网页端与桌面并发）挡在门外
     let _guard = try_acquire_confirm_slot()?;
+    // 返工 R1：AppHandle 会被下面的 catch_unwind 闭包 move 进确认流
+    //（PluginConfirmSteps::new(app)）；Err 臂的红点作废还要拿数据库连接，
+    // 提前克隆一份把手留在闭包外。
+    let badge_app = app.clone();
     // panic 兜底（原 spawn_blocking JoinError 臂的语义内移，两端共用）：panic 点
     // 可能已在 install 置位禁写之后——进程存活就必须复位（M-1 契约精神：失败后
     // 应用不得卡在只读态）；标记保留，交启动判定兜底。
@@ -1081,9 +1085,47 @@ fn confirm_and_install_blocking(app: tauri::AppHandle) -> Result<updater::Instal
             // 确认流在下载前中止（再次检查失败 / 写 pending 标记失败 / 防重入拒绝
             // 不会走到这——闸门在编排之前早退，不落流水）
             applog::log_error(&format!("确认安装流程中止: {e}"));
+            // 返工 R1：复查证实"远端已没有比当前更新的版本"→ 落库红点是陈旧
+            // 事实，两键一并作废（网页端出口3"重读红点、收横幅"后
+            // get_update_badge_detail 即灭，与 record_badge_from_result 的
+            // Ok(None) 同口径）；其他 Err（检查失败/写标记失败）≠ 无更新，红点
+            // 保持原状。清失败只落日志，不改变原 Err 返回——红点是副产物。
+            clear_stale_badge_best_effort(&badge_app, e);
         }
     }
     outcome
+}
+
+/// 返工 R1：确认流 Err 后的红点作废判定 + 动作（注入连接的纯逻辑，可测）：
+/// 仅当 Err 文案包含复查"查无新版"固定串（[`updater::ERR_NO_NEWER_REMOTE`]，
+/// 包含匹配，与网页端前端出口3 同口径）时清 available_version 与
+/// available_notes 两键并返回 true；其他 Err（检查失败/写标记失败）不动红点，
+/// 返回 false——检查失败≠无更新，红点保持原状。
+fn clear_stale_badge_if_remote_exhausted(
+    conn: &rusqlite::Connection,
+    err: &str,
+) -> Result<bool, String> {
+    if err.contains(updater::ERR_NO_NEWER_REMOTE) {
+        updater::clear_stale_badge(conn)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// 上者的 AppHandle 接线壳（薄封装不进单测，照 updater::record_badge_and_emit
+/// 容错口径）：连接取不到（状态未就绪/锁毒化）直接放弃；清理失败只落日志——
+/// 红点是副产物，绝不影响 confirm_and_install_blocking 的原 Err 返回。
+fn clear_stale_badge_best_effort(app: &tauri::AppHandle, err: &str) {
+    let Some(state) = app.try_state::<DbState>() else {
+        return;
+    };
+    let Ok(conn) = state.0.lock() else {
+        return;
+    };
+    if let Err(e) = clear_stale_badge_if_remote_exhausted(&conn, err) {
+        applog::log_error(&format!("复查无新版清红点失败（忽略）: {e}"));
+    }
 }
 
 /// 确认升级并安装（设置页按钮，票 06 接 UI）。编排（再次检查 → 写 pending 标记
@@ -2072,9 +2114,11 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::clear_stale_badge_if_remote_exhausted;
     use super::settle_settings_save;
     use super::try_acquire_confirm_slot;
     use crate::settings::AppSettings;
+    use crate::updater::{self, UpdateInfo};
 
     #[test]
     fn autostart_sync_failure_does_not_sink_saved_settings() {
@@ -2105,5 +2149,79 @@ mod tests {
         assert_eq!(second.unwrap_err(), "已有安装流程正在进行，请稍候");
         drop(first);
         assert!(try_acquire_confirm_slot().is_ok(), "Guard Drop 复位后可再进");
+    }
+
+    // ── 返工 R1：确认流复查"查无新版"时的红点作废接线 ──────────────────────
+    //（照 updater.rs 既有 mem_conn/注入式先例：接线处的连接动作 + 字符串分支
+    // 在此可测；AppHandle 薄壳 clear_stale_badge_best_effort 本身不进单测。）
+
+    fn mem_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("内存库打开失败");
+        crate::db::migrate(&conn).expect("迁移失败");
+        conn
+    }
+
+    /// 种一份"已发现新版"的完整红点落库（版本号 + 说明两键齐全）。
+    fn seed_badge(conn: &rusqlite::Connection) {
+        updater::record_badge_from_result(
+            conn,
+            &Ok(Some(UpdateInfo {
+                version: "9.9.9".into(),
+                notes: Some("修复若干问题".into()),
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn remote_exhausted_err_clears_both_badge_keys() {
+        // 复查查无新版的该特定 Err → 两键一并清（判活假、version/notes 皆空）；
+        // 文案带前后缀的包裹变体同样触发（包含匹配，与网页端出口3 同口径）。
+        let conn = mem_conn();
+
+        seed_badge(&conn);
+        let cleared =
+            clear_stale_badge_if_remote_exhausted(&conn, updater::ERR_NO_NEWER_REMOTE).unwrap();
+        assert!(cleared, "固定串应触发清理");
+        assert_eq!(updater::available_version(&conn).unwrap(), None);
+        assert_eq!(updater::available_notes(&conn).unwrap(), None);
+
+        seed_badge(&conn);
+        let cleared = clear_stale_badge_if_remote_exhausted(
+            &conn,
+            "确认安装流程中止: 远端已没有比当前更新的版本",
+        )
+        .unwrap();
+        assert!(cleared, "包含匹配应触发清理");
+        assert_eq!(updater::available_version(&conn).unwrap(), None);
+        assert_eq!(updater::available_notes(&conn).unwrap(), None);
+    }
+
+    #[test]
+    fn other_confirm_errs_leave_badge_keys_untouched() {
+        // 其他 Err（检查失败/防重入/写标记失败/部分串）≠ 无更新：两键原样，
+        // 红点保持原状（与 record_badge_from_result 的 Err 臂同口径）。
+        let conn = mem_conn();
+        seed_badge(&conn);
+
+        for err in [
+            "检查更新失败: 网络超时",
+            "已有安装流程正在进行，请稍候",
+            "写 pending 标记失败: 权限不足",
+            "远端已没有", // 部分串不触发：必须包含全串才判"查无新版"
+        ] {
+            let cleared =
+                clear_stale_badge_if_remote_exhausted(&conn, err).expect("判定本身不应失败");
+            assert!(!cleared, "「{err}」不应触发红点清理");
+        }
+        assert_eq!(
+            updater::available_version(&conn).unwrap().as_deref(),
+            Some("9.9.9")
+        );
+        assert_eq!(
+            updater::available_notes(&conn).unwrap().as_deref(),
+            Some("修复若干问题")
+        );
     }
 }

@@ -72,6 +72,12 @@ pub const K_AVAILABLE_NOTES: &str = "update_available_notes";
 /// 不随版本号变，无需在发版时改这里。
 pub const RELEASES_PAGE_URL: &str = "https://github.com/allanpk716/AntFeedingLog/releases/latest";
 
+/// 确认流复查"查无新版"的固定中止文案：[`PluginConfirmSteps::fresh_update`]
+/// 远端没有比当前更新的版本时返回；网页端前端出口3 与 lib.rs 确认流 Err 臂的
+/// 红点清理判定（返工 R1）都按这一串做包含匹配——收敛为常量，生产者与匹配方
+/// 共用，防文案漂移。
+pub const ERR_NO_NEWER_REMOTE: &str = "远端已没有比当前更新的版本";
+
 /// 远端有新版时的最小信息：版本号 + release 说明。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct UpdateInfo {
@@ -603,6 +609,18 @@ pub fn record_badge_from_result(
     badge_available(conn, current_version)
 }
 
+/// 复查证实无新版后的红点作废（返工 R1）：确认升级流首步复查返回
+/// [`ERR_NO_NEWER_REMOTE`]（远端已没有比当前更新的版本）时，落库红点已成
+/// 陈旧事实——available_version 与 available_notes 两键一并清（与
+/// [`record_badge_from_result`] 的 Ok(None) 臂同款同步清，绝不外显陈旧
+/// notes）。由 lib.rs 确认流 Err 接线调用（清失败只落日志，不拦流程）；每日/
+/// 手动检查路径仍走 [`record_badge_from_result`]，两条路径互不干扰。
+pub fn clear_stale_badge(conn: &Connection) -> Result<(), String> {
+    set_available_version(conn, None)?;
+    set_available_notes(conn, None)?;
+    Ok(())
+}
+
 /// 网页端红点详情命令的数据源（webui-update 票 01 spec B，桌面
 /// [`BadgeState`] 形状不变——本结构只服务新只读命令）：available 沿用判活
 /// 语义（落库版本数值上比当前新）；version/notes 来自落库（无记录 = null）。
@@ -790,7 +808,7 @@ impl ConfirmSteps for PluginConfirmSteps {
         let updater = build_updater(&self.app)?;
         let update = tauri::async_runtime::block_on(updater.check())
             .map_err(|e| format!("检查更新失败: {e}"))?
-            .ok_or_else(|| "远端已没有比当前更新的版本".to_string())?;
+            .ok_or_else(|| ERR_NO_NEWER_REMOTE.to_string())?;
         let info = update_to_info(update.clone());
         *self
             .update
@@ -1579,6 +1597,35 @@ mod tests {
         .unwrap();
         assert_eq!(available_version(&conn).unwrap().as_deref(), Some("0.3.0"));
         assert_eq!(available_notes(&conn).unwrap().as_deref(), Some("n"));
+    }
+
+    #[test]
+    fn clear_stale_badge_clears_both_keys() {
+        // 返工 R1：复查证实无新版后的红点作废直测——版本号与说明两键同清
+        //（与 record_badge_from_result 的 Ok(None) 臂同口径）；键已空再清仍
+        // Ok（幂等）。
+        let conn = mem_conn();
+        record_badge_from_result(
+            &conn,
+            &Ok(Some(UpdateInfo {
+                version: "0.3.0".into(),
+                notes: Some("修复若干问题".into()),
+            })),
+            "0.2.0",
+        )
+        .unwrap();
+        assert_eq!(available_version(&conn).unwrap().as_deref(), Some("0.3.0"));
+        assert_eq!(
+            available_notes(&conn).unwrap().as_deref(),
+            Some("修复若干问题")
+        );
+
+        clear_stale_badge(&conn).unwrap();
+        assert_eq!(available_version(&conn).unwrap(), None);
+        assert_eq!(available_notes(&conn).unwrap(), None);
+
+        // 幂等：两键已空再清一次不报错
+        clear_stale_badge(&conn).unwrap();
     }
 
     #[test]
